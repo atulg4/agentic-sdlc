@@ -6,7 +6,7 @@ on:
       pull_request_number:
         description: Pull request to review
         required: true
-        type: number
+        type: string
       base_sha:
         description: Exact pull request base SHA
         required: true
@@ -42,8 +42,10 @@ jobs:
         env:
           BASE_SHA: ${{ inputs.base_sha }}
           HEAD_SHA: ${{ inputs.head_sha }}
+          PR_NUMBER: ${{ inputs.pull_request_number }}
         run: |
           set -euo pipefail
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]{0,9}$ ]]
           git cat-file -e "${BASE_SHA}^{commit}"
           test "$(git rev-parse HEAD)" = "$HEAD_SHA"
       - name: Create fixed review contract

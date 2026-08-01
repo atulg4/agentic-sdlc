@@ -15,20 +15,6 @@ def _job(document: str, name: str, next_name: str | None = None) -> str:
     return document[start:end]
 
 
-def _input(document: str, name: str) -> str:
-    lines = document.splitlines()
-    start = lines.index(f"      {name}:")
-    end = next(
-        (
-            index
-            for index in range(start + 1, len(lines))
-            if lines[index].startswith("      ") and not lines[index].startswith("        ")
-        ),
-        len(lines),
-    )
-    return "\n".join(lines[start:end])
-
-
 def test_platform_workflows_pin_external_actions_to_full_sha() -> None:
     pattern = re.compile(r"^[ \t]*(?:-[ \t]+)?uses:[ \t]+[^\s]+@([^\s#]+)", re.MULTILINE)
     for workflow in WORKFLOWS.glob("*.yml"):
@@ -108,35 +94,80 @@ def test_label_driven_templates_use_distinct_exact_trigger_labels() -> None:
     assert "trigger_actor: ${{ github.actor }}" in implementation
 
 
-def test_issue_numbers_cross_reusable_workflow_boundary_as_validated_strings() -> None:
+def test_cross_repository_identifiers_use_string_contracts() -> None:
+    reusable_inputs = {
+        "reusable-plan.yml": "issue_number",
+        "reusable-implement.yml": "issue_number",
+        "reusable-review.yml": "pull_request_number",
+    }
+    for filename, input_name in reusable_inputs.items():
+        document = (WORKFLOWS / filename).read_text(encoding="utf-8")
+        definition = re.search(
+            rf"^      {input_name}:\n(?P<body>(?:        .*\n)+)",
+            document,
+            re.MULTILINE,
+        )
+        assert definition is not None, filename
+        assert "        type: string\n" in definition.group("body"), filename
+
     template_root = ROOT / "src/agentic_sdlc/templates/github"
-    example_root = ROOT / "examples/marketmaestro/.github/workflows"
+    for filename in ("agent-plan.yml", "agent-implement.yml"):
+        document = (template_root / filename).read_text(encoding="utf-8")
+        definition = re.search(
+            r"^      issue_number:\n(?P<body>(?:        .*\n)+)",
+            document,
+            re.MULTILINE,
+        )
+        assert definition is not None, filename
+        assert "        type: string\n" in definition.group("body"), filename
 
-    for path in (
-        WORKFLOWS / "reusable-plan.yml",
-        WORKFLOWS / "reusable-implement.yml",
-        template_root / "agent-plan.yml",
-        template_root / "agent-implement.yml",
-        example_root / "agent-plan.yml",
-        example_root / "agent-implement.yml",
-    ):
-        document = path.read_text(encoding="utf-8")
-        assert "type: string" in _input(document, "issue_number"), path
+    auto_plan = (template_root / "agent-auto-plan.yml").read_text(encoding="utf-8")
+    auto_implement = (template_root / "agent-auto-implement.yml").read_text(encoding="utf-8")
+    review = (template_root / "agent-review.yml").read_text(encoding="utf-8")
+    issue_cast = "issue_number: ${{ format('{0}', github.event.issue.number) }}"
+    assert issue_cast in auto_plan
+    assert issue_cast in auto_implement
+    assert "pull_request_number: ${{ format('{0}', github.event.pull_request.number) }}" in review
 
-    string_conversion = "issue_number: ${{ format('{0}', github.event.issue.number) }}"
-    for path in (
-        template_root / "agent-auto-plan.yml",
-        template_root / "agent-auto-implement.yml",
-        ROOT / "templates/github/auto-plan.yml",
-        ROOT / "templates/github/auto-implement.yml",
-        example_root / "agent-auto-plan.yml",
-        example_root / "agent-auto-implement.yml",
-    ):
-        assert string_conversion in path.read_text(encoding="utf-8"), path
 
+def test_reusable_identifiers_are_allowlisted_before_api_use() -> None:
     issue_allowlist = '[[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]{0,9}$ ]]'
     for name in ("reusable-plan.yml", "reusable-implement.yml"):
-        assert issue_allowlist in (WORKFLOWS / name).read_text(encoding="utf-8")
+        document = (WORKFLOWS / name).read_text(encoding="utf-8")
+        assert issue_allowlist in document
+        assert document.index(issue_allowlist) < document.index(
+            "Read issue without shell interpolation"
+        )
+
+    review = (WORKFLOWS / "reusable-review.yml").read_text(encoding="utf-8")
+    pr_allowlist = '[[ "$PR_NUMBER" =~ ^[1-9][0-9]{0,9}$ ]]'
+    assert pr_allowlist in review
+    assert review.index(pr_allowlist) < review.index("Validate and publish review")
+
+
+def test_legacy_and_example_workflows_match_identifier_contracts() -> None:
+    issue_cast = "issue_number: ${{ format('{0}', github.event.issue.number) }}"
+    for path in (
+        ROOT / "templates/github/auto-plan.yml",
+        ROOT / "templates/github/auto-implement.yml",
+        ROOT / "examples/marketmaestro/.github/workflows/agent-auto-plan.yml",
+        ROOT / "examples/marketmaestro/.github/workflows/agent-auto-implement.yml",
+    ):
+        assert issue_cast in path.read_text(encoding="utf-8"), path
+
+    example_root = ROOT / "examples/marketmaestro/.github/workflows"
+    for name in ("agent-plan.yml", "agent-implement.yml"):
+        document = (example_root / name).read_text(encoding="utf-8")
+        definition = re.search(
+            r"^      issue_number:\n(?P<body>(?:        .*\n)+)",
+            document,
+            re.MULTILINE,
+        )
+        assert definition is not None, name
+        assert "        type: string\n" in definition.group("body"), name
+
+    review = (example_root / "agent-review.yml").read_text(encoding="utf-8")
+    assert "pull_request_number: ${{ format('{0}', github.event.pull_request.number) }}" in review
 
 
 def test_plan_and_review_publishers_receive_no_ai_credentials() -> None:
