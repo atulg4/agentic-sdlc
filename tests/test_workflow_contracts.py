@@ -130,6 +130,46 @@ def test_cross_repository_identifiers_use_string_contracts() -> None:
     assert "pull_request_number: ${{ format('{0}', github.event.pull_request.number) }}" in review
 
 
+def test_reusable_identifiers_are_allowlisted_before_api_use() -> None:
+    issue_allowlist = '[[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]{0,9}$ ]]'
+    for name in ("reusable-plan.yml", "reusable-implement.yml"):
+        document = (WORKFLOWS / name).read_text(encoding="utf-8")
+        assert issue_allowlist in document
+        assert document.index(issue_allowlist) < document.index(
+            "Read issue without shell interpolation"
+        )
+
+    review = (WORKFLOWS / "reusable-review.yml").read_text(encoding="utf-8")
+    pr_allowlist = '[[ "$PR_NUMBER" =~ ^[1-9][0-9]{0,9}$ ]]'
+    assert pr_allowlist in review
+    assert review.index(pr_allowlist) < review.index("Validate and publish review")
+
+
+def test_legacy_and_example_workflows_match_identifier_contracts() -> None:
+    issue_cast = "issue_number: ${{ format('{0}', github.event.issue.number) }}"
+    for path in (
+        ROOT / "templates/github/auto-plan.yml",
+        ROOT / "templates/github/auto-implement.yml",
+        ROOT / "examples/marketmaestro/.github/workflows/agent-auto-plan.yml",
+        ROOT / "examples/marketmaestro/.github/workflows/agent-auto-implement.yml",
+    ):
+        assert issue_cast in path.read_text(encoding="utf-8"), path
+
+    example_root = ROOT / "examples/marketmaestro/.github/workflows"
+    for name in ("agent-plan.yml", "agent-implement.yml"):
+        document = (example_root / name).read_text(encoding="utf-8")
+        definition = re.search(
+            r"^      issue_number:\n(?P<body>(?:        .*\n)+)",
+            document,
+            re.MULTILINE,
+        )
+        assert definition is not None, name
+        assert "        type: string\n" in definition.group("body"), name
+
+    review = (example_root / "agent-review.yml").read_text(encoding="utf-8")
+    assert "pull_request_number: ${{ format('{0}', github.event.pull_request.number) }}" in review
+
+
 def test_plan_and_review_publishers_receive_no_ai_credentials() -> None:
     plan = (WORKFLOWS / "reusable-plan.yml").read_text(encoding="utf-8")
     review = (WORKFLOWS / "reusable-review.yml").read_text(encoding="utf-8")
