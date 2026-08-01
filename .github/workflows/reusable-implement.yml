@@ -173,7 +173,7 @@ jobs:
             exit 2
           fi
       - name: Store validated implementation request
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: implementation-input-${{ github.run_id }}
           path: |
@@ -185,7 +185,7 @@ jobs:
           include-hidden-files: true
           retention-days: 3
       - name: Store pinned policy engine for credential-free jobs
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: policy-engine-${{ github.run_id }}
           path: .agentic-platform/src/agentic_sdlc/
@@ -276,7 +276,7 @@ jobs:
             --output .agentic-output/manifest.json
           cp .agentic-input/agent-message.md .agentic-output/agent-message.md
       - name: Store untrusted generated patch
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: generated-patch-${{ github.run_id }}
           path: .agentic-output/
@@ -425,7 +425,7 @@ jobs:
             --request-number "$ISSUE_NUMBER" \
             --output "${RUNNER_TEMP}/verified-patch/manifest.json"
       - name: Store patch from non-executing attestation job
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: verified-patch-${{ github.run_id }}
           path: ${{ runner.temp }}/verified-patch/
