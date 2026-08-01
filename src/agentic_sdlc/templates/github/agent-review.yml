@@ -16,7 +16,7 @@ jobs:
       issues: write
     uses: PLATFORM_REPOSITORY/.github/workflows/reusable-review.yml@PLATFORM_COMMIT_SHA
     with:
-      pull_request_number: ${{ github.event.pull_request.number }}
+      pull_request_number: ${{ format('{0}', github.event.pull_request.number) }}
       base_sha: ${{ github.event.pull_request.base.sha }}
       head_sha: ${{ github.event.pull_request.head.sha }}
     secrets:
