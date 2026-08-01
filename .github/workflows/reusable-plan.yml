@@ -6,7 +6,7 @@ on:
       issue_number:
         description: Issue to plan
         required: true
-        type: number
+        type: string
       trigger_actor:
         description: GitHub actor who authorized this run
         required: true
@@ -66,9 +66,11 @@ jobs:
           printf 'sha=%s\n' "$actual" >> "$GITHUB_OUTPUT"
       - name: Validate platform identity
         env:
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
           PLATFORM_REF: ${{ inputs.platform_ref }}
           PLATFORM_REPOSITORY: ${{ inputs.platform_repository }}
         run: |
+          [[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]{0,9}$ ]]
           [[ "$PLATFORM_REF" =~ ^[0-9a-f]{40}$ ]]
           [[ "$PLATFORM_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
       - name: Require repository write authority from trigger actor
