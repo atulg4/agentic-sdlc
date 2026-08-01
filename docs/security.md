@@ -34,6 +34,8 @@ The pipeline uses separate jobs and fresh checkouts:
    native short-lived token only for branch contents, then a separate
    current-repository GitHub App token for the pull request and issue comment.
 7. The reviewer has read access and an independent AI credential context.
+   Its fixed publisher has no checkout or AI credential and receives only
+   pull-request write permission to post the validated review comment.
 
 GitHub publishing uses the native `GITHUB_TOKEN` for the branch push so that
 push-triggered workflows do not run on the unreviewed branch. It then requires

@@ -13,7 +13,7 @@ jobs:
       github.event.pull_request.draft == false
     permissions:
       contents: read
-      issues: write
+      pull-requests: write
     uses: PLATFORM_REPOSITORY/.github/workflows/reusable-review.yml@PLATFORM_COMMIT_SHA
     with:
       pull_request_number: ${{ format('{0}', github.event.pull_request.number) }}

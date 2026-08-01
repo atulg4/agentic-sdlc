@@ -137,7 +137,19 @@ def test_plan_and_review_publishers_receive_no_ai_credentials() -> None:
     assert "API_KEY" not in _job(plan, "publish")
     review_publisher = _job(review, "enforce_review")
     assert "API_KEY" not in review_publisher
-    assert "pull-requests: write" not in review_publisher
+    assert "pull-requests: write" in review_publisher
+    assert "issues: write" not in review_publisher
+    assert "actions/checkout" not in review_publisher
+
+
+def test_review_caller_grants_only_required_comment_authority() -> None:
+    document = (ROOT / "src/agentic_sdlc/templates/github/agent-review.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "contents: read" in document
+    assert "pull-requests: write" in document
+    assert "issues: write" not in document
 
 
 def test_secret_bearing_workflows_never_use_pull_request_target() -> None:
