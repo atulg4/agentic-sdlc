@@ -2,33 +2,6 @@ name: Reusable agent plan diagnostic
 
 on:
   workflow_call:
-    inputs:
-      issue_number:
-        description: Issue to plan
-        required: true
-        type: number
-      trigger_actor:
-        description: GitHub actor who authorized this run
-        required: true
-        type: string
-      config_path:
-        description: Policy file in the caller repository
-        required: false
-        default: agentic-sdlc.toml
-        type: string
-      platform_ref:
-        description: Immutable Agentic SDLC commit SHA
-        required: true
-        type: string
-      platform_repository:
-        description: Agentic SDLC repository in owner/name form
-        required: true
-        type: string
-    secrets:
-      OPENAI_API_KEY:
-        required: true
-      PLATFORM_READ_TOKEN:
-        required: false
 
 permissions: {}
 
