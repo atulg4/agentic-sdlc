@@ -18,7 +18,7 @@ jobs:
       issues: write
     uses: atulg4/agentic-sdlc/.github/workflows/reusable-plan.yml@PLATFORM_COMMIT_SHA
     with:
-      issue_number: ${{ github.event.issue.number }}
+      issue_number: ${{ format('{0}', github.event.issue.number) }}
       trigger_actor: ${{ github.actor }}
       config_path: agentic-sdlc.toml
       platform_ref: PLATFORM_COMMIT_SHA
