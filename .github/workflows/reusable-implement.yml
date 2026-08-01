@@ -207,12 +207,12 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Restore validated request
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: implementation-input-${{ github.run_id }}
           path: .agentic-input
       - name: Restore pinned policy engine
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: policy-engine-${{ github.run_id }}
           path: .agentic-platform/src/agentic_sdlc
@@ -302,14 +302,14 @@ jobs:
           CONFIG_PATH: ${{ inputs.config_path }}
         run: cp -- "$CONFIG_PATH" "${RUNNER_TEMP}/trusted-policy.toml"
       - name: Restore pinned policy engine without repository credentials
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: policy-engine-${{ github.run_id }}
           path: .agentic-platform/src/agentic_sdlc
       - name: Exclude verifier material from diff
         run: printf '/.agentic-platform/\n' >> .git/info/exclude
       - name: Restore generated patch
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: generated-patch-${{ github.run_id }}
           path: ${{ runner.temp }}/generated-patch
@@ -377,14 +377,14 @@ jobs:
           CONFIG_PATH: ${{ inputs.config_path }}
         run: cp -- "$CONFIG_PATH" "${RUNNER_TEMP}/trusted-policy.toml"
       - name: Restore pinned policy engine without repository credentials
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: policy-engine-${{ github.run_id }}
           path: .agentic-platform/src/agentic_sdlc
       - name: Exclude attestation material from diff
         run: printf '/.agentic-platform/\n' >> .git/info/exclude
       - name: Restore original generated patch
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: generated-patch-${{ github.run_id }}
           path: ${{ runner.temp }}/generated-patch
@@ -455,7 +455,7 @@ jobs:
           fetch-depth: 0
           token: ${{ github.token }}
       - name: Restore verified patch only
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: verified-patch-${{ github.run_id }}
           path: ${{ runner.temp }}/verified-patch
