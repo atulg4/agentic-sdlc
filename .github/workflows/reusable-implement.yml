@@ -234,6 +234,14 @@ jobs:
           sandbox: workspace-write
           safety-strategy: drop-sudo
           codex-args: '["--ephemeral"]'
+      - name: Install bubblewrap (Claude Code subprocess isolation)
+        if: inputs.agent == 'claude'
+        # Claude Code 2.x requires bubblewrap on Linux when subprocess env
+        # scrubbing is enabled (CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 below);
+        # without it the CLI refuses to start and the install step fails.
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q bubblewrap
       - name: Generate patch with Claude Code in isolated checkout
         id: claude
         if: inputs.agent == 'claude'
