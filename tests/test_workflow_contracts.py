@@ -94,6 +94,42 @@ def test_label_driven_templates_use_distinct_exact_trigger_labels() -> None:
     assert "trigger_actor: ${{ github.actor }}" in implementation
 
 
+def test_cross_repository_identifiers_use_string_contracts() -> None:
+    reusable_inputs = {
+        "reusable-plan.yml": "issue_number",
+        "reusable-implement.yml": "issue_number",
+        "reusable-review.yml": "pull_request_number",
+    }
+    for filename, input_name in reusable_inputs.items():
+        document = (WORKFLOWS / filename).read_text(encoding="utf-8")
+        definition = re.search(
+            rf"^      {input_name}:\n(?P<body>(?:        .*\n)+)",
+            document,
+            re.MULTILINE,
+        )
+        assert definition is not None, filename
+        assert "        type: string\n" in definition.group("body"), filename
+
+    template_root = ROOT / "src/agentic_sdlc/templates/github"
+    for filename in ("agent-plan.yml", "agent-implement.yml"):
+        document = (template_root / filename).read_text(encoding="utf-8")
+        definition = re.search(
+            r"^      issue_number:\n(?P<body>(?:        .*\n)+)",
+            document,
+            re.MULTILINE,
+        )
+        assert definition is not None, filename
+        assert "        type: string\n" in definition.group("body"), filename
+
+    auto_plan = (template_root / "agent-auto-plan.yml").read_text(encoding="utf-8")
+    auto_implement = (template_root / "agent-auto-implement.yml").read_text(encoding="utf-8")
+    review = (template_root / "agent-review.yml").read_text(encoding="utf-8")
+    issue_cast = "issue_number: ${{ format('{0}', github.event.issue.number) }}"
+    assert issue_cast in auto_plan
+    assert issue_cast in auto_implement
+    assert "pull_request_number: ${{ format('{0}', github.event.pull_request.number) }}" in review
+
+
 def test_plan_and_review_publishers_receive_no_ai_credentials() -> None:
     plan = (WORKFLOWS / "reusable-plan.yml").read_text(encoding="utf-8")
     review = (WORKFLOWS / "reusable-review.yml").read_text(encoding="utf-8")
