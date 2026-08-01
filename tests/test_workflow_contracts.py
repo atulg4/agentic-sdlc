@@ -15,6 +15,20 @@ def _job(document: str, name: str, next_name: str | None = None) -> str:
     return document[start:end]
 
 
+def _input(document: str, name: str) -> str:
+    lines = document.splitlines()
+    start = lines.index(f"      {name}:")
+    end = next(
+        (
+            index
+            for index in range(start + 1, len(lines))
+            if lines[index].startswith("      ") and not lines[index].startswith("        ")
+        ),
+        len(lines),
+    )
+    return "\n".join(lines[start:end])
+
+
 def test_platform_workflows_pin_external_actions_to_full_sha() -> None:
     pattern = re.compile(r"^[ \t]*(?:-[ \t]+)?uses:[ \t]+[^\s]+@([^\s#]+)", re.MULTILINE)
     for workflow in WORKFLOWS.glob("*.yml"):
@@ -92,6 +106,37 @@ def test_label_driven_templates_use_distinct_exact_trigger_labels() -> None:
     assert "github.event.label.name == 'implementation-approved'" in implementation
     assert "trigger_actor: ${{ github.actor }}" in plan
     assert "trigger_actor: ${{ github.actor }}" in implementation
+
+
+def test_issue_numbers_cross_reusable_workflow_boundary_as_validated_strings() -> None:
+    template_root = ROOT / "src/agentic_sdlc/templates/github"
+    example_root = ROOT / "examples/marketmaestro/.github/workflows"
+
+    for path in (
+        WORKFLOWS / "reusable-plan.yml",
+        WORKFLOWS / "reusable-implement.yml",
+        template_root / "agent-plan.yml",
+        template_root / "agent-implement.yml",
+        example_root / "agent-plan.yml",
+        example_root / "agent-implement.yml",
+    ):
+        document = path.read_text(encoding="utf-8")
+        assert "type: string" in _input(document, "issue_number"), path
+
+    string_conversion = "issue_number: ${{ format('{0}', github.event.issue.number) }}"
+    for path in (
+        template_root / "agent-auto-plan.yml",
+        template_root / "agent-auto-implement.yml",
+        ROOT / "templates/github/auto-plan.yml",
+        ROOT / "templates/github/auto-implement.yml",
+        example_root / "agent-auto-plan.yml",
+        example_root / "agent-auto-implement.yml",
+    ):
+        assert string_conversion in path.read_text(encoding="utf-8"), path
+
+    issue_allowlist = '[[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]{0,9}$ ]]'
+    for name in ("reusable-plan.yml", "reusable-implement.yml"):
+        assert issue_allowlist in (WORKFLOWS / name).read_text(encoding="utf-8")
 
 
 def test_plan_and_review_publishers_receive_no_ai_credentials() -> None:
