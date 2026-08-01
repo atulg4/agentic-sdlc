@@ -6,7 +6,7 @@ on:
       issue_number:
         description: GitHub issue number
         required: true
-        type: number
+        type: string
 
 permissions: {}
 

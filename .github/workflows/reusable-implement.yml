@@ -6,7 +6,7 @@ on:
       issue_number:
         description: Approved issue to implement
         required: true
-        type: number
+        type: string
       trigger_actor:
         description: GitHub actor who authorized this run
         required: true
