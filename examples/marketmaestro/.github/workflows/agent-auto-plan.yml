@@ -1,0 +1,28 @@
+name: Automatic agent plan
+
+on:
+  issues:
+    types: [labeled]
+
+permissions: {}
+
+jobs:
+  plan:
+    if: >-
+      github.event.label.name == 'claude-ready' &&
+      github.event.issue.pull_request == null &&
+      contains(github.event.issue.labels.*.name, 'claude-ready') &&
+      contains(github.event.issue.labels.*.name, 'human-review-required')
+    permissions:
+      contents: read
+      issues: write
+    uses: atulg4/agentic-sdlc/.github/workflows/reusable-plan.yml@PLATFORM_COMMIT_SHA
+    with:
+      issue_number: ${{ github.event.issue.number }}
+      trigger_actor: ${{ github.actor }}
+      config_path: agentic-sdlc.toml
+      platform_ref: PLATFORM_COMMIT_SHA
+      platform_repository: atulg4/agentic-sdlc
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      PLATFORM_READ_TOKEN: ${{ secrets.PLATFORM_READ_TOKEN }}

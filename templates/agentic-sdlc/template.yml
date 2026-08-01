@@ -1,0 +1,55 @@
+spec:
+  inputs:
+    stage:
+      default: agent-plan
+    platform_project_path:
+      description: Namespace/project path for the Agentic SDLC GitLab mirror
+    platform_ref:
+      description: Immutable Agentic SDLC commit SHA
+      regex: '^[0-9a-f]{40}$'
+    config_path:
+      default: agentic-sdlc.toml
+    mode:
+      default: plan
+      options: [plan, implement]
+---
+
+agentic-sdlc-prepare:
+  stage: $[[ inputs.stage ]]
+  rules:
+    - if: '$AGENTIC_SDLC_RUN == "true" && $AGENTIC_ISSUE_IID =~ /^[0-9]+$/'
+  variables:
+    GIT_STRATEGY: clone
+  script:
+    - test -n "$AGENTIC_GITLAB_READ_TOKEN"
+    - >-
+      git clone --filter=blob:none
+      "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/$[[ inputs.platform_project_path ]].git"
+      .agentic-platform
+    - git -C .agentic-platform checkout --detach "$[[ inputs.platform_ref ]]"
+    - mkdir -p .agentic-input
+    - >-
+      curl --fail --silent --show-error
+      --header "PRIVATE-TOKEN: ${AGENTIC_GITLAB_READ_TOKEN}"
+      "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/issues/${AGENTIC_ISSUE_IID}"
+      --output .agentic-input/request.json
+    - >-
+      PYTHONPATH="${CI_PROJECT_DIR}/.agentic-platform/src"
+      python3 -m agentic_sdlc prepare-request
+      --provider gitlab
+      --config "$[[ inputs.config_path ]]"
+      --expected-project-id "${CI_PROJECT_PATH}"
+      --expected-default-branch "${CI_DEFAULT_BRANCH}"
+      --request .agentic-input/request.json
+      --mode "$[[ inputs.mode ]]"
+      --task-output .agentic-input/task.md
+      --prompt-output .agentic-input/prompt.md
+      --decision-output .agentic-input/decision.json
+  artifacts:
+    access: developer
+    expire_in: 3 days
+    when: always
+    paths:
+      - .agentic-input/task.md
+      - .agentic-input/prompt.md
+      - .agentic-input/decision.json

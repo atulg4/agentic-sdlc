@@ -1,0 +1,80 @@
+version = 1
+
+[project]
+id = "atulg4/marketmaestro"
+provider = "github"
+default_branch = "main"
+
+[agents]
+planner = "codex"
+implementer = "codex"
+reviewer = "codex"
+
+[automation]
+default_mode = "plan"
+ready_label = "claude-ready"
+human_review_label = "human-review-required"
+implementation_label = "implementation-approved"
+
+[policy]
+human_merge_required = true
+max_changed_files = 30
+max_diff_lines = 3000
+max_patch_bytes = 5000000
+
+forbidden_paths = [
+  ".github/**",
+  ".github/workflows/**",
+  ".gitlab-ci.yml",
+  ".gitlab/**",
+  "agentic-sdlc.toml",
+  "CODEOWNERS",
+  "**/CODEOWNERS",
+  "REVIEW.md",
+  "scripts/ci_quality_check.py",
+  "AGENTS.md",
+  "**/AGENTS.md",
+  "CLAUDE.md",
+  "**/CLAUDE.md",
+  ".env*",
+  "**/.env*",
+  "*.pem",
+  "**/*.pem",
+  "*.key",
+  "**/*.key",
+  "data/rh_*.json",
+  "data/**/credentials*",
+]
+
+protected_paths = [
+  "src/preview_shares.py",
+  "src/auth/**",
+  "src/trading/**",
+  "src/database/**",
+  "migrations/**",
+  "deployment/**",
+  "config/confidence_engine.json",
+]
+
+low_risk_paths = [
+  "docs/**",
+  "**/*.md",
+]
+
+forbidden_task_patterns = [
+  '\blive[- ]trad',
+  '\bplace\b.{0,40}\b(?:trade|order)s?\b',
+  '\bdeploy\b.{0,40}\bprod',
+  '\b(?:broker|production)\b.{0,40}\b(?:credential|password|token)',
+  '\bdisable\b.{0,40}\b(?:auth|test|safety)',
+]
+
+[commands]
+setup = 'python -m pip install -e ".[dev]"'
+quality = "python scripts/ci_quality_check.py --base origin/main --head HEAD"
+test = "pytest tests/unit -q"
+integration = "pytest tests/integration -q"
+
+[verification]
+gates = ["setup", "quality"]
+timeout_seconds = { setup = 900, quality = 600 }

@@ -1,0 +1,38 @@
+name: Agent implementation
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Approved GitHub issue number
+        required: true
+        type: number
+      agent:
+        description: Patch generator
+        required: true
+        default: codex
+        type: choice
+        options: [codex, claude]
+
+permissions: {}
+
+jobs:
+  implement:
+    permissions:
+      contents: write
+      issues: read
+      pull-requests: read
+    uses: PLATFORM_REPOSITORY/.github/workflows/reusable-implement.yml@PLATFORM_COMMIT_SHA
+    with:
+      issue_number: ${{ inputs.issue_number }}
+      trigger_actor: ${{ github.actor }}
+      config_path: agentic-sdlc.toml
+      platform_ref: PLATFORM_COMMIT_SHA
+      platform_repository: PLATFORM_REPOSITORY
+      publisher_app_client_id: ${{ vars.PUBLISHER_APP_CLIENT_ID }}
+      agent: ${{ inputs.agent }}
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      PLATFORM_READ_TOKEN: ${{ secrets.PLATFORM_READ_TOKEN }}
+      PUBLISHER_APP_PRIVATE_KEY: ${{ secrets.PUBLISHER_APP_PRIVATE_KEY }}

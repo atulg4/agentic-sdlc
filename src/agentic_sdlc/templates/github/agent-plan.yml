@@ -1,0 +1,27 @@
+name: Agent plan
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: GitHub issue number
+        required: true
+        type: number
+
+permissions: {}
+
+jobs:
+  plan:
+    permissions:
+      contents: read
+      issues: write
+    uses: PLATFORM_REPOSITORY/.github/workflows/reusable-plan.yml@PLATFORM_COMMIT_SHA
+    with:
+      issue_number: ${{ inputs.issue_number }}
+      trigger_actor: ${{ github.actor }}
+      config_path: agentic-sdlc.toml
+      platform_ref: PLATFORM_COMMIT_SHA
+      platform_repository: PLATFORM_REPOSITORY
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      PLATFORM_READ_TOKEN: ${{ secrets.PLATFORM_READ_TOKEN }}

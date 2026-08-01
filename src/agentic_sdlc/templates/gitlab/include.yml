@@ -1,0 +1,7 @@
+include:
+  - component: PLATFORM_REPOSITORY/agentic-sdlc@PLATFORM_COMMIT_SHA
+    inputs:
+      platform_project_path: PLATFORM_PROJECT_PATH
+      platform_ref: PLATFORM_COMMIT_SHA
+      config_path: agentic-sdlc.toml
+      mode: plan

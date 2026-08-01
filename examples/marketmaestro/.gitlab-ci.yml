@@ -1,0 +1,15 @@
+include:
+  - component: gitlab.example.com/atulg4/agentic-sdlc/agentic-sdlc@PLATFORM_COMMIT_SHA
+    inputs:
+      platform_project_path: atulg4/agentic-sdlc
+      platform_ref: PLATFORM_COMMIT_SHA
+      config_path: agentic-sdlc.toml
+      mode: plan
+
+stages:
+  - agent-plan
+
+# Trigger with protected variables:
+# AGENTIC_SDLC_RUN=true
+# AGENTIC_ISSUE_IID=<issue number>
+# AGENTIC_GITLAB_READ_TOKEN=<masked, protected read_api project token>

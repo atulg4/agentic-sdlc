@@ -1,0 +1,206 @@
+name: Reusable agent plan
+
+on:
+  workflow_call:
+    inputs:
+      issue_number:
+        description: Issue to plan
+        required: true
+        type: number
+      trigger_actor:
+        description: GitHub actor who authorized this run
+        required: true
+        type: string
+      config_path:
+        description: Policy file in the caller repository
+        required: false
+        default: agentic-sdlc.toml
+        type: string
+      platform_ref:
+        description: Immutable Agentic SDLC commit SHA
+        required: true
+        type: string
+      platform_repository:
+        description: Agentic SDLC repository in owner/name form
+        required: true
+        type: string
+    secrets:
+      OPENAI_API_KEY:
+        required: true
+      PLATFORM_READ_TOKEN:
+        required: false
+
+permissions: {}
+
+concurrency:
+  group: agent-plan-${{ github.repository }}-${{ inputs.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      base_sha: ${{ steps.base.outputs.sha }}
+    steps:
+      - name: Check out consumer repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Record immutable protected default-branch base
+        id: base
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          expected="$(git rev-parse --verify "refs/remotes/origin/${DEFAULT_BRANCH}^{commit}")"
+          if [ "$actual" != "$expected" ]; then
+            printf 'Agent runs must start from the protected default branch.\n' >&2
+            exit 2
+          fi
+          printf 'sha=%s\n' "$actual" >> "$GITHUB_OUTPUT"
+      - name: Validate platform identity
+        env:
+          PLATFORM_REF: ${{ inputs.platform_ref }}
+          PLATFORM_REPOSITORY: ${{ inputs.platform_repository }}
+        run: |
+          [[ "$PLATFORM_REF" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PLATFORM_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+      - name: Require repository write authority from trigger actor
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRIGGER_ACTOR: ${{ inputs.trigger_actor }}
+        run: |
+          set -euo pipefail
+          encoded_actor="$(jq -rn --arg actor "$TRIGGER_ACTOR" '$actor | @uri')"
+          permission="$(gh api --method GET \
+            "repos/${GITHUB_REPOSITORY}/collaborators/${encoded_actor}/permission" \
+            --jq '.permission')"
+          case "$permission" in
+            admin|write) ;;
+            *) printf 'Trigger actor lacks repository write authority.\n' >&2; exit 2 ;;
+          esac
+      - name: Check out policy engine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ inputs.platform_repository }}
+          ref: ${{ inputs.platform_ref }}
+          path: .agentic-platform
+          persist-credentials: false
+          token: ${{ secrets.PLATFORM_READ_TOKEN || github.token }}
+      - name: Read issue without shell interpolation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: |
+          set -euo pipefail
+          mkdir -p .agentic-input
+          gh api --method GET \
+            "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}" \
+            > .agentic-input/request.json
+      - name: Validate request and render prompt
+        env:
+          CONFIG_PATH: ${{ inputs.config_path }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH="${GITHUB_WORKSPACE}/.agentic-platform/src" \
+            python3 -m agentic_sdlc prepare-request \
+              --provider github \
+              --config "$CONFIG_PATH" \
+              --expected-project-id "$GITHUB_REPOSITORY" \
+              --expected-default-branch "$DEFAULT_BRANCH" \
+              --request .agentic-input/request.json \
+              --mode plan \
+              --task-output .agentic-input/task.md \
+              --prompt-output .agentic-input/prompt.md \
+              --decision-output .agentic-input/decision.json \
+              --metadata-output .agentic-input/metadata.json
+      - name: Store validated request
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: agent-plan-input-${{ github.run_id }}
+          path: |
+            .agentic-input/task.md
+            .agentic-input/prompt.md
+            .agentic-input/decision.json
+            .agentic-input/metadata.json
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 3
+
+  plan:
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      final_message: ${{ steps.codex.outputs.final-message }}
+    steps:
+      - name: Check out exact consumer base
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.base_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Restore validated request
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: agent-plan-input-${{ github.run_id }}
+          path: .agentic-input
+      - name: Exclude pipeline material from repository state
+        run: printf '/.agentic-input/\n' >> .git/info/exclude
+      - name: Produce read-only architecture plan
+        id: codex
+        uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: .agentic-input/prompt.md
+          output-file: .agentic-input/plan.md
+          sandbox: read-only
+          safety-strategy: drop-sudo
+          codex-args: '["--ephemeral"]'
+      - name: Store plan
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: agent-plan-result-${{ github.run_id }}
+          path: .agentic-input/plan.md
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 7
+
+  publish:
+    needs: [prepare, plan]
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Restore plan only
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: agent-plan-result-${{ github.run_id }}
+          path: ${{ runner.temp }}/agent-plan
+      - name: Post bounded plan to issue
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          PLAN_PATH: ${{ runner.temp }}/agent-plan/plan.md
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync(process.env.PLAN_PATH, 'utf8');
+            const clipped = plan.length > 60000
+              ? `${plan.slice(0, 60000)}\n\n[Plan clipped; full artifact retained.]`
+              : plan;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number(process.env.ISSUE_NUMBER),
+              body: `## Agentic SDLC plan\n\n${clipped}`,
+            });

@@ -1,0 +1,58 @@
+name: Agentic SDLC policy
+description: Validate a provider work request and produce a bounded agent prompt
+
+inputs:
+  provider:
+    description: Source control provider
+    required: true
+  config:
+    description: Path to agentic-sdlc.toml in the consumer repository
+    required: true
+  request:
+    description: Path to the provider issue JSON document
+    required: true
+  mode:
+    description: plan, implement, or review
+    required: true
+
+outputs:
+  task:
+    description: Validated work request body
+    value: ${{ steps.prepare.outputs.task }}
+  prompt:
+    description: Agent prompt with untrusted-data boundaries
+    value: ${{ steps.prepare.outputs.prompt }}
+  decision:
+    description: Machine-readable policy decision
+    value: ${{ steps.prepare.outputs.decision }}
+
+runs:
+  using: composite
+  steps:
+    - id: prepare
+      shell: bash
+      env:
+        INPUT_PROVIDER: ${{ inputs.provider }}
+        INPUT_CONFIG: ${{ inputs.config }}
+        INPUT_REQUEST: ${{ inputs.request }}
+        INPUT_MODE: ${{ inputs.mode }}
+      run: |
+        set -euo pipefail
+        platform_root="$(cd "${GITHUB_ACTION_PATH}/../.." && pwd)"
+        output_root="${RUNNER_TEMP}/agentic-sdlc-${GITHUB_RUN_ID}-${GITHUB_JOB}"
+        mkdir -p "$output_root"
+
+        PYTHONPATH="${platform_root}/src" python3 -m agentic_sdlc prepare-request \
+          --provider "$INPUT_PROVIDER" \
+          --config "$INPUT_CONFIG" \
+          --request "$INPUT_REQUEST" \
+          --mode "$INPUT_MODE" \
+          --task-output "${output_root}/task.md" \
+          --prompt-output "${output_root}/prompt.md" \
+          --decision-output "${output_root}/decision.json"
+
+        {
+          printf 'task=%s\n' "${output_root}/task.md"
+          printf 'prompt=%s\n' "${output_root}/prompt.md"
+          printf 'decision=%s\n' "${output_root}/decision.json"
+        } >> "$GITHUB_OUTPUT"

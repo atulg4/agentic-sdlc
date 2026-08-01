@@ -1,0 +1,525 @@
+name: Reusable agent implementation
+
+on:
+  workflow_call:
+    inputs:
+      issue_number:
+        description: Approved issue to implement
+        required: true
+        type: number
+      trigger_actor:
+        description: GitHub actor who authorized this run
+        required: true
+        type: string
+      config_path:
+        description: Policy file in the caller repository
+        required: false
+        default: agentic-sdlc.toml
+        type: string
+      platform_ref:
+        description: Immutable Agentic SDLC commit SHA
+        required: true
+        type: string
+      platform_repository:
+        description: Agentic SDLC repository in owner/name form
+        required: true
+        type: string
+      publisher_app_client_id:
+        description: Client ID of the repository-scoped publisher GitHub App
+        required: true
+        type: string
+      agent:
+        description: Patch generator, codex or claude
+        required: false
+        default: codex
+        type: string
+    secrets:
+      OPENAI_API_KEY:
+        required: false
+      ANTHROPIC_API_KEY:
+        required: false
+      PLATFORM_READ_TOKEN:
+        required: false
+      PUBLISHER_APP_PRIVATE_KEY:
+        required: true
+
+permissions: {}
+
+concurrency:
+  group: agent-implement-${{ github.repository }}-${{ inputs.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    outputs:
+      base_sha: ${{ steps.base.outputs.sha }}
+    steps:
+      - name: Check out consumer repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Record immutable protected default-branch base
+        id: base
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          expected="$(git rev-parse --verify "refs/remotes/origin/${DEFAULT_BRANCH}^{commit}")"
+          if [ "$actual" != "$expected" ]; then
+            printf 'Agent runs must start from the protected default branch.\n' >&2
+            exit 2
+          fi
+          printf 'sha=%s\n' "$actual" >> "$GITHUB_OUTPUT"
+      - name: Validate agent adapter
+        env:
+          AGENT: ${{ inputs.agent }}
+        run: |
+          case "$AGENT" in
+            codex|claude) ;;
+            *) printf 'Unsupported agent adapter: %s\n' "$AGENT" >&2; exit 2 ;;
+          esac
+      - name: Validate platform identity
+        env:
+          PLATFORM_REF: ${{ inputs.platform_ref }}
+          PLATFORM_REPOSITORY: ${{ inputs.platform_repository }}
+        run: |
+          [[ "$PLATFORM_REF" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PLATFORM_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+      - name: Require repository write authority from trigger actor
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRIGGER_ACTOR: ${{ inputs.trigger_actor }}
+        run: |
+          set -euo pipefail
+          encoded_actor="$(jq -rn --arg actor "$TRIGGER_ACTOR" '$actor | @uri')"
+          permission="$(gh api --method GET \
+            "repos/${GITHUB_REPOSITORY}/collaborators/${encoded_actor}/permission" \
+            --jq '.permission')"
+          case "$permission" in
+            admin|write) ;;
+            *) printf 'Trigger actor lacks repository write authority.\n' >&2; exit 2 ;;
+          esac
+      - name: Check out policy engine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ inputs.platform_repository }}
+          ref: ${{ inputs.platform_ref }}
+          path: .agentic-platform
+          persist-credentials: false
+          token: ${{ secrets.PLATFORM_READ_TOKEN || github.token }}
+      - name: Read issue without shell interpolation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: |
+          set -euo pipefail
+          mkdir -p .agentic-input
+          gh api --method GET \
+            "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}" \
+            > .agentic-input/request.json
+      - name: Enforce specification and implementation approval
+        env:
+          CONFIG_PATH: ${{ inputs.config_path }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH="${GITHUB_WORKSPACE}/.agentic-platform/src" \
+            python3 -m agentic_sdlc prepare-request \
+              --provider github \
+              --config "$CONFIG_PATH" \
+              --expected-project-id "$GITHUB_REPOSITORY" \
+              --expected-default-branch "$DEFAULT_BRANCH" \
+              --request .agentic-input/request.json \
+              --mode implement \
+              --task-output .agentic-input/task.md \
+              --prompt-output .agentic-input/prompt.md \
+              --decision-output .agentic-input/task-decision.json \
+              --metadata-output .agentic-input/metadata.json
+      - name: Require every dependency issue to be closed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r dependency; do
+            state="$(gh api --method GET \
+              "repos/${GITHUB_REPOSITORY}/issues/${dependency}" \
+              --jq '.state')"
+            if [ "$state" != "closed" ]; then
+              printf 'Dependency issue #%s is not closed.\n' "$dependency" >&2
+              exit 2
+            fi
+          done < <(jq -r '.dependencies[]' .agentic-input/metadata.json)
+      - name: Refuse a duplicate open pull request for this issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: |
+          set -euo pipefail
+          marker="Closes #${ISSUE_NUMBER}"
+          existing="$(gh pr list --state open --limit 1000 --json body,url |
+            jq -r --arg marker "$marker" \
+              'first(.[] | select(((.body // "") | split("\n") | index($marker)) != null) | .url) // ""')"
+          if [ -n "$existing" ]; then
+            printf 'An open pull request already implements this issue: %s\n' "$existing" >&2
+            exit 2
+          fi
+      - name: Store validated implementation request
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: implementation-input-${{ github.run_id }}
+          path: |
+            .agentic-input/task.md
+            .agentic-input/prompt.md
+            .agentic-input/task-decision.json
+            .agentic-input/metadata.json
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 3
+      - name: Store pinned policy engine for credential-free jobs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: policy-engine-${{ github.run_id }}
+          path: .agentic-platform/src/agentic_sdlc/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 3
+
+  generate_patch:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Check out exact consumer base without credentials
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.base_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Restore validated request
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: implementation-input-${{ github.run_id }}
+          path: .agentic-input
+      - name: Restore pinned policy engine
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: policy-engine-${{ github.run_id }}
+          path: .agentic-platform/src/agentic_sdlc
+      - name: Exclude pipeline material from proposed diff
+        run: |
+          printf '/.agentic-input/\n/.agentic-output/\n/.agentic-platform/\n' \
+            >> .git/info/exclude
+          mkdir -p .agentic-output
+      - name: Generate patch with Codex in isolated checkout
+        id: codex
+        if: inputs.agent == 'codex'
+        uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: .agentic-input/prompt.md
+          output-file: .agentic-input/agent-message.md
+          sandbox: workspace-write
+          safety-strategy: drop-sudo
+          codex-args: '["--ephemeral"]'
+      - name: Generate patch with Claude Code in isolated checkout
+        id: claude
+        if: inputs.agent == 'claude'
+        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
+        env:
+          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
+          prompt: >-
+            Read .agentic-input/prompt.md and perform that implementation in the
+            current checkout. Do not push, open a pull request, deploy, or access
+            credentials. Leave all intended edits in the working tree.
+          claude_args: >-
+            --max-turns 30
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash"
+      - name: Record Claude adapter completion
+        if: inputs.agent == 'claude'
+        run: >-
+          printf '%s\n' 'Claude Code completed patch generation; see the patch artifact.'
+          > .agentic-input/agent-message.md
+      - name: Collect and check proposed patch
+        env:
+          BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+          CONFIG_PATH: ${{ inputs.config_path }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="${GITHUB_WORKSPACE}/.agentic-platform/src"
+          python3 -m agentic_sdlc inspect-diff \
+            --config "$CONFIG_PATH" \
+            --repository . \
+            --base "$BASE_SHA" \
+            --patch-output .agentic-output/change.patch \
+            --paths-output .agentic-output/paths.txt \
+            --decision-output .agentic-output/generator-decision.json
+          python3 -m agentic_sdlc create-manifest \
+            --patch .agentic-output/change.patch \
+            --base-sha "$BASE_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --request-number "$ISSUE_NUMBER" \
+            --output .agentic-output/manifest.json
+          cp .agentic-input/agent-message.md .agentic-output/agent-message.md
+      - name: Store untrusted generated patch
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: generated-patch-${{ github.run_id }}
+          path: .agentic-output/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 3
+
+  verify:
+    needs: [prepare, generate_patch]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Check out exact consumer base without credentials
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.base_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Preserve policy from protected base
+        env:
+          CONFIG_PATH: ${{ inputs.config_path }}
+        run: cp -- "$CONFIG_PATH" "${RUNNER_TEMP}/trusted-policy.toml"
+      - name: Restore pinned policy engine without repository credentials
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: policy-engine-${{ github.run_id }}
+          path: .agentic-platform/src/agentic_sdlc
+      - name: Exclude verifier material from diff
+        run: printf '/.agentic-platform/\n' >> .git/info/exclude
+      - name: Restore generated patch
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: generated-patch-${{ github.run_id }}
+          path: ${{ runner.temp }}/generated-patch
+      - name: Verify patch identity and apply
+        env:
+          BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="${GITHUB_WORKSPACE}/.agentic-platform/src"
+          python3 -m agentic_sdlc verify-artifact \
+            --patch "${RUNNER_TEMP}/generated-patch/change.patch" \
+            --manifest "${RUNNER_TEMP}/generated-patch/manifest.json" \
+            --base-sha "$BASE_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --request-number "$ISSUE_NUMBER"
+          git apply --check "${RUNNER_TEMP}/generated-patch/change.patch"
+          git apply --index "${RUNNER_TEMP}/generated-patch/change.patch"
+      - name: Re-evaluate patch with fresh trusted policy
+        env:
+          BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/pre-gate-policy"
+          export PYTHONPATH="${GITHUB_WORKSPACE}/.agentic-platform/src"
+          python3 -m agentic_sdlc inspect-diff \
+            --config "${RUNNER_TEMP}/trusted-policy.toml" \
+            --repository . \
+            --base "$BASE_SHA" \
+            --patch-output "${RUNNER_TEMP}/pre-gate-policy/change.patch" \
+            --paths-output "${RUNNER_TEMP}/pre-gate-policy/paths.txt" \
+            --decision-output "${RUNNER_TEMP}/pre-gate-policy/decision.json"
+      - name: Create local verification commit
+        run: |
+          set -euo pipefail
+          git config user.name "agentic-sdlc-verifier"
+          git config user.email "agentic-sdlc-verifier@users.noreply.github.com"
+          git config core.hooksPath /dev/null
+          git commit -m "Agentic SDLC verification snapshot"
+      - name: Run project-defined deterministic gates
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/verification"
+          PYTHONPATH="${GITHUB_WORKSPACE}/.agentic-platform/src" \
+            python3 -m agentic_sdlc run-gates \
+              --config "${RUNNER_TEMP}/trusted-policy.toml" \
+              --repository . \
+              --output "${RUNNER_TEMP}/verification/report.json"
+
+  attest_patch:
+    needs: [prepare, generate_patch, verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out exact consumer base without credentials
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.base_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Preserve policy from protected base
+        env:
+          CONFIG_PATH: ${{ inputs.config_path }}
+        run: cp -- "$CONFIG_PATH" "${RUNNER_TEMP}/trusted-policy.toml"
+      - name: Restore pinned policy engine without repository credentials
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: policy-engine-${{ github.run_id }}
+          path: .agentic-platform/src/agentic_sdlc
+      - name: Exclude attestation material from diff
+        run: printf '/.agentic-platform/\n' >> .git/info/exclude
+      - name: Restore original generated patch
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: generated-patch-${{ github.run_id }}
+          path: ${{ runner.temp }}/generated-patch
+      - name: Verify original patch identity and apply without executing it
+        env:
+          BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="${GITHUB_WORKSPACE}/.agentic-platform/src"
+          python3 -m agentic_sdlc verify-artifact \
+            --patch "${RUNNER_TEMP}/generated-patch/change.patch" \
+            --manifest "${RUNNER_TEMP}/generated-patch/manifest.json" \
+            --base-sha "$BASE_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --request-number "$ISSUE_NUMBER"
+          git apply --check "${RUNNER_TEMP}/generated-patch/change.patch"
+          git apply --index "${RUNNER_TEMP}/generated-patch/change.patch"
+      - name: Reconstruct attested patch with trusted policy
+        env:
+          BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/verified-patch"
+          export PYTHONPATH="${GITHUB_WORKSPACE}/.agentic-platform/src"
+          python3 -m agentic_sdlc inspect-diff \
+            --config "${RUNNER_TEMP}/trusted-policy.toml" \
+            --repository . \
+            --base "$BASE_SHA" \
+            --patch-output "${RUNNER_TEMP}/verified-patch/change.patch" \
+            --paths-output "${RUNNER_TEMP}/verified-patch/paths.txt" \
+            --decision-output "${RUNNER_TEMP}/verified-patch/decision.json"
+          python3 -m agentic_sdlc create-manifest \
+            --patch "${RUNNER_TEMP}/verified-patch/change.patch" \
+            --base-sha "$BASE_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --request-number "$ISSUE_NUMBER" \
+            --output "${RUNNER_TEMP}/verified-patch/manifest.json"
+      - name: Store patch from non-executing attestation job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verified-patch-${{ github.run_id }}
+          path: ${{ runner.temp }}/verified-patch/
+          if-no-files-found: error
+          retention-days: 3
+
+  publish_draft:
+    needs: [prepare, attest_patch]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Create short-lived repository publisher token
+        id: publisher-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ inputs.publisher_app_client_id }}
+          private-key: ${{ secrets.PUBLISHER_APP_PRIVATE_KEY }}
+          permission-contents: read
+          permission-issues: write
+          permission-pull-requests: write
+      - name: Check out exact verified base
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.base_sha }}
+          fetch-depth: 0
+          token: ${{ github.token }}
+      - name: Restore verified patch only
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: verified-patch-${{ github.run_id }}
+          path: ${{ runner.temp }}/verified-patch
+      - name: Verify artifact without executing consumer code
+        env:
+          BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          PATCH_PATH: ${{ runner.temp }}/verified-patch/change.patch
+          MANIFEST_PATH: ${{ runner.temp }}/verified-patch/manifest.json
+        run: |
+          set -euo pipefail
+          python3 - "$PATCH_PATH" "$MANIFEST_PATH" "$BASE_SHA" \
+            "$GITHUB_REPOSITORY" "$ISSUE_NUMBER" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          patch_path, manifest_path, base_sha, repository, issue_number = sys.argv[1:]
+          patch = pathlib.Path(patch_path).read_bytes()
+          manifest = json.loads(pathlib.Path(manifest_path).read_text(encoding="utf-8"))
+          expected = {
+              "schemaVersion": 1,
+              "baseSha": base_sha,
+              "repository": repository,
+              "requestNumber": int(issue_number),
+              "patchBytes": len(patch),
+              "patchSha256": hashlib.sha256(patch).hexdigest(),
+          }
+          if any(manifest.get(key) != value for key, value in expected.items()):
+              raise SystemExit("verified patch manifest mismatch")
+          PY
+      - name: Create branch containing exact verified patch
+        env:
+          BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          PATCH_PATH: ${{ runner.temp }}/verified-patch/change.patch
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$BASE_SHA"
+          branch="agent/issue-${ISSUE_NUMBER}-${GITHUB_RUN_ID}"
+          git switch -c "$branch"
+          git config user.name "agentic-sdlc[bot]"
+          git config user.email "agentic-sdlc[bot]@users.noreply.github.com"
+          git config core.hooksPath /dev/null
+          git apply --check "$PATCH_PATH"
+          git apply --index "$PATCH_PATH"
+          git commit -m "Implement issue #${ISSUE_NUMBER}"
+          git push origin "HEAD:refs/heads/${branch}"
+          printf 'branch=%s\n' "$branch" >> "$GITHUB_ENV"
+      - name: Open draft pull request
+        env:
+          GH_TOKEN: ${{ steps.publisher-token.outputs.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: |
+          set -euo pipefail
+          body="$(printf '%s\n\n%s\n\n%s' \
+            'Automated patch generated in an isolated AI job and republished only after fresh deterministic verification.' \
+            "Closes #${ISSUE_NUMBER}" \
+            "Verification run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")"
+          pr_url="$(gh pr create \
+            --draft \
+            --base "${{ github.event.repository.default_branch }}" \
+            --head "$branch" \
+            --title "Agent implementation for issue #${ISSUE_NUMBER}" \
+            --body "$body")"
+          gh issue comment "$ISSUE_NUMBER" --body "Verified draft pull request: ${pr_url}"
