@@ -61,7 +61,7 @@ jobs:
       base_sha: ${{ steps.base.outputs.sha }}
     steps:
       - name: Check out consumer repository
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
@@ -109,7 +109,7 @@ jobs:
             *) printf 'Trigger actor lacks repository write authority.\n' >&2; exit 2 ;;
           esac
       - name: Check out policy engine
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ inputs.platform_repository }}
           ref: ${{ inputs.platform_ref }}
@@ -201,7 +201,7 @@ jobs:
       contents: read
     steps:
       - name: Check out exact consumer base without credentials
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare.outputs.base_sha }}
           fetch-depth: 0
@@ -292,7 +292,7 @@ jobs:
       contents: read
     steps:
       - name: Check out exact consumer base without credentials
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare.outputs.base_sha }}
           fetch-depth: 0
@@ -367,7 +367,7 @@ jobs:
       contents: read
     steps:
       - name: Check out exact consumer base without credentials
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare.outputs.base_sha }}
           fetch-depth: 0
@@ -449,7 +449,7 @@ jobs:
           permission-issues: write
           permission-pull-requests: write
       - name: Check out exact verified base
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare.outputs.base_sha }}
           fetch-depth: 0
