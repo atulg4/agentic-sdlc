@@ -256,7 +256,8 @@ jobs:
             current checkout. Do not push, open a pull request, deploy, or access
             credentials. Leave all intended edits in the working tree.
           claude_args: >-
-            --max-turns 30
+            --model claude-sonnet-5
+            --max-turns 60
             --allowedTools "Read,Edit,Write,Glob,Grep,Bash"
       - name: Record Claude adapter completion
         if: inputs.agent == 'claude'
