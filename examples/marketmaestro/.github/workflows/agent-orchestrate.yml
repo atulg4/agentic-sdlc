@@ -1,0 +1,49 @@
+name: Agent orchestration
+
+# MarketMaestro consumes the platform orchestration state machine through this
+# thin SHA-pinned caller. No lifecycle logic is copied into this repository.
+
+on:
+  issues:
+    types: [opened, labeled, closed]
+  workflow_dispatch:
+    inputs:
+      unit_id:
+        description: Work unit (issue number)
+        required: true
+        type: string
+      action:
+        description: Orchestration action
+        required: true
+        default: transition
+        type: choice
+        options:
+          - create
+          - transition
+          - verification
+          - review
+      to_state:
+        description: Target state for transition actions
+        required: false
+        type: string
+
+permissions: {}
+
+jobs:
+  orchestrate:
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    uses: atulg4/agentic-sdlc/.github/workflows/reusable-orchestrate.yml@PLATFORM_COMMIT_SHA
+    with:
+      unit_id: ${{ inputs.unit_id || github.event.issue.number }}
+      action: ${{ inputs.action || (github.event.action == 'opened' && 'create' || 'transition') }}
+      to_state: ${{ inputs.to_state || '' }}
+      event_key: ${{ github.event_name }}-${{ github.run_id }}-${{ github.event.action }}
+      actor_kind: human
+      config_path: agentic-sdlc.toml
+      platform_ref: PLATFORM_COMMIT_SHA
+      platform_repository: atulg4/agentic-sdlc
+    secrets:
+      PLATFORM_READ_TOKEN: ${{ secrets.PLATFORM_READ_TOKEN }}
