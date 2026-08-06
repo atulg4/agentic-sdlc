@@ -12,6 +12,12 @@ from .artifact import ArtifactError, create_manifest, verify_manifest, write_man
 from .events import EventError, normalize_event
 from .gates import GateError, run_gates, write_report
 from .git_diff import GitDiffError, collect_git_diff
+from .missions import (
+    MissionError,
+    create_dispatch_envelope,
+    load_agents,
+    load_registry,
+)
 from .policy import evaluate_diff, evaluate_task, load_policy
 from .scaffold import ScaffoldError, scaffold_project
 from .task_spec import TaskSpecError, parse_task, render_prompt
@@ -150,6 +156,35 @@ def _verify_artifact(args: argparse.Namespace) -> int:
     return 0
 
 
+def _validate_missions(args: argparse.Namespace) -> int:
+    registry = load_registry(args.missions, load_policy(args.config))
+    _write(registry.as_dict(), args.output)
+    return 0
+
+
+def _dispatch_mission(args: argparse.Namespace) -> int:
+    registry = load_registry(args.missions, load_policy(args.config))
+    agents = load_agents(json.loads(Path(args.agents).read_text(encoding="utf-8")))
+    history: dict[str, str] = {}
+    if args.history:
+        raw = json.loads(Path(args.history).read_text(encoding="utf-8"))
+        if not isinstance(raw, dict) or not all(
+            isinstance(key, str) and isinstance(value, str) for key, value in raw.items()
+        ):
+            raise MissionError("history must map mission IDs to agent IDs")
+        history = raw
+    agent = registry.select_agent(args.mission_id, agents, history=history)
+    envelope = create_dispatch_envelope(
+        registry.get(args.mission_id),
+        agent,
+        work_ref=args.work_ref,
+        prompt=Path(args.prompt).read_text(encoding="utf-8"),
+        input_refs=tuple(args.input_ref),
+    )
+    _write(envelope, args.output)
+    return 0
+
+
 def _run_gates(args: argparse.Namespace) -> int:
     report = run_gates(args.config, args.repository)
     write_report(report, args.output)
@@ -248,6 +283,24 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--request-number", type=int)
     verify.set_defaults(handler=_verify_artifact)
 
+    missions = commands.add_parser("validate-missions")
+    missions.add_argument("--config", required=True)
+    missions.add_argument("--missions")
+    missions.add_argument("--output")
+    missions.set_defaults(handler=_validate_missions)
+
+    dispatch = commands.add_parser("dispatch-mission")
+    dispatch.add_argument("--config", required=True)
+    dispatch.add_argument("--missions")
+    dispatch.add_argument("--mission-id", required=True)
+    dispatch.add_argument("--agents", required=True)
+    dispatch.add_argument("--history")
+    dispatch.add_argument("--work-ref", required=True)
+    dispatch.add_argument("--input-ref", action="append", default=[])
+    dispatch.add_argument("--prompt", required=True)
+    dispatch.add_argument("--output")
+    dispatch.set_defaults(handler=_dispatch_mission)
+
     gates = commands.add_parser("run-gates")
     gates.add_argument("--config", required=True)
     gates.add_argument("--repository", default=".")
@@ -277,6 +330,7 @@ def main(argv: list[str] | None = None) -> int:
         EventError,
         GateError,
         GitDiffError,
+        MissionError,
         ScaffoldError,
         OSError,
         ValueError,

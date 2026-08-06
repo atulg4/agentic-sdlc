@@ -143,3 +143,112 @@ def test_prepare_request_rejects_wrong_repository_context(
     )
 
     assert result == 2
+
+
+def test_validate_missions_cli_writes_registry(tmp_path: Path, policy_file: Path) -> None:
+    output = tmp_path / "registry.json"
+    result = main(["validate-missions", "--config", str(policy_file), "--output", str(output)])
+    assert result == 0
+    document = json.loads(output.read_text(encoding="utf-8"))
+    assert "implementation-worker" in document["missions"]
+
+
+def test_dispatch_mission_cli_produces_envelope(tmp_path: Path, policy_file: Path) -> None:
+    agents = tmp_path / "agents.json"
+    history = tmp_path / "history.json"
+    prompt = tmp_path / "prompt.md"
+    output = tmp_path / "envelope.json"
+    agents.write_text(
+        json.dumps(
+            [
+                {
+                    "agentId": "codex-1",
+                    "adapter": "codex",
+                    "adapterVersion": "1.0.0",
+                    "provider": "openai",
+                    "model": "gpt-5",
+                    "capabilities": ["edit-code", "author-tests", "run-commands"],
+                },
+                {
+                    "agentId": "claude-1",
+                    "adapter": "claude",
+                    "adapterVersion": "2.0.0",
+                    "provider": "anthropic",
+                    "model": "claude-opus-5",
+                    "capabilities": ["review-code", "review-security"],
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+    history.write_text(json.dumps({"implementation-worker": "codex-1"}), encoding="utf-8")
+    prompt.write_text("Review the patch.", encoding="utf-8")
+    result = main(
+        [
+            "dispatch-mission",
+            "--config",
+            str(policy_file),
+            "--mission-id",
+            "security-reviewer",
+            "--agents",
+            str(agents),
+            "--history",
+            str(history),
+            "--work-ref",
+            "example/project#7",
+            "--input-ref",
+            "patch",
+            "--prompt",
+            str(prompt),
+            "--output",
+            str(output),
+        ]
+    )
+    assert result == 0
+    envelope = json.loads(output.read_text(encoding="utf-8"))
+    assert envelope["agentId"] == "claude-1"
+    assert envelope["missionId"] == "security-reviewer"
+    assert len(envelope["envelopeSha256"]) == 64
+
+
+def test_dispatch_mission_cli_fails_closed_on_independence(
+    tmp_path: Path, policy_file: Path
+) -> None:
+    agents = tmp_path / "agents.json"
+    history = tmp_path / "history.json"
+    prompt = tmp_path / "prompt.md"
+    agents.write_text(
+        json.dumps(
+            [
+                {
+                    "agentId": "codex-1",
+                    "adapter": "codex",
+                    "adapterVersion": "1.0.0",
+                    "provider": "openai",
+                    "model": "gpt-5",
+                    "capabilities": ["edit-code", "review-code", "review-security"],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    history.write_text(json.dumps({"implementation-worker": "codex-1"}), encoding="utf-8")
+    prompt.write_text("Review the patch.", encoding="utf-8")
+    result = main(
+        [
+            "dispatch-mission",
+            "--config",
+            str(policy_file),
+            "--mission-id",
+            "security-reviewer",
+            "--agents",
+            str(agents),
+            "--history",
+            str(history),
+            "--work-ref",
+            "example/project#7",
+            "--prompt",
+            str(prompt),
+        ]
+    )
+    assert result == 2
