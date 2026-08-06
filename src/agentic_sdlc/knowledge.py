@@ -212,11 +212,22 @@ def _validate_record(record: EvidenceRecord) -> None:
 
 
 def sanitize_payload(text: str) -> str:
-    """Neutralize control characters and prompt-boundary markers in payloads."""
-    cleaned = text.replace("\x00", "")
-    cleaned = re.sub(r"</?\s*untrusted-evidence\s*>", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"</?\s*untrusted-work-request\s*>", "", cleaned, flags=re.IGNORECASE)
-    return cleaned
+    """Neutralize control characters and prompt-boundary markers in payloads.
+
+    Stripping runs to a fixpoint: removing one marker can concatenate the
+    surrounding fragments into a new marker (for example
+    ``</untrusted-</untrusted-evidence>evidence>``), so a single pass would
+    let crafted payloads smuggle a live boundary tag into the prompt. Every
+    pass strictly shrinks the text, so the loop always terminates.
+    """
+    cleaned = text
+    while True:
+        previous = cleaned
+        cleaned = cleaned.replace("\x00", "")
+        cleaned = re.sub(r"</?\s*untrusted-evidence\s*>", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"</?\s*untrusted-work-request\s*>", "", cleaned, flags=re.IGNORECASE)
+        if cleaned == previous:
+            return cleaned
 
 
 def render_evidence_for_prompt(record: EvidenceRecord) -> str:
