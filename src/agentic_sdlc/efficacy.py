@@ -654,6 +654,11 @@ def promote_experiment(
             "a high-risk policy change cannot be evaluated and approved by its own "
             "proposer; independent review is required"
         )
+    if experiment.high_risk and approved_by.strip() == experiment.proposed_by:
+        raise EfficacyError(
+            "a high-risk policy change cannot be approved by its own proposer; "
+            "independent approval is required"
+        )
     store.approve(experiment.challenger_version, approved_by=approved_by)
     return replace(
         experiment,

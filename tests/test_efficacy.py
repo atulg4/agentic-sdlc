@@ -237,6 +237,10 @@ def test_promotion_requires_human_and_independent_review_for_high_risk() -> None
     )
     with pytest.raises(EfficacyError, match="named human approver"):
         promote_experiment(independent, store, approved_by="  ")
+    # The proposer can never approve its own high-risk change, even when an
+    # independent party evaluated it.
+    with pytest.raises(EfficacyError, match="independent approval"):
+        promote_experiment(independent, store, approved_by="efficacy-manager")
     promoted = promote_experiment(independent, store, approved_by="atulg4")
     assert promoted.status == "promoted"
     assert store.is_approved(challenger_version)
