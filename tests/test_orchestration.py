@@ -265,6 +265,97 @@ def test_human_merge_remains_mandatory() -> None:
         Orchestrator(human_merge_required=False)
 
 
+def test_agents_cannot_grant_approval_or_resume_blocked_work() -> None:
+    engine = Orchestrator()
+    engine.create_unit("u1", event_key="evt-1", timestamp=T)
+    for index, state in enumerate(
+        (
+            WorkUnitState.TRIAGED,
+            WorkUnitState.SPECIFIED,
+            WorkUnitState.PLANNED,
+            WorkUnitState.APPROVAL_PENDING,
+        )
+    ):
+        engine.transition(
+            "u1", state, actor="s", actor_kind="system", event_key=f"u1-{index}", timestamp=T
+        )
+    # Once approval is explicitly pending, only a human can grant it.
+    for actor_kind in ("agent", "system"):
+        with pytest.raises(OrchestrationError, match="human actor|agent actor"):
+            engine.transition(
+                "u1",
+                WorkUnitState.APPROVED,
+                actor="codex-1",
+                actor_kind=actor_kind,
+                event_key=f"approve-{actor_kind}",
+                timestamp=T,
+            )
+    engine.transition(
+        "u1",
+        WorkUnitState.APPROVED,
+        actor="atulg4",
+        actor_kind="human",
+        event_key="approve-human",
+        timestamp=T,
+    )
+    assert engine.get("u1").state is WorkUnitState.APPROVED
+
+    # The auto-approval path (planned -> approved) stays open to the system
+    # policy engine but never to an agent actor.
+    engine.create_unit("u2", event_key="evt-2", timestamp=T)
+    for index, state in enumerate(
+        (WorkUnitState.TRIAGED, WorkUnitState.SPECIFIED, WorkUnitState.PLANNED)
+    ):
+        engine.transition(
+            "u2", state, actor="s", actor_kind="system", event_key=f"u2-{index}", timestamp=T
+        )
+    with pytest.raises(OrchestrationError, match="agent actor"):
+        engine.transition(
+            "u2",
+            WorkUnitState.APPROVED,
+            actor="codex-1",
+            actor_kind="agent",
+            event_key="u2-agent-approve",
+            timestamp=T,
+        )
+    engine.transition(
+        "u2",
+        WorkUnitState.APPROVED,
+        actor="policy",
+        actor_kind="system",
+        event_key="u2-auto-approve",
+        timestamp=T,
+    )
+
+    # Escalated (blocked) work resumes only on a human decision.
+    engine.transition(
+        "u2",
+        WorkUnitState.BLOCKED,
+        actor="s",
+        actor_kind="system",
+        event_key="u2-blocked",
+        timestamp=T,
+    )
+    with pytest.raises(OrchestrationError, match="human decision"):
+        engine.transition(
+            "u2",
+            WorkUnitState.DISPATCHED,
+            actor="codex-1",
+            actor_kind="agent",
+            event_key="u2-agent-resume",
+            timestamp=T,
+        )
+    engine.transition(
+        "u2",
+        WorkUnitState.DISPATCHED,
+        actor="atulg4",
+        actor_kind="human",
+        event_key="u2-human-resume",
+        timestamp=T,
+    )
+    assert engine.get("u2").state is WorkUnitState.DISPATCHED
+
+
 def test_manual_override_cannot_mint_merge_authority() -> None:
     engine = Orchestrator()
     _advance_to_dispatched(engine, "u1")

@@ -31,6 +31,11 @@ with `cancelled` and `superseded` reachable from every non-terminal state.
   with the repair cycle it observed; approving from a pre-repair review is
   rejected. Reviewer selection goes through the mission registry, so an
   implementer can never review its own work, even as a fallback.
+- **Approval and unblocking are never agent-granted.** Once a unit is
+  `approval-pending`, only a human actor can move it to `approved`; the
+  auto-approval path (`planned → approved`) is open to the system policy
+  engine but never to an agent actor; and resuming `blocked` (escalated)
+  work requires a human decision.
 - **Human merge is mandatory.** `merged` requires a human actor; the
   constructor refuses `human_merge_required=False`; manual overrides cannot
   target `merged`. There are no deployment states at all.

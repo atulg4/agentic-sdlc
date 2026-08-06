@@ -301,6 +301,21 @@ class Orchestrator:
                 actor_kind == "human",
                 "merge requires a human actor; agents never hold merge authority",
             )
+        if target is WorkUnitState.APPROVED:
+            _require(
+                actor_kind != "agent",
+                "approval cannot be granted by an agent actor",
+            )
+            if unit.state is WorkUnitState.APPROVAL_PENDING:
+                _require(
+                    actor_kind == "human",
+                    "explicit approval requires a human actor",
+                )
+        if unit.state is WorkUnitState.BLOCKED and target not in _ABORT:
+            _require(
+                actor_kind == "human",
+                "resuming blocked work requires a human decision",
+            )
         if target is WorkUnitState.DISPATCHED:
             blocking = [
                 dependency
