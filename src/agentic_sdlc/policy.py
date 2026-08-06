@@ -18,6 +18,8 @@ _BASELINE_FORBIDDEN_PATHS = (
     ".gitlab-ci.yml",
     ".gitlab/**",
     "agentic-sdlc.toml",
+    "missions.toml",
+    "**/missions.toml",
     "CODEOWNERS",
     "**/CODEOWNERS",
     "AGENTS.md",
