@@ -12,6 +12,7 @@ from .artifact import ArtifactError, create_manifest, verify_manifest, write_man
 from .events import EventError, normalize_event
 from .gates import GateError, run_gates, write_report
 from .git_diff import GitDiffError, collect_git_diff
+from .knowledge import KnowledgeError, load_sources
 from .missions import (
     MissionError,
     create_dispatch_envelope,
@@ -185,6 +186,15 @@ def _dispatch_mission(args: argparse.Namespace) -> int:
     return 0
 
 
+def _validate_knowledge(args: argparse.Namespace) -> int:
+    sources = load_sources(args.knowledge)
+    _write(
+        {"schemaVersion": 1, "sources": [source.as_dict() for source in sources]},
+        args.output,
+    )
+    return 0
+
+
 def _run_gates(args: argparse.Namespace) -> int:
     report = run_gates(args.config, args.repository)
     write_report(report, args.output)
@@ -301,6 +311,11 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch.add_argument("--output")
     dispatch.set_defaults(handler=_dispatch_mission)
 
+    knowledge = commands.add_parser("validate-knowledge")
+    knowledge.add_argument("--knowledge", required=True)
+    knowledge.add_argument("--output")
+    knowledge.set_defaults(handler=_validate_knowledge)
+
     gates = commands.add_parser("run-gates")
     gates.add_argument("--config", required=True)
     gates.add_argument("--repository", default=".")
@@ -330,6 +345,7 @@ def main(argv: list[str] | None = None) -> int:
         EventError,
         GateError,
         GitDiffError,
+        KnowledgeError,
         MissionError,
         ScaffoldError,
         OSError,
