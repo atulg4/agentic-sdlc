@@ -234,6 +234,12 @@ jobs:
           sandbox: workspace-write
           safety-strategy: drop-sudo
           codex-args: '["--ephemeral"]'
+      - name: Install Claude subprocess sandbox dependency
+        if: inputs.agent == 'claude'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
       - name: Generate patch with Claude Code in isolated checkout
         id: claude
         if: inputs.agent == 'claude'
