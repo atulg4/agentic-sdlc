@@ -245,7 +245,7 @@ jobs:
       - name: Generate patch with Claude Code in isolated checkout
         id: claude
         if: inputs.agent == 'claude'
-        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
+        uses: anthropics/claude-code-action@9db594c7a0e82298c121c18b7f08aa1579ce7341 # v1
         env:
           CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
         with:
