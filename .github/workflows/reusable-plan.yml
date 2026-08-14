@@ -24,6 +24,11 @@ on:
         description: Agentic SDLC repository in owner/name form
         required: true
         type: string
+      planner_model:
+        description: Explicit OpenAI model for planning
+        required: false
+        default: gpt-5.6-luna
+        type: string
     secrets:
       OPENAI_API_KEY:
         required: true
@@ -64,15 +69,20 @@ jobs:
             exit 2
           fi
           printf 'sha=%s\n' "$actual" >> "$GITHUB_OUTPUT"
-      - name: Validate platform identity
+      - name: Validate platform identity and planner model
         env:
           ISSUE_NUMBER: ${{ inputs.issue_number }}
           PLATFORM_REF: ${{ inputs.platform_ref }}
           PLATFORM_REPOSITORY: ${{ inputs.platform_repository }}
+          PLANNER_MODEL: ${{ inputs.planner_model }}
         run: |
           [[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]{0,9}$ ]]
           [[ "$PLATFORM_REF" =~ ^[0-9a-f]{40}$ ]]
           [[ "$PLATFORM_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          case "$PLANNER_MODEL" in
+            gpt-5.6-luna|gpt-5.6-terra|gpt-5.6-sol|gpt-5.4-mini) ;;
+            *) printf 'Unsupported planner model: %s\n' "$PLANNER_MODEL" >&2; exit 2 ;;
+          esac
       - name: Require repository write authority from trigger actor
         env:
           GH_TOKEN: ${{ github.token }}
@@ -162,6 +172,7 @@ jobs:
         uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          model: ${{ inputs.planner_model }}
           prompt-file: .agentic-input/prompt.md
           output-file: .agentic-input/plan.md
           sandbox: read-only
