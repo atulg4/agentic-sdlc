@@ -33,10 +33,17 @@ on:
         required: false
         default: codex
         type: string
+      claude_auth_mode:
+        description: Claude authentication mode, subscription_oauth or direct_api
+        required: false
+        default: subscription_oauth
+        type: string
     secrets:
       OPENAI_API_KEY:
         required: false
       ANTHROPIC_API_KEY:
+        required: false
+      CLAUDE_CODE_OAUTH_TOKEN:
         required: false
       PLATFORM_READ_TOKEN:
         required: false
@@ -79,12 +86,20 @@ jobs:
             exit 2
           fi
           printf 'sha=%s\n' "$actual" >> "$GITHUB_OUTPUT"
-      - name: Validate agent adapter
+      - name: Validate agent adapter and Claude auth mode
         env:
           AGENT: ${{ inputs.agent }}
+          CLAUDE_AUTH_MODE: ${{ inputs.claude_auth_mode }}
         run: |
+          set -euo pipefail
           case "$AGENT" in
-            codex|claude) ;;
+            codex) ;;
+            claude)
+              case "$CLAUDE_AUTH_MODE" in
+                subscription_oauth|direct_api) ;;
+                *) printf 'Unsupported Claude auth mode: %s\n' "$CLAUDE_AUTH_MODE" >&2; exit 2 ;;
+              esac
+              ;;
             *) printf 'Unsupported agent adapter: %s\n' "$AGENT" >&2; exit 2 ;;
           esac
       - name: Validate platform identity
@@ -242,9 +257,26 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q bubblewrap
-      - name: Generate patch with Claude Code in isolated checkout
-        id: claude
-        if: inputs.agent == 'claude'
+      - name: Generate patch with Claude Code using Max/Pro OAuth
+        id: claude-oauth
+        if: inputs.agent == 'claude' && inputs.claude_auth_mode == 'subscription_oauth'
+        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
+        env:
+          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          prompt: >-
+            Read .agentic-input/prompt.md and perform that implementation in the
+            current checkout. Do not push, open a pull request, deploy, or access
+            credentials. Leave all intended edits in the working tree.
+          claude_args: >-
+            --model claude-opus-5
+            --max-turns 60
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash"
+      - name: Generate patch with Claude Code using direct API billing
+        id: claude-api
+        if: inputs.agent == 'claude' && inputs.claude_auth_mode == 'direct_api'
         uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
         env:
           CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
