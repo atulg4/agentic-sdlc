@@ -156,6 +156,10 @@ jobs:
           path: .agentic-input
       - name: Exclude pipeline material from repository state
         run: printf '/.agentic-input/\n' >> .git/info/exclude
+      - name: Snapshot tracked source before planning
+        run: |
+          set -euo pipefail
+          git ls-files -z | xargs -0 sha256sum > "$RUNNER_TEMP/agent-plan-source.sha256"
       - name: Produce read-only architecture plan with Claude Max OAuth
         uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
         env:
@@ -171,7 +175,14 @@ jobs:
           claude_args: >-
             --model claude-opus-5
             --max-turns 40
-            --allowedTools "Read,Write,Glob,Grep,Bash"
+            --allowedTools "Read,Write,Glob,Grep"
+      - name: Prove planning did not mutate repository source
+        run: |
+          set -euo pipefail
+          sha256sum --check --strict "$RUNNER_TEMP/agent-plan-source.sha256"
+          git diff --quiet --
+          git diff --cached --quiet --
+          test -z "$(git status --porcelain --untracked-files=all)"
       - name: Verify plan artifact exists
         run: |
           set -euo pipefail
