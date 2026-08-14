@@ -32,15 +32,18 @@ def test_implementation_separates_ai_verifier_and_publisher_authority() -> None:
 
     assert "OPENAI_API_KEY" in generator
     assert "ANTHROPIC_API_KEY" in generator
+    assert "CLAUDE_CODE_OAUTH_TOKEN" in generator
     assert "PUBLISHER_APP_PRIVATE_KEY" not in generator
     assert "Refuse a duplicate open pull request" in document
     assert "contents: write" not in generator
     assert "API_KEY" not in verifier
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in verifier
     assert "PUBLISHER_APP_PRIVATE_KEY" not in verifier
     assert "contents: write" not in verifier
     assert "run-gates" in verifier
     assert "verified-patch-${{ github.run_id }}" not in verifier
     assert "API_KEY" not in attestor
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in attestor
     assert "PUBLISHER_APP_PRIVATE_KEY" not in attestor
     assert "contents: write" not in attestor
     assert "run-gates" not in attestor
@@ -54,11 +57,31 @@ def test_implementation_separates_ai_verifier_and_publisher_authority() -> None:
     assert "GH_TOKEN: ${{ steps.publisher-token.outputs.token }}" in publisher
     assert "GH_TOKEN: ${{ github.token }}" not in publisher
     assert "API_KEY" not in publisher
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in publisher
     assert "PUBLISHER_APP_PRIVATE_KEY" in publisher
     assert "codex-action" not in publisher
     assert "claude-code-action" not in publisher
     assert "verified-patch-${{ github.run_id }}" in publisher
     assert "needs: [prepare, attest_patch]" in publisher
+
+
+def test_claude_subscription_oauth_is_explicit_and_never_silently_falls_back() -> None:
+    document = (WORKFLOWS / "reusable-implement.yml").read_text(encoding="utf-8")
+    generator = _job(document, "generate_patch", "verify")
+
+    assert "claude_auth_mode:" in document
+    assert "default: subscription_oauth" in document
+    assert "subscription_oauth|direct_api" in document
+    assert "inputs.claude_auth_mode == 'subscription_oauth'" in generator
+    assert "claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}" in generator
+    assert "inputs.claude_auth_mode == 'direct_api'" in generator
+    assert "anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}" in generator
+
+    caller = (ROOT / "src/agentic_sdlc/templates/github/agent-implement.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "claude_auth_mode: ${{ inputs.claude_auth_mode }}" in caller
+    assert "CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}" in caller
 
 
 def test_implementation_caller_grants_only_branch_write_to_native_token() -> None:
