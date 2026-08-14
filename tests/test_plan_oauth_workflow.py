@@ -53,19 +53,12 @@ def test_planner_records_and_verifies_source_integrity_around_ai_step() -> None:
     assert "git ls-files -z | xargs -0 sha256sum" in plan
     assert invoke in plan
     assert verify in plan
-    checksum_check = (
-        'sha256sum --check --strict "$RUNNER_TEMP/agent-plan-source.sha256"'
-    )
+    checksum_check = 'sha256sum --check --strict "$RUNNER_TEMP/agent-plan-source.sha256"'
     assert checksum_check in plan
     assert "git diff --quiet --" in plan
     assert "git diff --cached --quiet --" in plan
     assert "git status --porcelain --untracked-files=all" in plan
-    assert (
-        plan.index(snapshot)
-        < plan.index(invoke)
-        < plan.index(verify)
-        < plan.index(artifact)
-    )
+    assert plan.index(snapshot) < plan.index(invoke) < plan.index(verify) < plan.index(artifact)
 
 
 def test_ai_planning_job_cannot_publish_or_write_repository_contents() -> None:
