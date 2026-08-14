@@ -35,9 +35,10 @@ def test_planner_has_no_shell_tool_and_scrubs_subprocess_environment() -> None:
     assert 'CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"' in plan
     assert '--allowedTools "Read,Write,Glob,Grep"' in plan
     assert '--allowedTools "Read,Write,Glob,Grep,Bash"' not in plan
-    assert "Bash" not in plan.split("claude_args:", 1)[1].split(
+    claude_args = plan.split("claude_args:", 1)[1].split(
         "Prove planning did not mutate repository source", 1
     )[0]
+    assert "Bash" not in claude_args
 
 
 def test_planner_records_and_verifies_source_integrity_around_ai_step() -> None:
@@ -52,11 +53,19 @@ def test_planner_records_and_verifies_source_integrity_around_ai_step() -> None:
     assert "git ls-files -z | xargs -0 sha256sum" in plan
     assert invoke in plan
     assert verify in plan
-    assert 'sha256sum --check --strict "$RUNNER_TEMP/agent-plan-source.sha256"' in plan
+    checksum_check = (
+        'sha256sum --check --strict "$RUNNER_TEMP/agent-plan-source.sha256"'
+    )
+    assert checksum_check in plan
     assert "git diff --quiet --" in plan
     assert "git diff --cached --quiet --" in plan
-    assert 'git status --porcelain --untracked-files=all' in plan
-    assert plan.index(snapshot) < plan.index(invoke) < plan.index(verify) < plan.index(artifact)
+    assert "git status --porcelain --untracked-files=all" in plan
+    assert (
+        plan.index(snapshot)
+        < plan.index(invoke)
+        < plan.index(verify)
+        < plan.index(artifact)
+    )
 
 
 def test_ai_planning_job_cannot_publish_or_write_repository_contents() -> None:
