@@ -15,6 +15,11 @@ on:
         description: Exact pull request head SHA
         required: true
         type: string
+      review_model:
+        description: Explicit OpenAI model for routine independent review
+        required: false
+        default: gpt-5.4-mini
+        type: string
     secrets:
       OPENAI_API_KEY:
         required: true
@@ -32,6 +37,14 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Validate review model
+        env:
+          REVIEW_MODEL: ${{ inputs.review_model }}
+        run: |
+          case "$REVIEW_MODEL" in
+            gpt-5.4-mini|gpt-5.6-luna|gpt-5.6-terra|gpt-5.6-sol) ;;
+            *) printf 'Unsupported review model: %s\n' "$REVIEW_MODEL" >&2; exit 2 ;;
+          esac
       - name: Check out exact pull request head without credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -90,6 +103,7 @@ jobs:
         uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          model: ${{ inputs.review_model }}
           prompt: |
             Independently review pull request #${{ inputs.pull_request_number }}.
             Review only the change between base ${{ inputs.base_sha }} and head ${{ inputs.head_sha }}.
