@@ -128,9 +128,7 @@ def test_non_low_risk_defaults_to_human_policy_review() -> None:
 
 
 def test_unmanaged_or_sensitive_work_stays_explicitly_denied() -> None:
-    evidence = _normalize(
-        labels=[], deployment_requested=True, broker_access_requested=True
-    )
+    evidence = _normalize(labels=[], deployment_requested=True, broker_access_requested=True)
 
     assert evidence.forge_managed is False
     assert evidence.deployment_requested is True
