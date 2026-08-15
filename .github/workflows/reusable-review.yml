@@ -47,8 +47,59 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$PR_NUMBER" =~ ^[1-9][0-9]{0,9}$ ]]
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
           git cat-file -e "${BASE_SHA}^{commit}"
           test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+      - name: Check out immutable deterministic pre-review engine
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: atulg4/agentic-sdlc
+          ref: 3cf5befe3015f906d3f6984caea5b15b7eda521f
+          path: .agentic-pre-review-platform
+          persist-credentials: false
+      - name: Exclude trusted pre-review engine from consumer diff
+        run: printf '/.agentic-pre-review-platform/\n' >> .git/info/exclude
+      - name: Install deterministic pre-review checker
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check -q ./.agentic-pre-review-platform
+      - name: Run deterministic pre-review before Claude
+        id: deterministic-pre-review
+        env:
+          BASE_SHA: ${{ inputs.base_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/deterministic-pre-review"
+          python3 - "$BASE_SHA" "${RUNNER_TEMP}/deterministic-pre-review/report.json" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          from agentic_sdlc.pre_review import run_pre_review
+
+          base, output = sys.argv[1:]
+          report = run_pre_review("agentic-sdlc.toml", ".", base)
+          pathlib.Path(output).write_text(
+              json.dumps(report, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          if not report["passed"]:
+              for finding in report["findings"]:
+                  print(
+                      f"::error file={finding['path']}::{finding['code']}: "
+                      f"{finding['message']}"
+                  )
+              raise SystemExit(2)
+          PY
+      - name: Store deterministic pre-review evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: deterministic-pre-review-${{ github.run_id }}
+          path: ${{ runner.temp }}/deterministic-pre-review/report.json
+          if-no-files-found: error
+          retention-days: 7
       - name: Create fixed review contract
         run: |
           set -euo pipefail
