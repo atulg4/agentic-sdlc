@@ -104,13 +104,9 @@ def normalize_merge_evidence(
         scope_bounded=scope_bounded,
         security_clear=security_clear,
         high_risk=risk_level.strip().lower() != "low",
-        deterministic_verification_passed=_all_success(
-            policy.deterministic_checks, conclusions
-        ),
+        deterministic_verification_passed=_all_success(policy.deterministic_checks, conclusions),
         quality_passed=_all_success(policy.quality_checks, conclusions),
-        independent_review_approved=_all_success(
-            policy.independent_review_checks, conclusions
-        ),
+        independent_review_approved=_all_success(policy.independent_review_checks, conclusions),
         secret_scan_passed=_all_success(policy.secret_scan_checks, conclusions),
         branch_protection_allows=branch_protection_allows,
         unresolved_conversations=unresolved_conversations,
