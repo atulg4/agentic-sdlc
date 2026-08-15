@@ -7,23 +7,32 @@ on:
         description: Approved GitHub issue number
         required: true
         type: string
-      agent:
-        description: Patch generator
-        required: true
-        default: codex
-        type: choice
-        options:
-          - codex
-          - claude
 
 permissions: {}
 
 jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Require Claude Max OAuth and publisher configuration
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          PUBLISHER_APP_CLIENT_ID: ${{ vars.PUBLISHER_APP_CLIENT_ID }}
+          PUBLISHER_APP_PRIVATE_KEY: ${{ secrets.PUBLISHER_APP_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$CLAUDE_CODE_OAUTH_TOKEN"
+          test -n "$PUBLISHER_APP_CLIENT_ID"
+          test -n "$PUBLISHER_APP_PRIVATE_KEY"
+
   implement:
+    needs: preflight
     permissions:
       contents: write
       issues: read
       pull-requests: read
+      id-token: write
     uses: atulg4/agentic-sdlc/.github/workflows/reusable-implement.yml@PLATFORM_COMMIT_SHA
     with:
       issue_number: ${{ inputs.issue_number }}
@@ -32,9 +41,9 @@ jobs:
       platform_ref: PLATFORM_COMMIT_SHA
       platform_repository: atulg4/agentic-sdlc
       publisher_app_client_id: ${{ vars.PUBLISHER_APP_CLIENT_ID }}
-      agent: ${{ inputs.agent }}
+      agent: claude
+      claude_auth_mode: subscription_oauth
     secrets:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       PLATFORM_READ_TOKEN: ${{ secrets.PLATFORM_READ_TOKEN }}
       PUBLISHER_APP_PRIVATE_KEY: ${{ secrets.PUBLISHER_APP_PRIVATE_KEY }}
