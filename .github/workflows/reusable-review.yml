@@ -139,10 +139,33 @@ jobs:
       - name: Verify review scope and repository integrity
         env:
           EXPECTED_DIFF_SHA256: ${{ steps.review-diff.outputs.sha256 }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          HEAD_SHA: ${{ inputs.head_sha }}
         run: |
           set -euo pipefail
           echo "${EXPECTED_DIFF_SHA256}  .agentic-review/change.diff" | sha256sum -c -
-          git diff --exit-code -- .
+
+          # claude-code-action intentionally replaces executable agent-control
+          # files from the PR head with trusted repository versions before the
+          # model runs. Accept only that documented hardening mutation, and only
+          # when every changed path exactly matches the fixed PR base SHA.
+          changed=$(git diff --name-only "${HEAD_SHA}" -- .)
+          while IFS= read -r path; do
+            [ -z "$path" ] && continue
+            case "$path" in
+              CLAUDE.md|CLAUDE.local.md|.mcp.json|.claude.json|.gitmodules|.ripgreprc|.claude/*|.husky/*)
+                git diff --quiet "${BASE_SHA}" -- "$path" || {
+                  echo "trusted agent-control path does not match fixed base: $path" >&2
+                  exit 1
+                }
+                ;;
+              *)
+                echo "unexpected tracked repository mutation during review: $path" >&2
+                exit 1
+                ;;
+            esac
+          done <<< "$changed"
+
           unexpected=$(git ls-files --others --exclude-standard | grep -v '^\.agentic-review/' || true)
           test -z "$unexpected"
           python - <<'PY'
