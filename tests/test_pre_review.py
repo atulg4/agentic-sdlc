@@ -164,7 +164,10 @@ def test_provider_api_key_addition_fails_but_preexisting_text_is_not_reflagged(
     _git(tmp_path, "add", "--", ".")
     _git(tmp_path, "commit", "-qm", "docs base")
     base = _git(tmp_path, "rev-parse", "HEAD")
-    target.write_text("No provider credentials here.\nOPENAI_API_KEY must not return.\n", encoding="utf-8")
+    target.write_text(
+        "No provider credentials here.\nOPENAI_API_KEY must not return.\n",
+        encoding="utf-8",
+    )
 
     report = run_pre_review(tmp_path / "agentic-sdlc.toml", tmp_path, base)
 
