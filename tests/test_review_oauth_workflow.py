@@ -47,7 +47,7 @@ def test_review_fails_closed_instead_of_disabling_subprocess_isolation() -> None
 
     assert "bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / /bin/true" in review
     assert "continue-on-error: true" not in review
-    assert "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: \"0\"" not in review
+    assert 'CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "0"' not in review
 
 
 def test_ai_review_job_remains_read_only_to_repository() -> None:
