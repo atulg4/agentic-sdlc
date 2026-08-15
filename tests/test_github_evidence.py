@@ -126,8 +126,12 @@ def test_graphql_head_disagreement_or_incomplete_threads_fail_closed() -> None:
                 readiness,
             ]
         )
+
+        def opener(_request, response_iterator=responses):
+            return next(response_iterator)
+
         with pytest.raises(ValueError):
-            GitHubMergeEvidenceCollector("token", opener=lambda _request: next(responses)).collect(
+            GitHubMergeEvidenceCollector("token", opener=opener).collect(
                 repository="owner/repo", pull_request_number=7
             )
 
