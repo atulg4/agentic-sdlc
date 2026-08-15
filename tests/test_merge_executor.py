@@ -106,7 +106,7 @@ def test_merge_gateway_is_never_called_when_any_gate_denies(
 
 
 @pytest.mark.parametrize(
-    "request",
+    "merge_request",
     [
         MergeRequest("invalid", 66, "a" * 40),
         MergeRequest("atulg4/example", 0, "a" * 40),
@@ -117,11 +117,11 @@ def test_merge_gateway_is_never_called_when_any_gate_denies(
     ],
 )
 def test_malformed_merge_requests_fail_before_gateway(
-    request: MergeRequest,
+    merge_request: MergeRequest,
 ) -> None:
     gateway = RecordingGateway()
 
-    outcome = ProtectedMergeExecutor().execute(request, _ready(), gateway)
+    outcome = ProtectedMergeExecutor().execute(merge_request, _ready(), gateway)
 
     assert outcome.allowed is False
     assert outcome.merged is False
