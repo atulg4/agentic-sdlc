@@ -99,7 +99,10 @@ class AutonomousIntakeDispatcher:
 
         _require(bool(event.provider.strip()), "provider is required")
         _require(bool(event.repository.strip()), "repository is required")
-        _require(event.number is not None and event.number > 0, "positive work item number is required")
+        _require(
+            event.number is not None and event.number > 0,
+            "positive work item number is required",
+        )
         _require(bool(timestamp.strip()), "timestamp is required")
 
         unit_id = f"{event.provider}:{event.repository}:{event.kind.value}:{event.number}"
