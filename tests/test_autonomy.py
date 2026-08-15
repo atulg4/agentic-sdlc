@@ -131,7 +131,9 @@ def test_unknown_phase_is_rejected_instead_of_falling_back() -> None:
 
 
 def test_policy_contract_contains_no_paid_api_key_fallback_names() -> None:
-    source = (__import__("pathlib").Path(__file__).parents[1] / "src/agentic_sdlc/autonomy.py").read_text()
+    source = (
+        __import__("pathlib").Path(__file__).parents[1] / "src/agentic_sdlc/autonomy.py"
+    ).read_text()
 
     forbidden = ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "browser cookie", "session scraping")
     for token in forbidden:
