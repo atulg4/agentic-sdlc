@@ -1,9 +1,10 @@
 """End-to-end trusted evidence path for autonomous protected merges.
 
 This service is the narrow seam between read-only GitHub evidence collection and the
-credential-isolated merge gateway.  Callers may supply policy context that GitHub
+credential-isolated merge gateway. Callers may supply policy context that GitHub
 cannot infer (bounded scope, risk, security classification), but they cannot assert
-that required CI/review/security checks passed or substitute a different PR head.
+that required checks passed, conversations are resolved, branch protection allows
+merge, or substitute a different PR head.
 """
 
 from __future__ import annotations
@@ -31,8 +32,6 @@ class ProtectedMergeContext:
     risk_level: str
     scope_bounded: bool
     security_clear: bool
-    branch_protection_allows: bool
-    unresolved_conversations: int
     deployment_requested: bool = False
     broker_access_requested: bool = False
 
@@ -52,12 +51,7 @@ class TrustedProtectedMergeService:
         collector: MergeEvidenceCollector,
         gateway: MergeGateway,
     ) -> MergeOutcome:
-        """Attempt a merge using only freshly collected exact-head check evidence.
-
-        Evidence collection errors and head drift fail closed before the merge gateway
-        receives a request.  Required check success is derived exclusively from the
-        collected GitHub check-runs snapshot.
-        """
+        """Attempt a merge using only freshly collected exact-head gate evidence."""
 
         try:
             collected = collector.collect(
@@ -87,8 +81,8 @@ class TrustedProtectedMergeService:
                 risk_level=context.risk_level,
                 scope_bounded=context.scope_bounded,
                 security_clear=context.security_clear,
-                branch_protection_allows=context.branch_protection_allows,
-                unresolved_conversations=context.unresolved_conversations,
+                branch_protection_allows=collected.branch_protection_allows,
+                unresolved_conversations=collected.unresolved_conversations,
                 deployment_requested=context.deployment_requested,
                 broker_access_requested=context.broker_access_requested,
                 checks=collected.checks,
