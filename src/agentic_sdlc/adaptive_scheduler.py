@@ -43,10 +43,7 @@ def fill_safe_slots(
         raise ValueError("now must be non-negative")
 
     def resolve_agent(unit_id: str) -> str:
-        if callable(agent_for):
-            value = agent_for(unit_id)
-        else:
-            value = agent_for.get(unit_id, "")
+        value = agent_for(unit_id) if callable(agent_for) else agent_for.get(unit_id, "")
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"missing agent id for ready unit {unit_id}")
         return value
