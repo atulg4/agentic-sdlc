@@ -11,6 +11,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 
+from .checkpoints import CheckpointError, CheckpointRecord, CheckpointStore
 from .models import WorkEvent
 from .orchestration import OrchestrationError, Orchestrator, WorkUnitState
 
@@ -72,30 +73,75 @@ class AutonomousIntakeDispatcher:
         self,
         orchestrator: Orchestrator,
         *,
+        checkpoints: CheckpointStore | None = None,
         managed_label: str = "forge-managed",
         blocked_labels: tuple[str, ...] = ("forge-paused", "security-review-required"),
     ) -> None:
         _require(bool(managed_label.strip()), "managed_label is required")
         self._orchestrator = orchestrator
+        self._checkpoints = checkpoints
         self.managed_label = managed_label
         self.blocked_labels = frozenset(blocked_labels)
+
+    @staticmethod
+    def _from_checkpoint(
+        record: CheckpointRecord, *, reason: str | None = None
+    ) -> DispatchDecision:
+        return DispatchDecision(
+            record.accepted,
+            record.unit_id,
+            record.event_key,
+            record.state,
+            reason or record.reason,
+        )
+
+    def _persist(self, decision: DispatchDecision, *, timestamp: str) -> None:
+        if self._checkpoints is None:
+            return
+        try:
+            self._checkpoints.record(
+                CheckpointRecord(
+                    event_key=decision.event_key,
+                    unit_id=decision.unit_id,
+                    state=decision.state,
+                    accepted=decision.accepted,
+                    reason=decision.reason,
+                    timestamp=timestamp,
+                )
+            )
+        except CheckpointError as exc:
+            raise DispatchError(f"checkpoint persistence failed: {exc}") from exc
 
     def dispatch(self, event: WorkEvent, *, timestamp: str) -> DispatchDecision:
         """Normalize one event into an idempotent Forge work unit when policy permits."""
 
-        labels = frozenset(event.labels)
+        _require(bool(timestamp.strip()), "timestamp is required")
         key = event_fingerprint(event)
+        if self._checkpoints is not None:
+            try:
+                self._checkpoints.touch_heartbeat(timestamp)
+                replay = self._checkpoints.get_event(key)
+            except CheckpointError as exc:
+                raise DispatchError(f"checkpoint preflight failed: {exc}") from exc
+            if replay is not None:
+                return self._from_checkpoint(replay)
+
+        labels = frozenset(event.labels)
         if self.managed_label not in labels:
-            return DispatchDecision(False, "", key, "ignored", "missing forge-managed marker")
+            decision = DispatchDecision(False, "", key, "ignored", "missing forge-managed marker")
+            self._persist(decision, timestamp=timestamp)
+            return decision
         blocked = sorted(labels & self.blocked_labels)
         if blocked:
-            return DispatchDecision(
+            decision = DispatchDecision(
                 False,
                 "",
                 key,
                 "blocked",
                 "autonomous intake blocked by label: " + ", ".join(blocked),
             )
+            self._persist(decision, timestamp=timestamp)
+            return decision
 
         _require(bool(event.provider.strip()), "provider is required")
         _require(bool(event.repository.strip()), "repository is required")
@@ -103,9 +149,24 @@ class AutonomousIntakeDispatcher:
             event.number is not None and event.number > 0,
             "positive work item number is required",
         )
-        _require(bool(timestamp.strip()), "timestamp is required")
 
         unit_id = f"{event.provider}:{event.repository}:{event.kind.value}:{event.number}"
+        if self._checkpoints is not None:
+            try:
+                prior_unit = self._checkpoints.get_unit(unit_id)
+            except CheckpointError as exc:
+                raise DispatchError(f"checkpoint lookup failed: {exc}") from exc
+            if prior_unit is not None and prior_unit.accepted:
+                decision = DispatchDecision(
+                    True,
+                    unit_id,
+                    key,
+                    prior_unit.state,
+                    "checkpoint-replay",
+                )
+                self._persist(decision, timestamp=timestamp)
+                return decision
+
         unit = self._orchestrator.create_unit(
             unit_id,
             event_key=key,
@@ -126,4 +187,6 @@ class AutonomousIntakeDispatcher:
             except OrchestrationError as exc:
                 raise DispatchError(str(exc)) from exc
 
-        return DispatchDecision(True, unit_id, key, unit.state.value, "accepted")
+        decision = DispatchDecision(True, unit_id, key, unit.state.value, "accepted")
+        self._persist(decision, timestamp=timestamp)
+        return decision
