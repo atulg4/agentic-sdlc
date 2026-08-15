@@ -304,8 +304,10 @@ def run_pre_review(
     if not isinstance(required_phrases, dict):
         raise PreReviewError("pre_review.required_phrases must be a TOML table")
     for path, phrases in required_phrases.items():
-        if not isinstance(path, str) or not isinstance(phrases, list) or not all(
-            isinstance(phrase, str) and phrase for phrase in phrases
+        if (
+            not isinstance(path, str)
+            or not isinstance(phrases, list)
+            or not all(isinstance(phrase, str) and phrase for phrase in phrases)
         ):
             raise PreReviewError("pre_review.required_phrases values must be arrays of strings")
         target = root / path
