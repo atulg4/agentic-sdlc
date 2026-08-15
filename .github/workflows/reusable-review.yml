@@ -86,13 +86,25 @@ jobs:
             }
           }
           JSON
-      - name: Install Claude subprocess isolation dependencies
+      - name: Install and verify Claude subprocess isolation
         run: |
           set -euo pipefail
           sudo apt-get update -q
           sudo apt-get install -y -q bubblewrap socat
           command -v bwrap >/dev/null
           command -v socat >/dev/null
+
+          # Ubuntu 24.04+ restricts unprivileged user namespaces via AppArmor.
+          # Claude Code's bubblewrap sandbox requires them. Keep isolation
+          # enabled and make the sandbox usable rather than opting out of
+          # subprocess environment scrubbing.
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+          # Fail closed before spending a Claude turn if bubblewrap cannot
+          # create the user namespace/uid map that isolated Bash needs.
+          bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / /bin/true
       - name: Independently review the exact diff with Claude Max OAuth
         id: claude-review
         uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
