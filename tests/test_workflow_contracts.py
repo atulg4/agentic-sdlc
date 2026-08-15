@@ -150,10 +150,7 @@ def test_cross_repository_identifiers_use_string_contracts() -> None:
     issue_cast = "issue_number: ${{ format('{0}', github.event.issue.number) }}"
     assert issue_cast in auto_plan
     assert issue_cast in auto_implement
-    assert (
-        "pull_request_number: ${{ needs.review_eligibility.outputs.pull_request_number }}"
-        in review
-    )
+    assert "pull_request_number: ${{ needs.review_eligibility.outputs.pull_request_number }}" in review
 
 
 def test_reusable_identifiers_are_allowlisted_before_api_use() -> None:
