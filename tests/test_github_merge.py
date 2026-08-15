@@ -51,7 +51,9 @@ def test_token_is_required_and_custom_origins_are_rejected() -> None:
 def test_rejected_merge_does_not_claim_success() -> None:
     gateway = GitHubMergeGateway(
         "token",
-        opener=lambda request: FakeResponse({"merged": False, "message": "Required checks pending"}),
+        opener=lambda request: FakeResponse(
+            {"merged": False, "message": "Required checks pending"}
+        ),
     )
 
     result = gateway.merge(
