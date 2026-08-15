@@ -68,6 +68,7 @@ def test_protected_change_requires_architect_review(policy_file: Path) -> None:
     assert decision.allowed
     assert decision.risk == RiskLevel.HIGH
     assert "architect-security-review" in decision.required_gates
+    assert not decision.automatic_merge_allowed
 
 
 def test_documentation_only_change_is_low_risk(policy_file: Path) -> None:
@@ -128,12 +129,72 @@ def test_baseline_policy_protects_nested_control_and_secret_paths(
     assert not decision.allowed
 
 
-def test_policy_version_one_cannot_disable_human_merge(policy_file: Path) -> None:
+def _disable_human_merge(policy_file: Path) -> None:
     document = policy_file.read_text(encoding="utf-8").replace(
         "human_merge_required = true",
         "human_merge_required = false",
     )
     policy_file.write_text(document, encoding="utf-8")
 
-    with pytest.raises(ValueError, match="human_merge_required must be true"):
+
+def test_policy_version_one_accepts_explicit_autonomous_merge_mode(policy_file: Path) -> None:
+    _disable_human_merge(policy_file)
+
+    policy = load_policy(policy_file)
+    assert policy.human_merge_required is False
+
+
+def test_autonomous_mode_removes_only_the_human_merge_gate(
+    policy_file: Path, valid_body: str
+) -> None:
+    _disable_human_merge(policy_file)
+    policy = load_policy(policy_file)
+    task = parse_task("Task", valid_body, ("agent-ready", "human-review-required"))
+
+    decision = evaluate_task(task, policy)
+
+    assert decision.allowed
+    assert "deterministic-ci" in decision.required_gates
+    assert "independent-agent-review" in decision.required_gates
+    assert "human-merge-approval" not in decision.required_gates
+    assert not decision.automatic_merge_allowed
+
+
+def test_autonomous_mode_allows_only_unprotected_low_risk_diff_eligibility(
+    policy_file: Path,
+) -> None:
+    _disable_human_merge(policy_file)
+    policy = load_policy(policy_file)
+
+    low_risk = evaluate_diff(("docs/usage.md",), 5, 1, policy)
+    ordinary_code = evaluate_diff(("src/app.py",), 5, 1, policy)
+    protected = evaluate_diff(("src/auth/session.py",), 5, 1, policy)
+    forbidden = evaluate_diff(("agentic-sdlc.toml",), 1, 1, policy)
+
+    assert low_risk.allowed
+    assert low_risk.risk is RiskLevel.LOW
+    assert low_risk.automatic_merge_allowed
+
+    assert ordinary_code.allowed
+    assert ordinary_code.risk is RiskLevel.MEDIUM
+    assert not ordinary_code.automatic_merge_allowed
+
+    assert protected.allowed
+    assert protected.risk is RiskLevel.HIGH
+    assert "architect-security-review" in protected.required_gates
+    assert not protected.automatic_merge_allowed
+
+    assert not forbidden.allowed
+    assert forbidden.risk is RiskLevel.CRITICAL
+    assert not forbidden.automatic_merge_allowed
+
+
+def test_human_merge_policy_must_be_boolean(policy_file: Path) -> None:
+    document = policy_file.read_text(encoding="utf-8").replace(
+        "human_merge_required = true",
+        'human_merge_required = "false"',
+    )
+    policy_file.write_text(document, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="human_merge_required must be a boolean"):
         load_policy(policy_file)
