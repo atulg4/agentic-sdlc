@@ -7,15 +7,26 @@ on:
 permissions: {}
 
 jobs:
-  plan:
+  preflight:
     if: >-
       github.event.label.name == 'claude-ready' &&
       github.event.issue.pull_request == null &&
       contains(github.event.issue.labels.*.name, 'claude-ready') &&
       contains(github.event.issue.labels.*.name, 'human-review-required')
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Require Claude Max OAuth
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: test -n "$CLAUDE_CODE_OAUTH_TOKEN"
+
+  plan:
+    needs: preflight
     permissions:
       contents: read
       issues: write
+      id-token: write
     uses: atulg4/agentic-sdlc/.github/workflows/reusable-plan.yml@PLATFORM_COMMIT_SHA
     with:
       issue_number: ${{ format('{0}', github.event.issue.number) }}
@@ -24,5 +35,5 @@ jobs:
       platform_ref: PLATFORM_COMMIT_SHA
       platform_repository: atulg4/agentic-sdlc
     secrets:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       PLATFORM_READ_TOKEN: ${{ secrets.PLATFORM_READ_TOKEN }}
