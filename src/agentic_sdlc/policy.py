@@ -20,6 +20,8 @@ _BASELINE_FORBIDDEN_PATHS = (
     "agentic-sdlc.toml",
     "missions.toml",
     "**/missions.toml",
+    "knowledge.toml",
+    "**/knowledge.toml",
     "CODEOWNERS",
     "**/CODEOWNERS",
     "AGENTS.md",
