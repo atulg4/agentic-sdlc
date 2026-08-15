@@ -19,6 +19,7 @@ from .missions import (
     load_agents,
     load_registry,
 )
+from .orchestration import OrchestrationError, Orchestrator
 from .policy import evaluate_diff, evaluate_task, load_policy
 from .scaffold import ScaffoldError, scaffold_project
 from .task_spec import TaskSpecError, parse_task, render_prompt
@@ -186,6 +187,70 @@ def _dispatch_mission(args: argparse.Namespace) -> int:
     return 0
 
 
+def _orchestrate(args: argparse.Namespace) -> int:
+    state_path = Path(args.state)
+    if state_path.is_file():
+        document = json.loads(state_path.read_text(encoding="utf-8"))
+        engine = Orchestrator.from_dict(document)
+    else:
+        engine = Orchestrator(max_repair_cycles=args.max_repair_cycles)
+
+    if args.action == "create":
+        engine.create_unit(
+            args.unit,
+            event_key=args.event_key,
+            timestamp=args.timestamp,
+            concurrency_group=args.concurrency_group or "",
+            depends_on=tuple(args.depends_on),
+        )
+    elif args.action == "transition":
+        engine.transition(
+            args.unit,
+            args.to,
+            actor=args.actor,
+            actor_kind=args.actor_kind,
+            event_key=args.event_key,
+            timestamp=args.timestamp,
+            reason=args.reason,
+        )
+    elif args.action == "start-run":
+        envelope = json.loads(Path(args.envelope).read_text(encoding="utf-8"))
+        engine.start_run(
+            args.unit,
+            args.kind,
+            envelope,
+            event_key=args.event_key,
+            timestamp=args.timestamp,
+        )
+    elif args.action == "finish-run":
+        engine.finish_run(
+            args.unit,
+            args.run_id,
+            result=args.result,
+            timestamp=args.timestamp,
+            commit_sha=args.commit_sha,
+        )
+    elif args.action == "verification":
+        engine.record_verification(
+            args.unit,
+            passed=args.result == "succeeded",
+            event_key=args.event_key,
+            timestamp=args.timestamp,
+        )
+    elif args.action == "review":
+        engine.record_review(
+            args.unit,
+            args.run_id,
+            findings=args.findings,
+            event_key=args.event_key,
+            timestamp=args.timestamp,
+        )
+    _write(engine.as_dict(), str(state_path))
+    if args.status_output:
+        Path(args.status_output).write_text(engine.status_document(args.unit), encoding="utf-8")
+    return 0
+
+
 def _validate_knowledge(args: argparse.Namespace) -> int:
     sources = load_sources(args.knowledge)
     _write(
@@ -311,6 +376,32 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch.add_argument("--output")
     dispatch.set_defaults(handler=_dispatch_mission)
 
+    orchestrate = commands.add_parser("orchestrate")
+    orchestrate.add_argument(
+        "--action",
+        choices=("create", "transition", "start-run", "finish-run", "verification", "review"),
+        required=True,
+    )
+    orchestrate.add_argument("--state", required=True)
+    orchestrate.add_argument("--unit", required=True)
+    orchestrate.add_argument("--event-key", default="")
+    orchestrate.add_argument("--timestamp", required=True)
+    orchestrate.add_argument("--to")
+    orchestrate.add_argument("--actor", default="system")
+    orchestrate.add_argument("--actor-kind", choices=("human", "agent", "system"), default="system")
+    orchestrate.add_argument("--reason", default="")
+    orchestrate.add_argument("--concurrency-group")
+    orchestrate.add_argument("--depends-on", action="append", default=[])
+    orchestrate.add_argument("--kind")
+    orchestrate.add_argument("--envelope")
+    orchestrate.add_argument("--run-id")
+    orchestrate.add_argument("--result", choices=("succeeded", "failed"))
+    orchestrate.add_argument("--findings", type=int, default=0)
+    orchestrate.add_argument("--commit-sha", default="")
+    orchestrate.add_argument("--max-repair-cycles", type=int, default=2)
+    orchestrate.add_argument("--status-output")
+    orchestrate.set_defaults(handler=_orchestrate)
+
     knowledge = commands.add_parser("validate-knowledge")
     knowledge.add_argument("--knowledge", required=True)
     knowledge.add_argument("--output")
@@ -347,6 +438,7 @@ def main(argv: list[str] | None = None) -> int:
         GitDiffError,
         KnowledgeError,
         MissionError,
+        OrchestrationError,
         ScaffoldError,
         OSError,
         ValueError,

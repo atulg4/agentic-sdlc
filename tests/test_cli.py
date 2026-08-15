@@ -252,3 +252,44 @@ def test_dispatch_mission_cli_fails_closed_on_independence(
         ]
     )
     assert result == 2
+
+
+def test_orchestrate_cli_round_trips_state(tmp_path: Path) -> None:
+    state = tmp_path / "state.json"
+    status = tmp_path / "status.md"
+    base = [
+        "orchestrate",
+        "--state",
+        str(state),
+        "--unit",
+        "42",
+        "--timestamp",
+        "2026-08-06T12:00:00Z",
+        "--status-output",
+        str(status),
+    ]
+    assert main([*base, "--action", "create", "--event-key", "evt-1"]) == 0
+    assert (
+        main(
+            [
+                *base,
+                "--action",
+                "transition",
+                "--event-key",
+                "evt-2",
+                "--to",
+                "triaged",
+                "--actor",
+                "atulg4",
+                "--actor-kind",
+                "human",
+            ]
+        )
+        == 0
+    )
+    document = json.loads(state.read_text(encoding="utf-8"))
+    assert document["units"]["42"]["state"] == "triaged"
+    assert status.read_text(encoding="utf-8").startswith("<!-- agentic-sdlc:status -->")
+    # Replaying the same event is a no-op, and invalid transitions fail closed.
+    assert main([*base, "--action", "transition", "--event-key", "evt-2", "--to", "triaged"]) == 0
+    assert main([*base, "--action", "transition", "--event-key", "evt-3", "--to", "merged"]) == 2
