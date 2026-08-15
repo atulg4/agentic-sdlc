@@ -218,3 +218,30 @@ def test_review_caller_grants_only_required_comment_authority() -> None:
 def test_secret_bearing_workflows_never_use_pull_request_target() -> None:
     for workflow in WORKFLOWS.glob("*.yml"):
         assert "pull_request_target" not in workflow.read_text(encoding="utf-8")
+
+
+def test_orchestrate_workflow_holds_no_ai_credentials_or_merge_authority() -> None:
+    document = (WORKFLOWS / "reusable-orchestrate.yml").read_text(encoding="utf-8")
+
+    assert "API_KEY" not in document
+    assert "PUBLISHER_APP_PRIVATE_KEY" not in document
+    assert "contents: write" not in document
+    assert "merge" not in document.lower().replace("human merge", "").replace("merge authority", "")
+    assert "orchestrate" in document
+    assert "agentic-orchestration-state" in document
+    assert "agentic-sdlc:status" in document
+
+
+def test_orchestrate_consumer_fixture_is_thin_and_sha_pinned() -> None:
+    document = (ROOT / "examples/marketmaestro/.github/workflows/agent-orchestrate.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert (
+        "uses: atulg4/agentic-sdlc/.github/workflows/reusable-orchestrate.yml"
+        "@PLATFORM_COMMIT_SHA" in document
+    )
+    assert "platform_ref: PLATFORM_COMMIT_SHA" in document
+    assert "python" not in document
+    assert "sdlcctl" not in document
+    assert "repair" not in document
