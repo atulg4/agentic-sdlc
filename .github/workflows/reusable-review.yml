@@ -86,11 +86,13 @@ jobs:
             }
           }
           JSON
-      - name: Install bubblewrap for Claude subprocess isolation
+      - name: Install Claude subprocess isolation dependencies
         run: |
           set -euo pipefail
           sudo apt-get update -q
-          sudo apt-get install -y -q bubblewrap
+          sudo apt-get install -y -q bubblewrap socat
+          command -v bwrap >/dev/null
+          command -v socat >/dev/null
       - name: Independently review the exact diff with Claude Max OAuth
         id: claude-review
         uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
