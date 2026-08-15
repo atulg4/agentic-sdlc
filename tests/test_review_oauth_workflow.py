@@ -70,10 +70,34 @@ def test_review_scope_and_repository_mutation_are_deterministically_verified() -
 
     assert "Verify review scope and repository integrity" in review
     assert 'echo "${EXPECTED_DIFF_SHA256}  .agentic-review/change.diff" | sha256sum -c -' in review
-    assert "git diff --exit-code -- ." in review
+    assert 'changed=$(git diff --name-only "${HEAD_SHA}" -- .)' in review
+    assert 'git diff --quiet "${BASE_SHA}" -- "$path"' in review
+    assert "unexpected tracked repository mutation during review" in review
     assert "git ls-files --others --exclude-standard" in review
     assert "actual == expected" in review
     assert "'schema.json', 'change.diff', 'review.json'" in review
+
+
+def test_expected_claude_action_hardening_is_narrow_and_base_pinned() -> None:
+    review = _review_job()
+
+    for protected in (
+        "CLAUDE.md",
+        "CLAUDE.local.md",
+        ".mcp.json",
+        ".claude.json",
+        ".gitmodules",
+        ".ripgreprc",
+        ".claude/*",
+        ".husky/*",
+    ):
+        assert protected in review
+
+    assert "BASE_SHA: ${{ inputs.base_sha }}" in review
+    assert "HEAD_SHA: ${{ inputs.head_sha }}" in review
+    assert 'git diff --quiet "${BASE_SHA}" -- "$path"' in review
+    assert "trusted agent-control path does not match fixed base" in review
+    assert "origin/main" not in review
 
 
 def test_review_fails_closed_instead_of_disabling_subprocess_isolation() -> None:
