@@ -78,7 +78,12 @@ class FakeGateway:
 def _collector(
     *, head: str = HEAD, labels: tuple[str, ...] = ("forge-managed",), test: str = "success"
 ) -> FakeCollector:
-    return FakeCollector(GitHubPullRequestEvidence(head, labels, _checks(head=head, test_conclusion=test)))
+    evidence = GitHubPullRequestEvidence(
+        head,
+        labels,
+        _checks(head=head, test_conclusion=test),
+    )
+    return FakeCollector(evidence)
 
 
 def test_fresh_exact_head_green_evidence_reaches_merge_gateway_once() -> None:
