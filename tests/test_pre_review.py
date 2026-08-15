@@ -22,10 +22,7 @@ def _init(repository: Path, *, command: str = "python -m pytest -q") -> str:
     _git(repository, "config", "user.email", "test@example.com")
     _git(repository, "config", "user.name", "Test")
     (repository / "agentic-sdlc.toml").write_text(
-        "[commands]\n"
-        f'test = "{command}"\n\n'
-        "[verification]\n"
-        'gates = ["test"]\n',
+        f'[commands]\ntest = "{command}"\n\n[verification]\ngates = ["test"]\n',
         encoding="utf-8",
     )
     (repository / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
