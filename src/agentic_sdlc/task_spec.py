@@ -115,9 +115,15 @@ def render_prompt(task: TaskSpec, mode: str) -> str:
             "regression, and test findings. Do not modify files."
         ),
     }
-    body = task.raw_body.replace("<untrusted-work-request>", "").replace(
-        "</untrusted-work-request>", ""
-    )
+    # Strip boundary markers to a fixpoint: removing one marker can join the
+    # surrounding fragments into a new marker, so a single pass would let a
+    # crafted body smuggle a live boundary tag into the prompt.
+    body = task.raw_body
+    while True:
+        previous = body
+        body = body.replace("<untrusted-work-request>", "").replace("</untrusted-work-request>", "")
+        if body == previous:
+            break
     return "\n\n".join(
         [
             "You are operating inside the Agentic SDLC pipeline.",
