@@ -6,9 +6,9 @@ provider = "github"
 default_branch = "main"
 
 [agents]
-planner = "codex"
-implementer = "codex"
-reviewer = "codex"
+planner = "claude"
+implementer = "claude"
+reviewer = "claude"
 
 [automation]
 default_mode = "plan"
@@ -47,6 +47,8 @@ forbidden_paths = [
 ]
 
 protected_paths = [
+  "docs/engineering/**",
+  "scripts/dashboard.py",
   "src/preview_shares.py",
   "src/auth/**",
   "src/trading/**",
@@ -56,10 +58,7 @@ protected_paths = [
   "config/confidence_engine.json",
 ]
 
-low_risk_paths = [
-  "docs/**",
-  "**/*.md",
-]
+low_risk_paths = ["docs/forge-generated/**"]
 
 forbidden_task_patterns = [
   '\blive[- ]trad',
@@ -70,11 +69,11 @@ forbidden_task_patterns = [
 ]
 
 [commands]
-setup = 'python -m pip install -e ".[dev]"'
+setup = 'python -m pip install -e ".[dev]" && python -m pip install -r requirements-web.txt'
 quality = "python scripts/ci_quality_check.py --base origin/main --head HEAD"
-test = "pytest tests/unit -q"
+test = 'DB_URL=sqlite:// pytest tests/unit -q'
 integration = "pytest tests/integration -q"
 
 [verification]
-gates = ["setup", "quality"]
-timeout_seconds = { setup = 900, quality = 600 }
+gates = ["setup", "quality", "test"]
+timeout_seconds = { setup = 900, quality = 600, test = 1800 }
