@@ -102,13 +102,9 @@ def build_factory_metrics(
         "completedPerHour": round(completed / window_hours, 4),
         "medianCycleSeconds": round(float(median(cycle_values)), 2) if cycle_values else 0.0,
         "firstPassVerificationRate": efficacy["first_pass_verification_rate"].value,
-        "firstPassReviewAcceptanceRate": efficacy[
-            "first_pass_review_acceptance_rate"
-        ].value,
+        "firstPassReviewAcceptanceRate": efficacy["first_pass_review_acceptance_rate"].value,
         "meanRepairRounds": (
-            round(sum(item.repair_rounds for item in sample) / len(sample), 4)
-            if sample
-            else 0.0
+            round(sum(item.repair_rounds for item in sample) / len(sample), 4) if sample else 0.0
         ),
         "totalRuntimeSeconds": total_runtime,
         "totalWaitSeconds": total_wait,
