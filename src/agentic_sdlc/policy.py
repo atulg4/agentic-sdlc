@@ -22,6 +22,8 @@ _BASELINE_FORBIDDEN_PATHS = (
     "**/missions.toml",
     "knowledge.toml",
     "**/knowledge.toml",
+    "intake.toml",
+    "**/intake.toml",
     "CODEOWNERS",
     "**/CODEOWNERS",
     "AGENTS.md",
