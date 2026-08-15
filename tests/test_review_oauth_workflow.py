@@ -25,17 +25,29 @@ def test_review_uses_subscription_oauth_without_paid_api_fallbacks() -> None:
     assert "anthropic_api_key:" not in document
 
 
-def test_sandbox_dependencies_are_installed_before_isolated_claude_review() -> None:
+def test_sandbox_is_prepared_and_verified_before_isolated_claude_review() -> None:
     review = _review_job()
-    install = "Install Claude subprocess isolation dependencies"
+    install = "Install and verify Claude subprocess isolation"
     invoke = "Independently review the exact diff with Claude Max OAuth"
 
     assert install in review
     assert "sudo apt-get install -y -q bubblewrap socat" in review
     assert "command -v bwrap >/dev/null" in review
     assert "command -v socat >/dev/null" in review
+    assert "apparmor_restrict_unprivileged_userns" in review
+    assert "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0" in review
+    assert "bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / /bin/true" in review
     assert 'CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"' in review
+    assert 'CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "0"' not in review
     assert review.index(install) < review.index(invoke)
+
+
+def test_review_fails_closed_instead_of_disabling_subprocess_isolation() -> None:
+    review = _review_job()
+
+    assert "bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / /bin/true" in review
+    assert "continue-on-error: true" not in review
+    assert 'CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "0"' not in review
 
 
 def test_ai_review_job_remains_read_only_to_repository() -> None:
