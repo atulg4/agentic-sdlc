@@ -15,6 +15,7 @@ def _autonomy_ready() -> AutonomyGateEvidence:
         scope_bounded=True,
         security_clear=True,
         claude_oauth_available=True,
+        high_risk=False,
         deterministic_verification_passed=True,
         quality_passed=True,
         independent_review_approved=True,
