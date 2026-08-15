@@ -84,7 +84,9 @@ class AutonomousIntakeDispatcher:
         self.blocked_labels = frozenset(blocked_labels)
 
     @staticmethod
-    def _from_checkpoint(record: CheckpointRecord, *, reason: str | None = None) -> DispatchDecision:
+    def _from_checkpoint(
+        record: CheckpointRecord, *, reason: str | None = None
+    ) -> DispatchDecision:
         return DispatchDecision(
             record.accepted,
             record.unit_id,
@@ -155,7 +157,13 @@ class AutonomousIntakeDispatcher:
             except CheckpointError as exc:
                 raise DispatchError(f"checkpoint lookup failed: {exc}") from exc
             if prior_unit is not None and prior_unit.accepted:
-                decision = DispatchDecision(True, unit_id, key, prior_unit.state, "checkpoint-replay")
+                decision = DispatchDecision(
+                    True,
+                    unit_id,
+                    key,
+                    prior_unit.state,
+                    "checkpoint-replay",
+                )
                 self._persist(decision, timestamp=timestamp)
                 return decision
 
