@@ -240,10 +240,7 @@ def evaluate_diff(
         detail.append(f"diff is within policy limits ({len(paths)} files, {total_lines} lines)")
 
     automatic_merge_allowed = (
-        not policy.human_merge_required
-        and not reasons
-        and not protected
-        and risk is RiskLevel.LOW
+        not policy.human_merge_required and not reasons and not protected and risk is RiskLevel.LOW
     )
 
     return PolicyDecision(
