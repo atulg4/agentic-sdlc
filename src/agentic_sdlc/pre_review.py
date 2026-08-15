@@ -263,8 +263,11 @@ def run_pre_review(
     """Run cheap fail-closed checks against the exact base-to-HEAD change."""
 
     root = Path(repository)
+    config_path = Path(config)
+    if not config_path.is_absolute():
+        config_path = root / config_path
     snapshot = collect_git_diff(root, base)
-    findings = _gate_command_findings(config)
+    findings = _gate_command_findings(config_path)
 
     changed_workflows = sorted(
         path
@@ -275,7 +278,7 @@ def run_pre_review(
         if (root / path).is_file():
             findings.extend(_workflow_findings(root, path))
 
-    config_doc = _load_config(config)
+    config_doc = _load_config(config_path)
     pre_review = config_doc.get("pre_review", {})
     if pre_review and not isinstance(pre_review, dict):
         raise PreReviewError("pre_review must be a TOML table")
@@ -292,7 +295,8 @@ def run_pre_review(
                     PreReviewFinding(
                         "forbidden-provider-addition",
                         path,
-                        f"new line reintroduces forbidden provider credential/action token: {token}",
+                        "new line reintroduces forbidden provider credential/action "
+                        f"token: {token}",
                     )
                 )
 
@@ -307,7 +311,11 @@ def run_pre_review(
         target = root / path
         if not target.is_file():
             findings.append(
-                PreReviewFinding("required-policy-file-missing", path, "required policy file is missing")
+                PreReviewFinding(
+                    "required-policy-file-missing",
+                    path,
+                    "required policy file is missing",
+                )
             )
             continue
         text = target.read_text(encoding="utf-8")
