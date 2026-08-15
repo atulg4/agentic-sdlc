@@ -17,7 +17,26 @@ class _Response:
         return self._body
 
 
-def test_collector_binds_checks_to_the_prs_current_exact_head() -> None:
+def _readiness(*, head: str = HEAD, state: str = "CLEAN", resolved: tuple[bool, ...] = ()):
+    return _Response(
+        {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "headRefOid": head,
+                        "mergeStateStatus": state,
+                        "reviewThreads": {
+                            "nodes": [{"isResolved": value} for value in resolved],
+                            "pageInfo": {"hasNextPage": False},
+                        },
+                    }
+                }
+            }
+        }
+    )
+
+
+def test_collector_binds_checks_and_merge_readiness_to_current_exact_head() -> None:
     requests = []
     responses = iter(
         [
@@ -40,6 +59,7 @@ def test_collector_binds_checks_to_the_prs_current_exact_head() -> None:
                     ]
                 }
             ),
+            _readiness(resolved=(True, False)),
         ]
     )
 
@@ -56,17 +76,73 @@ def test_collector_binds_checks_to_the_prs_current_exact_head() -> None:
     assert evidence.checks == (
         {"id": 21, "name": "test", "head_sha": HEAD, "conclusion": "success"},
     )
+    assert evidence.branch_protection_allows is True
+    assert evidence.unresolved_conversations == 1
     assert requests[0].full_url.endswith("/repos/atulg4/marketmaestro/pulls/121")
     assert requests[1].full_url.endswith(f"/commits/{HEAD}/check-runs?per_page=100")
-    assert all(request.method == "GET" for request in requests)
+    assert requests[2].full_url.endswith("/graphql")
+    assert [request.method for request in requests] == ["GET", "GET", "POST"]
 
 
-def test_token_is_header_only_and_never_serialized_into_urls() -> None:
+def test_non_clean_merge_state_and_unresolved_threads_fail_closed_as_evidence() -> None:
+    responses = iter(
+        [
+            _Response({"head": {"sha": HEAD}, "labels": []}),
+            _Response({"check_runs": []}),
+            _readiness(state="BLOCKED", resolved=(False, False)),
+        ]
+    )
+    evidence = GitHubMergeEvidenceCollector(
+        "token", opener=lambda _request: next(responses)
+    ).collect(repository="owner/repo", pull_request_number=7)
+    assert evidence.branch_protection_allows is False
+    assert evidence.unresolved_conversations == 2
+
+
+def test_graphql_head_disagreement_or_incomplete_threads_fail_closed() -> None:
+    for readiness in (
+        _readiness(head="b" * 40),
+        _Response(
+            {
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "headRefOid": HEAD,
+                            "mergeStateStatus": "CLEAN",
+                            "reviewThreads": {
+                                "nodes": [],
+                                "pageInfo": {"hasNextPage": True},
+                            },
+                        }
+                    }
+                }
+            }
+        ),
+    ):
+        responses = iter(
+            [
+                _Response({"head": {"sha": HEAD}, "labels": []}),
+                _Response({"check_runs": []}),
+                readiness,
+            ]
+        )
+
+        def opener(_request, response_iterator=responses):
+            return next(response_iterator)
+
+        with pytest.raises(ValueError):
+            GitHubMergeEvidenceCollector("token", opener=opener).collect(
+                repository="owner/repo", pull_request_number=7
+            )
+
+
+def test_token_is_header_only_and_never_serialized_into_urls_or_bodies() -> None:
     requests = []
     responses = iter(
         [
             _Response({"head": {"sha": HEAD}, "labels": []}),
             _Response({"check_runs": []}),
+            _readiness(),
         ]
     )
 
@@ -80,7 +156,7 @@ def test_token_is_header_only_and_never_serialized_into_urls() -> None:
 
     assert all("top-secret" not in request.full_url for request in requests)
     assert all(request.get_header("Authorization") == "Bearer top-secret" for request in requests)
-    assert all(request.data is None for request in requests)
+    assert all(request.data is None or b"top-secret" not in request.data for request in requests)
 
 
 @pytest.mark.parametrize(
@@ -117,11 +193,7 @@ def test_malformed_pr_head_fails_closed_before_check_collection() -> None:
 
 
 def test_malformed_labels_or_check_runs_fail_closed() -> None:
-    responses = iter(
-        [
-            _Response({"head": {"sha": HEAD}, "labels": "not-a-list"}),
-        ]
-    )
+    responses = iter([_Response({"head": {"sha": HEAD}, "labels": "not-a-list"})])
     with pytest.raises(ValueError, match="missing labels"):
         GitHubMergeEvidenceCollector("token", opener=lambda _request: next(responses)).collect(
             repository="owner/repo", pull_request_number=3
