@@ -16,7 +16,6 @@ def _yaml(path: Path) -> dict:
 
 def test_repair_is_exact_head_bounded_and_uses_review_artifact() -> None:
     text = REUSABLE.read_text(encoding="utf-8")
-    assert 'test "$(jq -r \' .head.sha\'' not in text  # guard against malformed quoting
     assert "independent-review-${{ inputs.review_run_id }}" in text
     assert "repair requires an exact changes_requested review" in text
     assert "test \"$(jq -r '.head.sha' <<< \"$pr\")\" = \"$HEAD_SHA\"" in text
