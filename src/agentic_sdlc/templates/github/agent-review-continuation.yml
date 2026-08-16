@@ -142,7 +142,8 @@ jobs:
     uses: PLATFORM_REPOSITORY/.github/workflows/reusable-repair.yml@PLATFORM_COMMIT_SHA
     with:
       pull_request_number: ${{ needs.classify.outputs.pull_request_number }}
-      reviewed_head_sha: ${{ needs.classify.outputs.head_sha }}
+      base_sha: ${{ needs.classify.outputs.base_sha }}
+      head_sha: ${{ needs.classify.outputs.head_sha }}
       review_run_id: ${{ github.event.workflow_run.id }}
       repair_cycle: ${{ fromJSON(needs.classify.outputs.repair_cycle) }}
       max_repair_cycles: ${{ fromJSON(vars.FORGE_MAX_REPAIR_CYCLES || '2') }}
