@@ -47,16 +47,44 @@ def decide_review_continuation(
     """
     normalized = verdict.strip().lower().replace("-", "_")
     if not reviewed_head_sha or reviewed_head_sha != current_head_sha:
-        return ContinuationDecision(ContinuationAction.NOOP, "review is not for the current exact head", repair_cycle)
+        return ContinuationDecision(
+            ContinuationAction.NOOP,
+            "review is not for the current exact head",
+            repair_cycle,
+        )
     if repair_cycle < 0 or max_repair_cycles < 0:
-        return ContinuationDecision(ContinuationAction.BLOCK, "repair counters must be non-negative", repair_cycle)
+        return ContinuationDecision(
+            ContinuationAction.BLOCK,
+            "repair counters must be non-negative",
+            repair_cycle,
+        )
     if normalized in {"changes_requested", "request_changes"}:
         if repair_cycle >= max_repair_cycles:
-            return ContinuationDecision(ContinuationAction.BLOCK, "bounded repair budget exhausted", repair_cycle)
-        return ContinuationDecision(ContinuationAction.REPAIR, "independent review requested changes", repair_cycle + 1)
+            return ContinuationDecision(
+                ContinuationAction.BLOCK,
+                "bounded repair budget exhausted",
+                repair_cycle,
+            )
+        return ContinuationDecision(
+            ContinuationAction.REPAIR,
+            "independent review requested changes",
+            repair_cycle + 1,
+        )
     if normalized in {"approved", "approve"}:
         decision = evaluate_autonomy(AutonomyPhase.MERGE, merge_evidence)
         if not decision.allowed:
-            return ContinuationDecision(ContinuationAction.BLOCK, "; ".join(decision.reasons), repair_cycle)
-        return ContinuationDecision(ContinuationAction.MERGE, "exact-head review and merge gates passed", repair_cycle)
-    return ContinuationDecision(ContinuationAction.BLOCK, f"unsupported or non-terminal review verdict: {verdict}", repair_cycle)
+            return ContinuationDecision(
+                ContinuationAction.BLOCK,
+                "; ".join(decision.reasons),
+                repair_cycle,
+            )
+        return ContinuationDecision(
+            ContinuationAction.MERGE,
+            "exact-head review and merge gates passed",
+            repair_cycle,
+        )
+    return ContinuationDecision(
+        ContinuationAction.BLOCK,
+        f"unsupported or non-terminal review verdict: {verdict}",
+        repair_cycle,
+    )
