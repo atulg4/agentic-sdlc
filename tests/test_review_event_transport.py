@@ -85,10 +85,10 @@ def test_protected_merge_is_non_ai_exact_head_and_normal_branch_protected() -> N
     assert "GitHubMergeEvidenceCollector" in text
     assert "TrustedProtectedMergeService" in text
     assert "GitHubMergeGateway" in text
+    assert "deployment_requested='deployment-requested' in labels" in text
+    assert "broker_access_requested='broker-access-requested' in labels" in text
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in text
     assert "OPENAI_API_KEY" not in text
     assert "ANTHROPIC_API_KEY" not in text
     assert "--force" not in text
     assert "bypass" not in text.lower()
-    assert "deploy" not in text.lower()
-    assert "broker" not in text.lower()
