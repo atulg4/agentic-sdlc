@@ -17,9 +17,9 @@ def test_repair_is_exact_head_bounded_and_uses_review_artifact() -> None:
     text = REUSABLE.read_text(encoding="utf-8")
     assert "independent-review-${{ inputs.review_run_id }}" in text
     assert "repair requires an exact changes_requested review" in text
-    assert "test \"$(jq -r '.head.sha' <<< \"$pr\")\" = \"$HEAD_SHA\"" in text
+    assert 'test "$(jq -r \'.head.sha\' <<< "$pr")" = "$HEAD_SHA"' in text
     assert 'test "$REPAIR_CYCLE" -le "$MAX_REPAIR_CYCLES"' in text
-    assert "git push origin \"HEAD:refs/heads/${HEAD_REF}\"" in text
+    assert 'git push origin "HEAD:refs/heads/${HEAD_REF}"' in text
 
 
 def test_ai_repair_job_has_no_repository_write_or_publisher_secret() -> None:
