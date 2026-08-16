@@ -56,6 +56,7 @@ def test_factory_metrics_expose_throughput_waiting_and_first_pass_quality() -> N
     assert report["sampleCount"] == 3
     assert report["completedMergedCount"] == 2
     assert report["completedPerHour"] == 2.0
+    assert report["completedPerDay"] == 48.0
     assert report["medianCycleSeconds"] == 180.0
     assert report["firstPassVerificationRate"] == pytest.approx(1 / 3, abs=0.0001)
     assert report["firstPassReviewAcceptanceRate"] == 0.5
@@ -77,6 +78,7 @@ def test_failures_and_cancelled_work_remain_in_denominators() -> None:
     assert report["sampleCount"] == 3
     assert report["completedMergedCount"] == 1
     assert report["completedPerHour"] == 0.5
+    assert report["completedPerDay"] == 12.0
     assert report["firstPassVerificationRate"] == pytest.approx(1 / 3, abs=0.0001)
 
 

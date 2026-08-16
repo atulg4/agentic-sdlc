@@ -64,6 +64,7 @@ def build_factory_metrics(
     total_runtime = sum(item.runtime_seconds for item in sample)
     total_wait = sum(_wait_seconds(item) for item in sample)
     window_hours = window / 3600
+    window_days = window / 86400
 
     utilization: dict[str, Any]
     if parallel_slots is None and busy_slot_seconds is None:
@@ -100,6 +101,7 @@ def build_factory_metrics(
         "completedMergedCount": completed,
         "observationWindowSeconds": window,
         "completedPerHour": round(completed / window_hours, 4),
+        "completedPerDay": round(completed / window_days, 4),
         "medianCycleSeconds": round(float(median(cycle_values)), 2) if cycle_values else 0.0,
         "firstPassVerificationRate": efficacy["first_pass_verification_rate"].value,
         "firstPassReviewAcceptanceRate": efficacy["first_pass_review_acceptance_rate"].value,
