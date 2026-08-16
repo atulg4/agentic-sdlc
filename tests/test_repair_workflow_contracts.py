@@ -2,7 +2,6 @@ from pathlib import Path
 
 import yaml
 
-
 ROOT = Path(__file__).parents[1]
 REUSABLE = ROOT / ".github" / "workflows" / "reusable-repair.yml"
 TEMPLATE = ROOT / "src" / "agentic_sdlc" / "templates" / "github" / "agent-repair.yml"
