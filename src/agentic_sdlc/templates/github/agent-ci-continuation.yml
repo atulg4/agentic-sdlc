@@ -1,20 +1,21 @@
-name: Review continuation
+name: CI failure continuation
 
 on:
   workflow_run:
-    workflows: [Independent agent review]
+    workflows: [CI]
     types: [completed]
 
 permissions: {}
 
 concurrency:
-  # Shared with deterministic-CI continuation so only one repair decision for
-  # a given exact head can be active at once.
+  # Shared with review continuation so a CI failure and review finding at the
+  # same exact head cannot race into duplicate repair publication.
   group: forge-repair-continuation-${{ github.event.workflow_run.head_sha }}
   cancel-in-progress: false
 
 jobs:
   classify:
+    if: github.event.workflow_run.conclusion == 'failure'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -28,19 +29,24 @@ jobs:
       head_sha: ${{ steps.bind.outputs.head_sha }}
       repair_cycle: ${{ steps.decision.outputs.repair_cycle }}
     steps:
-      - name: Bind completed review run to current exact same-repository PR
+      - name: Bind failed CI run to current exact same-repository PR
         id: bind
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          RUN_EVENT: ${{ github.event.workflow_run.event }}
         with:
           github-token: ${{ github.token }}
           script: |
             const sha = process.env.RUN_HEAD_SHA || '';
             const number = Number(process.env.PR_NUMBER || 0);
+            if (process.env.RUN_EVENT !== 'pull_request') {
+              core.setFailed('CI continuation accepts pull_request runs only');
+              return;
+            }
             if (!/^[0-9a-f]{40}$/.test(sha) || !Number.isInteger(number) || number <= 0) {
-              core.setFailed('completed review run is not bound to a valid pull request head');
+              core.setFailed('failed CI run is not bound to a valid pull request head');
               return;
             }
             const pr = await github.rest.pulls.get({
@@ -49,58 +55,31 @@ jobs:
               pull_number: number,
             });
             if (pr.data.state !== 'open' || pr.data.draft) {
-              core.setFailed('review continuation requires an open non-draft pull request');
+              core.setOutput('stale', 'true');
               return;
             }
             if (pr.data.head.repo.full_name !== `${context.repo.owner}/${context.repo.repo}`) {
-              core.setFailed('review continuation requires a same-repository pull request');
-              return;
-            }
-            if (pr.data.head.sha !== sha) {
-              core.setOutput('number', String(number));
-              core.setOutput('base_sha', pr.data.base.sha);
-              core.setOutput('head_sha', sha);
-              core.setOutput('stale', 'true');
+              core.setFailed('CI continuation requires a same-repository pull request');
               return;
             }
             core.setOutput('number', String(number));
             core.setOutput('base_sha', pr.data.base.sha);
             core.setOutput('head_sha', sha);
-            core.setOutput('stale', 'false');
-      - name: Restore exact independent review artifact from completed run
-        if: steps.bind.outputs.stale == 'false'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: independent-review-${{ github.event.workflow_run.id }}
-          path: ${{ runner.temp }}/independent-review
-          github-token: ${{ github.token }}
-          run-id: ${{ github.event.workflow_run.id }}
-      - name: Decide bounded exact-head continuation
+            core.setOutput('stale', pr.data.head.sha === sha ? 'false' : 'true');
+      - name: Decide bounded exact-head CI repair
         id: decision
+        if: steps.bind.outputs.stale == 'false'
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           PR_NUMBER: ${{ steps.bind.outputs.number }}
           HEAD_SHA: ${{ steps.bind.outputs.head_sha }}
-          STALE: ${{ steps.bind.outputs.stale }}
-          REVIEW_PATH: ${{ runner.temp }}/independent-review/review.json
           MAX_REPAIR_CYCLES: ${{ vars.FORGE_MAX_REPAIR_CYCLES || '2' }}
         with:
           github-token: ${{ github.token }}
           script: |
-            const fs = require('fs');
-            if (process.env.STALE === 'true') {
-              core.setOutput('action', 'noop');
-              core.setOutput('repair_cycle', '0');
-              return;
-            }
             const max = Number(process.env.MAX_REPAIR_CYCLES);
             if (!Number.isInteger(max) || max < 1 || max > 20) {
               core.setFailed('FORGE_MAX_REPAIR_CYCLES must be an integer from 1 to 20');
-              return;
-            }
-            const review = JSON.parse(fs.readFileSync(process.env.REVIEW_PATH, 'utf8'));
-            if (!['approve', 'changes_requested'].includes(review.verdict)) {
-              core.setFailed('independent review artifact has a non-terminal verdict');
               return;
             }
             const comments = await github.paginate(github.rest.issues.listComments, {
@@ -111,43 +90,34 @@ jobs:
             });
             const trusted = comments.filter(comment => comment.user?.login === 'github-actions[bot]');
             const escaped = process.env.HEAD_SHA.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            const marker = new RegExp(`<!-- forge-repair head=${escaped} cycle=([0-9]+) -->`);
-            const sameHead = trusted
-              .map(comment => String(comment.body || '').match(marker))
-              .filter(Boolean)
-              .map(match => Number(match[1]));
-            if (sameHead.length) {
+            const sameHead = new RegExp(`<!-- forge-repair head=${escaped} cycle=([0-9]+) -->`);
+            if (trusted.some(comment => sameHead.test(String(comment.body || '')))) {
               core.setOutput('action', 'noop');
-              core.setOutput('repair_cycle', String(Math.max(...sameHead)));
+              core.setOutput('repair_cycle', '0');
               return;
             }
-            const allRepairMarkers = trusted
+            const cycles = trusted
               .map(comment => String(comment.body || '').match(/<!-- forge-repair head=[0-9a-f]{40} cycle=([0-9]+) -->/))
               .filter(Boolean)
               .map(match => Number(match[1]));
-            const previous = allRepairMarkers.length ? Math.max(...allRepairMarkers) : 0;
-            if (review.verdict === 'changes_requested') {
-              if (previous >= max) {
-                core.setOutput('action', 'block');
-                core.setOutput('repair_cycle', String(previous));
-                return;
-              }
-              core.setOutput('action', 'repair');
-              core.setOutput('repair_cycle', String(previous + 1));
+            const previous = cycles.length ? Math.max(...cycles) : 0;
+            if (previous >= max) {
+              core.setOutput('action', 'block');
+              core.setOutput('repair_cycle', String(previous));
               return;
             }
-            core.setOutput('action', 'merge');
-            core.setOutput('repair_cycle', String(previous));
+            core.setOutput('action', 'repair');
+            core.setOutput('repair_cycle', String(previous + 1));
 
   repair:
     if: needs.classify.outputs.action == 'repair'
     needs: classify
-    uses: PLATFORM_REPOSITORY/.github/workflows/reusable-repair.yml@PLATFORM_COMMIT_SHA
+    uses: PLATFORM_REPOSITORY/.github/workflows/reusable-ci-repair.yml@PLATFORM_COMMIT_SHA
     with:
       pull_request_number: ${{ needs.classify.outputs.pull_request_number }}
       base_sha: ${{ needs.classify.outputs.base_sha }}
       head_sha: ${{ needs.classify.outputs.head_sha }}
-      review_run_id: ${{ github.event.workflow_run.id }}
+      ci_run_id: ${{ github.event.workflow_run.id }}
       repair_cycle: ${{ fromJSON(needs.classify.outputs.repair_cycle) }}
       max_repair_cycles: ${{ fromJSON(vars.FORGE_MAX_REPAIR_CYCLES || '2') }}
       config_path: agentic-sdlc.toml
@@ -167,7 +137,7 @@ jobs:
     permissions:
       issues: write
     steps:
-      - name: Record completed repair cycle for idempotency
+      - name: Record completed CI repair cycle for idempotency
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           PR_NUMBER: ${{ needs.classify.outputs.pull_request_number }}
@@ -180,7 +150,7 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: Number(process.env.PR_NUMBER),
-              body: `<!-- forge-repair head=${process.env.HEAD_SHA} cycle=${process.env.REPAIR_CYCLE} -->\nForge completed bounded repair cycle ${process.env.REPAIR_CYCLE}; exact-head CI will drive the next review automatically.`,
+              body: `<!-- forge-repair head=${process.env.HEAD_SHA} cycle=${process.env.REPAIR_CYCLE} -->\nForge completed bounded CI repair cycle ${process.env.REPAIR_CYCLE}; the new head must pass fresh deterministic CI and independent review.`,
             });
 
   report_block:
@@ -191,7 +161,7 @@ jobs:
     permissions:
       issues: write
     steps:
-      - name: Report exhausted repair budget
+      - name: Report exhausted shared repair budget
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           PR_NUMBER: ${{ needs.classify.outputs.pull_request_number }}
@@ -203,21 +173,5 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: Number(process.env.PR_NUMBER),
-              body: `Forge stopped automatic repair after ${process.env.REPAIR_CYCLE} bounded cycle(s). No merge was attempted.`,
+              body: `Forge stopped automatic repair after ${process.env.REPAIR_CYCLE} bounded cycle(s). No rerun or merge was attempted.`,
             });
-
-  merge:
-    if: >-
-      needs.classify.outputs.action == 'merge' &&
-      vars.FORGE_AUTONOMOUS_MERGE_ENABLED == 'true'
-    needs: classify
-    uses: PLATFORM_REPOSITORY/.github/workflows/reusable-protected-merge.yml@PLATFORM_COMMIT_SHA
-    with:
-      pull_request_number: ${{ needs.classify.outputs.pull_request_number }}
-      expected_head_sha: ${{ needs.classify.outputs.head_sha }}
-      platform_ref: PLATFORM_COMMIT_SHA
-      platform_repository: PLATFORM_REPOSITORY
-      deterministic_checks_json: ${{ vars.FORGE_DETERMINISTIC_CHECKS_JSON }}
-      quality_checks_json: ${{ vars.FORGE_QUALITY_CHECKS_JSON }}
-      independent_review_checks_json: ${{ vars.FORGE_REVIEW_CHECKS_JSON }}
-      secret_scan_checks_json: ${{ vars.FORGE_SECRET_SCAN_CHECKS_JSON }}

@@ -70,7 +70,7 @@ TRANSITIONS: dict[WorkUnitState, frozenset[WorkUnitState]] = {
     _S.APPROVED: frozenset({_S.DISPATCHED, _S.BLOCKED}) | _ABORT,
     _S.DISPATCHED: frozenset({_S.IMPLEMENTING, _S.BLOCKED}) | _ABORT,
     _S.IMPLEMENTING: frozenset({_S.VERIFYING, _S.FAILED}) | _ABORT,
-    _S.VERIFYING: frozenset({_S.REVIEWING, _S.FAILED}) | _ABORT,
+    _S.VERIFYING: frozenset({_S.REVIEWING, _S.REPAIR_NEEDED, _S.BLOCKED, _S.FAILED}) | _ABORT,
     _S.REVIEWING: frozenset({_S.READY_FOR_HUMAN_MERGE, _S.REPAIR_NEEDED, _S.BLOCKED, _S.FAILED})
     | _ABORT,
     _S.REPAIR_NEEDED: frozenset({_S.REPAIRING, _S.BLOCKED}) | _ABORT,
@@ -609,14 +609,23 @@ class Orchestrator:
             unit.state is WorkUnitState.VERIFYING,
             f"verification result requires state verifying, not {unit.state.value}",
         )
+        if passed:
+            target = WorkUnitState.REVIEWING
+            reason = "verification passed"
+        elif unit.repair_count < self.max_repair_cycles:
+            target = WorkUnitState.REPAIR_NEEDED
+            reason = "deterministic verification failed; bounded repair required"
+        else:
+            target = WorkUnitState.BLOCKED
+            reason = "deterministic verification failed; repair budget exhausted"
         return self.transition(
             unit_id,
-            WorkUnitState.REVIEWING if passed else WorkUnitState.FAILED,
+            target,
             actor=actor,
             actor_kind="system",
             event_key=event_key,
             timestamp=timestamp,
-            reason="verification passed" if passed else "verification failed",
+            reason=reason,
         )
 
     def record_review(
