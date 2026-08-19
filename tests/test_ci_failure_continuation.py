@@ -55,7 +55,7 @@ def test_ci_repair_validates_trusted_failed_run_before_claude() -> None:
     assert "'.head_sha' <<< \"$run\"" in text
     assert "'.conclusion' <<< \"$run\"" in text
     assert "test \"$path\" = '.github/workflows/ci.yml'" in text
-    assert "gh run view \"$CI_RUN_ID\" --log-failed" in text
+    assert 'gh run view "$CI_RUN_ID" --log-failed' in text
     assert "truncated to final 200000 bytes" in text
 
 
