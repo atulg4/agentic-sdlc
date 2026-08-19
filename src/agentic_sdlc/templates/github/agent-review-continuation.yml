@@ -8,7 +8,9 @@ on:
 permissions: {}
 
 concurrency:
-  group: review-continuation-${{ github.event.workflow_run.head_sha }}
+  # Shared with deterministic-CI continuation so only one repair decision for
+  # a given exact head can be active at once.
+  group: forge-repair-continuation-${{ github.event.workflow_run.head_sha }}
   cancel-in-progress: false
 
 jobs:
@@ -107,9 +109,10 @@ jobs:
               issue_number: Number(process.env.PR_NUMBER),
               per_page: 100,
             });
+            const trusted = comments.filter(comment => comment.user?.login === 'github-actions[bot]');
             const escaped = process.env.HEAD_SHA.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
             const marker = new RegExp(`<!-- forge-repair head=${escaped} cycle=([0-9]+) -->`);
-            const sameHead = comments
+            const sameHead = trusted
               .map(comment => String(comment.body || '').match(marker))
               .filter(Boolean)
               .map(match => Number(match[1]));
@@ -118,7 +121,7 @@ jobs:
               core.setOutput('repair_cycle', String(Math.max(...sameHead)));
               return;
             }
-            const allRepairMarkers = comments
+            const allRepairMarkers = trusted
               .map(comment => String(comment.body || '').match(/<!-- forge-repair head=[0-9a-f]{40} cycle=([0-9]+) -->/))
               .filter(Boolean)
               .map(match => Number(match[1]));
