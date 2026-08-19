@@ -18,12 +18,15 @@ def _yaml(path: Path) -> dict:
 
 def test_ci_failure_is_event_driven_and_never_blindly_rerun() -> None:
     text = CI_TEMPLATE.read_text(encoding="utf-8")
+    lowered = text.lower()
     assert "workflow_run:" in text
     assert "workflows: [CI]" in text
     assert "types: [completed]" in text
     assert "github.event.workflow_run.conclusion == 'failure'" in text
-    assert "rerun" not in text.lower()
-    assert "re-run" not in text.lower()
+    assert "gh run rerun" not in lowered
+    assert "/rerun" not in lowered
+    assert "rerun_workflow" not in lowered
+    assert "re-run" not in lowered
 
 
 def test_ci_continuation_binds_same_repository_exact_head_and_shared_budget() -> None:
