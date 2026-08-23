@@ -3,6 +3,11 @@ name: Reusable agent plan
 on:
   workflow_call:
     inputs:
+      runs_on:
+        description: JSON runner target for every job, e.g. '"ubuntu-latest"' or '["self-hosted","linux","x64"]'
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
       issue_number:
         description: Issue to plan
         required: true
@@ -38,7 +43,7 @@ concurrency:
 
 jobs:
   prepare:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     permissions:
       contents: read
       issues: read
@@ -138,7 +143,7 @@ jobs:
 
   plan:
     needs: prepare
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     permissions:
       contents: read
       id-token: write
@@ -198,7 +203,7 @@ jobs:
 
   publish:
     needs: [prepare, plan]
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     permissions:
       issues: write
     steps:
