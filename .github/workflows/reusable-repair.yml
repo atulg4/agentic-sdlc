@@ -3,6 +3,11 @@ name: Reusable bounded review repair
 on:
   workflow_call:
     inputs:
+      runs_on:
+        description: JSON runner target for every job, e.g. '"ubuntu-latest"' or '["self-hosted","linux","x64"]'
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
       pull_request_number:
         required: true
         type: string
@@ -51,7 +56,7 @@ concurrency:
 
 jobs:
   prepare:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     timeout-minutes: 10
     permissions:
       actions: read
@@ -186,7 +191,7 @@ jobs:
 
   generate_patch:
     needs: prepare
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     timeout-minutes: 90
     permissions:
       contents: read
@@ -275,7 +280,7 @@ jobs:
 
   verify:
     needs: [prepare, generate_patch]
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     timeout-minutes: 60
     permissions:
       contents: read
@@ -362,7 +367,7 @@ jobs:
 
   publish:
     needs: [prepare, verify]
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     timeout-minutes: 10
     permissions:
       contents: read

@@ -3,6 +3,11 @@ name: Reusable independent review
 on:
   workflow_call:
     inputs:
+      runs_on:
+        description: JSON runner target for every job, e.g. '"ubuntu-latest"' or '["self-hosted","linux","x64"]'
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
       pull_request_number:
         description: Pull request to review
         required: true
@@ -27,7 +32,7 @@ concurrency:
 
 jobs:
   review:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     timeout-minutes: 30
     permissions:
       contents: read
@@ -198,7 +203,7 @@ jobs:
 
   enforce_review:
     needs: review
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     timeout-minutes: 10
     permissions:
       pull-requests: write
