@@ -109,7 +109,9 @@ def _prepare_request(args: argparse.Namespace) -> int:
     if not decision.allowed:
         return 2
     Path(args.task_output).write_text(body + "\n", encoding="utf-8")
-    Path(args.prompt_output).write_text(render_prompt(task, args.mode) + "\n", encoding="utf-8")
+    Path(args.prompt_output).write_text(
+        render_prompt(task, args.mode, policy=policy) + "\n", encoding="utf-8"
+    )
     return 0
 
 
