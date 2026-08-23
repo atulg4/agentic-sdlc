@@ -1,0 +1,135 @@
+name: Reusable protected merge
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        description: JSON runner target for every job, e.g. '"ubuntu-latest"' or '["self-hosted","linux","x64"]'
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
+      pull_request_number:
+        required: true
+        type: string
+      expected_head_sha:
+        required: true
+        type: string
+      platform_ref:
+        required: true
+        type: string
+      platform_repository:
+        required: true
+        type: string
+      deterministic_checks_json:
+        required: true
+        type: string
+      quality_checks_json:
+        required: true
+        type: string
+      independent_review_checks_json:
+        required: true
+        type: string
+      secret_scan_checks_json:
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: forge-protected-merge-${{ github.repository }}-${{ inputs.pull_request_number }}
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 10
+    permissions:
+      checks: read
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Validate exact-head merge inputs
+        env:
+          PR_NUMBER: ${{ inputs.pull_request_number }}
+          HEAD_SHA: ${{ inputs.expected_head_sha }}
+          PLATFORM_REF: ${{ inputs.platform_ref }}
+          PLATFORM_REPOSITORY: ${{ inputs.platform_repository }}
+        run: |
+          set -euo pipefail
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]{0,9}$ ]]
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PLATFORM_REF" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PLATFORM_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+      - name: Check out pinned Forge merge engine only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.platform_repository }}
+          ref: ${{ inputs.platform_ref }}
+          persist-credentials: false
+          path: .agentic-platform
+      - name: Collect trusted GitHub evidence and attempt normal protected merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pull_request_number }}
+          EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+          DETERMINISTIC_CHECKS_JSON: ${{ inputs.deterministic_checks_json }}
+          QUALITY_CHECKS_JSON: ${{ inputs.quality_checks_json }}
+          REVIEW_CHECKS_JSON: ${{ inputs.independent_review_checks_json }}
+          SECRET_SCAN_CHECKS_JSON: ${{ inputs.secret_scan_checks_json }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH="${GITHUB_WORKSPACE}/.agentic-platform/src" python3 - <<'PY'
+          import json
+          import os
+
+          from agentic_sdlc.github_evidence import GitHubMergeEvidenceCollector
+          from agentic_sdlc.github_merge import GitHubMergeGateway
+          from agentic_sdlc.merge_evidence import MergeEvidencePolicy
+          from agentic_sdlc.merge_executor import MergeRequest
+          from agentic_sdlc.protected_merge import ProtectedMergeContext, TrustedProtectedMergeService
+
+          def names(variable: str) -> tuple[str, ...]:
+              value = json.loads(os.environ[variable])
+              if not isinstance(value, list) or not value or not all(
+                  isinstance(item, str) and item.strip() for item in value
+              ):
+                  raise SystemExit(f'{variable} must be a non-empty JSON string array')
+              return tuple(item.strip() for item in value)
+
+          repository = os.environ['GITHUB_REPOSITORY']
+          pr_number = int(os.environ['PR_NUMBER'])
+          head_sha = os.environ['EXPECTED_HEAD_SHA']
+          token = os.environ['GH_TOKEN']
+          collector = GitHubMergeEvidenceCollector(token)
+          snapshot = collector.collect(repository=repository, pull_request_number=pr_number)
+          labels = set(snapshot.labels)
+
+          context = ProtectedMergeContext(
+              risk_level='low' if 'low-risk' in labels else 'high',
+              scope_bounded='scope-bounded' in labels,
+              security_clear='security-clear' in labels,
+              deployment_requested='deployment-requested' in labels,
+              broker_access_requested='broker-access-requested' in labels,
+          )
+          policy = MergeEvidencePolicy(
+              deterministic_checks=names('DETERMINISTIC_CHECKS_JSON'),
+              quality_checks=names('QUALITY_CHECKS_JSON'),
+              independent_review_checks=names('REVIEW_CHECKS_JSON'),
+              secret_scan_checks=names('SECRET_SCAN_CHECKS_JSON'),
+          )
+          outcome = TrustedProtectedMergeService().execute(
+              MergeRequest(repository, pr_number, head_sha),
+              context=context,
+              policy=policy,
+              collector=collector,
+              gateway=GitHubMergeGateway(token),
+          )
+          print(json.dumps({
+              'allowed': outcome.allowed,
+              'merged': outcome.merged,
+              'mergeSha': outcome.merge_sha,
+              'reason': outcome.reason,
+          }, sort_keys=True))
+          if not outcome.merged:
+              raise SystemExit(outcome.reason)
+          PY

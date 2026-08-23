@@ -1,0 +1,175 @@
+name: Reusable orchestration step
+
+# Thin, deterministic driver for the provider-neutral orchestration state
+# machine. Consumers call this workflow SHA-pinned; all lifecycle logic lives
+# in the platform (sdlcctl orchestrate), never in consumer repositories.
+#
+# This job holds no AI credentials and no merge authority. State is durable:
+# every transition is reproducible from the uploaded state document, and the
+# issue carries exactly one updateable status comment. Follow-on events that
+# must trigger other workflows use the least-privilege publisher GitHub App
+# token (see docs/github-publisher-app.md), never recursive GITHUB_TOKEN
+# behavior.
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        description: JSON runner target for every job, e.g. '"ubuntu-latest"' or '["self-hosted","linux","x64"]'
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
+      unit_id:
+        description: Work unit identifier (for issues, the issue number)
+        required: true
+        type: string
+      action:
+        description: Orchestration action (create, transition, verification, review)
+        required: true
+        type: string
+      to_state:
+        description: Target lifecycle state for transition actions
+        required: false
+        default: ""
+        type: string
+      event_key:
+        description: Idempotency key (for webhooks, the delivery GUID)
+        required: true
+        type: string
+      actor_kind:
+        description: human, agent, or system
+        required: false
+        default: system
+        type: string
+      reason:
+        description: Optional transition reason
+        required: false
+        default: ""
+        type: string
+      config_path:
+        description: Policy file in the caller repository
+        required: false
+        default: agentic-sdlc.toml
+        type: string
+      platform_ref:
+        description: Immutable Agentic SDLC commit SHA
+        required: true
+        type: string
+      platform_repository:
+        description: Agentic SDLC repository in owner/name form
+        required: true
+        type: string
+    secrets:
+      PLATFORM_READ_TOKEN:
+        required: false
+
+permissions: {}
+
+concurrency:
+  group: agent-orchestrate-${{ github.repository }}-${{ inputs.unit_id }}
+  cancel-in-progress: false
+
+jobs:
+  orchestrate:
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    steps:
+      - name: Validate platform identity
+        env:
+          PLATFORM_REF: ${{ inputs.platform_ref }}
+          PLATFORM_REPOSITORY: ${{ inputs.platform_repository }}
+          UNIT_ID: ${{ inputs.unit_id }}
+          EVENT_KEY: ${{ inputs.event_key }}
+        run: |
+          set -euo pipefail
+          [[ "$PLATFORM_REF" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PLATFORM_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          [[ "$UNIT_ID" =~ ^[A-Za-z0-9._/#-]{1,100}$ ]]
+          [[ -n "$EVENT_KEY" ]]
+      - name: Check out policy engine
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.platform_repository }}
+          ref: ${{ inputs.platform_ref }}
+          path: .agentic-platform
+          persist-credentials: false
+          token: ${{ secrets.PLATFORM_READ_TOKEN || github.token }}
+      - name: Restore durable orchestration state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p .agentic-state
+          artifact_id="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=agentic-orchestration-state&per_page=1" \
+            --jq '.artifacts[0].id // empty')"
+          if [ -n "$artifact_id" ]; then
+            gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" \
+              > .agentic-state/state.zip
+            unzip -o .agentic-state/state.zip -d .agentic-state
+            rm .agentic-state/state.zip
+          fi
+      - name: Apply orchestration action
+        env:
+          ACTION: ${{ inputs.action }}
+          UNIT_ID: ${{ inputs.unit_id }}
+          TO_STATE: ${{ inputs.to_state }}
+          EVENT_KEY: ${{ inputs.event_key }}
+          ACTOR: ${{ github.actor }}
+          ACTOR_KIND: ${{ inputs.actor_kind }}
+          REASON: ${{ inputs.reason }}
+        run: |
+          set -euo pipefail
+          timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          extra=()
+          if [ "$ACTION" = "transition" ]; then
+            extra+=(--to "$TO_STATE" --actor "$ACTOR" --actor-kind "$ACTOR_KIND")
+            [ -n "$REASON" ] && extra+=(--reason "$REASON")
+          fi
+          PYTHONPATH="${GITHUB_WORKSPACE}/.agentic-platform/src" \
+            python3 -m agentic_sdlc orchestrate \
+              --action "$ACTION" \
+              --state .agentic-state/state.json \
+              --unit "$UNIT_ID" \
+              --event-key "$EVENT_KEY" \
+              --timestamp "$timestamp" \
+              --status-output .agentic-state/status.md \
+              "${extra[@]}"
+      - name: Publish durable orchestration state
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: agentic-orchestration-state
+          path: .agentic-state/state.json
+          retention-days: 90
+      - name: Upsert the single status comment
+        if: ${{ always() && hashFiles('.agentic-state/status.md') != '' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          UNIT_ID: ${{ inputs.unit_id }}
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- agentic-sdlc:status -->';
+            const body = fs.readFileSync('.agentic-state/status.md', 'utf8');
+            const issueNumber = Number.parseInt(process.env.UNIT_ID, 10);
+            if (!Number.isInteger(issueNumber)) {
+              core.info('Unit is not an issue number; skipping status comment.');
+              return;
+            }
+            const { owner, repo } = context.repo;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: issueNumber, per_page: 100,
+            });
+            const existing = comments.find((item) => item.body?.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: issueNumber, body,
+              });
+            }

@@ -20,6 +20,10 @@ _BASELINE_FORBIDDEN_PATHS = (
     "agentic-sdlc.toml",
     "missions.toml",
     "**/missions.toml",
+    "knowledge.toml",
+    "**/knowledge.toml",
+    "intake.toml",
+    "**/intake.toml",
     "CODEOWNERS",
     "**/CODEOWNERS",
     "AGENTS.md",
@@ -125,8 +129,8 @@ def load_policy(path: str | Path) -> ProjectPolicy:
         raise ValueError("automation approval labels must be distinct")
 
     human_merge_required = policy.get("human_merge_required", True)
-    if human_merge_required is not True:
-        raise ValueError("policy.human_merge_required must be true for policy version 1")
+    if type(human_merge_required) is not bool:
+        raise ValueError("policy.human_merge_required must be a boolean")
     forbidden_paths = tuple(
         dict.fromkeys((*_BASELINE_FORBIDDEN_PATHS, *_patterns(policy, "forbidden_paths")))
     )
@@ -144,7 +148,7 @@ def load_policy(path: str | Path) -> ProjectPolicy:
         ready_label=ready_label,
         human_review_label=human_review_label,
         implementation_label=implementation_label,
-        human_merge_required=True,
+        human_merge_required=human_merge_required,
         max_changed_files=_integer(policy, "max_changed_files", 30, maximum=10_000),
         max_diff_lines=_integer(policy, "max_diff_lines", 3000, maximum=10_000_000),
         max_patch_bytes=_integer(policy, "max_patch_bytes", 5_000_000, maximum=100_000_000),
@@ -235,10 +239,14 @@ def evaluate_diff(
     if not detail:
         detail.append(f"diff is within policy limits ({len(paths)} files, {total_lines} lines)")
 
+    automatic_merge_allowed = (
+        not policy.human_merge_required and not reasons and not protected and risk is RiskLevel.LOW
+    )
+
     return PolicyDecision(
         allowed=not reasons,
         risk=risk,
         reasons=tuple(detail),
         required_gates=tuple(dict.fromkeys(gates)),
-        automatic_merge_allowed=False,
+        automatic_merge_allowed=automatic_merge_allowed,
     )
