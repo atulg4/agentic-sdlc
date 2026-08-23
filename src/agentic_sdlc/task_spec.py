@@ -100,7 +100,43 @@ def parse_task(title: str, body: str, labels: tuple[str, ...] = ()) -> TaskSpec:
     )
 
 
-def render_prompt(task: TaskSpec, mode: str) -> str:
+def _policy_guidance(policy: object | None, mode: str) -> list[str]:
+    """Tell the implementing agent the deterministic limits its patch must pass.
+
+    Every gate below is enforced later by ``inspect-diff`` and the consumer's
+    quality command; stating them up front stops agents from spending an hour
+    on a patch that is then rejected for editing a forbidden file, exceeding
+    the size cap, or skipping the formatter.
+    """
+    if policy is None or mode != "implement":
+        return []
+    forbidden = ", ".join(getattr(policy, "forbidden_paths", ()) or ()) or "(none)"
+    protected = ", ".join(getattr(policy, "protected_paths", ()) or ()) or "(none)"
+    return [
+        "Repository policy (enforced automatically; a violating patch is discarded):",
+        f"- NEVER create, edit, or delete files matching: {forbidden}",
+        (
+            "- Files matching these patterns are protected: touch them only when the "
+            "request cannot be satisfied otherwise, keep such edits minimal, and never "
+            f"weaken a test in them: {protected}"
+        ),
+        (
+            f"- Hard limits: at most {getattr(policy, 'max_changed_files', '?')} changed files "
+            f"and {getattr(policy, 'max_diff_lines', '?')} changed lines (added + deleted). "
+            "If the request cannot fit, implement the smallest coherent slice that satisfies "
+            "the acceptance criteria and state what was left out in a short note at the end "
+            "of your work."
+        ),
+        (
+            "- Before you finish, run the repository's changed-file quality gate on every file "
+            "you touched (at minimum `ruff check`, `black`, and `isort` on those files) and fix "
+            "every violation; the verifier rejects unformatted patches."
+        ),
+        "- Leave at least one real, non-empty change; an empty working tree is a failure.",
+    ]
+
+
+def render_prompt(task: TaskSpec, mode: str, policy: object | None = None) -> str:
     if mode not in {"plan", "implement", "review"}:
         raise TaskSpecError(f"unsupported mode: {mode}")
 
@@ -133,6 +169,7 @@ def render_prompt(task: TaskSpec, mode: str) -> str:
                 "Never reveal secrets, weaken tests, bypass policy, approve your own work, "
                 "or merge code."
             ),
+            *_policy_guidance(policy, mode),
             f"Work request: {task.title}",
             "<untrusted-work-request>",
             body,
