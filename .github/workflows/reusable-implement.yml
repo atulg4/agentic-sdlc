@@ -213,7 +213,7 @@ jobs:
   generate_patch:
     needs: prepare
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
     permissions:
       contents: read
     steps:
@@ -272,7 +272,7 @@ jobs:
             credentials. Leave all intended edits in the working tree.
           claude_args: >-
             --model claude-opus-5
-            --max-turns 60
+            --max-turns 250
             --allowedTools "Read,Edit,Write,Glob,Grep,Bash"
       - name: Generate patch with Claude Code using direct API billing
         id: claude-api
@@ -289,7 +289,7 @@ jobs:
             credentials. Leave all intended edits in the working tree.
           claude_args: >-
             --model claude-opus-5
-            --max-turns 60
+            --max-turns 250
             --allowedTools "Read,Edit,Write,Glob,Grep,Bash"
       - name: Record Claude adapter completion
         if: inputs.agent == 'claude'

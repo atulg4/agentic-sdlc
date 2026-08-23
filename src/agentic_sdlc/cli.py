@@ -133,7 +133,18 @@ def _inspect_diff(args: argparse.Namespace) -> int:
         "paths": list(snapshot.paths),
     }
     _write(document, args.decision_output)
-    return 0 if decision.allowed and snapshot.paths else 2
+    if decision.allowed and snapshot.paths:
+        return 0
+    # The workflow step that runs this aborts on exit 2 before the decision
+    # artifact is uploaded, so the rejection reason must be visible in the log.
+    reasons = list(decision.reasons) if not decision.allowed else []
+    if not snapshot.paths:
+        reasons.append("no files changed: the agent left an empty working tree")
+    print(
+        "ERROR: inspect-diff rejected the generated patch: " + "; ".join(reasons),
+        file=sys.stderr,
+    )
+    return 2
 
 
 def _create_manifest(args: argparse.Namespace) -> int:
