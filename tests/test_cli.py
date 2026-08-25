@@ -254,6 +254,75 @@ def test_dispatch_mission_cli_fails_closed_on_independence(
     assert result == 2
 
 
+def test_classify_failure_cli_writes_transient_class(tmp_path: Path) -> None:
+    log = tmp_path / "failed.log"
+    output = tmp_path / "class.json"
+    log.write_text(
+        "HttpError: No server is currently available to service your request.",
+        encoding="utf-8",
+    )
+
+    result = main(
+        [
+            "classify-failure",
+            "--conclusion",
+            "failure",
+            "--log",
+            str(log),
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert result == 0
+    assert json.loads(output.read_text(encoding="utf-8")) == {
+        "failureClass": "transient_infrastructure"
+    }
+
+
+def test_decide_infra_retry_cli_updates_exact_head_state(tmp_path: Path) -> None:
+    state = tmp_path / "state.json"
+    output = tmp_path / "decision.json"
+    head = "a" * 40
+
+    result = main(
+        [
+            "decide-infra-retry",
+            "--state",
+            str(state),
+            "--repository",
+            "atulg4/agentic-sdlc",
+            "--pull-request-number",
+            "129",
+            "--run-id",
+            "456",
+            "--head-sha",
+            head,
+            "--current-head-sha",
+            head,
+            "--failure-class",
+            "transient_infrastructure",
+            "--failed-job-id",
+            "42",
+            "--max-attempts",
+            "3",
+            "--event-key",
+            "workflow-run-456",
+            "--timestamp",
+            "2026-08-25T12:00:00Z",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert result == 0
+    decision = json.loads(output.read_text(encoding="utf-8"))
+    assert decision["action"] == "retry_failed_jobs"
+    assert decision["retryJobIds"] == [42]
+    persisted = json.loads(state.read_text(encoding="utf-8"))
+    assert persisted["records"][f"atulg4/agentic-sdlc#pr-129:run-456:head-{head}"]["attempts"] == 1
+
+
 def test_orchestrate_cli_round_trips_state(tmp_path: Path) -> None:
     state = tmp_path / "state.json"
     status = tmp_path / "status.md"
