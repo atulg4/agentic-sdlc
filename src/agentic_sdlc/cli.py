@@ -12,6 +12,15 @@ from .artifact import ArtifactError, create_manifest, verify_manifest, write_man
 from .events import EventError, normalize_event
 from .gates import GateError, run_gates, write_report
 from .git_diff import GitDiffError, collect_git_diff
+from .infra_recovery import (
+    FailureClass,
+    InfraRecoveryError,
+    RetryAction,
+    classify_failure,
+    decide_retry,
+    load_retry_state,
+    write_retry_state,
+)
 from .knowledge import KnowledgeError, load_sources
 from .missions import (
     MissionError,
@@ -273,6 +282,41 @@ def _validate_knowledge(args: argparse.Namespace) -> int:
     return 0
 
 
+def _classify_failure(args: argparse.Namespace) -> int:
+    log = Path(args.log).read_text(encoding="utf-8", errors="replace") if args.log else ""
+    failure_class = classify_failure(
+        conclusion=args.conclusion,
+        log=log,
+        review_verdict=args.review_verdict,
+        policy_decision=args.policy_decision,
+    )
+    _write({"failureClass": failure_class.value}, args.output)
+    return 0
+
+
+def _decide_infra_retry(args: argparse.Namespace) -> int:
+    state = load_retry_state(args.state)
+    decision = decide_retry(
+        repository=args.repository,
+        pull_request_number=args.pull_request_number,
+        run_id=args.run_id,
+        head_sha=args.head_sha,
+        current_head_sha=args.current_head_sha,
+        failure_class=FailureClass(args.failure_class),
+        state=state,
+        failed_job_ids=tuple(args.failed_job_id),
+        max_attempts=args.max_attempts,
+        base_delay_seconds=args.base_delay_seconds,
+    )
+    if decision.action is RetryAction.RETRY_FAILED_JOBS and args.event_key:
+        state.record_retry(decision, event_key=args.event_key, timestamp=args.timestamp)
+    elif decision.action is RetryAction.BLOCK and args.event_key:
+        state.record_exhaustion(decision, event_key=args.event_key, timestamp=args.timestamp)
+    write_retry_state(state, args.state)
+    _write(decision.as_dict(), args.output)
+    return 0 if decision.action is not RetryAction.BLOCK else 2
+
+
 def _run_gates(args: argparse.Namespace) -> int:
     report = run_gates(args.config, args.repository)
     write_report(report, args.output)
@@ -420,6 +464,34 @@ def build_parser() -> argparse.ArgumentParser:
     knowledge.add_argument("--output")
     knowledge.set_defaults(handler=_validate_knowledge)
 
+    classify_failure_parser = commands.add_parser("classify-failure")
+    classify_failure_parser.add_argument("--conclusion", default="")
+    classify_failure_parser.add_argument("--log")
+    classify_failure_parser.add_argument("--review-verdict", default="")
+    classify_failure_parser.add_argument("--policy-decision", default="")
+    classify_failure_parser.add_argument("--output")
+    classify_failure_parser.set_defaults(handler=_classify_failure)
+
+    infra_retry = commands.add_parser("decide-infra-retry")
+    infra_retry.add_argument("--state", required=True)
+    infra_retry.add_argument("--repository", required=True)
+    infra_retry.add_argument("--pull-request-number", type=int, required=True)
+    infra_retry.add_argument("--run-id", type=int, required=True)
+    infra_retry.add_argument("--head-sha", required=True)
+    infra_retry.add_argument("--current-head-sha", required=True)
+    infra_retry.add_argument(
+        "--failure-class",
+        choices=tuple(item.value for item in FailureClass),
+        required=True,
+    )
+    infra_retry.add_argument("--failed-job-id", action="append", default=[], type=int)
+    infra_retry.add_argument("--max-attempts", type=int, default=3)
+    infra_retry.add_argument("--base-delay-seconds", type=int, default=60)
+    infra_retry.add_argument("--event-key", default="")
+    infra_retry.add_argument("--timestamp", default="")
+    infra_retry.add_argument("--output")
+    infra_retry.set_defaults(handler=_decide_infra_retry)
+
     gates = commands.add_parser("run-gates")
     gates.add_argument("--config", required=True)
     gates.add_argument("--repository", default=".")
@@ -449,6 +521,7 @@ def main(argv: list[str] | None = None) -> int:
         EventError,
         GateError,
         GitDiffError,
+        InfraRecoveryError,
         KnowledgeError,
         MissionError,
         OrchestrationError,
