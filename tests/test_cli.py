@@ -360,6 +360,72 @@ def test_route_executor_cli_selects_lowest_ecps_eligible_model(
     assert decision["policyVersion"] == "1.0.0"
 
 
+def test_route_executor_cli_fails_closed_when_quality_floor_rejects_cheap_models(
+    tmp_path: Path, policy_file: Path
+) -> None:
+    executors = tmp_path / "executors.json"
+    routing_policy = tmp_path / "routing-policy.json"
+    output = tmp_path / "route.json"
+    executors.write_text(
+        json.dumps(
+            [
+                {
+                    "executorId": "deepseek-cheap",
+                    "provider": "deepseek",
+                    "adapter": "deepseek-direct",
+                    "adapterVersion": "1.0.0",
+                    "executionType": "direct-api",
+                    "authMode": "api-key",
+                    "model": "deepseek-reasoner",
+                    "modelFamily": "deepseek",
+                    "taskClasses": ["implementation"],
+                    "capabilities": ["edit-code", "author-tests", "run-commands"],
+                    "toolCapabilities": ["structured-output"],
+                    "contextWindow": 128000,
+                    "maxRisk": "medium",
+                    "qualityLowerBound": 0.8,
+                    "directCostUsd": 0.5,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    routing_policy.write_text(
+        json.dumps({"policyVersion": "strict", "qualityFloors": {"medium": 0.9}}),
+        encoding="utf-8",
+    )
+
+    result = main(
+        [
+            "route-executor",
+            "--config",
+            str(policy_file),
+            "--mission-id",
+            "implementation-worker",
+            "--executors",
+            str(executors),
+            "--routing-policy",
+            str(routing_policy),
+            "--repository",
+            "example/project",
+            "--task-class",
+            "implementation",
+            "--required-tool-capability",
+            "structured-output",
+            "--budget-usd",
+            "5",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert result == 2
+    decision = json.loads(output.read_text(encoding="utf-8"))
+    assert decision["status"] == "insufficient-budget-or-assurance"
+    assert decision["selectedExecutorId"] == ""
+    assert decision["candidates"][0]["rejectionReasons"] == ["quality floor not met: 0.800 < 0.900"]
+
+
 def test_orchestrate_cli_round_trips_state(tmp_path: Path) -> None:
     state = tmp_path / "state.json"
     status = tmp_path / "status.md"

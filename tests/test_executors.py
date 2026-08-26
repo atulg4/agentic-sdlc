@@ -78,6 +78,50 @@ def test_deepseek_can_be_selected_when_it_meets_quality_and_capability_floor() -
     assert selected["ecps"] < 1
 
 
+def test_initial_provider_families_are_valid_registry_entries() -> None:
+    entries = [
+        ("anthropic", "claude-code", "subscription-runner", "oauth", "claude-opus-5"),
+        ("aws-bedrock", "bedrock", "cloud-platform", "oidc", "amazon.nova-pro"),
+        ("azure-foundry", "foundry", "cloud-platform", "workload-identity", "gpt-5-mini"),
+        ("codex", "codex-cloud", "subscription-cloud", "oauth", "gpt-5-codex"),
+        ("deepseek", "deepseek-direct", "direct-api", "api-key", "deepseek-reasoner"),
+        ("google-vertex", "vertex", "cloud-platform", "workload-identity", "gemini-2.5-flash"),
+        ("kimi", "kimi-direct", "direct-api", "api-key", "kimi-k2"),
+        ("moonshot", "moonshot-direct", "direct-api", "api-key", "moonshot-v1-128k"),
+        ("openai", "openai-direct", "direct-api", "api-key", "gpt-5-mini"),
+        ("self-hosted", "trusted-runner", "self-hosted", "local-trusted-runner", "qwen3-coder"),
+    ]
+    executors = load_executors(
+        [
+            _executor(
+                f"{provider}-executor",
+                provider=provider,
+                adapter=adapter,
+                executionType=execution_type,
+                authMode=auth_mode,
+                model=model,
+                modelFamily=model.split(".", 1)[0],
+                shadowCostUsd=0.2 if execution_type.startswith("subscription") else 0.0,
+                subscriptionMonthlyUsd=20 if execution_type.startswith("subscription") else 0.0,
+                subscriptionCapacityRemaining=5 if execution_type.startswith("subscription") else 0,
+                supportsCloud=execution_type != "self-hosted",
+                dataResidency="local-only" if execution_type == "self-hosted" else "us",
+            )
+            for provider, adapter, execution_type, auth_mode, model in entries
+        ]
+    )
+
+    assert {executor.provider for executor in executors} == {entry[0] for entry in entries}
+    serialized = [executor.as_dict() for executor in executors]
+    assert {item["authMode"] for item in serialized} == {
+        "api-key",
+        "local-trusted-runner",
+        "oauth",
+        "oidc",
+        "workload-identity",
+    }
+
+
 def test_cheapest_executor_never_wins_below_quality_floor() -> None:
     executors = load_executors(
         [
@@ -112,6 +156,42 @@ def test_no_executor_inside_budget_returns_assurance_decision() -> None:
     assert decision.selected_executor_id == ""
     assert "no eligible executor" in decision.reason
     assert decision.candidates[0]["rejectionReasons"] == ["budget exceeded: 6.0000 > 1.0000"]
+
+
+def test_policy_quality_floor_can_reject_all_cheap_models() -> None:
+    policy = load_routing_policy({"policyVersion": "strict", "qualityFloors": {"medium": 0.92}})
+    executors = load_executors(
+        [
+            _executor(
+                "deepseek-cheap",
+                provider="deepseek",
+                adapter="deepseek-direct",
+                model="deepseek-reasoner",
+                modelFamily="deepseek",
+                directCostUsd=0.25,
+                qualityLowerBound=0.82,
+            ),
+            _executor(
+                "kimi-cheap",
+                provider="kimi",
+                adapter="kimi-direct",
+                model="kimi-k2",
+                modelFamily="kimi",
+                directCostUsd=0.35,
+                qualityLowerBound=0.84,
+            ),
+        ]
+    )
+
+    decision = route_executor(_request(), executors, policy)
+
+    assert decision.status is RouteStatus.INSUFFICIENT_BUDGET_OR_ASSURANCE
+    assert decision.required_quality_floor == 0.92
+    for candidate in decision.candidates:
+        assert candidate["eligible"] is False
+        assert any(
+            reason.startswith("quality floor not met") for reason in candidate["rejectionReasons"]
+        )
 
 
 def test_capability_tool_context_and_capacity_rejections_are_explainable() -> None:
