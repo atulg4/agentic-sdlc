@@ -254,6 +254,178 @@ def test_dispatch_mission_cli_fails_closed_on_independence(
     assert result == 2
 
 
+def test_validate_executors_cli_writes_normalized_registry(tmp_path: Path) -> None:
+    executors = tmp_path / "executors.json"
+    output = tmp_path / "normalized.json"
+    executors.write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "executors": [
+                    {
+                        "executorId": "deepseek-1",
+                        "provider": "deepseek",
+                        "adapter": "deepseek-direct",
+                        "adapterVersion": "1.0.0",
+                        "executionType": "direct-api",
+                        "authMode": "api-key",
+                        "model": "deepseek-reasoner",
+                        "modelFamily": "deepseek",
+                        "taskClasses": ["implementation"],
+                        "capabilities": ["edit-code", "author-tests", "run-commands"],
+                        "qualityLowerBound": 0.8,
+                        "directCostUsd": 0.5,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = main(["validate-executors", "--executors", str(executors), "--output", str(output)])
+
+    assert result == 0
+    document = json.loads(output.read_text(encoding="utf-8"))
+    assert document["executors"][0]["provider"] == "deepseek"
+    assert "authMode" in document["executors"][0]
+
+
+def test_route_executor_cli_selects_lowest_ecps_eligible_model(
+    tmp_path: Path, policy_file: Path
+) -> None:
+    executors = tmp_path / "executors.json"
+    output = tmp_path / "route.json"
+    base = {
+        "adapterVersion": "1.0.0",
+        "executionType": "direct-api",
+        "authMode": "api-key",
+        "taskClasses": ["implementation"],
+        "capabilities": ["edit-code", "author-tests", "run-commands"],
+        "toolCapabilities": ["structured-output"],
+        "contextWindow": 128000,
+        "maxRisk": "medium",
+        "qualityLowerBound": 0.78,
+    }
+    executors.write_text(
+        json.dumps(
+            [
+                {
+                    **base,
+                    "executorId": "openai-1",
+                    "provider": "openai",
+                    "adapter": "openai-direct",
+                    "model": "gpt-5",
+                    "modelFamily": "gpt-5",
+                    "directCostUsd": 3.0,
+                },
+                {
+                    **base,
+                    "executorId": "deepseek-1",
+                    "provider": "deepseek",
+                    "adapter": "deepseek-direct",
+                    "model": "deepseek-reasoner",
+                    "modelFamily": "deepseek",
+                    "directCostUsd": 0.7,
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = main(
+        [
+            "route-executor",
+            "--config",
+            str(policy_file),
+            "--mission-id",
+            "implementation-worker",
+            "--executors",
+            str(executors),
+            "--repository",
+            "example/project",
+            "--task-class",
+            "implementation",
+            "--required-tool-capability",
+            "structured-output",
+            "--budget-usd",
+            "5",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert result == 0
+    decision = json.loads(output.read_text(encoding="utf-8"))
+    assert decision["selectedExecutorId"] == "deepseek-1"
+    assert decision["policyVersion"] == "1.0.0"
+
+
+def test_route_executor_cli_fails_closed_when_quality_floor_rejects_cheap_models(
+    tmp_path: Path, policy_file: Path
+) -> None:
+    executors = tmp_path / "executors.json"
+    routing_policy = tmp_path / "routing-policy.json"
+    output = tmp_path / "route.json"
+    executors.write_text(
+        json.dumps(
+            [
+                {
+                    "executorId": "deepseek-cheap",
+                    "provider": "deepseek",
+                    "adapter": "deepseek-direct",
+                    "adapterVersion": "1.0.0",
+                    "executionType": "direct-api",
+                    "authMode": "api-key",
+                    "model": "deepseek-reasoner",
+                    "modelFamily": "deepseek",
+                    "taskClasses": ["implementation"],
+                    "capabilities": ["edit-code", "author-tests", "run-commands"],
+                    "toolCapabilities": ["structured-output"],
+                    "contextWindow": 128000,
+                    "maxRisk": "medium",
+                    "qualityLowerBound": 0.8,
+                    "directCostUsd": 0.5,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    routing_policy.write_text(
+        json.dumps({"policyVersion": "strict", "qualityFloors": {"medium": 0.9}}),
+        encoding="utf-8",
+    )
+
+    result = main(
+        [
+            "route-executor",
+            "--config",
+            str(policy_file),
+            "--mission-id",
+            "implementation-worker",
+            "--executors",
+            str(executors),
+            "--routing-policy",
+            str(routing_policy),
+            "--repository",
+            "example/project",
+            "--task-class",
+            "implementation",
+            "--required-tool-capability",
+            "structured-output",
+            "--budget-usd",
+            "5",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert result == 2
+    decision = json.loads(output.read_text(encoding="utf-8"))
+    assert decision["status"] == "insufficient-budget-or-assurance"
+    assert decision["selectedExecutorId"] == ""
+    assert decision["candidates"][0]["rejectionReasons"] == ["quality floor not met: 0.800 < 0.900"]
+
+
 def test_orchestrate_cli_round_trips_state(tmp_path: Path) -> None:
     state = tmp_path / "state.json"
     status = tmp_path / "status.md"
