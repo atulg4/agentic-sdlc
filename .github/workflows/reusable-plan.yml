@@ -166,7 +166,7 @@ jobs:
           set -euo pipefail
           git ls-files -z | xargs -0 sha256sum > "$RUNNER_TEMP/agent-plan-source.sha256"
       - name: Produce read-only architecture plan with Claude Max OAuth
-        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
+        uses: anthropics/claude-code-action@fa2b2666b747000bf42767d1f332065b375e3c8f # v1
         env:
           CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
         with:

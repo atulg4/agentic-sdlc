@@ -229,7 +229,7 @@ jobs:
           fi
           bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / /bin/true
       - name: Generate bounded repair with Claude Max OAuth
-        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
+        uses: anthropics/claude-code-action@fa2b2666b747000bf42767d1f332065b375e3c8f # v1
         env:
           CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
         with:
