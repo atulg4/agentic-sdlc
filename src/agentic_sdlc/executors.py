@@ -17,6 +17,7 @@ __all__ = [
     "ExecutionType",
     "ExecutorError",
     "ExecutorProfile",
+    "RuntimeStatus",
     "RouteDecision",
     "RouteRequest",
     "RouteStatus",
@@ -62,6 +63,23 @@ class RouteStatus(StrEnum):
     INSUFFICIENT_BUDGET_OR_ASSURANCE = "insufficient-budget-or-assurance"
 
 
+class RuntimeStatus(StrEnum):
+    READY = "ready"
+    QUOTA_EXHAUSTED = "quota-exhausted"
+    CAPACITY_EXHAUSTED = "capacity-exhausted"
+    AUTH_EXHAUSTED = "auth-exhausted"
+    UNAVAILABLE = "unavailable"
+
+
+RECOVERABLE_RUNTIME_STATUSES = frozenset(
+    {
+        RuntimeStatus.QUOTA_EXHAUSTED,
+        RuntimeStatus.CAPACITY_EXHAUSTED,
+        RuntimeStatus.AUTH_EXHAUSTED,
+    }
+)
+
+
 KNOWN_PROVIDERS = frozenset(
     {
         "anthropic",
@@ -74,20 +92,76 @@ KNOWN_PROVIDERS = frozenset(
         "moonshot",
         "openai",
         "self-hosted",
+        "zai",
     }
 )
 
-KNOWN_MODELS: Mapping[str, frozenset[str]] = {
-    "anthropic": frozenset({"claude-opus-5", "claude-sonnet-5"}),
-    "aws-bedrock": frozenset({"anthropic.claude-opus-5", "meta.llama-4", "amazon.nova-pro"}),
-    "azure-foundry": frozenset({"gpt-5", "gpt-5-mini", "phi-4"}),
-    "codex": frozenset({"gpt-5", "gpt-5-codex"}),
-    "deepseek": frozenset({"deepseek-chat", "deepseek-reasoner"}),
-    "google-vertex": frozenset({"gemini-2.5-pro", "gemini-2.5-flash"}),
-    "kimi": frozenset({"kimi-k2", "kimi-k2-thinking"}),
-    "moonshot": frozenset({"kimi-k2", "moonshot-v1-128k"}),
-    "openai": frozenset({"gpt-5", "gpt-5-mini", "gpt-5-nano"}),
-    "self-hosted": frozenset({"llama-4", "qwen3-coder", "deepseek-r1"}),
+KNOWN_MODEL_ALIASES = frozenset(
+    {
+        "claude",
+        "claude-opus",
+        "claude-sonnet",
+        "codex",
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+        "glm-5.3",
+        "gpt-5",
+        "gpt-5-mini",
+        "kimi-k2",
+        "kimi-k3",
+        "self-hosted-coder",
+    }
+)
+
+DEFAULT_MODEL_ALIAS_PREFERENCES: Mapping[str, tuple[str, ...]] = {
+    "implementation:low": (
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+        "kimi-k2",
+        "glm-5.3",
+        "kimi-k3",
+        "claude",
+    ),
+    "implementation:medium": (
+        "deepseek-v4-pro",
+        "deepseek-v4-flash",
+        "glm-5.3",
+        "kimi-k3",
+        "claude",
+    ),
+    "implementation:high": ("glm-5.3", "deepseek-v4-pro", "kimi-k3", "claude"),
+    "implementation:critical": ("kimi-k3", "glm-5.3", "claude"),
+    "repair:low": ("deepseek-v4-pro", "deepseek-v4-flash", "glm-5.3", "kimi-k3"),
+    "repair:medium": ("deepseek-v4-pro", "glm-5.3", "kimi-k3", "claude"),
+    "repair:high": ("glm-5.3", "kimi-k3", "claude"),
+    "repair:critical": ("kimi-k3", "glm-5.3", "claude"),
+}
+
+LEGACY_MODEL_ALIASES: Mapping[tuple[str, str], str] = {
+    ("anthropic", "claude-opus-5"): "claude-opus",
+    ("anthropic", "claude-sonnet-5"): "claude-sonnet",
+    ("aws-bedrock", "anthropic.claude-opus-5"): "claude-opus",
+    ("aws-bedrock", "amazon.nova-pro"): "self-hosted-coder",
+    ("aws-bedrock", "meta.llama-4"): "self-hosted-coder",
+    ("azure-foundry", "gpt-5"): "gpt-5",
+    ("azure-foundry", "gpt-5-mini"): "gpt-5-mini",
+    ("azure-foundry", "phi-4"): "self-hosted-coder",
+    ("codex", "gpt-5"): "gpt-5",
+    ("codex", "gpt-5-codex"): "codex",
+    ("deepseek", "deepseek-chat"): "deepseek-v4-flash",
+    ("deepseek", "deepseek-reasoner"): "deepseek-v4-pro",
+    ("google-vertex", "gemini-2.5-flash"): "gpt-5-mini",
+    ("google-vertex", "gemini-2.5-pro"): "gpt-5",
+    ("kimi", "kimi-k2"): "kimi-k2",
+    ("kimi", "kimi-k2-thinking"): "kimi-k2",
+    ("moonshot", "kimi-k2"): "kimi-k2",
+    ("moonshot", "moonshot-v1-128k"): "kimi-k2",
+    ("openai", "gpt-5"): "gpt-5",
+    ("openai", "gpt-5-mini"): "gpt-5-mini",
+    ("openai", "gpt-5-nano"): "gpt-5-mini",
+    ("self-hosted", "deepseek-r1"): "self-hosted-coder",
+    ("self-hosted", "llama-4"): "self-hosted-coder",
+    ("self-hosted", "qwen3-coder"): "self-hosted-coder",
 }
 
 TOOL_CAPABILITIES = frozenset(
@@ -114,6 +188,7 @@ class ExecutorProfile:
     execution_type: ExecutionType
     auth_mode: AuthMode
     model: str
+    model_alias: str
     model_family: str
     task_classes: tuple[TaskClass, ...]
     capabilities: tuple[str, ...]
@@ -121,6 +196,8 @@ class ExecutorProfile:
     context_window: int = 0
     supports_cloud: bool = True
     available: bool = True
+    runtime_status: RuntimeStatus = RuntimeStatus.READY
+    runtime_status_reason: str = ""
     max_concurrency: int = 1
     active_runs: int = 0
     max_risk: RiskLevel = RiskLevel.MEDIUM
@@ -148,6 +225,7 @@ class ExecutorProfile:
             "executionType": self.execution_type.value,
             "authMode": self.auth_mode.value,
             "model": self.model,
+            "modelAlias": self.model_alias,
             "modelFamily": self.model_family,
             "taskClasses": [item.value for item in self.task_classes],
             "capabilities": list(self.capabilities),
@@ -155,6 +233,8 @@ class ExecutorProfile:
             "contextWindow": self.context_window,
             "supportsCloud": self.supports_cloud,
             "available": self.available,
+            "runtimeStatus": self.runtime_status.value,
+            "runtimeStatusReason": self.runtime_status_reason,
             "maxConcurrency": self.max_concurrency,
             "activeRuns": self.active_runs,
             "maxRisk": self.max_risk.value,
@@ -177,6 +257,7 @@ class RoutingPolicy:
     quality_floors: Mapping[RiskLevel, float] | None = None
     allowed_providers: tuple[str, ...] = tuple(sorted(KNOWN_PROVIDERS))
     denied_providers: tuple[str, ...] = ()
+    preferred_model_aliases: Mapping[str, tuple[str, ...]] | None = None
     require_no_training_storage: bool = False
     allowed_data_residency: tuple[str, ...] = tuple(sorted(DATA_RESIDENCY))
 
@@ -203,9 +284,18 @@ class RoutingPolicy:
             },
             "allowedProviders": list(self.allowed_providers),
             "deniedProviders": list(self.denied_providers),
+            "preferredModelAliases": {
+                key: list(value)
+                for key, value in sorted((self.preferred_model_aliases or {}).items())
+            },
             "requireNoTrainingStorage": self.require_no_training_storage,
             "allowedDataResidency": list(self.allowed_data_residency),
         }
+
+    def preference_for(self, task_class: TaskClass, risk: RiskLevel) -> tuple[str, ...]:
+        preferences = self.preferred_model_aliases or DEFAULT_MODEL_ALIAS_PREFERENCES
+        route_key = f"{task_class.value}:{risk.value}"
+        return preferences.get(route_key, preferences.get(task_class.value, ()))
 
 
 @dataclass(frozen=True)
@@ -308,6 +398,7 @@ def _parse_executor(entry: object) -> ExecutorProfile:
         "executionType",
         "authMode",
         "model",
+        "modelAlias",
         "modelFamily",
         "taskClasses",
         "capabilities",
@@ -315,6 +406,8 @@ def _parse_executor(entry: object) -> ExecutorProfile:
         "contextWindow",
         "supportsCloud",
         "available",
+        "runtimeStatus",
+        "runtimeStatusReason",
         "maxConcurrency",
         "activeRuns",
         "maxRisk",
@@ -340,7 +433,14 @@ def _parse_executor(entry: object) -> ExecutorProfile:
     provider = str(entry.get("provider", "")).strip()
     _require(provider in KNOWN_PROVIDERS, f"unknown provider: {provider}")
     model = str(entry.get("model", "")).strip()
-    _require(model in KNOWN_MODELS[provider], f"unknown model for {provider}: {model}")
+    _require(bool(model), f"executor {executor_id}: model is required")
+    model_alias = str(entry.get("modelAlias", "")).strip() or LEGACY_MODEL_ALIASES.get(
+        (provider, model), model
+    )
+    _require(
+        model_alias in KNOWN_MODEL_ALIASES,
+        f"executor {executor_id}: unknown modelAlias: {model_alias}",
+    )
     model_family = str(entry.get("modelFamily", "")).strip() or model
     adapter = str(entry.get("adapter", "")).strip()
     adapter_version = str(entry.get("adapterVersion", "")).strip()
@@ -380,6 +480,11 @@ def _parse_executor(entry: object) -> ExecutorProfile:
     available = entry.get("available", True)
     _require(isinstance(supports_cloud, bool), f"executor {executor_id}: supportsCloud is invalid")
     _require(isinstance(available, bool), f"executor {executor_id}: available is invalid")
+    try:
+        runtime_status = RuntimeStatus(str(entry.get("runtimeStatus", RuntimeStatus.READY.value)))
+    except ValueError as error:
+        raise ExecutorError(f"executor {executor_id}: runtimeStatus is unknown") from error
+    runtime_status_reason = str(entry.get("runtimeStatusReason", "")).strip()
 
     execution_type = _execution_type(entry.get("executionType"))
     shadow_cost_usd = _float(entry.get("shadowCostUsd", 0), "shadowCostUsd", 0, 1_000_000)
@@ -415,6 +520,7 @@ def _parse_executor(entry: object) -> ExecutorProfile:
         execution_type=execution_type,
         auth_mode=_auth_mode(entry.get("authMode")),
         model=model,
+        model_alias=model_alias,
         model_family=model_family,
         task_classes=task_classes,
         capabilities=capabilities,
@@ -422,6 +528,8 @@ def _parse_executor(entry: object) -> ExecutorProfile:
         context_window=_int(entry.get("contextWindow", 0), "contextWindow", 0, 10_000_000),
         supports_cloud=supports_cloud,
         available=available,
+        runtime_status=runtime_status,
+        runtime_status_reason=runtime_status_reason,
         max_concurrency=_int(entry.get("maxConcurrency", 1), "maxConcurrency", 1, 10_000),
         active_runs=_int(entry.get("activeRuns", 0), "activeRuns", 0, 10_000),
         max_risk=_risk(entry.get("maxRisk", "medium"), "maxRisk"),
@@ -490,6 +598,7 @@ def load_routing_policy(document: object | None) -> RoutingPolicy:
         raise ExecutorError(
             "deniedProviders contains unknown providers: " + ", ".join(unknown_denied)
         )
+    preferred_model_aliases = _preferred_model_aliases(document.get("preferredModelAliases"))
     allowed_data_residency = _string_tuple(
         document.get("allowedDataResidency"), "allowedDataResidency"
     )
@@ -508,9 +617,34 @@ def load_routing_policy(document: object | None) -> RoutingPolicy:
         quality_floors=quality_floors,
         allowed_providers=allowed_providers,
         denied_providers=denied_providers,
+        preferred_model_aliases=preferred_model_aliases or None,
         require_no_training_storage=require_no_training_storage,
         allowed_data_residency=allowed_data_residency,
     )
+
+
+def _preferred_model_aliases(value: object) -> dict[str, tuple[str, ...]]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ExecutorError("preferredModelAliases must be an object")
+    parsed: dict[str, tuple[str, ...]] = {}
+    allowed_keys = {item.value for item in TaskClass} | {
+        f"{task.value}:{risk.value}" for task in TaskClass for risk in RiskLevel
+    }
+    for key, raw_aliases in value.items():
+        key = str(key).strip()
+        if key not in allowed_keys:
+            raise ExecutorError(f"preferredModelAliases contains unknown route key: {key}")
+        aliases = _string_tuple(raw_aliases, f"preferredModelAliases.{key}")
+        unknown_aliases = sorted(set(aliases) - KNOWN_MODEL_ALIASES)
+        if unknown_aliases:
+            raise ExecutorError(
+                f"preferredModelAliases.{key} contains unknown aliases: "
+                + ", ".join(unknown_aliases)
+            )
+        parsed[key] = aliases
+    return parsed
 
 
 def _risk_order(risk: RiskLevel) -> int:
@@ -560,12 +694,20 @@ def route_executor(
     if request.budget_usd < 0:
         raise ExecutorError("budget_usd cannot be negative")
 
+    preference = active_policy.preference_for(request.task_class, request.risk)
+    preference_rank = {alias: index for index, alias in enumerate(preference)}
+    default_preference_rank = len(preference)
     considered: list[dict[str, Any]] = []
-    eligible: list[tuple[float, str, ExecutorProfile]] = []
+    eligible: list[tuple[int, float, str, ExecutorProfile]] = []
     for executor in executors:
         reasons: list[str] = []
         if not executor.available:
             reasons.append("unavailable")
+        if executor.runtime_status is not RuntimeStatus.READY:
+            status_reason = (
+                f": {executor.runtime_status_reason}" if executor.runtime_status_reason else ""
+            )
+            reasons.append(f"{executor.runtime_status.value}{status_reason}")
         if executor.provider not in active_policy.allowed_providers:
             reasons.append("provider not allowed")
         if executor.provider in active_policy.denied_providers:
@@ -622,18 +764,30 @@ def route_executor(
                 "executorId": executor.executor_id,
                 "provider": executor.provider,
                 "model": executor.model,
+                "modelAlias": executor.model_alias,
                 "executionType": executor.execution_type.value,
                 "authMode": executor.auth_mode.value,
                 "qualityLowerBound": executor.quality_lower_bound,
                 "expectedMissionCostUsd": round(executor.expected_mission_cost, 6),
                 "ecps": ecps,
+                "preferenceRank": preference_rank.get(
+                    executor.model_alias, default_preference_rank
+                ),
+                "recoverable": executor.runtime_status in RECOVERABLE_RUNTIME_STATUSES,
                 "eligible": not reasons,
                 "rejectionReasons": reasons,
             }
         )
         if not reasons:
             assert ecps is not None
-            eligible.append((ecps, executor.executor_id, executor))
+            eligible.append(
+                (
+                    preference_rank.get(executor.model_alias, default_preference_rank),
+                    ecps,
+                    executor.executor_id,
+                    executor,
+                )
+            )
 
     if not eligible:
         return RouteDecision(
@@ -647,7 +801,7 @@ def route_executor(
             "and budget constraints",
         )
 
-    _, _, selected = min(eligible)
+    _, _, _, selected = min(eligible)
     return RouteDecision(
         RouteStatus.SELECTED,
         selected.executor_id,
@@ -655,7 +809,8 @@ def route_executor(
         floor,
         request.budget_usd,
         tuple(considered),
-        "selected lowest expected cost per successful mission among eligible executors",
+        "selected first configured model alias preference, then lowest expected cost per "
+        "successful mission among eligible executors",
     )
 
 

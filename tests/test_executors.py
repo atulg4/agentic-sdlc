@@ -90,6 +90,7 @@ def test_initial_provider_families_are_valid_registry_entries() -> None:
         ("moonshot", "moonshot-direct", "direct-api", "api-key", "moonshot-v1-128k"),
         ("openai", "openai-direct", "direct-api", "api-key", "gpt-5-mini"),
         ("self-hosted", "trusted-runner", "self-hosted", "local-trusted-runner", "qwen3-coder"),
+        ("zai", "zai-direct", "direct-api", "api-key", "glm-5.3"),
     ]
     executors = load_executors(
         [
@@ -120,6 +121,7 @@ def test_initial_provider_families_are_valid_registry_entries() -> None:
         "oidc",
         "workload-identity",
     }
+    assert any(item["modelAlias"] == "glm-5.3" for item in serialized)
 
 
 def test_cheapest_executor_never_wins_below_quality_floor() -> None:
@@ -289,13 +291,127 @@ def test_deterministic_tie_breaking_uses_executor_id() -> None:
     assert decision.selected_executor_id == "a-runner"
 
 
-def test_unknown_provider_model_or_auth_mode_fails_closed() -> None:
+def test_unknown_provider_model_alias_or_auth_mode_fails_closed() -> None:
     with pytest.raises(ExecutorError, match="unknown provider"):
         load_executors([_executor("bad", provider="mystery")])
-    with pytest.raises(ExecutorError, match="unknown model"):
-        load_executors([_executor("bad", model="gpt-unknown")])
+    with pytest.raises(ExecutorError, match="unknown modelAlias"):
+        load_executors([_executor("bad", model="provider-id", modelAlias="gpt-unknown")])
     with pytest.raises(ExecutorError, match="authMode is unknown"):
         load_executors([_executor("bad", authMode="browser-cookie")])
+
+
+def test_model_identifiers_are_configurable_behind_documented_aliases() -> None:
+    executor = load_executors(
+        [
+            _executor(
+                "deepseek-flash",
+                provider="deepseek",
+                adapter="openai-compatible",
+                model="provider-specific-flash-id",
+                modelAlias="deepseek-v4-flash",
+                modelFamily="deepseek",
+                directCostUsd=0.2,
+            )
+        ]
+    )[0]
+
+    assert executor.model == "provider-specific-flash-id"
+    assert executor.model_alias == "deepseek-v4-flash"
+
+
+def test_default_policy_routes_routine_serious_difficult_and_escalation_tiers() -> None:
+    common = {
+        "taskClasses": ["implementation", "repair"],
+        "capabilities": ["edit-code", "author-tests", "run-commands"],
+        "toolCapabilities": ["structured-output"],
+        "contextWindow": 256000,
+        "maxRisk": "critical",
+        "qualityLowerBound": 0.96,
+    }
+    executors = load_executors(
+        [
+            _executor(
+                "flash",
+                **common,
+                provider="deepseek",
+                adapter="openai-compatible",
+                model="configured-flash-id",
+                modelAlias="deepseek-v4-flash",
+                modelFamily="deepseek",
+                directCostUsd=0.1,
+            ),
+            _executor(
+                "pro",
+                **common,
+                provider="deepseek",
+                adapter="openai-compatible",
+                model="configured-pro-id",
+                modelAlias="deepseek-v4-pro",
+                modelFamily="deepseek",
+                directCostUsd=0.2,
+            ),
+            _executor(
+                "glm",
+                **common,
+                provider="zai",
+                adapter="openai-compatible",
+                model="configured-glm-id",
+                modelAlias="glm-5.3",
+                modelFamily="glm",
+                directCostUsd=0.4,
+            ),
+            _executor(
+                "kimi",
+                **common,
+                provider="kimi",
+                adapter="openai-compatible",
+                model="configured-kimi-id",
+                modelAlias="kimi-k3",
+                modelFamily="kimi",
+                directCostUsd=1.0,
+            ),
+        ]
+    )
+
+    assert route_executor(_request(risk=RiskLevel.LOW), executors).selected_executor_id == "flash"
+    assert route_executor(_request(risk=RiskLevel.MEDIUM), executors).selected_executor_id == "pro"
+    assert route_executor(_request(risk=RiskLevel.HIGH), executors).selected_executor_id == "glm"
+    critical = route_executor(_request(risk=RiskLevel.CRITICAL), executors)
+    assert critical.selected_executor_id == "kimi"
+
+
+def test_recoverable_provider_exhaustion_reroutes_and_records_reason() -> None:
+    executors = load_executors(
+        [
+            _executor(
+                "pro-exhausted",
+                provider="deepseek",
+                adapter="openai-compatible",
+                model="configured-pro-id",
+                modelAlias="deepseek-v4-pro",
+                modelFamily="deepseek",
+                directCostUsd=0.2,
+                runtimeStatus="quota-exhausted",
+                runtimeStatusReason="daily paid quota reached",
+            ),
+            _executor(
+                "glm-fallback",
+                provider="zai",
+                adapter="openai-compatible",
+                model="configured-glm-id",
+                modelAlias="glm-5.3",
+                modelFamily="glm",
+                directCostUsd=0.4,
+            ),
+        ]
+    )
+
+    decision = route_executor(_request(risk=RiskLevel.MEDIUM), executors)
+
+    assert decision.selected_executor_id == "glm-fallback"
+    rejected = [item for item in decision.candidates if item["executorId"] == "pro-exhausted"][0]
+    assert rejected["recoverable"] is True
+    assert "quota-exhausted: daily paid quota reached" in rejected["rejectionReasons"]
 
 
 def test_registry_serialization_contains_no_credentials() -> None:

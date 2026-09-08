@@ -26,6 +26,7 @@ def _envelope(agent_id: str = "codex-1", mission_id: str = "implementation-worke
         "adapterVersion": "1.0.0",
         "provider": "openai",
         "model": "gpt-5",
+        "modelAlias": "gpt-5",
         "promptSha256": "a" * 64,
         "envelopeSha256": "b" * 64,
         "workRef": "example/project#1",
@@ -503,6 +504,7 @@ def test_run_records_pin_identity_and_artifacts() -> None:
     document = finished.as_dict()
     assert document["missionId"] == "implementation-worker"
     assert document["missionVersion"] == "1.0.0"
+    assert document["modelAlias"] == "gpt-5"
     assert document["promptSha256"] == "a" * 64
     assert document["commitSha"] == "f" * 40
     assert document["outputArtifacts"] == {
@@ -513,3 +515,29 @@ def test_run_records_pin_identity_and_artifacts() -> None:
     incomplete = {key: value for key, value in _envelope().items() if key != "promptSha256"}
     with pytest.raises(OrchestrationError, match="missing: promptSha256"):
         engine.start_run("u1", "verification", incomplete, event_key="v-1", timestamp=T)
+
+
+def test_run_records_include_routing_and_fallback_telemetry() -> None:
+    engine = Orchestrator()
+    _advance_to_dispatched(engine, "u1")
+    envelope = {
+        **_envelope(),
+        "provider": "zai",
+        "model": "configured-glm-id",
+        "modelAlias": "glm-5.3",
+        "routingPolicyVersion": "musicmaestro-v1",
+        "routeReason": "selected by implementation:high alias preference",
+        "fallbackReason": "deepseek-v4-pro quota-exhausted: daily quota reached",
+    }
+
+    run = engine.start_run("u1", "implementation", envelope, event_key="impl-1", timestamp=T)
+    document = run.as_dict()
+    restored = Orchestrator.from_dict(engine.as_dict()).get("u1").runs[0]
+
+    assert document["provider"] == "zai"
+    assert document["model"] == "configured-glm-id"
+    assert document["modelAlias"] == "glm-5.3"
+    assert document["routingPolicyVersion"] == "musicmaestro-v1"
+    assert document["fallbackReason"] == "deepseek-v4-pro quota-exhausted: daily quota reached"
+    assert restored.model_alias == "glm-5.3"
+    assert restored.route_reason == "selected by implementation:high alias preference"
