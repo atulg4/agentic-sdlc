@@ -20,6 +20,8 @@ remain in MarketMaestro; reusable orchestration lives here.
 
 - A provider-neutral work-request parser.
 - Deterministic task and diff policy checks.
+- Configuration-driven provider/model executor routing with recoverable
+  quota, capacity, and auth fallback.
 - GitHub and GitLab webhook normalization.
 - A command-line interface for CI: `sdlcctl`.
 - A reusable GitHub policy action.
@@ -108,6 +110,9 @@ have repository write authority, and every resulting pull request is a draft.
 
 See [GitLab Adapter](docs/gitlab.md) for the deliberately limited v0.1
 boundary.
+
+See [Provider and model routing](docs/routing.md) for configurable executor
+aliases, fallback semantics, and credential boundaries.
 
 ## Rollout
 
