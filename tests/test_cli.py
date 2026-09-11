@@ -735,3 +735,221 @@ def test_orchestrate_cli_round_trips_state(tmp_path: Path) -> None:
     # Replaying the same event is a no-op, and invalid transitions fail closed.
     assert main([*base, "--action", "transition", "--event-key", "evt-2", "--to", "triaged"]) == 0
     assert main([*base, "--action", "transition", "--event-key", "evt-3", "--to", "merged"]) == 2
+
+
+def _registry_document() -> dict:
+    return {
+        "schemaVersion": 1,
+        "projects": [
+            {
+                "projectId": "alpha",
+                "displayName": "Alpha",
+                "group": "maestro",
+                "repositories": [{"provider": "github", "identifier": "example/alpha"}],
+                "environments": [{"name": "production", "kind": "production"}],
+                "capabilities": ["planning", "implementation"],
+            },
+            {
+                "projectId": "beta",
+                "displayName": "Beta",
+                "repositories": [{"provider": "github", "identifier": "example/beta"}],
+            },
+        ],
+    }
+
+
+def _event_document(
+    sequence: int,
+    state: str,
+    stage: str,
+    *,
+    project_id: str = "alpha",
+    unit: str = "github:example/alpha:issue:1",
+    activity: str = "",
+) -> dict:
+    return {
+        "schemaVersion": 1,
+        "eventId": f"{project_id}:{sequence:04d}",
+        "idempotencyKey": f"{unit}:{sequence:04d}",
+        "workUnit": {
+            "projectId": project_id,
+            "workUnitId": unit,
+            "repository": f"example/{project_id}",
+            "issueRef": f"example/{project_id}#1",
+        },
+        "stage": stage,
+        "state": state,
+        "activity": activity,
+        "occurredAt": "2026-09-04T09:00:00Z",
+        "actor": {"name": "forge-lifecycle", "kind": "system"},
+        "provenance": {"source": "forge-ci"},
+    }
+
+
+def test_validate_registry_cli_writes_the_registry(tmp_path: Path) -> None:
+    registry = tmp_path / "projects.json"
+    output = tmp_path / "registry.json"
+    registry.write_text(json.dumps(_registry_document()), encoding="utf-8")
+
+    assert main(["validate-registry", "--registry", str(registry), "--output", str(output)]) == 0
+
+    document = json.loads(output.read_text(encoding="utf-8"))
+    assert [item["projectId"] for item in document["projects"]] == ["alpha", "beta"]
+
+
+def test_validate_registry_cli_fails_closed(tmp_path: Path) -> None:
+    registry = tmp_path / "projects.json"
+    registry.write_text(
+        json.dumps({"schemaVersion": 1, "projects": [{"projectId": "alpha"}]}), encoding="utf-8"
+    )
+
+    assert main(["validate-registry", "--registry", str(registry)]) == 2
+    assert main(["validate-registry", "--registry", str(tmp_path / "absent.json")]) == 2
+
+
+def test_record_event_cli_appends_idempotently_and_projects_state(tmp_path: Path) -> None:
+    ledger = tmp_path / "ledger.json"
+    registry = tmp_path / "projects.json"
+    event = tmp_path / "event.json"
+    projection = tmp_path / "projection.json"
+    registry.write_text(json.dumps(_registry_document()), encoding="utf-8")
+
+    for sequence, (state, stage) in enumerate(
+        (("intake", "intake"), ("triaged", "intake"), ("specified", "specification"))
+    ):
+        event.write_text(json.dumps(_event_document(sequence, state, stage)), encoding="utf-8")
+        assert (
+            main(
+                [
+                    "record-event",
+                    "--ledger",
+                    str(ledger),
+                    "--registry",
+                    str(registry),
+                    "--event",
+                    str(event),
+                    "--projection-output",
+                    str(projection),
+                ]
+            )
+            == 0
+        )
+
+    # Replaying the last delivery changes nothing.
+    before = ledger.read_text(encoding="utf-8")
+    assert main(["record-event", "--ledger", str(ledger), "--event", str(event)]) == 0
+    assert ledger.read_text(encoding="utf-8") == before
+
+    document = json.loads(projection.read_text(encoding="utf-8"))
+    assert document["durable"]["state"] == "specified"
+    assert document["durable"]["references"]["issueRef"] == "example/alpha#1"
+    assert document["ephemeral"]["activity"] == ""
+    assert len(json.loads(before)["events"]) == 3
+
+
+def test_record_event_cli_fails_closed_on_an_unregistered_project(tmp_path: Path) -> None:
+    ledger = tmp_path / "ledger.json"
+    registry = tmp_path / "projects.json"
+    event = tmp_path / "event.json"
+    registry.write_text(json.dumps(_registry_document()), encoding="utf-8")
+    event.write_text(
+        json.dumps(_event_document(0, "intake", "intake", project_id="gamma")), encoding="utf-8"
+    )
+
+    assert (
+        main(
+            [
+                "record-event",
+                "--ledger",
+                str(ledger),
+                "--registry",
+                str(registry),
+                "--event",
+                str(event),
+            ]
+        )
+        == 2
+    )
+    assert not ledger.exists()
+
+
+def test_record_event_cli_works_without_a_registry(tmp_path: Path) -> None:
+    ledger = tmp_path / "ledger.json"
+    event = tmp_path / "event.json"
+    event.write_text(json.dumps(_event_document(0, "intake", "intake")), encoding="utf-8")
+
+    assert main(["record-event", "--ledger", str(ledger), "--event", str(event)]) == 0
+    assert len(json.loads(ledger.read_text(encoding="utf-8"))["events"]) == 1
+
+
+def test_project_state_cli_answers_cross_project_and_single_unit_queries(tmp_path: Path) -> None:
+    ledger = tmp_path / "ledger.json"
+    event = tmp_path / "event.json"
+    output = tmp_path / "state.json"
+    plan = (
+        ("alpha", "github:example/alpha:issue:1", "intake", "intake", ""),
+        ("alpha", "github:example/alpha:issue:1", "triaged", "intake", ""),
+        (
+            "alpha",
+            "github:example/alpha:issue:1",
+            "triaged",
+            "intake",
+            "Claude reading the backlog on runner gha-7",
+        ),
+        ("beta", "github:example/beta:issue:9", "intake", "intake", ""),
+    )
+    for sequence, (project_id, unit, state, stage, activity) in enumerate(plan):
+        event.write_text(
+            json.dumps(
+                _event_document(
+                    sequence, state, stage, project_id=project_id, unit=unit, activity=activity
+                )
+            ),
+            encoding="utf-8",
+        )
+        assert main(["record-event", "--ledger", str(ledger), "--event", str(event)]) == 0
+
+    assert main(["project-state", "--ledger", str(ledger), "--output", str(output)]) == 0
+    everything = json.loads(output.read_text(encoding="utf-8"))
+    assert everything["aggregate"]["totals"]["projects"] == 2
+    assert len(everything["projections"]) == 2
+
+    assert (
+        main(
+            [
+                "project-state",
+                "--ledger",
+                str(ledger),
+                "--project-id",
+                "beta",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    only_beta = json.loads(output.read_text(encoding="utf-8"))
+    assert set(only_beta["aggregate"]["projects"]) == {"beta"}
+
+    assert (
+        main(
+            [
+                "project-state",
+                "--ledger",
+                str(ledger),
+                "--project-id",
+                "alpha",
+                "--unit",
+                "github:example/alpha:issue:1",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    unit_document = json.loads(output.read_text(encoding="utf-8"))
+    assert unit_document["durable"]["state"] == "triaged"
+    assert unit_document["ephemeral"]["activity"] == ("Claude reading the backlog on runner gha-7")
+
+    # A single-unit query needs exactly one project scope.
+    assert main(["project-state", "--ledger", str(ledger), "--unit", "whatever"]) == 2
