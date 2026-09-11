@@ -70,7 +70,7 @@ TRANSITIONS: dict[WorkUnitState, frozenset[WorkUnitState]] = {
     _S.APPROVED: frozenset({_S.DISPATCHED, _S.BLOCKED}) | _ABORT,
     _S.DISPATCHED: frozenset({_S.IMPLEMENTING, _S.BLOCKED}) | _ABORT,
     _S.IMPLEMENTING: frozenset({_S.VERIFYING, _S.FAILED}) | _ABORT,
-    _S.VERIFYING: frozenset({_S.REVIEWING, _S.FAILED}) | _ABORT,
+    _S.VERIFYING: frozenset({_S.REVIEWING, _S.REPAIR_NEEDED, _S.BLOCKED, _S.FAILED}) | _ABORT,
     _S.REVIEWING: frozenset({_S.READY_FOR_HUMAN_MERGE, _S.REPAIR_NEEDED, _S.BLOCKED, _S.FAILED})
     | _ABORT,
     _S.REPAIR_NEEDED: frozenset({_S.REPAIRING, _S.BLOCKED}) | _ABORT,
@@ -136,6 +136,7 @@ class AgentRunRecord:
     adapter_version: str
     provider: str
     model: str
+    model_alias: str
     prompt_sha256: str
     envelope_sha256: str
     work_ref: str
@@ -144,6 +145,9 @@ class AgentRunRecord:
     repair_cycle: int
     started_at: str
     event_key: str
+    routing_policy_version: str = ""
+    route_reason: str = ""
+    fallback_reason: str = ""
     finished_at: str = ""
     result: str = "running"
     commit_sha: str = ""
@@ -160,6 +164,7 @@ class AgentRunRecord:
             "adapterVersion": self.adapter_version,
             "provider": self.provider,
             "model": self.model,
+            "modelAlias": self.model_alias,
             "promptSha256": self.prompt_sha256,
             "envelopeSha256": self.envelope_sha256,
             "workRef": self.work_ref,
@@ -168,6 +173,9 @@ class AgentRunRecord:
             "repairCycle": self.repair_cycle,
             "startedAt": self.started_at,
             "eventKey": self.event_key,
+            "routingPolicyVersion": self.routing_policy_version,
+            "routeReason": self.route_reason,
+            "fallbackReason": self.fallback_reason,
             "finishedAt": self.finished_at,
             "result": self.result,
             "commitSha": self.commit_sha,
@@ -504,6 +512,7 @@ class Orchestrator:
             adapter_version=str(envelope["adapterVersion"]),
             provider=str(envelope["provider"]),
             model=str(envelope["model"]),
+            model_alias=str(envelope.get("modelAlias") or envelope["model"]),
             prompt_sha256=str(envelope["promptSha256"]),
             envelope_sha256=str(envelope["envelopeSha256"]),
             work_ref=str(envelope.get("workRef", unit.unit_id)),
@@ -512,6 +521,9 @@ class Orchestrator:
             repair_cycle=unit.repair_count + (1 if kind == "repair" else 0),
             started_at=timestamp,
             event_key=event_key,
+            routing_policy_version=str(envelope.get("routingPolicyVersion") or ""),
+            route_reason=str(envelope.get("routeReason") or ""),
+            fallback_reason=str(envelope.get("fallbackReason") or ""),
         )
         unit.runs.append(record)
         unit.event_keys.add(event_key)
@@ -609,14 +621,23 @@ class Orchestrator:
             unit.state is WorkUnitState.VERIFYING,
             f"verification result requires state verifying, not {unit.state.value}",
         )
+        if passed:
+            target = WorkUnitState.REVIEWING
+            reason = "verification passed"
+        elif unit.repair_count < self.max_repair_cycles:
+            target = WorkUnitState.REPAIR_NEEDED
+            reason = "deterministic verification failed; bounded repair required"
+        else:
+            target = WorkUnitState.BLOCKED
+            reason = "deterministic verification failed; repair budget exhausted"
         return self.transition(
             unit_id,
-            WorkUnitState.REVIEWING if passed else WorkUnitState.FAILED,
+            target,
             actor=actor,
             actor_kind="system",
             event_key=event_key,
             timestamp=timestamp,
-            reason="verification passed" if passed else "verification failed",
+            reason=reason,
         )
 
     def record_review(
@@ -723,7 +744,7 @@ class Orchestrator:
             lines.extend(["", "| run | kind | mission | agent | result |", "|---|---|---|---|---|"])
             lines.extend(
                 f"| `{run.run_id}` | {run.kind} | {run.mission_id}@{run.mission_version} "
-                f"| {run.agent_id} ({run.model}) | {run.result} |"
+                f"| {run.agent_id} ({run.model_alias}) | {run.result} |"
                 for run in unit.runs
             )
         return "\n".join(lines) + "\n"
@@ -785,6 +806,7 @@ class Orchestrator:
                     adapter_version=str(item["adapterVersion"]),
                     provider=str(item["provider"]),
                     model=str(item["model"]),
+                    model_alias=str(item.get("modelAlias") or item["model"]),
                     prompt_sha256=str(item["promptSha256"]),
                     envelope_sha256=str(item["envelopeSha256"]),
                     work_ref=str(item.get("workRef", "")),
@@ -793,6 +815,9 @@ class Orchestrator:
                     repair_cycle=int(item.get("repairCycle", 0)),
                     started_at=str(item["startedAt"]),
                     event_key=str(item.get("eventKey", "")),
+                    routing_policy_version=str(item.get("routingPolicyVersion", "")),
+                    route_reason=str(item.get("routeReason", "")),
+                    fallback_reason=str(item.get("fallbackReason", "")),
                     finished_at=str(item.get("finishedAt", "")),
                     result=str(item.get("result", "running")),
                     commit_sha=str(item.get("commitSha", "")),

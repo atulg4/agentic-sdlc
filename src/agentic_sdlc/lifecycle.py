@@ -174,12 +174,20 @@ class AutonomousLifecycleDriver:
                     reason="deterministic verification passed",
                 )
             if verification is StageResult.FAILED:
+                if unit.repair_count >= self._orchestrator.max_repair_cycles:
+                    return self._transition(
+                        unit_id,
+                        WorkUnitState.BLOCKED,
+                        timestamp=timestamp,
+                        event_key=event_key,
+                        reason="deterministic verification failed; repair budget exhausted",
+                    )
                 return self._transition(
                     unit_id,
-                    WorkUnitState.FAILED,
+                    WorkUnitState.REPAIR_NEEDED,
                     timestamp=timestamp,
                     event_key=event_key,
-                    reason="deterministic verification failed",
+                    reason="deterministic verification failed; bounded repair required",
                 )
             return self._waiting(unit_id, "waiting for deterministic verification")
         if state in {WorkUnitState.REVIEWING, WorkUnitState.RE_REVIEWING}:

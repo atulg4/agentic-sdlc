@@ -166,7 +166,7 @@ def test_implementation_must_pass_before_verification_starts() -> None:
     assert orchestrator.get(unit_id).state is WorkUnitState.VERIFYING
 
 
-def test_failed_deterministic_verification_is_terminal() -> None:
+def test_failed_deterministic_verification_enters_bounded_repair() -> None:
     driver, orchestrator, unit_id = _driver_at(WorkUnitState.VERIFYING)
 
     result = driver.advance(
@@ -177,8 +177,48 @@ def test_failed_deterministic_verification_is_terminal() -> None:
         verification=StageResult.FAILED,
     )
 
-    assert result.to_state is WorkUnitState.FAILED
-    assert orchestrator.get(unit_id).state is WorkUnitState.FAILED
+    assert result.to_state is WorkUnitState.REPAIR_NEEDED
+    assert "bounded repair required" in result.reason
+    assert orchestrator.get(unit_id).state is WorkUnitState.REPAIR_NEEDED
+
+
+def test_failed_deterministic_verification_blocks_only_after_repair_budget_exhausted() -> None:
+    orchestrator = Orchestrator(max_repair_cycles=1)
+    unit_id = "github:atulg4/example:issue:52"
+    orchestrator.create_unit(unit_id, event_key="create", timestamp="2026-08-15T06:00:00Z")
+    for index, target in enumerate(
+        [
+            WorkUnitState.TRIAGED,
+            WorkUnitState.SPECIFIED,
+            WorkUnitState.PLANNED,
+            WorkUnitState.APPROVED,
+            WorkUnitState.DISPATCHED,
+            WorkUnitState.IMPLEMENTING,
+            WorkUnitState.VERIFYING,
+        ],
+        start=1,
+    ):
+        orchestrator.transition(
+            unit_id,
+            target,
+            actor="test-system",
+            actor_kind="system",
+            event_key=f"seed-{index}",
+            timestamp="2026-08-15T06:00:00Z",
+        )
+    orchestrator.get(unit_id).repair_count = 1
+    driver = AutonomousLifecycleDriver(orchestrator)
+
+    result = driver.advance(
+        unit_id,
+        timestamp="2026-08-15T06:01:00Z",
+        event_key="verify-fail-exhausted",
+        autonomy=_autonomy_ready(),
+        verification=StageResult.FAILED,
+    )
+
+    assert result.to_state is WorkUnitState.BLOCKED
+    assert "repair budget exhausted" in result.reason
 
 
 def test_review_changes_enter_bounded_repair_path() -> None:
