@@ -67,14 +67,19 @@ def test_implementation_separates_ai_verifier_and_publisher_authority() -> None:
 
 def test_claude_subscription_oauth_is_explicit_and_never_silently_falls_back() -> None:
     document = (WORKFLOWS / "reusable-implement.yml").read_text(encoding="utf-8")
+    preparer = _job(document, "prepare", "generate_patch")
     generator = _job(document, "generate_patch", "verify")
 
     assert "claude_auth_mode:" in document
     assert "default: subscription_oauth" in document
     assert "subscription_oauth|direct_api" in document
-    assert "inputs.claude_auth_mode == 'subscription_oauth'" in generator
+    # The legacy input is translated into the routed executor auth mode in prepare,
+    # and patch generation dispatches only on that recorded auth mode.
+    assert "CLAUDE_AUTH_MODE: ${{ inputs.claude_auth_mode }}" in preparer
+    assert "inputs.claude_auth_mode" not in generator
+    assert "needs.prepare.outputs.selected_auth_mode == 'oauth'" in generator
     assert "claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}" in generator
-    assert "inputs.claude_auth_mode == 'direct_api'" in generator
+    assert "needs.prepare.outputs.selected_auth_mode == 'api-key'" in generator
     assert "anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}" in generator
 
     caller = (ROOT / "src/agentic_sdlc/templates/github/agent-implement.yml").read_text(

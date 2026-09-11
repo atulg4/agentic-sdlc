@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,19 @@ from .orchestration import OrchestrationError, Orchestrator
 from .policy import evaluate_diff, evaluate_task, load_policy
 from .scaffold import ScaffoldError, scaffold_project
 from .task_spec import TaskSpecError, parse_task, render_prompt
+
+
+def _budget_usd(value: str) -> float:
+    """Parse a budget, rejecting NaN and infinity which disable spend limits."""
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"budget must be a number: {value}") from error
+    if not math.isfinite(parsed):
+        raise argparse.ArgumentTypeError(f"budget must be a finite number: {value}")
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(f"budget cannot be negative: {value}")
+    return parsed
 
 
 def _write(data: dict[str, Any], output: str | None) -> None:
@@ -521,7 +535,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     route.add_argument("--required-tool-capability", action="append", default=[])
     route.add_argument("--min-context-window", type=int, default=0)
-    route.add_argument("--budget-usd", type=float, required=True)
+    route.add_argument("--budget-usd", type=_budget_usd, required=True)
     route.add_argument("--output")
     route.set_defaults(handler=_route_executor)
 
