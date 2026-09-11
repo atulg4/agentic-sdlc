@@ -11,14 +11,19 @@ from pathlib import Path
 from typing import Any
 
 __all__ = [
+    "RETRY_COMMENT_MARKER",
     "FailureClass",
     "InfraRecoveryError",
     "RetryAction",
     "RetryDecision",
     "RetryState",
+    "backoff_delay_seconds",
+    "build_blocker",
     "classify_failure",
     "decide_retry",
     "load_retry_state",
+    "render_retry_comment",
+    "retry_state_from_comments",
     "write_retry_state",
 ]
 
@@ -37,8 +42,23 @@ class FailureClass(StrEnum):
 
 class RetryAction(StrEnum):
     RETRY_FAILED_JOBS = "retry_failed_jobs"
+    ROUTE_TO_BOUNDED_REPAIR = "route_to_bounded_repair"
     BLOCK = "block"
     NOOP = "noop"
+
+
+#: Durable retry evidence lives in trusted bot comments on the pull request so
+#: it survives workflow interruption without a parallel state service.
+RETRY_COMMENT_MARKER = "forge-transient-retry"
+
+#: Failure classes that a bounded exact-head repair cycle owns. They are never
+#: retried as infrastructure: rerunning them would only reproduce the failure.
+_REPAIR_ROUTED = frozenset(
+    {
+        FailureClass.DETERMINISTIC_CODE_OR_TEST,
+        FailureClass.REVIEW_CHANGES_REQUESTED,
+    }
+)
 
 
 _TRANSIENT_PATTERNS = tuple(
@@ -104,6 +124,7 @@ class RetryDecision:
     head_sha: str
     retry_job_ids: tuple[int, ...] = ()
     next_delay_seconds: int = 0
+    head_unchanged: bool = True
     blocker: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -119,6 +140,7 @@ class RetryDecision:
             "headSha": self.head_sha,
             "retryJobIds": list(self.retry_job_ids),
             "nextDelaySeconds": self.next_delay_seconds,
+            "headUnchanged": self.head_unchanged,
         }
         if self.blocker is not None:
             document["blocker"] = self.blocker
@@ -168,6 +190,20 @@ class RetryState:
     ) -> bool:
         record = self._records.get(self.key(repository, pull_request_number, run_id, head_sha), {})
         return record.get("status") == "retrying"
+
+    def has_event(
+        self,
+        repository: str,
+        pull_request_number: int,
+        run_id: int,
+        head_sha: str,
+        event_key: str,
+    ) -> bool:
+        """Report whether this exact completion event was already acted on."""
+
+        record = self._records.get(self.key(repository, pull_request_number, run_id, head_sha), {})
+        events = record.get("events", [])
+        return isinstance(events, list) and event_key in events
 
     def record_retry(self, decision: RetryDecision, *, event_key: str, timestamp: str) -> None:
         if decision.action is not RetryAction.RETRY_FAILED_JOBS:
@@ -264,8 +300,17 @@ def decide_retry(
     failed_job_ids: tuple[int, ...] = (),
     max_attempts: int = 3,
     base_delay_seconds: int = 60,
+    event_key: str = "",
+    last_error_summary: str = "",
 ) -> RetryDecision:
-    """Return the next idempotent exact-head retry action."""
+    """Return the next idempotent exact-head retry action.
+
+    ``event_key`` identifies one trusted completion event (for GitHub Actions,
+    the run id plus its run attempt). When supplied, an event that was already
+    acted on is a no-op, so duplicate deliveries and the hourly watchdog can
+    replay the same evidence without spending retry budget. Without it the
+    decision falls back to the coarser in-flight check.
+    """
 
     _require_non_empty(repository, "repository")
     if pull_request_number <= 0:
@@ -282,84 +327,158 @@ def decide_retry(
         raise InfraRecoveryError("failed job IDs must be positive")
 
     attempts = state.attempts(repository, pull_request_number, run_id, head_sha)
-    if head_sha != current_head_sha:
+    head_unchanged = head_sha == current_head_sha
+
+    def _decision(
+        action: RetryAction,
+        reason: str,
+        *,
+        recorded_attempts: int | None = None,
+        retry_job_ids: tuple[int, ...] = (),
+        next_delay_seconds: int = 0,
+        blocker: dict[str, Any] | None = None,
+    ) -> RetryDecision:
         return RetryDecision(
-            RetryAction.NOOP,
+            action,
             failure_class,
-            "failed run is stale for the current PR head",
-            attempts,
+            reason,
+            attempts if recorded_attempts is None else recorded_attempts,
             max_attempts,
             repository,
             pull_request_number,
             run_id,
             head_sha,
-        )
-    if failure_class is not FailureClass.TRANSIENT_INFRASTRUCTURE:
-        return RetryDecision(
-            RetryAction.NOOP,
-            failure_class,
-            "failure class is not retryable as infrastructure",
-            attempts,
-            max_attempts,
-            repository,
-            pull_request_number,
-            run_id,
-            head_sha,
-        )
-    if state.in_flight(repository, pull_request_number, run_id, head_sha):
-        return RetryDecision(
-            RetryAction.NOOP,
-            failure_class,
-            "transient retry is already in flight for this exact head",
-            attempts,
-            max_attempts,
-            repository,
-            pull_request_number,
-            run_id,
-            head_sha,
-        )
-    if attempts >= max_attempts:
-        blocker = {
-            "class": "external_infrastructure",
-            "userActionRequired": False,
-            "headSha": head_sha,
-            "attempts": attempts,
-            "maxAttempts": max_attempts,
-            "lastErrorSummary": "transient infrastructure retry budget exhausted",
-            "nextAction": "blocked_exhausted",
-        }
-        return RetryDecision(
-            RetryAction.BLOCK,
-            failure_class,
-            "transient infrastructure retry budget exhausted",
-            attempts,
-            max_attempts,
-            repository,
-            pull_request_number,
-            run_id,
-            head_sha,
+            retry_job_ids=retry_job_ids,
+            next_delay_seconds=next_delay_seconds,
+            head_unchanged=head_unchanged,
             blocker=blocker,
         )
 
+    if not head_unchanged:
+        # A new head owns its own budget; old-head evidence is never reused.
+        return _decision(RetryAction.NOOP, "failed run is stale for the current PR head")
+    if failure_class in _REPAIR_ROUTED:
+        return _decision(
+            RetryAction.ROUTE_TO_BOUNDED_REPAIR,
+            "substantive failure belongs to bounded exact-head repair, not infrastructure retry",
+        )
+    if failure_class is not FailureClass.TRANSIENT_INFRASTRUCTURE:
+        return _decision(RetryAction.NOOP, "failure class is not retryable as infrastructure")
+    if event_key:
+        if state.has_event(repository, pull_request_number, run_id, head_sha, event_key):
+            return _decision(
+                RetryAction.NOOP,
+                "this completion event was already acted on for the exact head",
+            )
+    elif state.in_flight(repository, pull_request_number, run_id, head_sha):
+        return _decision(
+            RetryAction.NOOP, "transient retry is already in flight for this exact head"
+        )
+    if attempts >= max_attempts:
+        return _decision(
+            RetryAction.BLOCK,
+            "transient infrastructure retry budget exhausted",
+            blocker=build_blocker(
+                repository=repository,
+                pull_request_number=pull_request_number,
+                run_id=run_id,
+                head_sha=head_sha,
+                attempts=attempts,
+                max_attempts=max_attempts,
+                last_error_summary=last_error_summary,
+            ),
+        )
+
     next_attempt = attempts + 1
+    return _decision(
+        RetryAction.RETRY_FAILED_JOBS,
+        "retry only failed or cancelled jobs for the unchanged exact head",
+        recorded_attempts=next_attempt,
+        retry_job_ids=tuple(sorted(set(failed_job_ids))),
+        next_delay_seconds=backoff_delay_seconds(
+            repository=repository,
+            pull_request_number=pull_request_number,
+            run_id=run_id,
+            head_sha=head_sha,
+            attempt=next_attempt,
+            base_delay_seconds=base_delay_seconds,
+        ),
+    )
+
+
+def _sanitize_summary(last_error_summary: str) -> str:
+    """Reduce an untrusted CI log excerpt to inert single-line marker text.
+
+    The summary is quoted back inside an HTML comment marker, so a log that
+    contains ``-->`` would otherwise truncate the durable retry record and
+    silently reset the budget.
+    """
+
+    collapsed = " ".join(last_error_summary.split())
+    neutralized = collapsed.replace("-->", "--&gt;").replace("<!--", "&lt;!--")
+    return neutralized[:500] or "transient infrastructure retry budget exhausted"
+
+
+def backoff_delay_seconds(
+    *,
+    repository: str,
+    pull_request_number: int,
+    run_id: int,
+    head_sha: str,
+    attempt: int,
+    base_delay_seconds: int = 60,
+    max_delay_seconds: int = 3600,
+) -> int:
+    """Bounded exponential backoff with deterministic per-target jitter.
+
+    Jitter is derived from the retry target rather than a random source so the
+    same attempt always yields the same delay. Concurrent PRs hitting the same
+    platform incident still spread out, but a replayed decision never changes.
+    """
+
+    if attempt <= 0:
+        raise InfraRecoveryError("attempt must be positive")
+    if base_delay_seconds <= 0:
+        raise InfraRecoveryError("base_delay_seconds must be positive")
+    if max_delay_seconds < base_delay_seconds:
+        raise InfraRecoveryError("max_delay_seconds must not be below base_delay_seconds")
     digest = hashlib.sha256(
-        f"{repository}:{pull_request_number}:{run_id}:{head_sha}:{next_attempt}".encode()
+        f"{repository}:{pull_request_number}:{run_id}:{head_sha}:{attempt}".encode()
     ).hexdigest()
     jitter = int(digest[:4], 16) % base_delay_seconds
-    delay = min(base_delay_seconds * (2 ** (next_attempt - 1)) + jitter, 3600)
-    return RetryDecision(
-        RetryAction.RETRY_FAILED_JOBS,
-        failure_class,
-        "retry only failed or cancelled jobs for the unchanged exact head",
-        next_attempt,
-        max_attempts,
-        repository,
-        pull_request_number,
-        run_id,
-        head_sha,
-        retry_job_ids=tuple(sorted(set(failed_job_ids))),
-        next_delay_seconds=delay,
-    )
+    return min(base_delay_seconds * (2 ** (attempt - 1)) + jitter, max_delay_seconds)
+
+
+def build_blocker(
+    *,
+    repository: str,
+    pull_request_number: int,
+    run_id: int,
+    head_sha: str,
+    attempts: int,
+    max_attempts: int,
+    last_error_summary: str = "",
+) -> dict[str, Any]:
+    """Build the durable external-infrastructure blocker record.
+
+    ``userActionRequired`` is false: budget exhaustion is evidence about the
+    platform, not about the change under review. Nothing here bypasses a
+    required check or converts a red result to green.
+    """
+
+    summary = _sanitize_summary(last_error_summary)
+    return {
+        "class": "external_infrastructure",
+        "userActionRequired": False,
+        "repository": repository,
+        "pullRequestNumber": pull_request_number,
+        "runId": run_id,
+        "headSha": head_sha,
+        "attempts": attempts,
+        "maxAttempts": max_attempts,
+        "lastErrorSummary": summary,
+        "nextAction": "blocked_exhausted",
+    }
 
 
 def load_retry_state(path: str | Path) -> RetryState:
@@ -373,3 +492,151 @@ def write_retry_state(state: RetryState, path: str | Path) -> None:
     Path(path).write_text(
         json.dumps(state.as_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
+
+
+_MARKER = re.compile(
+    rf"<!--\s*{RETRY_COMMENT_MARKER}\s+(\{{.*?\}})\s*-->",
+    re.DOTALL,
+)
+
+#: Only comments authored by the repository's own Actions identity are trusted
+#: as retry evidence. Anyone can write a comment; nobody but the workflow can
+#: write one as this author.
+TRUSTED_RETRY_COMMENT_LOGINS: tuple[str, ...] = ("github-actions[bot]",)
+
+
+def render_retry_comment(decision: RetryDecision, *, event_key: str, timestamp: str) -> str:
+    """Render the durable pull-request comment that records one retry decision."""
+
+    if decision.action not in {RetryAction.RETRY_FAILED_JOBS, RetryAction.BLOCK}:
+        raise InfraRecoveryError("only retry and block decisions produce durable evidence")
+    _require_non_empty(event_key, "event_key")
+    _require_non_empty(timestamp, "timestamp")
+    if "-->" in event_key:
+        raise InfraRecoveryError("event_key must not close an HTML comment")
+    retrying = decision.action is RetryAction.RETRY_FAILED_JOBS
+    payload = {
+        "schemaVersion": 1,
+        "repository": decision.repository,
+        "pullRequestNumber": decision.pull_request_number,
+        "runId": decision.run_id,
+        "headSha": decision.head_sha,
+        "attempts": decision.attempts,
+        "maxAttempts": decision.max_attempts,
+        "status": "retrying" if retrying else "exhausted",
+        "eventKey": event_key,
+        "timestamp": timestamp,
+        "retryJobIds": list(decision.retry_job_ids),
+    }
+    if decision.blocker is not None:
+        payload["blocker"] = decision.blocker
+    marker = f"<!-- {RETRY_COMMENT_MARKER} {json.dumps(payload, sort_keys=True)} -->"
+    if retrying:
+        body = (
+            f"Forge classified run {decision.run_id} at exact head "
+            f"`{decision.head_sha}` as a transient GitHub infrastructure failure and "
+            f"is re-running only the failed jobs (auto-retry "
+            f"{decision.attempts}/{decision.max_attempts}, next attempt in "
+            f"{decision.next_delay_seconds}s). No required check was bypassed, "
+            "skipped, or converted to green."
+        )
+    else:
+        blocker = decision.blocker or {}
+        body = (
+            "Blocked: GitHub infrastructure. Forge stopped automatic retries after "
+            f"{decision.attempts}/{decision.max_attempts} attempts on unchanged head "
+            f"`{decision.head_sha}`. User action required: no. Last error: "
+            f"{blocker.get('lastErrorSummary', 'unknown')}. The pull request stays red "
+            "until the platform recovers or a new commit arrives."
+        )
+    return f"{marker}\n{body}"
+
+
+def retry_state_from_comments(
+    comments: Any,
+    *,
+    trusted_logins: tuple[str, ...] = TRUSTED_RETRY_COMMENT_LOGINS,
+) -> RetryState:
+    """Rebuild durable retry state from trusted pull-request comments.
+
+    Comment bodies are untrusted text: markers from any other author are
+    ignored, and a malformed payload is skipped rather than allowed to grant
+    extra budget.
+    """
+
+    if not isinstance(comments, list):
+        raise InfraRecoveryError("comments must be a list")
+    trusted = {login.lower() for login in trusted_logins}
+    records: dict[str, dict[str, Any]] = {}
+    for comment in comments:
+        if not isinstance(comment, dict):
+            raise InfraRecoveryError("each comment must be an object")
+        user = comment.get("user")
+        login = user.get("login", "") if isinstance(user, dict) else comment.get("login", "")
+        if not isinstance(login, str) or login.lower() not in trusted:
+            continue
+        body = comment.get("body")
+        if not isinstance(body, str):
+            continue
+        for match in _MARKER.finditer(body):
+            payload = _parse_marker(match.group(1))
+            if payload is None:
+                continue
+            _merge_marker(records, payload)
+    return RetryState(records)
+
+
+def _parse_marker(raw: str) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(payload, dict) or payload.get("schemaVersion") != 1:
+        return None
+    repository = payload.get("repository")
+    head_sha = payload.get("headSha")
+    event_key = payload.get("eventKey")
+    if not isinstance(repository, str) or not repository:
+        return None
+    if not isinstance(head_sha, str) or not _HEAD_SHA.fullmatch(head_sha):
+        return None
+    if not isinstance(event_key, str) or not event_key:
+        return None
+    for field in ("pullRequestNumber", "runId", "attempts"):
+        value = payload.get(field)
+        if type(value) is not int or value <= 0:
+            return None
+    if payload.get("status") not in {"retrying", "exhausted"}:
+        return None
+    return payload
+
+
+def _merge_marker(records: dict[str, dict[str, Any]], payload: dict[str, Any]) -> None:
+    key = RetryState.key(
+        payload["repository"],
+        payload["pullRequestNumber"],
+        payload["runId"],
+        payload["headSha"],
+    )
+    record = records.setdefault(
+        key,
+        {
+            "attempts": 0,
+            "events": [],
+            "repository": payload["repository"],
+            "pullRequestNumber": payload["pullRequestNumber"],
+            "runId": payload["runId"],
+            "headSha": payload["headSha"],
+        },
+    )
+    events = record["events"]
+    if payload["eventKey"] not in events:
+        events.append(payload["eventKey"])
+    record["attempts"] = max(int(record["attempts"]), payload["attempts"])
+    if payload["status"] == "exhausted":
+        record["status"] = "exhausted"
+        blocker = payload.get("blocker")
+        if isinstance(blocker, dict):
+            record["blocker"] = blocker
+    elif record.get("status") != "exhausted":
+        record["status"] = "retrying"

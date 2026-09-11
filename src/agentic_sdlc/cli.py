@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .artifact import ArtifactError, create_manifest, verify_manifest, write_manifest
+from .dashboard_efficiency import build_infrastructure_blocker_panel
 from .events import EventError, normalize_event
 from .executors import (
     ExecutorError,
@@ -27,6 +28,8 @@ from .infra_recovery import (
     classify_failure,
     decide_retry,
     load_retry_state,
+    render_retry_comment,
+    retry_state_from_comments,
     write_retry_state,
 )
 from .knowledge import KnowledgeError, load_sources
@@ -335,7 +338,13 @@ def _classify_failure(args: argparse.Namespace) -> int:
 
 
 def _decide_infra_retry(args: argparse.Namespace) -> int:
-    state = load_retry_state(args.state)
+    if bool(args.state) == bool(args.comments):
+        raise InfraRecoveryError("exactly one of --state or --comments is required")
+    if args.comments:
+        comments = json.loads(Path(args.comments).read_text(encoding="utf-8"))
+        state = retry_state_from_comments(comments)
+    else:
+        state = load_retry_state(args.state)
     decision = decide_retry(
         repository=args.repository,
         pull_request_number=args.pull_request_number,
@@ -347,12 +356,32 @@ def _decide_infra_retry(args: argparse.Namespace) -> int:
         failed_job_ids=tuple(args.failed_job_id),
         max_attempts=args.max_attempts,
         base_delay_seconds=args.base_delay_seconds,
+        event_key=args.event_key,
+        last_error_summary=args.last_error_summary,
     )
-    if decision.action is RetryAction.RETRY_FAILED_JOBS and args.event_key:
-        state.record_retry(decision, event_key=args.event_key, timestamp=args.timestamp)
-    elif decision.action is RetryAction.BLOCK and args.event_key:
-        state.record_exhaustion(decision, event_key=args.event_key, timestamp=args.timestamp)
-    write_retry_state(state, args.state)
+    if args.event_key:
+        if decision.action is RetryAction.RETRY_FAILED_JOBS:
+            state.record_retry(decision, event_key=args.event_key, timestamp=args.timestamp)
+        elif decision.action is RetryAction.BLOCK:
+            state.record_exhaustion(decision, event_key=args.event_key, timestamp=args.timestamp)
+    if args.state:
+        write_retry_state(state, args.state)
+    if args.comment_output and decision.action in {
+        RetryAction.RETRY_FAILED_JOBS,
+        RetryAction.BLOCK,
+    }:
+        Path(args.comment_output).write_text(
+            render_retry_comment(decision, event_key=args.event_key, timestamp=args.timestamp)
+            + "\n",
+            encoding="utf-8",
+        )
+    if args.panel_output:
+        _write(
+            build_infrastructure_blocker_panel(
+                decision.as_dict(), observed_at=args.timestamp or None
+            ),
+            args.panel_output,
+        )
     _write(decision.as_dict(), args.output)
     return 0 if decision.action is not RetryAction.BLOCK else 2
 
@@ -536,7 +565,8 @@ def build_parser() -> argparse.ArgumentParser:
     classify_failure_parser.set_defaults(handler=_classify_failure)
 
     infra_retry = commands.add_parser("decide-infra-retry")
-    infra_retry.add_argument("--state", required=True)
+    infra_retry.add_argument("--state")
+    infra_retry.add_argument("--comments")
     infra_retry.add_argument("--repository", required=True)
     infra_retry.add_argument("--pull-request-number", type=int, required=True)
     infra_retry.add_argument("--run-id", type=int, required=True)
@@ -552,6 +582,9 @@ def build_parser() -> argparse.ArgumentParser:
     infra_retry.add_argument("--base-delay-seconds", type=int, default=60)
     infra_retry.add_argument("--event-key", default="")
     infra_retry.add_argument("--timestamp", default="")
+    infra_retry.add_argument("--last-error-summary", default="")
+    infra_retry.add_argument("--comment-output")
+    infra_retry.add_argument("--panel-output")
     infra_retry.add_argument("--output")
     infra_retry.set_defaults(handler=_decide_infra_retry)
 
