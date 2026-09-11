@@ -135,3 +135,23 @@ template. It resolves a candidate from a failed `workflow_run` or
 `check_suite` completion, falls back to an hourly watchdog sweep that recovers
 at most one stranded head per pass, and calls the reusable workflow through a
 SHA-pinned reference with no copied decision logic.
+
+## Lifecycle event ledger
+
+The state machine above owns one work unit inside one repository. The
+multi-project ledger in `src/agentic_sdlc/event_ledger.py` records the same
+lifecycle as an append-only event stream across every registered project, and
+projects it back to current state deterministically.
+
+`FactoryState` is a superset of `WorkUnitState` — same values, plus the
+post-merge release states (`deploying`, `deployment-verifying`, `live`,
+`rolling-back`, `rolled-back`) that this engine deliberately does not own — and
+`FACTORY_TRANSITIONS` is derived from `TRANSITIONS` above, so the two tables
+cannot drift. A projected transition serializes to exactly the
+`TransitionRecord` shape this module writes, and
+`events_from_orchestrator_document()` migrates an existing
+`sdlcctl orchestrate` state file into ledger events without losing a
+transition.
+
+Authority stays here: the ledger records what happened and never re-decides who
+may approve, merge, or unblock. See [docs/project-registry.md](project-registry.md).
