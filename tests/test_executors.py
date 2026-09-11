@@ -456,3 +456,172 @@ def test_policy_can_deny_training_storage_and_provider_families() -> None:
     reasons = {item["executorId"]: item["rejectionReasons"] for item in decision.candidates}
     assert "provider denied" in reasons["openai-denied"]
     assert "training-data storage not allowed" in reasons["deepseek-training"]
+
+
+def test_explicit_empty_provider_allowlist_denies_every_executor() -> None:
+    executors = load_executors([_executor("openai-1")])
+    policy = load_routing_policy({"policyVersion": "deny-all", "allowedProviders": []})
+
+    assert policy.allowed_providers == ()
+
+    decision = route_executor(_request(), executors, policy)
+
+    assert decision.status is RouteStatus.INSUFFICIENT_BUDGET_OR_ASSURANCE
+    assert decision.selected_executor_id == ""
+    assert "provider not allowed" in decision.candidates[0]["rejectionReasons"]
+
+
+def test_missing_provider_allowlist_still_defaults_to_every_known_provider() -> None:
+    policy = load_routing_policy({"policyVersion": "defaults"})
+
+    assert "openai" in policy.allowed_providers
+    assert "deepseek" in policy.allowed_providers
+
+
+def test_routing_policy_rejects_unknown_top_level_keys() -> None:
+    with pytest.raises(ExecutorError, match="unknown keys: deniedProvider"):
+        load_routing_policy({"policyVersion": "typo", "deniedProvider": ["deepseek"]})
+
+    with pytest.raises(ExecutorError, match="unknown keys: requireNoTrainingStore"):
+        load_routing_policy({"requireNoTrainingStore": True})
+
+
+def test_non_finite_route_budget_is_rejected() -> None:
+    executors = load_executors([_executor("openai-1")])
+
+    with pytest.raises(ExecutorError, match="budget_usd must be a finite number"):
+        route_executor(_request(budget_usd=float("nan")), executors)
+
+    with pytest.raises(ExecutorError, match="budget_usd must be a finite number"):
+        route_executor(_request(budget_usd=float("inf")), executors)
+
+    with pytest.raises(ExecutorError, match="budget_usd cannot be negative"):
+        route_executor(_request(budget_usd=-1.0), executors)
+
+
+def test_zero_quality_executor_under_a_zero_floor_is_rejected_without_asserting() -> None:
+    executors = load_executors([_executor("free-but-unproven", qualityLowerBound=0.0)])
+    policy = load_routing_policy(
+        {
+            "policyVersion": "zero-floor",
+            "qualityFloors": {"low": 0, "medium": 0, "high": 0, "critical": 0},
+        }
+    )
+
+    decision = route_executor(_request(), executors, policy)
+
+    assert decision.status is RouteStatus.INSUFFICIENT_BUDGET_OR_ASSURANCE
+    candidate = decision.candidates[0]
+    assert candidate["ecps"] is None
+    assert candidate["eligible"] is False
+    assert any(
+        "qualityLowerBound must be greater than zero" in reason
+        for reason in candidate["rejectionReasons"]
+    )
+
+
+def test_capacity_exhaustion_is_reported_as_a_recoverable_fallback_reason() -> None:
+    executors = load_executors(
+        [
+            _executor("openai-busy", maxConcurrency=2, activeRuns=2),
+            _executor(
+                "claude-subscription-drained",
+                provider="anthropic",
+                adapter="claude-code",
+                model="claude-opus-5",
+                modelFamily="claude",
+                executionType="subscription-cloud",
+                authMode="oauth",
+                directCostUsd=0.0,
+                shadowCostUsd=1.5,
+                subscriptionMonthlyUsd=200.0,
+                subscriptionCapacityRemaining=0,
+            ),
+            _executor("openai-free", directCostUsd=1.0),
+        ]
+    )
+
+    decision = route_executor(_request(), executors)
+
+    assert decision.selected_executor_id == "openai-free"
+    by_id = {item["executorId"]: item for item in decision.candidates}
+    assert by_id["openai-busy"]["recoverable"] is True
+    assert by_id["claude-subscription-drained"]["recoverable"] is True
+    assert by_id["openai-free"]["recoverable"] is False
+
+
+def test_partial_preference_override_keeps_defaults_for_other_routes() -> None:
+    policy = load_routing_policy(
+        {
+            "policyVersion": "partial",
+            "preferredModelAliases": {"implementation:medium": ["kimi-k3"]},
+        }
+    )
+
+    assert policy.preference_for(TaskClass.IMPLEMENTATION, RiskLevel.MEDIUM) == ("kimi-k3",)
+    assert policy.preference_for(TaskClass.IMPLEMENTATION, RiskLevel.CRITICAL) == (
+        "kimi-k3",
+        "glm-5.3",
+        "claude",
+    )
+    assert policy.preference_for(TaskClass.REPAIR, RiskLevel.HIGH) == (
+        "glm-5.3",
+        "kimi-k3",
+        "claude",
+    )
+
+
+def test_task_class_preference_override_still_wins_over_default_risk_routes() -> None:
+    policy = load_routing_policy(
+        {
+            "policyVersion": "task-level",
+            "preferredModelAliases": {"implementation": ["glm-5.3", "claude"]},
+        }
+    )
+
+    assert policy.preference_for(TaskClass.IMPLEMENTATION, RiskLevel.LOW) == ("glm-5.3", "claude")
+    assert policy.preference_for(TaskClass.REPAIR, RiskLevel.LOW) == (
+        "deepseek-v4-pro",
+        "deepseek-v4-flash",
+        "glm-5.3",
+        "kimi-k3",
+    )
+
+
+def test_partial_preference_override_does_not_flatten_critical_escalation_order() -> None:
+    executors = load_executors(
+        [
+            _executor(
+                "kimi-escalation",
+                provider="kimi",
+                adapter="kimi-direct",
+                model="kimi-k2-thinking",
+                modelAlias="kimi-k3",
+                modelFamily="kimi",
+                maxRisk="critical",
+                qualityLowerBound=0.97,
+                directCostUsd=4.0,
+            ),
+            _executor(
+                "zai-cheaper",
+                provider="zai",
+                adapter="zai-direct",
+                model="glm-5.3",
+                modelAlias="glm-5.3",
+                modelFamily="glm",
+                maxRisk="critical",
+                qualityLowerBound=0.96,
+                directCostUsd=1.0,
+            ),
+        ]
+    )
+    policy = load_routing_policy(
+        {
+            "policyVersion": "partial",
+            "preferredModelAliases": {"implementation:medium": ["deepseek-v4-pro"]},
+        }
+    )
+
+    decision = route_executor(_request(risk=RiskLevel.CRITICAL, budget_usd=10.0), executors, policy)
+
+    assert decision.selected_executor_id == "kimi-escalation"

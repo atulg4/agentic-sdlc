@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from agentic_sdlc.cli import main
 
 
@@ -424,6 +426,54 @@ def test_route_executor_cli_fails_closed_when_quality_floor_rejects_cheap_models
     assert decision["status"] == "insufficient-budget-or-assurance"
     assert decision["selectedExecutorId"] == ""
     assert decision["candidates"][0]["rejectionReasons"] == ["quality floor not met: 0.800 < 0.900"]
+
+
+def test_route_executor_cli_rejects_non_finite_budgets(tmp_path: Path, policy_file: Path) -> None:
+    executors = tmp_path / "executors.json"
+    executors.write_text(
+        json.dumps(
+            [
+                {
+                    "executorId": "deepseek-1",
+                    "provider": "deepseek",
+                    "adapter": "deepseek-direct",
+                    "adapterVersion": "1.0.0",
+                    "executionType": "direct-api",
+                    "authMode": "api-key",
+                    "model": "deepseek-reasoner",
+                    "modelFamily": "deepseek",
+                    "taskClasses": ["implementation"],
+                    "capabilities": ["edit-code", "author-tests", "run-commands"],
+                    "toolCapabilities": ["structured-output"],
+                    "contextWindow": 128000,
+                    "maxRisk": "medium",
+                    "qualityLowerBound": 0.8,
+                    "directCostUsd": 0.5,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    base = [
+        "route-executor",
+        "--config",
+        str(policy_file),
+        "--mission-id",
+        "implementation-worker",
+        "--executors",
+        str(executors),
+        "--repository",
+        "example/project",
+        "--task-class",
+        "implementation",
+        "--required-tool-capability",
+        "structured-output",
+    ]
+
+    for budget in ("nan", "inf", "-inf", "-1"):
+        with pytest.raises(SystemExit) as error:
+            main([*base, "--budget-usd", budget])
+        assert error.value.code == 2
 
 
 def test_orchestrate_cli_round_trips_state(tmp_path: Path) -> None:
