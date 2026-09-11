@@ -1,0 +1,126 @@
+name: Transient infrastructure retry
+
+# Trusted GitHub completion events drive normal recovery. The hourly watchdog
+# only picks up work a missed event would otherwise have stranded; the platform
+# workflow it calls refuses to spend budget twice for the same completion event.
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+  check_suite:
+    types: [completed]
+  schedule:
+    - cron: "23 * * * *"
+
+permissions: {}
+
+concurrency:
+  group: forge-transient-retry-discovery-${{ github.event.workflow_run.head_sha || github.event.check_suite.head_sha || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      pull-requests: read
+    outputs:
+      found: ${{ steps.candidate.outputs.found }}
+      pull_request_number: ${{ steps.candidate.outputs.pull_request_number }}
+      head_sha: ${{ steps.candidate.outputs.head_sha }}
+      run_id: ${{ steps.candidate.outputs.run_id }}
+      run_attempt: ${{ steps.candidate.outputs.run_attempt }}
+    steps:
+      - name: Resolve one failed run bound to an open same-repository PR head
+        id: candidate
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const RECOVERABLE = ['failure', 'cancelled', 'timed_out', 'startup_failure'];
+            // Never let this workflow recover itself into a loop.
+            const SELF = ['Transient infrastructure retry'];
+
+            const openPullRequests = async () => github.paginate(github.rest.pulls.list, {
+              owner, repo, state: 'open', per_page: 100,
+            });
+
+            const bindHead = async (sha) => {
+              if (!/^[0-9a-f]{40}$/.test(sha || '')) return null;
+              const pulls = await openPullRequests();
+              const pr = pulls.find(candidate => candidate.head.sha === sha);
+              if (!pr || pr.draft) return null;
+              if (pr.head.repo?.full_name !== `${owner}/${repo}`) return null;
+              return pr.number;
+            };
+
+            const failedRunsForHead = async (sha) => {
+              const runs = await github.rest.actions.listWorkflowRunsForRepo({
+                owner, repo, head_sha: sha, status: 'completed', per_page: 50,
+              });
+              return runs.data.workflow_runs
+                .filter(run => RECOVERABLE.includes(run.conclusion))
+                .filter(run => !SELF.includes(run.name));
+            };
+
+            const emit = (number, run) => {
+              core.setOutput('found', 'true');
+              core.setOutput('pull_request_number', String(number));
+              core.setOutput('head_sha', run.head_sha);
+              core.setOutput('run_id', String(run.id));
+              core.setOutput('run_attempt', String(run.run_attempt || 1));
+            };
+
+            core.setOutput('found', 'false');
+
+            if (context.eventName === 'workflow_run') {
+              const run = context.payload.workflow_run;
+              if (!RECOVERABLE.includes(run.conclusion) || SELF.includes(run.name)) return;
+              const number = run.pull_requests?.[0]?.number || await bindHead(run.head_sha);
+              if (!number) return;
+              const pr = await github.rest.pulls.get({ owner, repo, pull_number: number });
+              if (pr.data.state !== 'open' || pr.data.head.sha !== run.head_sha) return;
+              emit(number, run);
+              return;
+            }
+
+            if (context.eventName === 'check_suite') {
+              const suite = context.payload.check_suite;
+              if (!RECOVERABLE.includes(suite.conclusion)) return;
+              const number = await bindHead(suite.head_sha);
+              if (!number) return;
+              const runs = await failedRunsForHead(suite.head_sha);
+              if (!runs.length) return;
+              emit(number, runs[0]);
+              return;
+            }
+
+            // Hourly watchdog: recover at most one stranded head per sweep.
+            for (const pr of await openPullRequests()) {
+              if (pr.draft) continue;
+              if (pr.head.repo?.full_name !== `${owner}/${repo}`) continue;
+              const runs = await failedRunsForHead(pr.head.sha);
+              if (!runs.length) continue;
+              emit(pr.number, runs[0]);
+              return;
+            }
+
+  retry:
+    if: needs.discover.outputs.found == 'true'
+    needs: discover
+    uses: PLATFORM_REPOSITORY/.github/workflows/reusable-transient-retry.yml@PLATFORM_COMMIT_SHA
+    with:
+      pull_request_number: ${{ needs.discover.outputs.pull_request_number }}
+      head_sha: ${{ needs.discover.outputs.head_sha }}
+      run_id: ${{ needs.discover.outputs.run_id }}
+      run_attempt: ${{ needs.discover.outputs.run_attempt }}
+      max_attempts: ${{ fromJSON(vars.FORGE_MAX_TRANSIENT_RETRIES || '3') }}
+      base_delay_seconds: ${{ fromJSON(vars.FORGE_TRANSIENT_RETRY_BASE_DELAY_SECONDS || '60') }}
+      platform_ref: PLATFORM_COMMIT_SHA
+      platform_repository: PLATFORM_REPOSITORY
+    secrets:
+      PLATFORM_READ_TOKEN: ${{ secrets.PLATFORM_READ_TOKEN }}

@@ -1,0 +1,283 @@
+name: Reusable transient infrastructure retry
+
+# Recover from GitHub platform failures without touching the change under
+# review. This workflow never runs an AI agent, never edits code, and never
+# reports a red result as green: its only authority is asking GitHub to re-run
+# the jobs that failed, on the unchanged exact head, a bounded number of times.
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        description: JSON runner target for every job, e.g. '"ubuntu-latest"' or '["self-hosted","linux","x64"]'
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
+      pull_request_number:
+        required: true
+        type: string
+      head_sha:
+        required: true
+        type: string
+      run_id:
+        required: true
+        type: string
+      run_attempt:
+        required: true
+        type: string
+      max_attempts:
+        required: false
+        default: 3
+        type: number
+      base_delay_seconds:
+        required: false
+        default: 60
+        type: number
+      platform_ref:
+        required: true
+        type: string
+      platform_repository:
+        required: true
+        type: string
+    secrets:
+      PLATFORM_READ_TOKEN:
+        required: false
+
+permissions: {}
+
+concurrency:
+  # Serialize every retry decision for one exact head so a duplicate completion
+  # event and the hourly watchdog cannot both spend budget at the same time.
+  group: forge-transient-retry-${{ github.repository }}-${{ inputs.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  classify:
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+      issues: read
+      pull-requests: read
+    outputs:
+      action: ${{ steps.decide.outputs.action }}
+      attempts: ${{ steps.decide.outputs.attempts }}
+      delay_seconds: ${{ steps.decide.outputs.delay_seconds }}
+      failure_class: ${{ steps.decide.outputs.failure_class }}
+    steps:
+      - name: Validate transient retry request
+        env:
+          PR_NUMBER: ${{ inputs.pull_request_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          RUN_ID: ${{ inputs.run_id }}
+          RUN_ATTEMPT: ${{ inputs.run_attempt }}
+          MAX_ATTEMPTS: ${{ inputs.max_attempts }}
+          BASE_DELAY_SECONDS: ${{ inputs.base_delay_seconds }}
+          PLATFORM_REF: ${{ inputs.platform_ref }}
+          PLATFORM_REPOSITORY: ${{ inputs.platform_repository }}
+        run: |
+          set -euo pipefail
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]{0,9}$ ]]
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+          [[ "$RUN_ATTEMPT" =~ ^[1-9][0-9]{0,4}$ ]]
+          [[ "$MAX_ATTEMPTS" =~ ^[1-9][0-9]?$ ]]
+          test "$MAX_ATTEMPTS" -le 20
+          [[ "$BASE_DELAY_SECONDS" =~ ^[1-9][0-9]{0,3}$ ]]
+          [[ "$PLATFORM_REF" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PLATFORM_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+      - name: Bind failed run to exact open same-repository PR head
+        id: bind
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pull_request_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          RUN_ID: ${{ inputs.run_id }}
+          RUN_ATTEMPT: ${{ inputs.run_attempt }}
+        run: |
+          set -euo pipefail
+          pr="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")"
+          test "$(jq -r '.state' <<< "$pr")" = open
+          test "$(jq -r '.head.repo.full_name' <<< "$pr")" = "$GITHUB_REPOSITORY"
+          current_head="$(jq -r '.head.sha' <<< "$pr")"
+          [[ "$current_head" =~ ^[0-9a-f]{40}$ ]]
+          run="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}")"
+          test "$(jq -r '.head_sha' <<< "$run")" = "$HEAD_SHA"
+          test "$(jq -r '.status' <<< "$run")" = completed
+          test "$(jq -r '.run_attempt' <<< "$run")" = "$RUN_ATTEMPT"
+          conclusion="$(jq -r '.conclusion' <<< "$run")"
+          case "$conclusion" in
+            failure|cancelled|timed_out|startup_failure) ;;
+            *) echo "run conclusion ${conclusion} is not recoverable" >&2; exit 1 ;;
+          esac
+          printf 'current_head_sha=%s\n' "$current_head" >> "$GITHUB_OUTPUT"
+      - name: Collect failed jobs and untrusted failure evidence
+        id: evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+          RUN_ATTEMPT: ${{ inputs.run_attempt }}
+          PR_NUMBER: ${{ inputs.pull_request_number }}
+        run: |
+          set -euo pipefail
+          mkdir -p .agentic-retry
+          gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/attempts/${RUN_ATTEMPT}/jobs" \
+            --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out") | .id' \
+            > .agentic-retry/failed-job-ids.txt
+          : > .agentic-retry/failure.log
+          while read -r job_id; do
+            [ -n "$job_id" ] || continue
+            gh api --method GET "repos/${GITHUB_REPOSITORY}/check-runs/${job_id}/annotations" \
+              --jq '.[] | [.annotation_level, .message] | @tsv' >> .agentic-retry/failure.log || true
+          done < .agentic-retry/failed-job-ids.txt
+          gh run view "$RUN_ID" --attempt "$RUN_ATTEMPT" --log-failed \
+            >> .agentic-retry/failure.log 2>/dev/null || true
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('.agentic-retry/failure.log')
+          data = path.read_bytes()
+          limit = 200_000
+          if len(data) > limit:
+              path.write_bytes(b'[truncated to final 200000 bytes]\n' + data[-limit:])
+          PY
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            --slurp --jq '[.[][] | {body: .body, user: {login: .user.login}}]' \
+            > .agentic-retry/comments.json
+      - name: Check out pinned policy engine
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.platform_repository }}
+          ref: ${{ inputs.platform_ref }}
+          path: .agentic-platform
+          persist-credentials: false
+          token: ${{ secrets.PLATFORM_READ_TOKEN || github.token }}
+      - name: Classify failure and decide bounded exact-head retry
+        id: decide
+        env:
+          PR_NUMBER: ${{ inputs.pull_request_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          CURRENT_HEAD_SHA: ${{ steps.bind.outputs.current_head_sha }}
+          RUN_ID: ${{ inputs.run_id }}
+          RUN_ATTEMPT: ${{ inputs.run_attempt }}
+          MAX_ATTEMPTS: ${{ inputs.max_attempts }}
+          BASE_DELAY_SECONDS: ${{ inputs.base_delay_seconds }}
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="${GITHUB_WORKSPACE}/.agentic-platform/src"
+          python3 -m agentic_sdlc classify-failure \
+            --conclusion failure \
+            --log .agentic-retry/failure.log \
+            --output .agentic-retry/class.json
+          failure_class="$(jq -r '.failureClass' .agentic-retry/class.json)"
+          job_args=()
+          while read -r job_id; do
+            [ -n "$job_id" ] && job_args+=(--failed-job-id "$job_id")
+          done < .agentic-retry/failed-job-ids.txt
+          summary="$(tail -c 400 .agentic-retry/failure.log | tr '\n\t' '  ')"
+          set +e
+          python3 -m agentic_sdlc decide-infra-retry \
+            --comments .agentic-retry/comments.json \
+            --repository "$GITHUB_REPOSITORY" \
+            --pull-request-number "$PR_NUMBER" \
+            --run-id "$RUN_ID" \
+            --head-sha "$HEAD_SHA" \
+            --current-head-sha "$CURRENT_HEAD_SHA" \
+            --failure-class "$failure_class" \
+            --max-attempts "$MAX_ATTEMPTS" \
+            --base-delay-seconds "$BASE_DELAY_SECONDS" \
+            --event-key "run-${RUN_ID}-attempt-${RUN_ATTEMPT}" \
+            --timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --last-error-summary "$summary" \
+            --comment-output .agentic-retry/comment.md \
+            --panel-output .agentic-retry/blocker.json \
+            --output .agentic-retry/decision.json \
+            "${job_args[@]}"
+          status=$?
+          set -e
+          test "$status" -eq 0 -o "$status" -eq 2
+          {
+            printf 'action=%s\n' "$(jq -r '.action' .agentic-retry/decision.json)"
+            printf 'attempts=%s\n' "$(jq -r '.attempts' .agentic-retry/decision.json)"
+            printf 'delay_seconds=%s\n' "$(jq -r '.nextDelaySeconds' .agentic-retry/decision.json)"
+            printf 'failure_class=%s\n' "$failure_class"
+          } >> "$GITHUB_OUTPUT"
+      - name: Store retry decision evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: transient-retry-decision-${{ github.run_id }}
+          path: |
+            .agentic-retry/decision.json
+            .agentic-retry/blocker.json
+            .agentic-retry/comment.md
+          if-no-files-found: warn
+          include-hidden-files: true
+          retention-days: 3
+
+  record:
+    # Durable evidence is written before the rerun, so a duplicate event or the
+    # watchdog always observes the attempt that is already under way.
+    needs: classify
+    if: needs.classify.outputs.action == 'retry_failed_jobs' || needs.classify.outputs.action == 'block'
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    steps:
+      - name: Restore retry decision evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: transient-retry-decision-${{ github.run_id }}
+          path: .agentic-retry
+      - name: Record durable exact-head retry evidence
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          PR_NUMBER: ${{ inputs.pull_request_number }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('.agentic-retry/comment.md', 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number(process.env.PR_NUMBER),
+              body,
+            });
+
+  rerun:
+    needs: [classify, record]
+    if: needs.classify.outputs.action == 'retry_failed_jobs'
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 30
+    permissions:
+      actions: write
+      pull-requests: read
+    steps:
+      - name: Wait out bounded backoff with jitter
+        env:
+          DELAY_SECONDS: ${{ needs.classify.outputs.delay_seconds }}
+        run: |
+          set -euo pipefail
+          [[ "$DELAY_SECONDS" =~ ^[0-9]{1,4}$ ]]
+          delay="$DELAY_SECONDS"
+          test "$delay" -le 900 || delay=900
+          sleep "$delay"
+      - name: Re-run only the failed jobs on the unchanged exact head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pull_request_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+          # Fail closed: a new head owns its own budget and its own checks.
+          pr="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")"
+          test "$(jq -r '.state' <<< "$pr")" = open
+          test "$(jq -r '.head.sha' <<< "$pr")" = "$HEAD_SHA"
+          run="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}")"
+          test "$(jq -r '.head_sha' <<< "$run")" = "$HEAD_SHA"
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/rerun-failed-jobs"
