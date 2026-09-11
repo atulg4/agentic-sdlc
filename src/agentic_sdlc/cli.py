@@ -10,6 +10,14 @@ from typing import Any
 
 from .artifact import ArtifactError, create_manifest, verify_manifest, write_manifest
 from .events import EventError, normalize_event
+from .executors import (
+    ExecutorError,
+    RouteRequest,
+    TaskClass,
+    load_executors,
+    load_routing_policy,
+    route_executor,
+)
 from .gates import GateError, run_gates, write_report
 from .git_diff import GitDiffError, collect_git_diff
 from .knowledge import KnowledgeError, load_sources
@@ -198,6 +206,38 @@ def _dispatch_mission(args: argparse.Namespace) -> int:
     )
     _write(envelope, args.output)
     return 0
+
+
+def _validate_executors(args: argparse.Namespace) -> int:
+    document = json.loads(Path(args.executors).read_text(encoding="utf-8"))
+    executors = load_executors(document)
+    _write(
+        {"schemaVersion": 1, "executors": [executor.as_dict() for executor in executors]},
+        args.output,
+    )
+    return 0
+
+
+def _route_executor(args: argparse.Namespace) -> int:
+    executors = load_executors(json.loads(Path(args.executors).read_text(encoding="utf-8")))
+    policy = None
+    if args.routing_policy:
+        policy = load_routing_policy(
+            json.loads(Path(args.routing_policy).read_text(encoding="utf-8"))
+        )
+    mission = load_registry(args.missions, load_policy(args.config)).get(args.mission_id)
+    request = RouteRequest(
+        repository=args.repository,
+        task_class=TaskClass(args.task_class),
+        risk=mission.risk,
+        required_capabilities=mission.capabilities,
+        required_tool_capabilities=tuple(args.required_tool_capability),
+        min_context_window=args.min_context_window,
+        budget_usd=args.budget_usd,
+    )
+    decision = route_executor(request, executors, policy)
+    _write(decision.as_dict(), args.output)
+    return 0 if decision.selected_executor_id else 2
 
 
 def _orchestrate(args: argparse.Namespace) -> int:
@@ -389,6 +429,29 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch.add_argument("--output")
     dispatch.set_defaults(handler=_dispatch_mission)
 
+    executors = commands.add_parser("validate-executors")
+    executors.add_argument("--executors", required=True)
+    executors.add_argument("--output")
+    executors.set_defaults(handler=_validate_executors)
+
+    route = commands.add_parser("route-executor")
+    route.add_argument("--config", required=True)
+    route.add_argument("--missions")
+    route.add_argument("--mission-id", required=True)
+    route.add_argument("--executors", required=True)
+    route.add_argument("--routing-policy")
+    route.add_argument("--repository", required=True)
+    route.add_argument(
+        "--task-class",
+        choices=tuple(item.value for item in TaskClass),
+        required=True,
+    )
+    route.add_argument("--required-tool-capability", action="append", default=[])
+    route.add_argument("--min-context-window", type=int, default=0)
+    route.add_argument("--budget-usd", type=float, required=True)
+    route.add_argument("--output")
+    route.set_defaults(handler=_route_executor)
+
     orchestrate = commands.add_parser("orchestrate")
     orchestrate.add_argument(
         "--action",
@@ -447,6 +510,7 @@ def main(argv: list[str] | None = None) -> int:
         TaskSpecError,
         ArtifactError,
         EventError,
+        ExecutorError,
         GateError,
         GitDiffError,
         KnowledgeError,
