@@ -78,3 +78,60 @@ least-privilege publisher GitHub App token (see
 `examples/marketmaestro/.github/workflows/agent-orchestrate.yml` shows
 MarketMaestro consuming the capability through a SHA-pinned call with zero
 copied orchestration logic.
+
+## Transient infrastructure retry
+
+A failed check is not evidence about the change until the platform that ran it
+is ruled out. `sdlcctl classify-failure` sorts terminal evidence into
+`transient_infrastructure`, `deterministic_code_or_test`,
+`review_changes_requested`, `policy_or_security_block`, or `unknown`. Only
+bounded platform signatures — GitHub 5xx and service-unavailable responses,
+runner provisioning and startup failures, temporary API availability errors —
+classify as transient. A pytest, Ruff, policy, or review failure never does,
+and the first two route to bounded exact-head repair instead.
+
+`sdlcctl decide-infra-retry` turns one classification into one idempotent
+action. For a transient failure on an unchanged head it asks GitHub to re-run
+only the failed jobs of the same run, so already-green evidence and the exact
+head SHA both survive. Attempts use bounded exponential backoff with
+deterministic per-target jitter and a budget that defaults to 3
+(`FORGE_MAX_TRANSIENT_RETRIES`).
+
+Retry state is durable and keyed by repository, pull request, run, and exact
+head SHA. It lives in `<!-- forge-transient-retry … -->` markers on trusted
+`github-actions[bot]` pull-request comments, the same evidence channel bounded
+repair uses, so it survives workflow interruption without a second state
+service. Each decision carries the completion event key (run id plus run
+attempt): a duplicate delivery or an hourly watchdog sweep replaying the same
+event spends no budget, while a genuinely new failed attempt does. A new head
+SHA is a different key, so old-head evidence is never reused and never
+inherited.
+
+When the budget is exhausted, the decision emits a durable blocker record —
+blocker class `external_infrastructure`, `userActionRequired` false, exact head
+SHA, attempts against maximum, last error summary, and next action.
+`build_infrastructure_blocker_panel` in `dashboard_efficiency.py` renders it
+for a Control Center as `Blocked: GitHub infrastructure`, `Auto-retry: 2/3`,
+plus the next retry time when one is known.
+
+Nothing in this path can bypass a required check, weaken branch protection,
+convert a red result to green, or merge. The failing run stays failing; the
+only authority exercised is asking GitHub to try the same jobs again.
+
+### Consumer integration
+
+`.github/workflows/reusable-transient-retry.yml` is the platform driver. It
+holds no AI credential at all: the classifier job reads run evidence and
+trusted comments, a separate job records durable evidence before any retry, and
+only the last job holds `actions: write` — using the repository's native
+short-lived token — to call
+`POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs`. It
+re-verifies the pull request head immediately before the rerun and fails closed
+if a new commit arrived. See `docs/security.md` for the credential-separation
+rules it follows.
+
+`src/agentic_sdlc/templates/github/agent-transient-retry.yml` is the consumer
+template. It resolves a candidate from a failed `workflow_run` or
+`check_suite` completion, falls back to an hourly watchdog sweep that recovers
+at most one stranded head per pass, and calls the reusable workflow through a
+SHA-pinned reference with no copied decision logic.
