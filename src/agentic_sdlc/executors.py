@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -178,6 +179,18 @@ TOOL_CAPABILITIES = frozenset(
 
 DATA_RESIDENCY = frozenset({"unspecified", "us", "eu", "customer-controlled", "local-only"})
 
+ROUTING_POLICY_KEYS = frozenset(
+    {
+        "policyVersion",
+        "qualityFloors",
+        "allowedProviders",
+        "deniedProviders",
+        "preferredModelAliases",
+        "requireNoTrainingStorage",
+        "allowedDataResidency",
+    }
+)
+
 
 @dataclass(frozen=True)
 class ExecutorProfile:
@@ -293,9 +306,22 @@ class RoutingPolicy:
         }
 
     def preference_for(self, task_class: TaskClass, risk: RiskLevel) -> tuple[str, ...]:
-        preferences = self.preferred_model_aliases or DEFAULT_MODEL_ALIAS_PREFERENCES
+        """Resolve the alias preference for one route.
+
+        Policy overrides are merged per key onto the defaults, so customizing one
+        tier never drops the documented escalation order of the other tiers. The
+        most specific override wins: an explicit ``task:risk`` override, then an
+        explicit task-class override, then the default ``task:risk`` preference,
+        then the default task-class preference.
+        """
+        overrides = self.preferred_model_aliases or {}
         route_key = f"{task_class.value}:{risk.value}"
-        return preferences.get(route_key, preferences.get(task_class.value, ()))
+        for source in (overrides, DEFAULT_MODEL_ALIAS_PREFERENCES):
+            for key in (route_key, task_class.value):
+                preference = source.get(key)
+                if preference is not None:
+                    return tuple(preference)
+        return ()
 
 
 @dataclass(frozen=True)
@@ -575,6 +601,9 @@ def load_routing_policy(document: object | None) -> RoutingPolicy:
         raise ExecutorError("routing policy must be an object")
     if any("credential" in key.lower() or "secret" in key.lower() for key in document):
         raise ExecutorError("routing policy must not contain credentials or secrets")
+    unknown = sorted(set(document) - ROUTING_POLICY_KEYS)
+    if unknown:
+        raise ExecutorError("routing policy declares unknown keys: " + ", ".join(unknown))
     version = str(document.get("policyVersion", "1.0.0")).strip()
     _require(bool(version), "policyVersion is required")
     floors = document.get("qualityFloors", {})
@@ -584,9 +613,11 @@ def load_routing_policy(document: object | None) -> RoutingPolicy:
         risk: _float(floors.get(risk.value, RoutingPolicy().floor_for(risk)), risk.value, 0, 1)
         for risk in (RiskLevel.LOW, RiskLevel.MEDIUM, RiskLevel.HIGH, RiskLevel.CRITICAL)
     }
-    allowed_providers = _string_tuple(document.get("allowedProviders"), "allowedProviders")
-    if not allowed_providers:
+    if document.get("allowedProviders") is None:
         allowed_providers = tuple(sorted(KNOWN_PROVIDERS))
+    else:
+        # An explicit empty allowlist is a deny-all decision and must not fail open.
+        allowed_providers = _string_tuple(document["allowedProviders"], "allowedProviders")
     unknown_allowed = sorted(set(allowed_providers) - KNOWN_PROVIDERS)
     if unknown_allowed:
         raise ExecutorError(
@@ -691,6 +722,8 @@ def route_executor(
     unknown_tools = sorted(required_tools - TOOL_CAPABILITIES)
     if unknown_tools:
         raise ExecutorError("request has unknown tool capabilities: " + ", ".join(unknown_tools))
+    if not math.isfinite(request.budget_usd):
+        raise ExecutorError("budget_usd must be a finite number")
     if request.budget_usd < 0:
         raise ExecutorError("budget_usd cannot be negative")
 
@@ -737,14 +770,17 @@ def route_executor(
                 "context window too small: "
                 f"{executor.context_window} < {request.min_context_window}"
             )
+        capacity_exhausted = False
         if executor.active_runs >= executor.max_concurrency:
             reasons.append("capacity exhausted")
+            capacity_exhausted = True
         if (
             executor.execution_type
             in {ExecutionType.SUBSCRIPTION_CLOUD, ExecutionType.SUBSCRIPTION_RUNNER}
             and executor.subscription_capacity_remaining <= 0
         ):
             reasons.append("subscription capacity exhausted")
+            capacity_exhausted = True
         if executor.expected_mission_cost > request.budget_usd:
             reasons.append(
                 f"budget exceeded: {executor.expected_mission_cost:.4f} > {request.budget_usd:.4f}"
@@ -754,11 +790,15 @@ def route_executor(
         if active_policy.require_no_training_storage and executor.stores_training_data:
             reasons.append("training-data storage not allowed")
 
+        # Expected cost per successful mission is undefined without a positive
+        # quality lower bound, so such an executor is never sortable or eligible.
         ecps = (
             round(executor.expected_mission_cost / executor.quality_lower_bound, 6)
             if executor.quality_lower_bound > 0
             else None
         )
+        if ecps is None:
+            reasons.append("qualityLowerBound must be greater than zero to rank expected cost")
         considered.append(
             {
                 "executorId": executor.executor_id,
@@ -773,13 +813,14 @@ def route_executor(
                 "preferenceRank": preference_rank.get(
                     executor.model_alias, default_preference_rank
                 ),
-                "recoverable": executor.runtime_status in RECOVERABLE_RUNTIME_STATUSES,
+                "recoverable": (
+                    executor.runtime_status in RECOVERABLE_RUNTIME_STATUSES or capacity_exhausted
+                ),
                 "eligible": not reasons,
                 "rejectionReasons": reasons,
             }
         )
-        if not reasons:
-            assert ecps is not None
+        if not reasons and ecps is not None:
             eligible.append(
                 (
                     preference_rank.get(executor.model_alias, default_preference_rank),

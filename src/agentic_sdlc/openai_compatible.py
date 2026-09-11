@@ -9,12 +9,21 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 
 class AdapterError(RuntimeError):
     """Raised when a provider cannot produce an applicable patch."""
+
+
+class ProviderExhaustedError(AdapterError):
+    """Raised when a provider is out of quota, capacity, or valid credentials."""
+
+    def __init__(self, status: str, message: str) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 @dataclass(frozen=True)
@@ -43,21 +52,55 @@ PROVIDERS = {
 }
 
 MAX_CONTEXT_BYTES = 160_000
+MAX_TASK_BYTES = 65_536
 MAX_FILE_BYTES = 24_000
 MAX_CONTEXT_FILES = 24
+
+# The adapter never sends more than the task plus the context bundle, so the route
+# must require an executor whose declared context window can hold that much.
+ROUTED_BUNDLE_BYTES = MAX_TASK_BYTES + MAX_CONTEXT_BYTES
+BYTES_PER_TOKEN_ESTIMATE = 4
+ROUTED_MIN_CONTEXT_WINDOW = ROUTED_BUNDLE_BYTES // BYTES_PER_TOKEN_ESTIMATE
+
+RECOVERABLE_PROVIDER_STATUSES = frozenset(
+    {"auth-exhausted", "quota-exhausted", "capacity-exhausted"}
+)
+
+# Bounded number of routed candidates tried in one adapter invocation.
+MAX_ROUTE_ATTEMPTS = 3
+
 TEXT_SUFFIXES = {
+    ".bash",
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cs",
     ".css",
+    ".cxx",
+    ".go",
+    ".h",
+    ".hh",
+    ".hpp",
+    ".hxx",
     ".html",
+    ".java",
     ".js",
     ".json",
+    ".kt",
+    ".kts",
     ".md",
+    ".php",
     ".py",
+    ".rb",
+    ".rs",
+    ".sh",
     ".toml",
     ".ts",
     ".tsx",
     ".txt",
     ".yml",
     ".yaml",
+    ".zsh",
 }
 SENSITIVE_PARTS = {
     ".env",
@@ -136,7 +179,30 @@ def _score_path(path: str, prompt_tokens: set[str]) -> int:
     return score
 
 
-def build_repository_context(prompt: str) -> str:
+def is_readable_tracked_file(path: str, root: Path | None = None) -> bool:
+    """Return True only for a regular file that stays inside the checkout root.
+
+    A tracked path that is a symlink, or that traverses a symlinked directory, is
+    rejected before any read so a consumer repository cannot pull runner files
+    outside the checkout into the prompt sent to a third-party provider.
+    """
+    checkout_root = (root or Path.cwd()).resolve()
+    candidate = checkout_root / path
+    current = checkout_root
+    for part in Path(path).parts:
+        current = current / part
+        if current.is_symlink():
+            return False
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        return False
+    if not resolved.is_relative_to(checkout_root):
+        return False
+    return resolved.is_file()
+
+
+def build_repository_context(prompt: str, *, max_context_bytes: int = MAX_CONTEXT_BYTES) -> str:
     """Build a bounded, secret-filtered source context bundle for routed providers."""
     files = _tracked_files()
     prompt_tokens = _tokenize(prompt)
@@ -144,18 +210,20 @@ def build_repository_context(prompt: str) -> str:
     selected = ranked[:MAX_CONTEXT_FILES]
     chunks = ["Repository files:\n" + "\n".join(files[:1500])]
     used = sum(len(chunk.encode("utf-8")) for chunk in chunks)
+    checkout_root = Path.cwd().resolve()
     for path in selected:
-        file_path = Path(path)
+        if not is_readable_tracked_file(path, checkout_root):
+            continue
         try:
-            content = file_path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
+            content = (checkout_root / path).read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
             continue
         if not content.strip():
             continue
         content = content[:MAX_FILE_BYTES]
         chunk = f"\n\n--- FILE: {path} ---\n{content}"
         chunk_bytes = len(chunk.encode("utf-8"))
-        if used + chunk_bytes > MAX_CONTEXT_BYTES:
+        if used + chunk_bytes > max_context_bytes:
             break
         chunks.append(chunk)
         used += chunk_bytes
@@ -273,7 +341,10 @@ def chat_completion(
     except urllib.error.HTTPError as error:
         error_body = error.read().decode("utf-8", errors="replace")
         status = classify_provider_error(error.code, error_body)
-        raise AdapterError(f"{status}: provider request failed with HTTP {error.code}") from error
+        message = f"{status}: provider request failed with HTTP {error.code}"
+        if status in RECOVERABLE_PROVIDER_STATUSES:
+            raise ProviderExhaustedError(status, message) from error
+        raise AdapterError(message) from error
     return payload
 
 
@@ -282,10 +353,24 @@ def request_patch(
     provider: str,
     model: str,
     prompt: str,
+    validate: Callable[[str], None] | None = None,
 ) -> str:
+    """Request one patch, with a single corrective retry.
+
+    ``validate`` is applied to an extracted patch and must raise ``AdapterError``
+    when the patch is unusable. A patch that extracts but does not apply therefore
+    gets the same bounded corrective retry as a response with no patch at all.
+    """
+
+    def _patch_from(response: dict[str, object]) -> str:
+        patch = extract_response_patch(response)
+        if validate is not None:
+            validate(patch)
+        return patch
+
     response = chat_completion(provider=provider, model=model, prompt=prompt)
     try:
-        return extract_response_patch(response)
+        return _patch_from(response)
     except AdapterError as first_error:
         first_text = extract_text(response)
         retry_response = chat_completion(
@@ -296,20 +381,102 @@ def request_patch(
                 "Your previous response was rejected because it did not contain an "
                 "applicable unified git patch. Return exactly one JSON object with a "
                 'single "patch" string. The string must start with diff --git. '
-                "No prose, no markdown fences, no explanation."
+                "Every hunk must apply cleanly to the files in the context bundle with "
+                "git apply. No prose, no markdown fences, no explanation.\n"
+                f"Rejection detail: {_excerpt(str(first_error), 400)}"
             ),
         )
         try:
-            return extract_response_patch(retry_response)
+            return _patch_from(retry_response)
         except AdapterError as retry_error:
             retry_text = extract_text(retry_response)
             raise AdapterError(
-                "provider response did not contain a unified git patch; "
+                "provider response did not contain an applicable unified git patch; "
                 f"first_error={first_error}; "
                 f"first_excerpt={_excerpt(first_text)!r}; "
                 f"retry_error={retry_error}; "
                 f"retry_excerpt={_excerpt(retry_text)!r}"
             ) from retry_error
+
+
+@dataclass(frozen=True)
+class RouteCandidate:
+    executor_id: str
+    provider: str
+    model: str
+
+
+def route_candidates(document: object) -> tuple[RouteCandidate, ...]:
+    """Return the eligible OpenAI-compatible candidates of a route decision.
+
+    Candidates are ordered exactly as routing ranks them - preference rank, then
+    expected cost per successful mission, then executor id - so an in-process
+    re-route after live provider exhaustion stays deterministic. The selected
+    executor is always tried first.
+    """
+    if not isinstance(document, dict):
+        return ()
+    selected_id = str(document.get("selectedExecutorId", ""))
+    ranked: list[tuple[int, float, str, RouteCandidate]] = []
+    for entry in document.get("candidates") or ():
+        if not isinstance(entry, dict) or not entry.get("eligible"):
+            continue
+        provider = str(entry.get("provider", ""))
+        model = str(entry.get("model", ""))
+        executor_id = str(entry.get("executorId", ""))
+        if provider not in PROVIDERS or not model:
+            continue
+        rank = entry.get("preferenceRank")
+        ecps = entry.get("ecps")
+        ranked.append(
+            (
+                int(rank) if isinstance(rank, int) else 1_000_000,
+                float(ecps) if isinstance(ecps, int | float) else float("inf"),
+                executor_id,
+                RouteCandidate(executor_id=executor_id, provider=provider, model=model),
+            )
+        )
+    ordered = [candidate for *_, candidate in sorted(ranked, key=lambda item: item[:3])]
+    selected = [item for item in ordered if item.executor_id == selected_id]
+    return tuple(selected + [item for item in ordered if item.executor_id != selected_id])
+
+
+def _attempt_order(
+    provider: str,
+    model: str,
+    candidates: Sequence[RouteCandidate],
+) -> tuple[RouteCandidate, ...]:
+    # Keep the selected executor's id on the first attempt so fallback telemetry
+    # names the executor rather than only its provider.
+    first = next(
+        (item for item in candidates if (item.provider, item.model) == (provider, model)),
+        RouteCandidate(executor_id="", provider=provider, model=model),
+    )
+    attempts = [first]
+    for candidate in candidates:
+        if (candidate.provider, candidate.model) == (provider, model):
+            continue
+        attempts.append(candidate)
+    return tuple(attempts[:MAX_ROUTE_ATTEMPTS])
+
+
+def _bundle_prompt(prompt: str) -> str:
+    task_bytes = len(prompt.encode("utf-8"))
+    if task_bytes > MAX_TASK_BYTES:
+        raise AdapterError(
+            f"task prompt is {task_bytes} bytes, above the routed bundle task budget "
+            f"of {MAX_TASK_BYTES} bytes"
+        )
+    context = build_repository_context(
+        prompt,
+        max_context_bytes=min(MAX_CONTEXT_BYTES, ROUTED_BUNDLE_BYTES - task_bytes),
+    )
+    return (
+        f"{prompt}\n\n"
+        "Use this bounded repository context to produce the patch. "
+        "If more files would be useful, make the smallest correct change with the "
+        f"files provided instead of returning prose.\n\n{context}"
+    )
 
 
 def generate_and_apply_patch(
@@ -319,38 +486,63 @@ def generate_and_apply_patch(
     prompt_path: Path,
     output_patch: Path,
     output_message: Path,
+    candidates: Sequence[RouteCandidate] = (),
 ) -> None:
-    prompt = prompt_path.read_text(encoding="utf-8")
-    context = build_repository_context(prompt)
-    patch = request_patch(
-        provider=provider,
-        model=model,
-        prompt=(
-            f"{prompt}\n\n"
-            "Use this bounded repository context to produce the patch. "
-            "If more files would be useful, make the smallest correct change with the "
-            "files provided instead of returning prose.\n\n"
-            f"{context}"
-        ),
-    )
-    output_patch.write_text(patch, encoding="utf-8")
-    subprocess.run(["git", "apply", "--check", str(output_patch)], check=True)
-    subprocess.run(["git", "apply", str(output_patch)], check=True)
-    output_message.write_text(
-        f"Generated patch with routed OpenAI-compatible provider {provider}.\n",
-        encoding="utf-8",
-    )
+    bundle = _bundle_prompt(prompt_path.read_text(encoding="utf-8"))
+
+    def _check_applies(patch: str) -> None:
+        output_patch.write_text(patch, encoding="utf-8")
+        result = subprocess.run(
+            ["git", "apply", "--check", str(output_patch)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise AdapterError(
+                "patch does not apply to the checkout: " + _excerpt(result.stderr.strip())
+            )
+
+    attempts = _attempt_order(provider, model, candidates)
+    fallbacks: list[str] = []
+    for index, attempt in enumerate(attempts):
+        try:
+            patch = request_patch(
+                provider=attempt.provider,
+                model=attempt.model,
+                prompt=bundle,
+                validate=_check_applies,
+            )
+        except ProviderExhaustedError as error:
+            label = attempt.executor_id or attempt.provider
+            fallbacks.append(f"{label} {error.status}")
+            if index + 1 >= len(attempts):
+                raise AdapterError(
+                    "every routed candidate was exhausted: " + "; ".join(fallbacks)
+                ) from error
+            print(f"Routing fallback: {label} {error.status}", file=sys.stderr)
+            continue
+        output_patch.write_text(patch, encoding="utf-8")
+        subprocess.run(["git", "apply", str(output_patch)], check=True)
+        message = f"Generated patch with routed OpenAI-compatible provider {attempt.provider}.\n"
+        if fallbacks:
+            message += "Routing fallback: " + "; ".join(fallbacks) + "\n"
+        output_message.write_text(message, encoding="utf-8")
+        return
 
 
 def main(argv: list[str] | None = None) -> int:
     args = list(argv or sys.argv[1:])
-    if len(args) != 5:
+    if len(args) not in {5, 6}:
         print(
-            "usage: openai_compatible <provider> <model> <prompt> <patch-output> <message-output>",
+            "usage: openai_compatible <provider> <model> <prompt> <patch-output> "
+            "<message-output> [route-json]",
             file=sys.stderr,
         )
         return 2
-    provider, model, prompt, patch_output, message_output = args
+    provider, model, prompt, patch_output, message_output = args[:5]
+    candidates: tuple[RouteCandidate, ...] = ()
+    if len(args) == 6 and args[5]:
+        candidates = route_candidates(json.loads(Path(args[5]).read_text(encoding="utf-8")))
     try:
         generate_and_apply_patch(
             provider=provider,
@@ -358,6 +550,7 @@ def main(argv: list[str] | None = None) -> int:
             prompt_path=Path(prompt),
             output_patch=Path(patch_output),
             output_message=Path(message_output),
+            candidates=candidates,
         )
     except (AdapterError, OSError, subprocess.CalledProcessError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
