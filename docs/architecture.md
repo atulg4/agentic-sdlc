@@ -49,6 +49,8 @@ The Python package owns behavior that must be identical on GitHub and GitLab:
 - task eligibility;
 - path, size, and risk policy;
 - prompt boundaries for untrusted issue text;
+- the versioned multi-project registry and the append-only lifecycle event
+  ledger it feeds (`docs/project-registry.md`);
 - machine-readable decisions and audit output.
 
 ### Provider adapters

@@ -11,6 +11,7 @@ from typing import Any
 
 from .artifact import ArtifactError, create_manifest, verify_manifest, write_manifest
 from .dashboard_efficiency import build_infrastructure_blocker_panel
+from .event_ledger import EventLedger, LedgerError, load_lifecycle_event
 from .events import EventError, normalize_event
 from .executors import (
     ExecutorError,
@@ -42,6 +43,11 @@ from .missions import (
 )
 from .orchestration import OrchestrationError, Orchestrator
 from .policy import evaluate_diff, evaluate_task, load_policy
+from .project_registry import (
+    ProjectRegistryError,
+    read_optional_project_registry,
+    read_project_registry,
+)
 from .scaffold import ScaffoldError, scaffold_project
 from .task_spec import TaskSpecError, parse_task, render_prompt
 
@@ -330,6 +336,54 @@ def _orchestrate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _validate_registry(args: argparse.Namespace) -> int:
+    registry = read_project_registry(args.registry)
+    _write(registry.as_dict(), args.output)
+    return 0
+
+
+def _record_event(args: argparse.Namespace) -> int:
+    registry = read_optional_project_registry(args.registry)
+    ledger_path = Path(args.ledger)
+    if ledger_path.is_file():
+        ledger = EventLedger.from_dict(
+            json.loads(ledger_path.read_text(encoding="utf-8")), registry=registry
+        )
+    else:
+        ledger = EventLedger(registry=registry)
+    document = json.loads(Path(args.event).read_text(encoding="utf-8"))
+    event = ledger.append(load_lifecycle_event(document))
+    _write(ledger.as_dict(), str(ledger_path))
+    if args.output:
+        _write(event.as_dict(), args.output)
+    if args.projection_output:
+        projection = ledger.projection(event.project_id, event.work_unit_id)
+        _write(projection.as_dict(), args.projection_output)
+    return 0
+
+
+def _project_state(args: argparse.Namespace) -> int:
+    registry = read_optional_project_registry(args.registry)
+    ledger = EventLedger.from_dict(
+        json.loads(Path(args.ledger).read_text(encoding="utf-8")), registry=registry
+    )
+    project_ids = tuple(args.project_id) or None
+    if args.unit:
+        if project_ids is None or len(project_ids) != 1:
+            raise LedgerError("--unit requires exactly one --project-id")
+        _write(ledger.projection(project_ids[0], args.unit).as_dict(), args.output)
+        return 0
+    _write(
+        {
+            "schemaVersion": 1,
+            "projections": [item.as_dict() for item in ledger.projections(project_ids=project_ids)],
+            "aggregate": ledger.aggregate(project_ids=project_ids),
+        },
+        args.output,
+    )
+    return 0
+
+
 def _validate_knowledge(args: argparse.Namespace) -> int:
     sources = load_sources(args.knowledge)
     _write(
@@ -565,6 +619,27 @@ def build_parser() -> argparse.ArgumentParser:
     orchestrate.add_argument("--status-output")
     orchestrate.set_defaults(handler=_orchestrate)
 
+    registry = commands.add_parser("validate-registry")
+    registry.add_argument("--registry", required=True)
+    registry.add_argument("--output")
+    registry.set_defaults(handler=_validate_registry)
+
+    record_event = commands.add_parser("record-event")
+    record_event.add_argument("--ledger", required=True)
+    record_event.add_argument("--event", required=True)
+    record_event.add_argument("--registry")
+    record_event.add_argument("--projection-output")
+    record_event.add_argument("--output")
+    record_event.set_defaults(handler=_record_event)
+
+    project_state = commands.add_parser("project-state")
+    project_state.add_argument("--ledger", required=True)
+    project_state.add_argument("--registry")
+    project_state.add_argument("--project-id", action="append", default=[])
+    project_state.add_argument("--unit")
+    project_state.add_argument("--output")
+    project_state.set_defaults(handler=_project_state)
+
     knowledge = commands.add_parser("validate-knowledge")
     knowledge.add_argument("--knowledge", required=True)
     knowledge.add_argument("--output")
@@ -634,8 +709,10 @@ def main(argv: list[str] | None = None) -> int:
         GitDiffError,
         InfraRecoveryError,
         KnowledgeError,
+        LedgerError,
         MissionError,
         OrchestrationError,
+        ProjectRegistryError,
         ScaffoldError,
         OSError,
         ValueError,
