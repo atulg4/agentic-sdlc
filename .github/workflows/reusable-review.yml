@@ -122,7 +122,7 @@ jobs:
           bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / /bin/true
       - name: Independently review the exact diff with Claude Max OAuth
         id: claude-review
-        uses: anthropics/claude-code-action@9c5ddab2e6d17b83ea679153b31f1d5f023cf636 # v1
+        uses: anthropics/claude-code-action@19dda84776b3518d98b8798e591daee763049ed3 # v1
         env:
           CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
         with:
