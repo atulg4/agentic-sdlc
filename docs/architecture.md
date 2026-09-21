@@ -51,6 +51,9 @@ The Python package owns behavior that must be identical on GitHub and GitLab:
 - prompt boundaries for untrusted issue text;
 - the versioned multi-project registry and the append-only lifecycle event
   ledger it feeds (`docs/project-registry.md`);
+- the per-run usage ledger, pricing snapshots and estimator calibration that
+  account for tokens, time, model, worker and cost without fabricating unknown
+  or subscription-backed figures (`docs/usage-accounting.md`);
 - machine-readable decisions and audit output.
 
 ### Provider adapters
