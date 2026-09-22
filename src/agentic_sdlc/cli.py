@@ -10,6 +10,12 @@ from pathlib import Path
 from typing import Any
 
 from .artifact import ArtifactError, create_manifest, verify_manifest, write_manifest
+from .capacity_metrics import (
+    CapacityError,
+    ObservationWindow,
+    build_capacity_report,
+    load_capacity_inputs,
+)
 from .dashboard_efficiency import build_infrastructure_blocker_panel
 from .event_ledger import EventLedger, LedgerError, LifecycleStage, load_lifecycle_event
 from .events import EventError, normalize_event
@@ -495,6 +501,23 @@ def _estimate_usage(args: argparse.Namespace) -> int:
     return 0
 
 
+def _capacity_report(args: argparse.Namespace) -> int:
+    ledger = _read_usage_ledger(args.usage, args.registry, create=False)
+    inputs = None
+    if args.inputs:
+        inputs = load_capacity_inputs(json.loads(Path(args.inputs).read_text(encoding="utf-8")))
+    _write(
+        build_capacity_report(
+            ledger.records,
+            window=ObservationWindow(args.window_start, args.window_end),
+            inputs=inputs,
+            project_ids=tuple(args.project_id) or None,
+        ),
+        args.output,
+    )
+    return 0
+
+
 def _validate_knowledge(args: argparse.Namespace) -> int:
     sources = load_sources(args.knowledge)
     _write(
@@ -796,6 +819,16 @@ def build_parser() -> argparse.ArgumentParser:
     estimate_usage.add_argument("--output")
     estimate_usage.set_defaults(handler=_estimate_usage)
 
+    capacity = commands.add_parser("capacity-report")
+    capacity.add_argument("--usage", required=True)
+    capacity.add_argument("--window-start", required=True)
+    capacity.add_argument("--window-end", required=True)
+    capacity.add_argument("--inputs")
+    capacity.add_argument("--registry")
+    capacity.add_argument("--project-id", action="append", default=[])
+    capacity.add_argument("--output")
+    capacity.set_defaults(handler=_capacity_report)
+
     knowledge = commands.add_parser("validate-knowledge")
     knowledge.add_argument("--knowledge", required=True)
     knowledge.add_argument("--output")
@@ -859,6 +892,7 @@ def main(argv: list[str] | None = None) -> int:
     except (
         TaskSpecError,
         ArtifactError,
+        CapacityError,
         EventError,
         ExecutorError,
         GateError,

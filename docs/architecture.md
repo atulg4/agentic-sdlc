@@ -59,6 +59,9 @@ The Python package owns behavior that must be identical on GitHub and GitLab:
 - the per-run usage ledger, pricing snapshots and estimator calibration that
   account for tokens, time, model, worker and cost without fabricating unknown
   or subscription-backed figures (`docs/usage-accounting.md`);
+- the capacity instrument that reads that ledger for concurrency, queueing,
+  runner and plan-capacity utilization, useful work and bottlenecks
+  (`docs/capacity-metrics.md`);
 - machine-readable decisions and audit output.
 
 ### Provider adapters
