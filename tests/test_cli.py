@@ -953,3 +953,299 @@ def test_project_state_cli_answers_cross_project_and_single_unit_queries(tmp_pat
 
     # A single-unit query needs exactly one project scope.
     assert main(["project-state", "--ledger", str(ledger), "--unit", "whatever"]) == 2
+
+
+def _pricing_document() -> dict:
+    return {
+        "schemaVersion": 1,
+        "pricing": [
+            {
+                "pricingId": "anthropic-payg",
+                "provider": "anthropic",
+                "model": "claude-opus-5",
+                "billingMode": "payg",
+                "version": "2026-09-01",
+                "usdPerMillion": {"input": 15, "output": 75, "cacheRead": 1.5, "cacheWrite": 18.75},
+            },
+            {
+                "pricingId": "claude-max",
+                "provider": "anthropic",
+                "model": "claude-opus-5",
+                "billingMode": "subscription",
+                "version": "2026-09",
+                "plan": {"name": "Claude Max", "capacityUnit": "five-hour-window-share"},
+            },
+        ],
+    }
+
+
+def _usage_document(
+    run_id: str,
+    *,
+    project_id: str = "alpha",
+    estimate: dict | None = None,
+    actual: dict | None = None,
+) -> dict:
+    return {
+        "schemaVersion": 1,
+        "usageId": f"usage-{project_id}-{run_id}",
+        "workUnit": {
+            "projectId": project_id,
+            "workUnitId": f"github:example/{project_id}:issue:1",
+            "changeRequestRef": f"example/{project_id}!12",
+        },
+        "stage": "implementation",
+        "taskClass": "implementation",
+        "runId": run_id,
+        "attempt": 1,
+        "actor": {"name": "claude", "kind": "agent", "model": "claude-opus-5", "worker": "gha-7"},
+        "complexityClass": "medium",
+        "recordedAt": "2026-09-21T10:00:00Z",
+        "estimate": estimate,
+        "actual": actual,
+    }
+
+
+def _estimate_cli(tmp_path: Path, output: Path, *extra: str) -> int:
+    return main(
+        [
+            "estimate-usage",
+            "--model",
+            "claude-opus-5",
+            "--stage",
+            "implementation",
+            "--task-class",
+            "implementation",
+            "--complexity",
+            "medium",
+            "--baseline-input-tokens",
+            "1000",
+            "--baseline-output-tokens",
+            "500",
+            "--baseline-cache-read-tokens",
+            "0",
+            "--baseline-cache-write-tokens",
+            "0",
+            "--baseline-runtime-seconds",
+            "600",
+            "--output",
+            str(output),
+            *extra,
+        ]
+    )
+
+
+def test_usage_cli_records_estimates_then_actuals_idempotently(tmp_path: Path) -> None:
+    pricing = tmp_path / "pricing.json"
+    pricing.write_text(json.dumps(_pricing_document()), encoding="utf-8")
+    registry = tmp_path / "projects.json"
+    registry.write_text(json.dumps(_registry_document()), encoding="utf-8")
+    estimate = tmp_path / "estimate.json"
+    ledger = tmp_path / "usage.json"
+    record = tmp_path / "record.json"
+    error = tmp_path / "error.json"
+
+    assert (
+        _estimate_cli(
+            tmp_path, estimate, "--pricing", str(pricing), "--pricing-id", "anthropic-payg"
+        )
+        == 0
+    )
+    estimated = json.loads(estimate.read_text(encoding="utf-8"))
+    assert estimated["basis"].startswith("cold-start")
+    assert estimated["monetary"]["status"] == "payg"
+    assert estimated["monetary"]["billedUsd"] == 0.0525
+
+    record.write_text(json.dumps(_usage_document("run-1", estimate=estimated)), encoding="utf-8")
+    command = ["record-usage", "--ledger", str(ledger), "--registry", str(registry), "--record"]
+    assert main([*command, str(record), "--error-output", str(error)]) == 0
+    assert json.loads(error.read_text(encoding="utf-8"))["status"] == "unavailable"
+    before = ledger.read_text(encoding="utf-8")
+    assert main([*command, str(record)]) == 0
+    assert ledger.read_text(encoding="utf-8") == before, "replay changes nothing"
+
+    actual = {
+        "tokens": {"input": 1500, "output": 500, "cacheRead": 0, "cacheWrite": 0},
+        "monetary": {
+            "status": "payg",
+            "pricing": _pricing_document()["pricing"][0],
+            "paygEquivalentUsd": 0.06,
+            "billedUsd": 0.06,
+        },
+        "result": "completed",
+        "startedAt": "2026-09-21T10:01:00Z",
+        "finishedAt": "2026-09-21T10:11:00Z",
+    }
+    record.write_text(json.dumps(_usage_document("run-1", actual=actual)), encoding="utf-8")
+    assert main([*command, str(record), "--error-output", str(error)]) == 0
+    stored = json.loads(ledger.read_text(encoding="utf-8"))["records"]
+    assert len(stored) == 1
+    assert stored[0]["estimate"]["tokens"]["input"] == 1000
+    assert stored[0]["actual"]["runtimeSeconds"] == 600
+    computed = json.loads(error.read_text(encoding="utf-8"))
+    assert computed["status"] == "available"
+    assert computed["dimensions"]["input"]["percentage"] == 50.0
+
+    # A rewritten actual and an unregistered project both fail closed, leaving the ledger intact.
+    before = ledger.read_text(encoding="utf-8")
+    actual["tokens"]["input"] = 1
+    record.write_text(json.dumps(_usage_document("run-1", actual=actual)), encoding="utf-8")
+    assert main([*command, str(record)]) == 2
+    record.write_text(json.dumps(_usage_document("run-9", project_id="gamma")), encoding="utf-8")
+    assert main([*command, str(record)]) == 2
+    assert ledger.read_text(encoding="utf-8") == before
+
+
+def test_usage_report_cli_groups_and_scopes(tmp_path: Path) -> None:
+    ledger = tmp_path / "usage.json"
+    record = tmp_path / "record.json"
+    output = tmp_path / "report.json"
+    subscription = {
+        "tokens": {"input": 2000, "output": 800, "cacheRead": 0, "cacheWrite": 0},
+        "monetary": {
+            "status": "subscription",
+            "pricing": _pricing_document()["pricing"][1],
+            "planCapacityUnits": 0.2,
+            "planCapacityUnit": "five-hour-window-share",
+        },
+        "result": "completed",
+        "runtimeSeconds": 700,
+    }
+    for run_id, project_id, actual in (
+        ("run-1", "alpha", subscription),
+        ("run-2", "alpha", None),
+        ("run-3", "beta", subscription),
+    ):
+        record.write_text(
+            json.dumps(_usage_document(run_id, project_id=project_id, actual=actual)),
+            encoding="utf-8",
+        )
+        assert main(["record-usage", "--ledger", str(ledger), "--record", str(record)]) == 0
+
+    assert main(["usage-report", "--ledger", str(ledger), "--output", str(output)]) == 0
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["groupBy"] == ["projectId"]
+    assert [bucket["key"]["projectId"] for bucket in report["buckets"]] == ["alpha", "beta"]
+    alpha = report["buckets"][0]
+    assert alpha["actual"]["billedUsd"] == {"value": None, "knownRecords": 0, "unknownRecords": 2}
+    assert alpha["actual"]["planCapacityUnits"]["five-hour-window-share"]["value"] == 0.2
+    assert alpha["actual"]["tokens"]["input"] == {
+        "value": 2000,
+        "knownRecords": 1,
+        "unknownRecords": 1,
+    }
+
+    assert (
+        main(
+            [
+                "usage-report",
+                "--ledger",
+                str(ledger),
+                "--project-id",
+                "beta",
+                "--group-by",
+                "changeRequest",
+                "--group-by",
+                "model",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    scoped = json.loads(output.read_text(encoding="utf-8"))
+    assert scoped["buckets"] == [scoped["buckets"][0]]
+    assert scoped["buckets"][0]["key"] == {
+        "changeRequestRef": "example/beta!12",
+        "model": "claude-opus-5",
+    }
+    assert scoped["totals"]["records"] == 1
+
+    assert main(["usage-report", "--ledger", str(ledger), "--group-by", "colour"]) == 2
+    assert main(["usage-report", "--ledger", str(tmp_path / "absent.json")]) == 2
+
+
+def test_usage_cli_calibrates_and_applies_learned_coefficients(tmp_path: Path) -> None:
+    ledger = tmp_path / "usage.json"
+    record = tmp_path / "record.json"
+    calibration = tmp_path / "calibration.json"
+    summary = tmp_path / "summary.json"
+    estimate = tmp_path / "estimate.json"
+    pricing = tmp_path / "pricing.json"
+    pricing.write_text(json.dumps(_pricing_document()), encoding="utf-8")
+
+    baseline = {
+        "tokens": {"input": 1000, "output": 500, "cacheRead": 0, "cacheWrite": 0},
+        "runtimeSeconds": 600,
+    }
+    for run_id, factor in (("run-1", 2), ("run-2", 2), ("run-3", 2)):
+        actual = {
+            "tokens": {
+                "input": 1000 * factor,
+                "output": 500 * factor,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+            },
+            "runtimeSeconds": 600 * factor,
+            "result": "completed",
+        }
+        record.write_text(
+            json.dumps(_usage_document(run_id, estimate=baseline, actual=actual)),
+            encoding="utf-8",
+        )
+        assert main(["record-usage", "--ledger", str(ledger), "--record", str(record)]) == 0
+
+    command = ["calibrate-usage", "--ledger", str(ledger), "--calibration", str(calibration)]
+    assert main([*command, "--min-samples", "3", "--output", str(summary)]) == 0
+    first = json.loads(summary.read_text(encoding="utf-8"))
+    assert first == {
+        "schemaVersion": 1,
+        "learnedRecords": 3,
+        "observedRecords": 3,
+        "ledgerRecords": 3,
+    }
+    assert json.loads(calibration.read_text(encoding="utf-8"))["minSamples"] == 3
+
+    assert main([*command, "--output", str(summary)]) == 0
+    assert json.loads(summary.read_text(encoding="utf-8"))["learnedRecords"] == 0
+
+    assert (
+        _estimate_cli(
+            tmp_path,
+            estimate,
+            "--calibration",
+            str(calibration),
+            "--pricing",
+            str(pricing),
+            "--pricing-id",
+            "claude-max",
+            "--plan-capacity-units",
+            "0.1",
+        )
+        == 0
+    )
+    learned = json.loads(estimate.read_text(encoding="utf-8"))
+    assert learned["tokens"] == {
+        "input": 2000,
+        "output": 1000,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "total": 3000,
+        "status": "known",
+    }
+    assert learned["runtimeSeconds"] == 1200
+    assert learned["basis"].startswith("calibrated:")
+    assert learned["monetary"]["status"] == "subscription"
+    assert learned["monetary"]["billedUsd"] is None
+    assert learned["monetary"]["planCapacityUnits"] == 0.1
+
+    # An out-of-range --min-samples must never overwrite a stored calibration with a
+    # document the loader would then refuse to read back.
+    stored = calibration.read_text(encoding="utf-8")
+    assert main([*command, "--min-samples", "0"]) == 2
+    assert calibration.read_text(encoding="utf-8") == stored
+    assert main([*command, "--output", str(summary)]) == 0
+
+    assert _estimate_cli(tmp_path, estimate, "--pricing-id", "claude-max") == 2
+    assert _estimate_cli(tmp_path, estimate, "--pricing", str(pricing), "--pricing-id", "nope") == 2
+    assert main([*command[:-2], "--calibration", str(tmp_path / "missing" / "c.json")]) == 2
