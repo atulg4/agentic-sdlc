@@ -225,6 +225,44 @@ def _seconds_between(start: str, end: str, label: str) -> int:
     return int(delta)
 
 
+def _non_negative_int(value: int | None, label: str) -> None:
+    _require(
+        value is None or (isinstance(value, int) and not isinstance(value, bool) and value >= 0),
+        f"{label} must be an integer >= 0 or null",
+    )
+
+
+def _non_negative_number(value: float | None, label: str) -> None:
+    _require(
+        value is None
+        or (
+            isinstance(value, int | float)
+            and not isinstance(value, bool)
+            and value == value
+            and value not in (float("inf"), float("-inf"))
+            and value >= 0
+        ),
+        f"{label} must be a finite number >= 0 or null",
+    )
+
+
+def _bounded_text_fields(value: Any, label: str) -> None:
+    """Apply this module's free-text bound to a dataclass loaded elsewhere.
+
+    ``WorkUnitRef`` and ``EventActor`` come from the event ledger, whose loader
+    has no length bound. Usage records promise that no field carries a prompt
+    or a transcript, so the bound is applied here rather than assumed.
+    """
+    for item in fields(value):
+        field_value = getattr(value, item.name)
+        if isinstance(field_value, str):
+            _require(
+                len(field_value) <= MAX_TEXT_LENGTH,
+                f"{label}: {item.name} exceeds {MAX_TEXT_LENGTH} characters; usage records "
+                "carry references and labels, never prompts or transcripts",
+            )
+
+
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -248,6 +286,10 @@ class TokenCounts:
     output: int | None = None
     cache_read: int | None = None
     cache_write: int | None = None
+
+    def __post_init__(self) -> None:
+        for dimension in TOKEN_DIMENSIONS:
+            _non_negative_int(self.value(dimension), f"token count {dimension}")
 
     def value(self, dimension: str) -> int | None:
         return {
@@ -327,6 +369,15 @@ class PricingSnapshot:
     plan_capacity_unit: str = ""
     plan_monthly_usd: float | None = None
     capacity_units_per_million_tokens: float | None = None
+
+    def __post_init__(self) -> None:
+        for dimension in TOKEN_DIMENSIONS:
+            _non_negative_number(self.rate(dimension), f"pricing snapshot {dimension} rate")
+        _non_negative_number(self.plan_monthly_usd, "pricing snapshot plan.monthlyUsd")
+        _non_negative_number(
+            self.capacity_units_per_million_tokens,
+            "pricing snapshot plan.capacityUnitsPerMillionTokens",
+        )
 
     def rate(self, dimension: str) -> float | None:
         return {
@@ -490,6 +541,11 @@ class MonetaryEquivalent:
     plan_capacity_units: float | None = None
     plan_capacity_unit: str = ""
     basis: str = ""
+
+    def __post_init__(self) -> None:
+        _non_negative_number(self.payg_equivalent_usd, "monetary paygEquivalentUsd")
+        _non_negative_number(self.billed_usd, "monetary billedUsd")
+        _non_negative_number(self.plan_capacity_units, "monetary planCapacityUnits")
 
     @property
     def billing_mode(self) -> str:
@@ -658,6 +714,18 @@ class AppliedCoefficient:
     samples: int
     coefficient: float
 
+    def __post_init__(self) -> None:
+        _require(
+            self.dimension in ESTIMATE_DIMENSIONS,
+            f"applied coefficient: unknown dimension {self.dimension}",
+        )
+        _non_negative_int(self.samples, "applied coefficient samples")
+        _require(
+            _RATIO_FLOOR <= self.coefficient <= _RATIO_CEILING,
+            f"applied coefficient must stay within the observed ratio bounds "
+            f"[{_RATIO_FLOOR}, {_RATIO_CEILING}]: {self.coefficient}",
+        )
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "dimension": self.dimension,
@@ -677,6 +745,9 @@ class UsageEstimate:
     estimator_version: str = ESTIMATOR_VERSION
     basis: str = ""
     calibration: tuple[AppliedCoefficient, ...] = ()
+
+    def __post_init__(self) -> None:
+        _non_negative_int(self.runtime_seconds, "usage estimate runtimeSeconds")
 
     def value(self, dimension: str) -> int | None:
         if dimension == "runtimeSeconds":
@@ -726,14 +797,12 @@ class UsageActual:
             )
             if self.wait_seconds is None:
                 object.__setattr__(self, "wait_seconds", observed)
-        _require(
-            self.runtime_seconds is None or self.runtime_seconds >= 0,
-            "usage actual: runtimeSeconds cannot be negative",
-        )
-        _require(
-            self.wait_seconds is None or self.wait_seconds >= 0,
-            "usage actual: waitSeconds cannot be negative",
-        )
+        # Every observable ordering is checked, including the partial shape that
+        # omits startedAt, so no pair of timestamps can run backwards unnoticed.
+        if self.queued_at and self.finished_at:
+            _seconds_between(self.queued_at, self.finished_at, "usage actual: queuedAt/finishedAt")
+        _non_negative_int(self.runtime_seconds, "usage actual runtimeSeconds")
+        _non_negative_int(self.wait_seconds, "usage actual waitSeconds")
 
     def value(self, dimension: str) -> int | None:
         if dimension == "runtimeSeconds":
@@ -765,6 +834,13 @@ class InfrastructureUsage:
     storage_bytes: int | None = None
     network_bytes: int | None = None
     basis: str = ""
+
+    def __post_init__(self) -> None:
+        _non_negative_int(self.runner_seconds, "infrastructure runnerSeconds")
+        _non_negative_int(self.storage_bytes, "infrastructure storageBytes")
+        _non_negative_int(self.network_bytes, "infrastructure networkBytes")
+        _non_negative_number(self.ci_minutes, "infrastructure ciMinutes")
+        _non_negative_number(self.cost_usd, "infrastructure costUsd")
 
     @property
     def status(self) -> str:
@@ -814,6 +890,39 @@ _INFRASTRUCTURE_KEYS = frozenset(
 )
 
 
+def _same_money(expected: float | None, claimed: float | None) -> bool:
+    if expected is None or claimed is None:
+        return expected is None and claimed is None
+    return abs(expected - claimed) <= 1e-06
+
+
+def _require_reproducible_money(
+    tokens: TokenCounts, monetary: MonetaryEquivalent, label: str
+) -> None:
+    """A recorded figure must be the one its own snapshot and tokens produce.
+
+    The snapshot is embedded so a cost can be re-derived later. That promise is
+    empty if a producer may state any number beside it, so a figure that does
+    not reproduce is refused rather than trusted and aggregated.
+    """
+    if monetary.pricing is None:
+        return
+    expected = monetary_equivalent(
+        tokens, monetary.pricing, plan_capacity_units=monetary.plan_capacity_units
+    )
+    _require(
+        expected.status is monetary.status,
+        f"{label}: status {monetary.status.value} does not follow from the embedded "
+        f"pricing snapshot and token counts (expected {expected.status.value})",
+    )
+    _require(
+        _same_money(expected.payg_equivalent_usd, monetary.payg_equivalent_usd)
+        and _same_money(expected.billed_usd, monetary.billed_usd),
+        f"{label}: monetary values must reproduce from the embedded pricing snapshot "
+        f"{monetary.pricing_id} and the recorded token counts",
+    )
+
+
 def _load_estimate(raw: Any) -> UsageEstimate | None:
     if raw is None:
         return None
@@ -846,10 +955,13 @@ def _load_estimate(raw: Any) -> UsageEstimate | None:
                 coefficient=value,
             )
         )
+    tokens = _load_tokens(entry.get("tokens"), f"{label} tokens")
+    monetary = _load_monetary(entry.get("monetary"), f"{label} monetary")
+    _require_reproducible_money(tokens, monetary, f"{label} monetary")
     return UsageEstimate(
-        tokens=_load_tokens(entry.get("tokens"), f"{label} tokens"),
+        tokens=tokens,
         runtime_seconds=_optional_int(entry, "runtimeSeconds", label),
-        monetary=_load_monetary(entry.get("monetary"), f"{label} monetary"),
+        monetary=monetary,
         estimator_version=_text(entry, "estimatorVersion", label) or ESTIMATOR_VERSION,
         basis=_text(entry, "basis", label),
         calibration=tuple(calibration),
@@ -867,11 +979,14 @@ def _load_actual(raw: Any) -> UsageActual | None:
         result = UsageResult(result_value)
     except ValueError as error:
         raise UsageError(f"{label}: unknown result: {result_value}") from error
+    tokens = _load_tokens(entry.get("tokens"), f"{label} tokens")
+    monetary = _load_monetary(entry.get("monetary"), f"{label} monetary")
+    _require_reproducible_money(tokens, monetary, f"{label} monetary")
     return UsageActual(
-        tokens=_load_tokens(entry.get("tokens"), f"{label} tokens"),
+        tokens=tokens,
         runtime_seconds=_optional_int(entry, "runtimeSeconds", label),
         wait_seconds=_optional_int(entry, "waitSeconds", label),
-        monetary=_load_monetary(entry.get("monetary"), f"{label} monetary"),
+        monetary=monetary,
         result=result,
         source=_text(entry, "source", label),
         queued_at=_optional_timestamp(entry, "queuedAt", label),
@@ -1096,6 +1211,8 @@ def load_usage_record(document: Any) -> UsageRecord:
         actor = load_event_actor(entry.get("actor", {}))
     except ValueError as error:  # LedgerError is a ValueError
         raise UsageError(f"{label}: {error}") from error
+    _bounded_text_fields(work_unit, f"{label} workUnit")
+    _bounded_text_fields(actor, f"{label} actor")
     return UsageRecord(
         usage_id=_text(entry, "usageId", label, required=True),
         work_unit=work_unit,
@@ -1374,6 +1491,7 @@ class UsageLedger:
     def __init__(self, *, registry: ProjectRegistry = EMPTY_PROJECT_REGISTRY) -> None:
         self._registry = registry
         self._records: dict[str, UsageRecord] = {}
+        self._run_attempts: dict[tuple[str, str, str, int], str] = {}
 
     @property
     def registry(self) -> ProjectRegistry:
@@ -1399,9 +1517,20 @@ class UsageLedger:
                 record.project_id in self._registry,
                 f"unregistered project: {record.project_id}",
             )
+        # One run attempt is one record. Deduplicating on the caller-supplied id
+        # alone would let a changed id convention double-count the same run, so
+        # the logical identity is a second uniqueness key.
+        attempt_key = (record.project_id, record.work_unit_id, record.run_id, record.attempt)
+        owner = self._run_attempts.get(attempt_key)
+        _require(
+            owner is None or owner == record.usage_id,
+            f"usage record {record.usage_id}: run {record.run_id} attempt {record.attempt} "
+            f"of {record.work_unit_id} is already recorded as {owner}",
+        )
         existing = self._records.get(record.usage_id)
         if existing is None:
             self._records[record.usage_id] = record
+            self._run_attempts[attempt_key] = record.usage_id
             return record
         _require(
             replace(existing, estimate=None, actual=None, infrastructure=None).as_dict()
@@ -1443,18 +1572,27 @@ class UsageLedger:
         since: str | None = None,
         until: str | None = None,
     ) -> tuple[UsageRecord, ...]:
-        """Filter records; project scoping is exact so projects never leak."""
+        """Filter records; project scoping is exact so projects never leak.
+
+        Time bounds are compared as instants. Two RFC 3339 timestamps written
+        at different UTC offsets do not sort chronologically as strings, so a
+        window compared lexically would admit records outside it.
+        """
         scope = self._scope(project_id, project_ids)
         wanted_stage = LifecycleStage(stage) if stage is not None else None
+        lower = _parse_time(_timestamp(since, "usage query: since")) if since else None
+        upper = _parse_time(_timestamp(until, "usage query: until")) if until else None
         return tuple(
             record
-            for record in sorted(self._records.values(), key=lambda r: (r.occurred_at, r.usage_id))
+            for record in sorted(
+                self._records.values(), key=lambda r: (_parse_time(r.occurred_at), r.usage_id)
+            )
             if (scope is None or record.project_id in scope)
             and (work_unit_id is None or record.work_unit_id == work_unit_id)
             and (wanted_stage is None or record.stage is wanted_stage)
             and (model is None or record.actor.model == model)
-            and (since is None or record.occurred_at >= since)
-            and (until is None or record.occurred_at <= until)
+            and (lower is None or _parse_time(record.occurred_at) >= lower)
+            and (upper is None or _parse_time(record.occurred_at) <= upper)
         )
 
     def aggregate(
@@ -1525,6 +1663,11 @@ class UsageLedger:
         _require(
             version == USAGE_LEDGER_SCHEMA_VERSION,
             f"unsupported usage ledger schemaVersion: {version!r}",
+        )
+        record_version = entry.get("usageSchemaVersion", USAGE_SCHEMA_VERSION)
+        _require(
+            record_version == USAGE_SCHEMA_VERSION,
+            f"unsupported usage record schemaVersion: {record_version!r}",
         )
         raw = entry.get("records", [])
         _require(isinstance(raw, list), "usage ledger records must be an array")
@@ -1778,6 +1921,14 @@ class EstimatorCalibration:
                     f"{label}: coefficient samples and meanRatio are required",
                 )
                 assert samples is not None and mean_ratio is not None
+                # Observation clamps every ratio, so a stored one outside those
+                # bounds was not produced by observe() and cannot be trusted to
+                # scale a future estimate.
+                _require(
+                    _RATIO_FLOOR <= mean_ratio <= _RATIO_CEILING,
+                    f"{label}: meanRatio {mean_ratio} is outside the observed ratio "
+                    f"bounds [{_RATIO_FLOOR}, {_RATIO_CEILING}]",
+                )
                 calibration._coefficients.setdefault(key, {})[dimension] = _Coefficient(
                     samples=samples, mean_ratio=mean_ratio
                 )
