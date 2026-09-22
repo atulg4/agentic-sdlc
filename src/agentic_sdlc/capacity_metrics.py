@@ -31,7 +31,14 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from .usage_ledger import UsageRecord, UsageResult, parse_timestamp
+from .usage_ledger import (
+    CAPACITY_BASIS_ESTIMATED,
+    CAPACITY_BASIS_OBSERVED,
+    MonetaryStatus,
+    UsageRecord,
+    UsageResult,
+    parse_timestamp,
+)
 
 __all__ = [
     "CAPACITY_SCHEMA_VERSION",
@@ -109,6 +116,44 @@ def _ratio(numerator: float, denominator: float) -> float | None:
     return round(numerator / denominator, 4) if denominator > 0 else None
 
 
+def _seconds_value(value: float) -> float | int:
+    """Report a duration without throwing away the part below a second.
+
+    RFC 3339 permits fractional seconds, and truncating each interval on its
+    own erases real time: three back-to-back runs of six tenths of a second
+    would each measure zero and a fully occupied window would read idle.
+    Durations are therefore carried as floats and only rounded here, staying
+    integers whenever they really are whole.
+    """
+    return int(value) if float(value).is_integer() else round(value, 3)
+
+
+def _finite_number(value: Any, label: str) -> float | None:
+    """Accept a real number only: no booleans, no infinities, no NaN."""
+    if value is None:
+        return None
+    _require(
+        isinstance(value, int | float)
+        and not isinstance(value, bool)
+        and value == value
+        and value not in (float("inf"), float("-inf"))
+        and value >= 0,
+        f"{label} must be a finite number >= 0 or null",
+    )
+    return float(value)
+
+
+def _identifier(entry: Mapping[str, Any], key: str, label: str, *, required: bool = True) -> str:
+    """Read a declared identifier as a string, never coerce one into being."""
+    value = entry.get(key, "")
+    if value is None:
+        value = ""
+    _require(isinstance(value, str), f"{label}: {key} must be a string")
+    assert isinstance(value, str)
+    _require(not required or bool(value.strip()), f"{label}: {key} is required")
+    return value
+
+
 # -- window, pools and plan capacity ------------------------------------------
 
 
@@ -134,11 +179,11 @@ class ObservationWindow:
         return _instant(self.end, "observation window end")
 
     @property
-    def seconds(self) -> int:
-        return int((self.ended_at - self.started_at).total_seconds())
+    def seconds(self) -> float:
+        return (self.ended_at - self.started_at).total_seconds()
 
     def as_dict(self) -> dict[str, Any]:
-        return {"start": self.start, "end": self.end, "seconds": self.seconds}
+        return {"start": self.start, "end": self.end, "seconds": _seconds_value(self.seconds)}
 
 
 @dataclass(frozen=True)
@@ -187,16 +232,23 @@ class PlanCapacityObservation:
         _require(bool(self.capacity_unit.strip()), "plan capacity: capacityUnit is required")
         _instant(self.observed_at, "plan capacity observedAt")
         for name in ("units_total", "units_used"):
-            value = getattr(self, name)
-            _require(
-                value is None or (isinstance(value, int | float) and value >= 0),
-                f"plan capacity {name} must be a number >= 0 or null",
-            )
+            _finite_number(getattr(self, name), f"plan capacity {name}")
         if self.units_total is not None and self.units_used is not None:
             _require(
                 self.units_used <= self.units_total,
                 f"plan capacity {self.provider}: used exceeds the declared total",
             )
+
+    @property
+    def is_exhausted(self) -> bool:
+        """Fully consumed, judged on the declared values rather than a rounded share.
+
+        ``used_fraction`` is rounded for display, so a plan with a fraction of a
+        unit left would read as exactly 1.0 and be called exhausted.
+        """
+        if self.units_total is None or self.units_used is None:
+            return False
+        return self.units_used >= self.units_total
 
     @property
     def used_fraction(self) -> float | None:
@@ -243,6 +295,14 @@ class CapacityInputs:
     provider_limits: Mapping[str, int] | None = None
 
     def __post_init__(self) -> None:
+        seen_providers: set[str] = set()
+        for observation in self.plan_capacity:
+            _require(
+                observation.provider not in seen_providers,
+                f"provider {observation.provider} has more than one plan capacity "
+                "observation; which one applies cannot be decided by input order",
+            )
+            seen_providers.add(observation.provider)
         seen_pools: set[str] = set()
         owners: dict[str, str] = {}
         for pool in self.pools:
@@ -274,8 +334,8 @@ class _Interval:
     record: UsageRecord
 
     @property
-    def seconds(self) -> int:
-        return int((self.end - self.start).total_seconds())
+    def seconds(self) -> float:
+        return (self.end - self.start).total_seconds()
 
 
 @dataclass(frozen=True)
@@ -285,15 +345,15 @@ class _Segment:
     active: int
 
     @property
-    def seconds(self) -> int:
-        return int((self.end - self.start).total_seconds())
+    def seconds(self) -> float:
+        return (self.end - self.start).total_seconds()
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "from": self.start.isoformat(),
             "to": self.end.isoformat(),
             "active": self.active,
-            "seconds": self.seconds,
+            "seconds": _seconds_value(self.seconds),
         }
 
 
@@ -352,27 +412,27 @@ class _Track:
         return max((segment.active for segment in self._segments), default=0)
 
     @property
-    def busy_seconds(self) -> int:
+    def busy_seconds(self) -> float:
         return sum(segment.seconds * segment.active for segment in self._segments)
 
     @property
-    def occupied_seconds(self) -> int:
+    def occupied_seconds(self) -> float:
         """Seconds with at least one run active, however many were running."""
         return sum(segment.seconds for segment in self._segments if segment.active > 0)
 
     def seconds_at_or_above(
         self, level: int, start: datetime | None = None, end: datetime | None = None
-    ) -> int:
+    ) -> float:
         lower = start or self._window.started_at
         upper = end or self._window.ended_at
-        total = 0
+        total = 0.0
         for segment in self._segments:
             if segment.active < level:
                 continue
             overlap_start = max(segment.start, lower)
             overlap_end = min(segment.end, upper)
             if overlap_end > overlap_start:
-                total += int((overlap_end - overlap_start).total_seconds())
+                total += (overlap_end - overlap_start).total_seconds()
         return total
 
     def as_dict(self, *, with_segments: bool = False) -> dict[str, Any]:
@@ -380,10 +440,10 @@ class _Track:
         document: dict[str, Any] = {
             "peak": self.peak,
             "mean": _ratio(self.busy_seconds, window_seconds),
-            "busySeconds": self.busy_seconds,
-            "occupiedSeconds": self.occupied_seconds,
-            "idleSeconds": window_seconds - self.occupied_seconds,
-            "windowSeconds": window_seconds,
+            "busySeconds": _seconds_value(self.busy_seconds),
+            "occupiedSeconds": _seconds_value(self.occupied_seconds),
+            "idleSeconds": _seconds_value(window_seconds - self.occupied_seconds),
+            "windowSeconds": _seconds_value(window_seconds),
             "runs": len(self._intervals),
         }
         if with_segments:
@@ -515,26 +575,32 @@ def _classify_wait(
     return (WaitCause.UNCLASSIFIED, "")
 
 
-def _handoff_gaps(records: Sequence[UsageRecord]) -> dict[str, int]:
-    """Idle time between one stage finishing and the next being queued."""
-    by_unit: dict[str, list[tuple[datetime, datetime]]] = {}
+def _handoff_gaps(records: Sequence[UsageRecord]) -> dict[str, float]:
+    """Idle time between one stage finishing and a *different* stage being queued.
+
+    A retry of the same stage is rework, which the useful-work figures already
+    account for. Counting it here would report a handoff delay and recommend
+    looking at how the next stage is triggered, when no stage changed at all.
+    """
+    by_unit: dict[str, list[tuple[datetime, datetime, str]]] = {}
     for record in records:
         queued, _, finished = _times(record)
         if queued is None or finished is None:
             continue
         key = f"{record.project_id}:{record.work_unit_id}"
-        by_unit.setdefault(key, []).append((queued, finished))
-    gaps: dict[str, int] = {}
-    for key, pairs in by_unit.items():
-        ordered = sorted(pairs, key=lambda item: item[0])
-        total = 0
+        by_unit.setdefault(key, []).append((queued, finished, record.stage.value))
+    gaps: dict[str, float] = {}
+    for key, entries in by_unit.items():
+        total = 0.0
         previous_finish: datetime | None = None
-        for queued, finished in ordered:
-            if previous_finish is not None and queued > previous_finish:
-                total += int((queued - previous_finish).total_seconds())
-            previous_finish = (
-                finished if previous_finish is None else max(previous_finish, finished)
-            )
+        previous_stage = ""
+        for queued, finished, stage in sorted(entries, key=lambda item: item[0]):
+            crossed_stages = stage != previous_stage
+            if previous_finish is not None and queued > previous_finish and crossed_stages:
+                total += (queued - previous_finish).total_seconds()
+            if previous_finish is None or finished > previous_finish:
+                previous_finish = finished
+                previous_stage = stage
         if total > 0:
             gaps[key] = total
     return gaps
@@ -548,10 +614,10 @@ def _wait_report(
     coverage: Mapping[str, int],
 ) -> tuple[dict[str, Any], dict[str, list[_Interval]]]:
     by_cause: dict[str, dict[str, Any]] = {
-        cause.value: {"seconds": 0, "waits": 0, "blockers": {}} for cause in WaitCause
+        cause.value: {"seconds": 0.0, "waits": 0, "blockers": {}} for cause in WaitCause
     }
     classified: dict[str, list[_Interval]] = {cause.value: [] for cause in WaitCause}
-    by_stage: dict[str, int] = {}
+    by_stage: dict[str, float] = {}
     for wait in waits:
         cause, blocker = _classify_wait(wait, inputs, pool_tracks)
         bucket = by_cause[cause.value]
@@ -561,20 +627,26 @@ def _wait_report(
             bucket["blockers"][blocker] = bucket["blockers"].get(blocker, 0) + 1
         classified[cause.value].append(wait)
         stage = wait.record.stage.value
-        by_stage[stage] = by_stage.get(stage, 0) + wait.seconds
+        by_stage[stage] = by_stage.get(stage, 0.0) + wait.seconds
     gaps = _handoff_gaps(records)
     for bucket in by_cause.values():
         bucket["blockers"] = dict(sorted(bucket["blockers"].items()))
+    for bucket in by_cause.values():
+        bucket["seconds"] = _seconds_value(bucket["seconds"])
     return (
         {
-            "totalSeconds": sum(wait.seconds for wait in waits),
+            "totalSeconds": _seconds_value(sum(wait.seconds for wait in waits)),
             "waitsTimed": coverage["waitsTimed"],
             "waitsUntimed": coverage["waitsUntimed"],
             "byCause": by_cause,
-            "byStageSeconds": dict(sorted(by_stage.items())),
+            "byStageSeconds": {
+                name: _seconds_value(value) for name, value in sorted(by_stage.items())
+            },
             "handoff": {
-                "totalSeconds": sum(gaps.values()),
-                "byWorkUnitSeconds": dict(sorted(gaps.items())),
+                "totalSeconds": _seconds_value(sum(gaps.values())),
+                "byWorkUnitSeconds": {
+                    name: _seconds_value(value) for name, value in sorted(gaps.items())
+                },
             },
         },
         classified,
@@ -592,10 +664,15 @@ def _runner_report(
         for worker, items in sorted(_grouped(busy, lambda r: r.actor.worker).items())
     }
     for worker, document in by_worker.items():
+        pool = inputs.pool_for(worker)
+        # Without a declaration nothing grounds this worker's capacity, so a
+        # share of the window here would be exactly the invented percentage the
+        # report promises never to show.
         document["utilization"] = (
-            None if worker == "unattributed" else _ratio(document["busySeconds"], window.seconds)
+            _ratio(document["busySeconds"], window.seconds) if pool is not None else None
         )
-        document["pool"] = inputs.pool_for(worker).pool_id if inputs.pool_for(worker) else None
+        document["pool"] = pool.pool_id if pool is not None else None
+        document["utilizationStatus"] = "observed" if pool is not None else "unknown"
 
     tracks = _pool_tracks(busy, inputs, window)
     by_pool: dict[str, Any] = {}
@@ -613,9 +690,9 @@ def _runner_report(
                 "slots": pool.slots,
                 "kind": pool.kind,
                 "workers": list(pool.workers),
-                "availableSlotSeconds": available,
+                "availableSlotSeconds": _seconds_value(available),
                 "utilization": _ratio(track.busy_seconds, available),
-                "saturatedSeconds": track.seconds_at_or_above(pool.slots),
+                "saturatedSeconds": _seconds_value(track.seconds_at_or_above(pool.slots)),
                 "status": "observed",
             }
         )
@@ -668,26 +745,43 @@ def _plan_capacity_report(
     for provider in providers:
         items = [item for item in busy if item.record.actor.provider == provider]
         track = _Track(items, window)
-        consumed: dict[str, float] = {}
+        observed_units: dict[str, float] = {}
+        estimated_units: dict[str, float] = {}
         unknown_units = 0
         for item in items:
             monetary = item.record.actual.monetary if item.record.actual else None
-            if monetary is None or not monetary.plan_capacity_unit:
-                continue
-            if monetary.plan_capacity_units is None:
+            if monetary is None or monetary.status is MonetaryStatus.UNKNOWN:
+                # No monetary evidence at all says nothing about plan capacity.
                 unknown_units += 1
                 continue
+            if monetary.status is not MonetaryStatus.SUBSCRIPTION:
+                # Pay-as-you-go work consumes no plan capacity, so it is not a gap.
+                continue
+            if not monetary.plan_capacity_unit or monetary.plan_capacity_units is None:
+                unknown_units += 1
+                continue
+            # Units derived from token counts are this platform's arithmetic, not
+            # the provider's report, and must not be presented as observation.
+            target = (
+                estimated_units
+                if CAPACITY_BASIS_ESTIMATED in monetary.basis
+                else observed_units
+                if CAPACITY_BASIS_OBSERVED in monetary.basis
+                else estimated_units
+            )
             unit = monetary.plan_capacity_unit
-            consumed[unit] = round(consumed.get(unit, 0.0) + monetary.plan_capacity_units, 6)
+            target[unit] = round(target.get(unit, 0.0) + monetary.plan_capacity_units, 6)
         proxies = {
             "peakConcurrentRuns": track.peak,
-            "busySeconds": track.busy_seconds,
+            "busySeconds": _seconds_value(track.busy_seconds),
             "runs": len(items),
-            "observedCapacityUnits": dict(sorted(consumed.items())),
+            "observedCapacityUnits": dict(sorted(observed_units.items())),
+            "estimatedCapacityUnits": dict(sorted(estimated_units.items())),
             "runsWithUnknownCapacityUnits": unknown_units,
         }
         if provider in observed:
             document = observed[provider].as_dict()
+            document["exhausted"] = observed[provider].is_exhausted
             document["usageProxies"] = proxies
             report[provider] = document
         else:
@@ -698,6 +792,7 @@ def _plan_capacity_report(
                 "unitsTotal": None,
                 "unitsUsed": None,
                 "usedFraction": None,
+                "exhausted": None,
                 "usageProxies": proxies,
             }
     return report
@@ -708,15 +803,15 @@ def _plan_capacity_report(
 
 def _useful_work_report(busy: Sequence[_Interval]) -> dict[str, Any]:
     """Busy time is not the same as useful time; both are reported."""
-    by_result: dict[str, dict[str, int]] = {}
-    first_attempt = {"seconds": 0, "runs": 0}
-    retries = {"seconds": 0, "runs": 0}
-    useful_seconds = 0
-    total_seconds = 0
+    by_result: dict[str, dict[str, Any]] = {}
+    first_attempt: dict[str, Any] = {"seconds": 0.0, "runs": 0}
+    retries: dict[str, Any] = {"seconds": 0.0, "runs": 0}
+    useful_seconds = 0.0
+    total_seconds = 0.0
     for item in busy:
         record = item.record
         result = record.actual.result.value if record.actual else UsageResult.UNKNOWN.value
-        bucket = by_result.setdefault(result, {"seconds": 0, "runs": 0})
+        bucket = by_result.setdefault(result, {"seconds": 0.0, "runs": 0})
         bucket["seconds"] += item.seconds
         bucket["runs"] += 1
         target = first_attempt if record.attempt == 1 else retries
@@ -725,18 +820,22 @@ def _useful_work_report(busy: Sequence[_Interval]) -> dict[str, Any]:
         total_seconds += item.seconds
         if result == UsageResult.COMPLETED.value and record.attempt == 1:
             useful_seconds += item.seconds
+    for bucket in by_result.values():
+        bucket["seconds"] = _seconds_value(bucket["seconds"])
+    for bucket in (first_attempt, retries):
+        bucket["seconds"] = _seconds_value(bucket["seconds"])
     return {
-        "rawBusySeconds": total_seconds,
-        "usefulSeconds": useful_seconds,
-        "reworkSeconds": total_seconds - useful_seconds,
+        "rawBusySeconds": _seconds_value(total_seconds),
+        "usefulSeconds": _seconds_value(useful_seconds),
+        "reworkSeconds": _seconds_value(total_seconds - useful_seconds),
         "usefulWorkRatio": _ratio(useful_seconds, total_seconds),
         "formula": (
             "busy seconds of runs that completed on their first attempt / all busy "
             "seconds; failed, cancelled, abandoned, inconclusive and retried runs stay "
             "in the denominator"
         ),
-        "numeratorSeconds": useful_seconds,
-        "denominatorSeconds": total_seconds,
+        "numeratorSeconds": _seconds_value(useful_seconds),
+        "denominatorSeconds": _seconds_value(total_seconds),
         "byResult": {name: by_result[name] for name in sorted(by_result)},
         "firstAttempt": first_attempt,
         "retries": retries,
@@ -750,7 +849,7 @@ def _useful_work_report(busy: Sequence[_Interval]) -> dict[str, Any]:
 class _Finding:
     kind: BottleneckKind
     scope: str
-    impact_seconds: int
+    impact_seconds: float
     explanation: str
     evidence: Mapping[str, Any]
 
@@ -758,7 +857,7 @@ class _Finding:
         return {
             "kind": self.kind.value,
             "scope": self.scope,
-            "impactSeconds": self.impact_seconds,
+            "impactSeconds": _seconds_value(self.impact_seconds),
             "explanation": self.explanation,
             "evidence": dict(sorted(self.evidence.items())),
         }
@@ -810,9 +909,12 @@ def _bottlenecks(
         saturated = track.seconds_at_or_above(pool.slots)
         if saturated == 0:
             continue
+        # Only waits this detector's own classification calls resource-blocked
+        # count here. Charging a wait with explicit dependency evidence to a
+        # runner shortage would contradict the cause already reported for it.
         blocked = sum(
             track.seconds_at_or_above(pool.slots, wait.start, wait.end)
-            for wait in waits
+            for wait in classified.get(WaitCause.RESOURCE.value, ())
             if inputs.pool_for(wait.record.actor.worker) is pool
         )
         if blocked > 0:
@@ -823,15 +925,15 @@ def _bottlenecks(
                     impact_seconds=blocked,
                     explanation=(
                         f"pool {pool.pool_id} was at all {pool.slots} slots for "
-                        f"{saturated}s of the window, and work sat queued for {blocked}s "
-                        "of that time"
+                        f"{_seconds_value(saturated)}s of the window, and resource-blocked "
+                        f"work sat queued for {_seconds_value(blocked)}s of that time"
                     ),
                     evidence={
                         "poolId": pool.pool_id,
                         "slots": pool.slots,
-                        "saturatedSeconds": saturated,
-                        "queuedWhileSaturatedSeconds": blocked,
-                        "windowSeconds": window.seconds,
+                        "saturatedSeconds": _seconds_value(saturated),
+                        "queuedWhileSaturatedSeconds": _seconds_value(blocked),
+                        "windowSeconds": _seconds_value(window.seconds),
                     },
                 )
             )
@@ -860,12 +962,13 @@ def _bottlenecks(
                         impact_seconds=blocked,
                         explanation=(
                             f"concurrency group {group} never ran more than one unit at a "
-                            f"time, and its own work waited {blocked}s while it was busy"
+                            f"time, and its own work waited {_seconds_value(blocked)}s "
+                            "while it was busy"
                         ),
                         evidence={
                             "group": group,
                             "peakConcurrency": track.peak,
-                            "queuedWhileGroupBusySeconds": blocked,
+                            "queuedWhileGroupBusySeconds": _seconds_value(blocked),
                             "runs": len(items),
                         },
                     )
@@ -890,20 +993,20 @@ def _bottlenecks(
                     impact_seconds=blocked,
                     explanation=(
                         f"provider {provider} ran at its declared ceiling of {limit} "
-                        f"concurrent runs for {at_limit}s, and work waited {blocked}s of "
-                        "that time"
+                        f"concurrent runs for {_seconds_value(at_limit)}s, and work waited "
+                        f"{_seconds_value(blocked)}s of that time"
                     ),
                     evidence={
                         "provider": provider,
                         "concurrentRunLimit": limit,
-                        "atLimitSeconds": at_limit,
-                        "queuedWhileAtLimitSeconds": blocked,
+                        "atLimitSeconds": _seconds_value(at_limit),
+                        "queuedWhileAtLimitSeconds": _seconds_value(blocked),
                     },
                 )
             )
 
     for provider, document in sorted(plan_capacity.items()):
-        if document.get("usedFraction") == 1.0:
+        if document.get("exhausted") is True:
             findings.append(
                 _Finding(
                     kind=BottleneckKind.MODEL_CAPACITY_THROTTLING,
@@ -939,11 +1042,13 @@ def _bottlenecks(
                 kind=BottleneckKind.DEPENDENCY_FAN_IN,
                 scope=f"dependency:{blocker}",
                 impact_seconds=seconds,
-                explanation=(f"{len(items)} runs waited a combined {seconds}s on {blocker}"),
+                explanation=(
+                    f"{len(items)} runs waited a combined {_seconds_value(seconds)}s on {blocker}"
+                ),
                 evidence={
                     "blockingRef": blocker,
                     "waitingRuns": len(items),
-                    "blockedSeconds": seconds,
+                    "blockedSeconds": _seconds_value(seconds),
                     "threshold": _FAN_IN_THRESHOLD,
                 },
             )
@@ -964,12 +1069,12 @@ def _bottlenecks(
                 impact_seconds=seconds,
                 explanation=(
                     f"{len(repeated)} runs across {len(units)} work units were repairs or "
-                    f"re-reviews, costing {seconds}s of runtime"
+                    f"re-reviews, costing {_seconds_value(seconds)}s of runtime"
                 ),
                 evidence={
                     "runs": len(repeated),
                     "workUnits": units,
-                    "seconds": seconds,
+                    "seconds": _seconds_value(seconds),
                 },
             )
         )
@@ -983,14 +1088,15 @@ def _bottlenecks(
                 scope="global",
                 impact_seconds=total,
                 explanation=(
-                    f"{total}s passed between one stage finishing and the next being "
-                    f"queued, the worst being {worst[0]} at {worst[1]}s"
+                    f"{_seconds_value(total)}s passed between one stage finishing and a "
+                    f"different one being queued, the worst being {worst[0]} at "
+                    f"{_seconds_value(worst[1])}s"
                 ),
                 evidence={
-                    "totalSeconds": total,
+                    "totalSeconds": _seconds_value(total),
                     "workUnits": len(handoff),
                     "worstWorkUnit": worst[0],
-                    "worstSeconds": worst[1],
+                    "worstSeconds": _seconds_value(worst[1]),
                 },
             )
         )
@@ -1009,7 +1115,7 @@ def _recommendations(findings: Sequence[_Finding]) -> tuple[dict[str, Any], ...]
             "scope": finding.scope,
             "action": _ACTIONS[finding.kind],
             "rationale": finding.explanation,
-            "impactSeconds": finding.impact_seconds,
+            "impactSeconds": _seconds_value(finding.impact_seconds),
             "evidence": dict(sorted(finding.evidence.items())),
             "advisory": True,
         }
@@ -1059,13 +1165,18 @@ def build_capacity_report(
     )
 
     by_project: dict[str, Any] = {}
-    for project_id in sorted({record.project_id for record in reading.in_window}):
+    # A project whose work only queued inside the window still belongs here;
+    # dropping it would hide exactly the project that is fully backlogged.
+    scoped_projects = {item.record.project_id for item in reading.busy} | {
+        item.record.project_id for item in reading.waits
+    }
+    for project_id in sorted(scoped_projects):
         busy = [item for item in reading.busy if item.record.project_id == project_id]
         waits = [item for item in reading.waits if item.record.project_id == project_id]
         by_project[project_id] = {
             "concurrency": _Track(busy, window).as_dict(),
             "queue": _Track(waits, window).as_dict(),
-            "waitSeconds": sum(item.seconds for item in waits),
+            "waitSeconds": _seconds_value(sum(item.seconds for item in waits)),
             "usefulWork": _useful_work_report(busy),
         }
 
@@ -1163,15 +1274,16 @@ def load_capacity_inputs(document: Any) -> CapacityInputs:
         _known_keys(pool, _POOL_KEYS, "runner pool")
         workers = pool.get("workers", [])
         _require(
-            isinstance(workers, list) and all(isinstance(name, str) for name in workers),
-            "runner pool: workers must be an array of strings",
+            isinstance(workers, list)
+            and all(isinstance(name, str) and name.strip() for name in workers),
+            "runner pool: workers must be an array of non-empty strings",
         )
         pools.append(
             RunnerPool(
-                pool_id=str(pool.get("poolId", "")),
+                pool_id=_identifier(pool, "poolId", "runner pool"),
                 slots=_positive_int(pool.get("slots"), "runner pool: slots"),
                 workers=tuple(workers),
-                kind=str(pool.get("kind", "unspecified")),
+                kind=_identifier(pool, "kind", "runner pool", required=False) or "unspecified",
             )
         )
 
@@ -1183,12 +1295,12 @@ def load_capacity_inputs(document: Any) -> CapacityInputs:
         _known_keys(plan, _PLAN_KEYS, "plan capacity")
         plan_capacity.append(
             PlanCapacityObservation(
-                provider=str(plan.get("provider", "")),
-                plan=str(plan.get("plan", "")),
-                capacity_unit=str(plan.get("capacityUnit", "")),
-                observed_at=str(plan.get("observedAt", "")),
-                units_total=plan.get("unitsTotal"),
-                units_used=plan.get("unitsUsed"),
+                provider=_identifier(plan, "provider", "plan capacity"),
+                plan=_identifier(plan, "plan", "plan capacity", required=False),
+                capacity_unit=_identifier(plan, "capacityUnit", "plan capacity"),
+                observed_at=_identifier(plan, "observedAt", "plan capacity"),
+                units_total=_finite_number(plan.get("unitsTotal"), "plan capacity unitsTotal"),
+                units_used=_finite_number(plan.get("unitsUsed"), "plan capacity unitsUsed"),
             )
         )
 
@@ -1196,7 +1308,11 @@ def load_capacity_inputs(document: Any) -> CapacityInputs:
     for provider, limit in _mapping(
         entry.get("providerLimits", {}), "capacity inputs: providerLimits"
     ).items():
-        limits[str(provider)] = _positive_int(limit, f"provider limit for {provider}")
+        _require(
+            isinstance(provider, str) and bool(provider.strip()),
+            "capacity inputs: providerLimits keys must be non-empty strings",
+        )
+        limits[provider] = _positive_int(limit, f"provider limit for {provider}")
 
     return CapacityInputs(
         pools=tuple(pools),

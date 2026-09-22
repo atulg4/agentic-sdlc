@@ -50,6 +50,9 @@ from .project_registry import EMPTY_PROJECT_REGISTRY, ProjectRegistry
 
 __all__ = [
     "CALIBRATION_SCHEMA_VERSION",
+    "CAPACITY_BASIS_ESTIMATED",
+    "CAPACITY_BASIS_OBSERVED",
+    "CAPACITY_BASIS_UNKNOWN",
     "ESTIMATE_DIMENSIONS",
     "ESTIMATOR_VERSION",
     "GROUP_DIMENSIONS",
@@ -94,6 +97,13 @@ ESTIMATE_DIMENSIONS: tuple[str, ...] = TOKEN_DIMENSIONS + ("runtimeSeconds",)
 
 #: Free text in an accounting record is bounded so a prompt cannot be smuggled in.
 MAX_TEXT_LENGTH = 256
+
+#: How a subscription figure came by its plan capacity units. These appear in a
+#: MonetaryEquivalent's ``basis`` and are exported so a consumer can separate a
+#: provider-observed consumption from one this module derived from token counts.
+CAPACITY_BASIS_OBSERVED = "plan capacity units observed"
+CAPACITY_BASIS_ESTIMATED = "plan capacity units estimated from tokens"
+CAPACITY_BASIS_UNKNOWN = "plan capacity units unknown"
 _RATIO_FLOOR = 0.05
 _RATIO_CEILING = 20.0
 
@@ -619,13 +629,13 @@ def monetary_equivalent(
         plan_capacity_units is None or plan_capacity_units >= 0,
         "plan capacity units cannot be negative",
     )
-    capacity_basis = "plan capacity units unknown"
+    capacity_basis = CAPACITY_BASIS_UNKNOWN
     units = plan_capacity_units
     if units is not None:
-        capacity_basis = "plan capacity units observed"
+        capacity_basis = CAPACITY_BASIS_OBSERVED
     elif pricing.capacity_units_per_million_tokens is not None and tokens.total is not None:
         units = round(tokens.total * pricing.capacity_units_per_million_tokens / 1_000_000, 6)
-        capacity_basis = "plan capacity units estimated from tokens"
+        capacity_basis = CAPACITY_BASIS_ESTIMATED
     if usd is None:
         equivalent_basis = (
             "no reference rates in the subscription snapshot"

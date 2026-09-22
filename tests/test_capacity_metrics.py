@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -13,6 +14,7 @@ from agentic_sdlc.capacity_metrics import (
     RunnerPool,
     WaitCause,
     build_capacity_report,
+    load_capacity_inputs,
 )
 from agentic_sdlc.event_ledger import EventActor, LifecycleStage, WorkUnitRef
 from agentic_sdlc.usage_ledger import (
@@ -27,6 +29,21 @@ from agentic_sdlc.usage_ledger import (
 )
 
 WINDOW = ObservationWindow("2026-09-22T00:00:00Z", "2026-09-22T01:00:00Z")
+
+CODEX_PLAN = load_pricing_snapshot(
+    {
+        "pricingId": "codex-plan",
+        "provider": "codex",
+        "model": "gpt-5-codex",
+        "billingMode": "subscription",
+        "version": "2026-09",
+        "plan": {
+            "name": "ChatGPT Pro",
+            "capacityUnit": "requests",
+            "capacityUnitsPerMillionTokens": 10,
+        },
+    }
+)
 
 CLAUDE_MAX = load_pricing_snapshot(
     {
@@ -636,3 +653,211 @@ def test_bottlenecks_are_ordered_by_the_time_they_cost() -> None:
     impacts = [item["impactSeconds"] for item in report["bottlenecks"]]
     assert impacts == sorted(impacts, reverse=True)
     assert report["recommendations"][0]["recommendationId"] == "cap-001"
+
+
+# -- findings from the independent Codex review on #126 ------------------------
+
+
+def _at_second(value: str) -> str:
+    return f"2026-09-22T00:00:{value}Z"
+
+
+def _sub_second_run(usage_id: str, started: str, finished: str) -> UsageRecord:
+    return UsageRecord(
+        usage_id=usage_id,
+        work_unit=WorkUnitRef(project_id="alpha", work_unit_id="unit-1"),
+        stage=LifecycleStage.IMPLEMENTATION,
+        run_id=usage_id,
+        recorded_at=at(0),
+        actor=EventActor(name="claude", kind="agent", worker="w1"),
+        actual=UsageActual(started_at=started, finished_at=finished),
+    )
+
+
+def test_fractional_durations_survive_aggregation() -> None:
+    # Three back-to-back runs of six tenths of a second fill two seconds; each
+    # truncated on its own would measure zero and the window would read idle.
+    window = ObservationWindow(_at_second("00"), _at_second("02"))
+    report = build_capacity_report(
+        [
+            _sub_second_run("a", _at_second("00"), _at_second("00.6")),
+            _sub_second_run("b", _at_second("00.6"), _at_second("01.2")),
+            _sub_second_run("c", _at_second("01.2"), _at_second("02")),
+        ],
+        window=window,
+    )
+    concurrency = report["concurrency"]
+
+    assert concurrency["busySeconds"] == 2
+    assert concurrency["occupiedSeconds"] == 2
+    assert concurrency["idleSeconds"] == 0
+    assert concurrency["mean"] == 1.0
+    assert [item["seconds"] for item in concurrency["segments"]] == [0.6, 0.6, 0.8]
+    # Whole numbers stay integers so ordinary reports are unchanged.
+    assert isinstance(concurrency["busySeconds"], int)
+
+
+def test_a_retry_of_the_same_stage_is_not_a_handoff() -> None:
+    same_stage = build_capacity_report(
+        [
+            run("try-1", "w1", 0, 10, queued=0),
+            run("try-2", "w1", 30, 40, queued=25, attempt=2),
+        ],
+        window=WINDOW,
+    )
+    assert same_stage["wait"]["handoff"]["byWorkUnitSeconds"] == {}
+    assert find(same_stage, BottleneckKind.HANDOFF_DELAY) is None
+
+    # A genuine change of stage is still measured.
+    crossed = build_capacity_report(
+        [
+            run("plan", "w1", 0, 10, queued=0, stage=LifecycleStage.PLANNING),
+            run("build", "w1", 30, 40, queued=25, stage=LifecycleStage.IMPLEMENTATION),
+        ],
+        window=WINDOW,
+    )
+    assert crossed["wait"]["handoff"]["byWorkUnitSeconds"] == {"alpha:unit-1": 900}
+
+
+def test_a_project_that_only_queued_work_still_gets_a_report() -> None:
+    # Queued at 00:10, still not started when the window closes at 01:00.
+    report = build_capacity_report(
+        [run("backlogged", "w1", 70, 80, queued=10, project_id="beta", work_unit_id="unit-9")],
+        window=WINDOW,
+    )
+    assert report["queue"]["busySeconds"] == 3000
+    assert "beta" in report["byProject"], "the fully backlogged project must not vanish"
+    assert report["byProject"]["beta"]["queue"]["busySeconds"] == 3000
+    assert report["byProject"]["beta"]["concurrency"]["busySeconds"] == 0
+
+
+def test_a_nearly_full_plan_is_not_called_exhausted() -> None:
+    nearly = PlanCapacityObservation(
+        provider="anthropic",
+        plan="Claude Max",
+        capacity_unit="share",
+        observed_at=at(30),
+        units_total=10_000,
+        units_used=9_999.6,
+    )
+    report = build_capacity_report(
+        [run("a", "w1", 0, 10)], window=WINDOW, inputs=CapacityInputs(plan_capacity=(nearly,))
+    )
+    anthropic = report["planCapacity"]["anthropic"]
+
+    assert anthropic["usedFraction"] == 1.0, "rounded for display"
+    assert anthropic["unitsRemaining"] == 0.4
+    assert anthropic["exhausted"] is False, "judged on the raw values, not the rounded share"
+    assert find(report, BottleneckKind.MODEL_CAPACITY_THROTTLING) is None
+
+    full = replace(nearly, units_used=10_000)
+    exhausted = build_capacity_report(
+        [run("a", "w1", 0, 10)], window=WINDOW, inputs=CapacityInputs(plan_capacity=(full,))
+    )
+    assert exhausted["planCapacity"]["anthropic"]["exhausted"] is True
+    assert find(exhausted, BottleneckKind.MODEL_CAPACITY_THROTTLING) is not None
+
+
+def test_runs_without_plan_capacity_evidence_count_as_unknown() -> None:
+    subscription = monetary_equivalent(
+        TokenCounts(1000, 500, 0, 0), CLAUDE_MAX, plan_capacity_units=0.25
+    )
+    report = build_capacity_report(
+        [run("known", "w1", 0, 10, monetary=subscription), run("silent", "w2", 0, 10)],
+        window=WINDOW,
+    )
+    proxies = report["planCapacity"]["anthropic"]["usageProxies"]
+
+    assert proxies["observedCapacityUnits"] == {"five-hour-window-share": 0.25}
+    assert proxies["runsWithUnknownCapacityUnits"] == 1, "silence is not complete coverage"
+
+
+def test_units_derived_from_tokens_are_not_reported_as_observed() -> None:
+    estimated = monetary_equivalent(TokenCounts(1000, 500, 0, 0), CODEX_PLAN)
+    assert estimated.plan_capacity_units == 0.015
+
+    report = build_capacity_report(
+        [run("a", "w1", 0, 10, provider="codex", monetary=estimated)], window=WINDOW
+    )
+    proxies = report["planCapacity"]["codex"]["usageProxies"]
+
+    assert proxies["observedCapacityUnits"] == {}
+    assert proxies["estimatedCapacityUnits"] == {"requests": 0.015}
+
+
+def test_plan_capacity_rejects_booleans_and_non_finite_numbers() -> None:
+    for value in (True, float("inf"), float("nan"), -1):
+        with pytest.raises(CapacityError, match="must be a finite number >= 0 or null"):
+            PlanCapacityObservation("anthropic", "Max", "share", at(0), units_total=value)
+
+
+def test_a_dependency_wait_is_not_also_charged_to_a_runner_shortage() -> None:
+    inputs = CapacityInputs(
+        pools=(RunnerPool("hosted", slots=1, workers=("w1",)),),
+        dependency_blocked={"B": "alpha:unit-0"},
+    )
+    report = build_capacity_report(_saturated_pool_records(), window=WINDOW, inputs=inputs)
+
+    assert report["wait"]["byCause"][WaitCause.DEPENDENCY.value]["seconds"] == 1500
+    assert find(report, BottleneckKind.RUNNER_SHORTAGE) is None, (
+        "the wait already has an explicit cause; charging it twice contradicts it"
+    )
+    assert report["runners"]["byPool"]["hosted"]["saturatedSeconds"] == 2400
+
+
+def test_a_worker_outside_every_declared_pool_has_no_utilization() -> None:
+    bare = build_capacity_report([run("a", "w1", 30, 60)], window=WINDOW)
+    worker = bare["runners"]["byWorker"]["w1"]
+
+    assert worker["utilization"] is None, "nothing grounds an undeclared worker's capacity"
+    assert worker["utilizationStatus"] == "unknown"
+    assert worker["pool"] is None
+    assert worker["busySeconds"] == 1800
+
+    declared = build_capacity_report(
+        [run("a", "w1", 30, 60)],
+        window=WINDOW,
+        inputs=CapacityInputs(pools=(RunnerPool("hosted", slots=1, workers=("w1",)),)),
+    )
+    grounded = declared["runners"]["byWorker"]["w1"]
+    assert grounded["utilization"] == 0.5
+    assert grounded["utilizationStatus"] == "observed"
+
+
+def test_two_observations_for_one_provider_are_refused() -> None:
+    early = PlanCapacityObservation(
+        "anthropic", "Max", "share", at(10), units_total=100, units_used=10
+    )
+    late = replace(early, observed_at=at(50), units_used=90)
+    with pytest.raises(CapacityError, match="more than one plan capacity observation"):
+        CapacityInputs(plan_capacity=(early, late))
+
+
+def test_declared_identifiers_must_be_strings() -> None:
+    base = {
+        "planCapacity": [
+            {"provider": "anthropic", "plan": "Max", "capacityUnit": "share", "observedAt": at(0)}
+        ]
+    }
+    assert load_capacity_inputs(base).plan_capacity[0].provider == "anthropic"
+
+    for field_name, message in (
+        ("provider", "provider is required"),
+        ("capacityUnit", "capacityUnit is required"),
+    ):
+        document = {"planCapacity": [dict(base["planCapacity"][0]) | {field_name: None}]}
+        with pytest.raises(CapacityError, match=message):
+            load_capacity_inputs(document)
+
+    document = {"planCapacity": [dict(base["planCapacity"][0]) | {"provider": 7}]}
+    with pytest.raises(CapacityError, match="provider must be a string"):
+        load_capacity_inputs(document)
+
+    with pytest.raises(CapacityError, match="poolId must be a string"):
+        load_capacity_inputs({"pools": [{"poolId": 1, "slots": 1}]})
+    with pytest.raises(CapacityError, match="non-empty strings"):
+        load_capacity_inputs({"pools": [{"poolId": "p", "slots": 1, "workers": [""]}]})
+    with pytest.raises(CapacityError, match="must be a finite number >= 0 or null"):
+        load_capacity_inputs(
+            {"planCapacity": [dict(base["planCapacity"][0]) | {"unitsTotal": True}]}
+        )
