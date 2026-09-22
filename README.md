@@ -28,6 +28,9 @@ remain in MarketMaestro; reusable orchestration lives here.
 - GitHub plan, implementation, and review workflow templates.
 - A GitLab CI component template and webhook contract.
 - A MarketMaestro policy profile.
+- A provider-neutral usage ledger with estimate-versus-actual accounting for
+  tokens, time, model, worker and cost, subscription-aware and never
+  fabricating unknown figures.
 - Security, operations, onboarding, and phone-control documentation.
 - Offline unit tests for the core policy behavior.
 
