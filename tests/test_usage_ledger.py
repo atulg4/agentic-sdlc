@@ -384,6 +384,18 @@ def test_ledger_replay_is_a_noop_filling_is_allowed_and_rewriting_fails() -> Non
         ledger.append(replace(infra, infrastructure=InfrastructureUsage(cost_usd=0.5)))
 
 
+def test_record_rejects_an_unusable_identity_or_timestamp_at_construction() -> None:
+    # An aggregate must never be the first place a malformed record is noticed.
+    with pytest.raises(UsageError, match="recordedAt must be an RFC 3339 timestamp"):
+        _record(recorded_at="yesterday")
+    with pytest.raises(UsageError, match="usageId is required"):
+        replace(_record(), usage_id="  ")
+    with pytest.raises(UsageError, match="runId is required"):
+        replace(_record(), run_id="")
+    with pytest.raises(UsageError, match="attempt numbers start at 1"):
+        replace(_record(), attempt=0)
+
+
 def test_ledger_round_trips_and_fails_closed_on_unknown_versions() -> None:
     ledger = UsageLedger()
     ledger.append(_record(estimate=_estimate(), actual=_actual()))
@@ -808,8 +820,18 @@ def test_calibration_ignores_cancelled_incomplete_and_extreme_observations() -> 
     ).coefficient == round((20.0 + 0.05) / 2, 6)
     with pytest.raises(UsageError, match="unknown estimate dimension"):
         calibration.coefficient("mood", model="m", stage="s")
-    with pytest.raises(UsageError, match="min_samples"):
-        EstimatorCalibration(min_samples=0)
+
+
+@pytest.mark.parametrize("value", [0, -5, True])
+def test_min_samples_is_validated_on_every_assignment_path(value: int) -> None:
+    # A stored calibration must never be given a value its own loader rejects.
+    with pytest.raises(UsageError, match="min_samples must be an integer >= 1"):
+        EstimatorCalibration(min_samples=value)
+    calibration = EstimatorCalibration()
+    with pytest.raises(UsageError, match="min_samples must be an integer >= 1"):
+        calibration.min_samples = value
+    assert calibration.min_samples == 3
+    assert EstimatorCalibration.from_dict(calibration.as_dict()).min_samples == 3
 
 
 def test_calibration_round_trips_and_fails_closed() -> None:
