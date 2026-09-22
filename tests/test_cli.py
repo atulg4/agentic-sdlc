@@ -1249,3 +1249,130 @@ def test_usage_cli_calibrates_and_applies_learned_coefficients(tmp_path: Path) -
     assert _estimate_cli(tmp_path, estimate, "--pricing-id", "claude-max") == 2
     assert _estimate_cli(tmp_path, estimate, "--pricing", str(pricing), "--pricing-id", "nope") == 2
     assert main([*command[:-2], "--calibration", str(tmp_path / "missing" / "c.json")]) == 2
+
+
+def _timed_usage_document(
+    run_id: str,
+    worker: str,
+    queued: str,
+    started: str,
+    finished: str,
+    *,
+    project_id: str = "alpha",
+    result: str = "completed",
+) -> dict:
+    document = _usage_document(run_id, project_id=project_id)
+    document["usageId"] = f"usage-{project_id}-{run_id}"
+    document["actor"]["worker"] = worker
+    document["actor"]["provider"] = "anthropic"
+    document["actual"] = {
+        "queuedAt": queued,
+        "startedAt": started,
+        "finishedAt": finished,
+        "result": result,
+    }
+    return document
+
+
+def test_capacity_report_cli_measures_a_window_and_names_its_bottleneck(tmp_path: Path) -> None:
+    ledger = tmp_path / "usage.json"
+    record = tmp_path / "record.json"
+    inputs = tmp_path / "capacity-inputs.json"
+    output = tmp_path / "capacity.json"
+
+    plan = (
+        # One slot: run A holds it while run B waits behind it.
+        ("run-a", "w1", "2026-09-21T10:00:00Z", "2026-09-21T10:00:00Z", "2026-09-21T10:30:00Z"),
+        ("run-b", "w1", "2026-09-21T10:05:00Z", "2026-09-21T10:30:00Z", "2026-09-21T10:40:00Z"),
+    )
+    for run_id, worker, queued, started, finished in plan:
+        record.write_text(
+            json.dumps(_timed_usage_document(run_id, worker, queued, started, finished)),
+            encoding="utf-8",
+        )
+        assert main(["record-usage", "--ledger", str(ledger), "--record", str(record)]) == 0
+
+    inputs.write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "pools": [
+                    {"poolId": "hosted", "slots": 1, "workers": ["w1"], "kind": "github-hosted"}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    command = [
+        "capacity-report",
+        "--usage",
+        str(ledger),
+        "--window-start",
+        "2026-09-21T10:00:00Z",
+        "--window-end",
+        "2026-09-21T11:00:00Z",
+    ]
+    assert main([*command, "--inputs", str(inputs), "--output", str(output)]) == 0
+    report = json.loads(output.read_text(encoding="utf-8"))
+
+    assert report["window"]["seconds"] == 3600
+    assert report["concurrency"]["peak"] == 1
+    assert report["concurrency"]["busySeconds"] == 1800 + 600
+    assert report["queue"]["busySeconds"] == 1500
+    assert report["wait"]["byCause"]["resource"]["seconds"] == 1500
+    assert report["runners"]["byPool"]["hosted"]["utilization"] == round(2400 / 3600, 4)
+    assert report["bottlenecks"][0]["kind"] == "runner-shortage"
+    assert report["recommendations"][0]["advisory"] is True
+    # Without the pool declaration nothing can say the wait was for a slot.
+    assert main([*command, "--output", str(output)]) == 0
+    bare = json.loads(output.read_text(encoding="utf-8"))
+    assert bare["wait"]["byCause"]["unclassified"]["seconds"] == 1500
+    assert bare["runners"]["byPool"] == {}
+    assert bare["planCapacity"]["anthropic"]["usedFraction"] is None
+
+
+def test_capacity_report_cli_fails_closed(tmp_path: Path) -> None:
+    ledger = tmp_path / "usage.json"
+    record = tmp_path / "record.json"
+    inputs = tmp_path / "capacity-inputs.json"
+    record.write_text(
+        json.dumps(
+            _timed_usage_document(
+                "run-a",
+                "w1",
+                "2026-09-21T10:00:00Z",
+                "2026-09-21T10:00:00Z",
+                "2026-09-21T10:30:00Z",
+            )
+        ),
+        encoding="utf-8",
+    )
+    assert main(["record-usage", "--ledger", str(ledger), "--record", str(record)]) == 0
+    command = [
+        "capacity-report",
+        "--usage",
+        str(ledger),
+        "--window-start",
+        "2026-09-21T10:00:00Z",
+        "--window-end",
+        "2026-09-21T11:00:00Z",
+    ]
+
+    inputs.write_text(json.dumps({"pools": [{"poolId": "hosted", "slot": 1}]}), encoding="utf-8")
+    assert main([*command, "--inputs", str(inputs)]) == 2
+
+    assert main([*command[:2], str(tmp_path / "absent.json"), *command[3:]]) == 2
+    assert (
+        main(
+            [
+                "capacity-report",
+                "--usage",
+                str(ledger),
+                "--window-start",
+                "2026-09-21T11:00:00Z",
+                "--window-end",
+                "2026-09-21T10:00:00Z",
+            ]
+        )
+        == 2
+    )

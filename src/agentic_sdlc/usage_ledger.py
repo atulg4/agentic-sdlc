@@ -78,6 +78,7 @@ __all__ = [
     "load_pricing_snapshot",
     "load_usage_record",
     "monetary_equivalent",
+    "parse_timestamp",
     "secret_bearing_usage_fields",
     "usage_id_for",
 ]
@@ -217,6 +218,15 @@ def _optional_timestamp(entry: Mapping[str, Any], key: str, label: str) -> str:
 
 def _parse_time(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def parse_timestamp(value: str, label: str) -> datetime:
+    """Validate an RFC 3339 timestamp and return it as an aware instant.
+
+    Exposed so other modules compare instants rather than re-implementing the
+    parse, and never fall back to comparing timestamps as text.
+    """
+    return _parse_time(_timestamp(value, label))
 
 
 def _seconds_between(start: str, end: str, label: str) -> int:
