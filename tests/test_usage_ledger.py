@@ -10,10 +10,13 @@ from agentic_sdlc.event_ledger import EventActor, LifecycleStage, WorkUnitRef
 from agentic_sdlc.project_registry import load_project_registry
 from agentic_sdlc.usage_ledger import (
     ESTIMATE_DIMENSIONS,
+    MAX_TEXT_LENGTH,
     USAGE_SCHEMA_TYPES,
+    AppliedCoefficient,
     BillingMode,
     EstimatorCalibration,
     InfrastructureUsage,
+    MonetaryEquivalent,
     MonetaryStatus,
     PricingSnapshot,
     TokenCounts,
@@ -873,3 +876,159 @@ def test_pricing_snapshot_is_embedded_in_every_monetary_figure() -> None:
     document["estimate"]["monetary"]["pricingId"] = "someone-else"
     with pytest.raises(UsageError, match="does not match the embedded pricing snapshot"):
         load_usage_record(document)
+
+
+# -- findings from the independent Codex review on #125 ------------------------
+
+
+def test_dataclasses_reject_negative_values_built_through_the_python_api() -> None:
+    # An adapter that skips the loader must not be able to record negative usage.
+    for dimension in ("input", "output", "cache_read", "cache_write"):
+        with pytest.raises(UsageError, match="must be an integer >= 0 or null"):
+            TokenCounts(**{dimension: -5})
+    with pytest.raises(UsageError, match="usage estimate runtimeSeconds"):
+        UsageEstimate(runtime_seconds=-1)
+    with pytest.raises(UsageError, match="usage actual runtimeSeconds"):
+        UsageActual(runtime_seconds=-1)
+    with pytest.raises(UsageError, match="usage actual waitSeconds"):
+        UsageActual(wait_seconds=-1)
+    for field_name in ("runner_seconds", "storage_bytes", "network_bytes"):
+        with pytest.raises(UsageError, match="must be an integer >= 0 or null"):
+            InfrastructureUsage(**{field_name: -1})
+    for field_name in ("ci_minutes", "cost_usd"):
+        with pytest.raises(UsageError, match="must be a finite number >= 0 or null"):
+            InfrastructureUsage(**{field_name: -0.5})
+    with pytest.raises(UsageError, match="monetary billedUsd"):
+        MonetaryEquivalent(status=MonetaryStatus.PAYG, billed_usd=-1)
+    with pytest.raises(UsageError, match="pricing snapshot input rate"):
+        replace(PAYG, input_usd_per_million=-1)
+    with pytest.raises(UsageError, match="within the observed ratio bounds"):
+        AppliedCoefficient(dimension="input", key="*", samples=1, coefficient=1000.0)
+    with pytest.raises(UsageError, match="unknown dimension"):
+        AppliedCoefficient(dimension="mood", key="*", samples=1, coefficient=1.0)
+
+
+def test_monetary_values_must_reproduce_from_the_embedded_snapshot() -> None:
+    # The snapshot is embedded so a cost can be re-derived; a figure that does
+    # not reproduce would make it decorative.
+    document = _record(estimate=_estimate(), actual=_actual()).as_dict()
+    document["estimate"]["monetary"]["billedUsd"] = 999.0
+    document["estimate"]["monetary"]["paygEquivalentUsd"] = 999.0
+    with pytest.raises(UsageError, match="must reproduce from the embedded pricing snapshot"):
+        load_usage_record(document)
+
+    document = _record(actual=_actual()).as_dict()
+    document["actual"]["tokens"]["input"] = 999_999
+    with pytest.raises(UsageError, match="must reproduce from the embedded pricing snapshot"):
+        load_usage_record(document)
+
+    # Claiming a billed figure while a priced token count is unknown is refused,
+    # because the snapshot cannot produce that status.
+    document = _record(actual=_actual()).as_dict()
+    document["actual"]["tokens"]["cacheWrite"] = None
+    with pytest.raises(UsageError, match="does not follow from the embedded"):
+        load_usage_record(document)
+
+    # A consistent record still round-trips, including subscription equivalents.
+    for record in (
+        _record(estimate=_estimate(), actual=_actual()),
+        _record(
+            estimate=_estimate(pricing=CLAUDE_MAX),
+            actual=_actual(pricing=CLAUDE_MAX, plan_capacity_units=0.1),
+        ),
+        _record(estimate=_estimate(pricing=CODEX_PLAN)),
+    ):
+        assert load_usage_record(record.as_dict()) == record
+
+
+def test_one_record_per_run_attempt_whatever_id_the_producer_uses() -> None:
+    ledger = UsageLedger()
+    ledger.append(_record("run-1", estimate=_estimate()))
+    with pytest.raises(UsageError, match="is already recorded as"):
+        ledger.append(replace(_record("run-1", actual=_actual()), usage_id="renamed-by-producer"))
+    assert len(ledger) == 1
+
+    # A different attempt, run, unit or project is a different record.
+    ledger.append(_record("run-1", attempt=2, estimate=_estimate()))
+    ledger.append(_record("run-2", estimate=_estimate()))
+    ledger.append(_record("run-1", work_unit_id="other-unit", estimate=_estimate()))
+    ledger.append(_record("run-1", project_id="beta", estimate=_estimate()))
+    assert len(ledger) == 5
+
+    # The real second half of the same attempt still merges.
+    merged = ledger.append(_record("run-1", actual=_actual()))
+    assert merged.estimate is not None and merged.actual is not None
+    assert len(ledger) == 5
+    assert UsageLedger.from_dict(ledger.as_dict()).as_dict() == ledger.as_dict()
+
+
+def test_time_bounds_compare_instants_not_strings() -> None:
+    # 2026-09-22T00:30:00+02:00 is 2026-09-21T22:30Z, before the requested window.
+    ledger = UsageLedger()
+    ledger.append(_record("run-early", recorded_at="2026-09-22T00:30:00+02:00"))
+    ledger.append(_record("run-inside", recorded_at="2026-09-22T09:00:00Z"))
+
+    inside = ledger.query(since="2026-09-22T00:00:00Z")
+    assert [item.run_id for item in inside] == ["run-inside"]
+    assert [item.run_id for item in ledger.query(until="2026-09-22T00:00:00Z")] == ["run-early"]
+    assert len(ledger.query()) == 2
+
+    # Ordering is chronological, so the offset record sorts first.
+    assert [item.run_id for item in ledger.query()] == ["run-early", "run-inside"]
+    assert (
+        ledger.aggregate(group_by=("run",), since="2026-09-22T00:00:00Z")["totals"]["records"] == 1
+    )
+
+    with pytest.raises(UsageError, match="since must be an RFC 3339 timestamp"):
+        ledger.query(since="yesterday")
+    with pytest.raises(UsageError, match="until must be an RFC 3339 timestamp"):
+        ledger.query(until="tomorrow")
+
+
+def test_declared_record_schema_version_is_checked_not_merely_allowed() -> None:
+    ledger = UsageLedger()
+    ledger.append(_record(estimate=_estimate()))
+    document = ledger.as_dict()
+    assert UsageLedger.from_dict(document).as_dict() == document
+
+    document["usageSchemaVersion"] = 99
+    with pytest.raises(UsageError, match="unsupported usage record schemaVersion"):
+        UsageLedger.from_dict(document)
+
+
+def test_stored_calibration_ratios_obey_the_bounds_observation_applies() -> None:
+    calibration = EstimatorCalibration(min_samples=1)
+    calibration.observe(_observed("run-1", 1.5))
+    document = calibration.as_dict()
+    assert EstimatorCalibration.from_dict(document).as_dict() == document
+
+    for ratio in (1_000_000.0, 20.0001, 0.0499):
+        broken = calibration.as_dict()
+        broken["coefficients"]["*"]["input"] = {"samples": 5, "meanRatio": ratio}
+        with pytest.raises(UsageError, match="outside the observed ratio bounds"):
+            EstimatorCalibration.from_dict(broken)
+
+
+def test_partial_timestamp_sequences_cannot_run_backwards() -> None:
+    # The shape that omits startedAt is valid, and must still be ordered.
+    with pytest.raises(UsageError, match="queuedAt/finishedAt: timestamps run backwards"):
+        UsageActual(queued_at="2026-09-21T12:00:00Z", finished_at="2026-09-21T10:00:00Z")
+
+    forward = UsageActual(queued_at="2026-09-21T10:00:00Z", finished_at="2026-09-21T12:00:00Z")
+    assert forward.runtime_seconds is None, "runtime needs startedAt to be known"
+    assert forward.wait_seconds is None
+
+
+def test_shared_actor_and_work_unit_text_obeys_the_usage_bound() -> None:
+    # These loaders come from the event ledger, which has no length bound.
+    for section, field_name in (
+        ("actor", "worker"),
+        ("actor", "name"),
+        ("actor", "model"),
+        ("workUnit", "issueRef"),
+        ("workUnit", "repository"),
+    ):
+        document = _record(estimate=_estimate()).as_dict()
+        document[section][field_name] = "PROMPT " + "x" * MAX_TEXT_LENGTH
+        with pytest.raises(UsageError, match="never prompts or transcripts"):
+            load_usage_record(document)

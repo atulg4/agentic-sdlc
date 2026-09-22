@@ -470,6 +470,12 @@ def _estimate_usage(args: argparse.Namespace) -> int:
         if args.pricing_id not in snapshots:
             raise UsageError(f"unknown pricingId: {args.pricing_id}")
         pricing = snapshots[args.pricing_id]
+        if pricing.model != args.model:
+            raise UsageError(
+                f"pricing snapshot {args.pricing_id} prices model {pricing.model}, "
+                f"not {args.model}; an estimate priced at another model's rates is "
+                "not a cost for this run"
+            )
     estimate = calibration.estimate(
         baseline_tokens=TokenCounts(
             input=args.baseline_input_tokens,
