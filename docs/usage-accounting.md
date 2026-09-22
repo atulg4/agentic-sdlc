@@ -146,6 +146,13 @@ remembered, so re-running calibration over the same ledger changes nothing.
 The calibration document is versioned and round-trips through
 `as_dict`/`from_dict` fail-closed.
 
+## Reading the ledger for capacity
+
+The per-run timing and worker identity recorded here are what
+[capacity metrics](capacity-metrics.md) measures: concurrency, queue depth,
+why work waited, runner and plan-capacity utilization, useful work versus
+rework, and the bottlenecks behind them.
+
 ## Non-goals
 
 No automatic purchasing or plan changes; no fabricated per-run dollars for
