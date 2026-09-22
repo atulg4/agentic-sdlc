@@ -5,7 +5,10 @@
 - Date: 2026-09-19.
 - Decision owner: repository owner; architecture and security review required.
 - Baseline inspected: `atulg4/agentic-sdlc` at
-  `d91b31aabf3f392fa0d3bd855ab7c010c54c804b`.
+  `89c8dadffc8e83fad5316951bafc6d79e3d0c18c`. The original draft was written
+  against `d91b31aabf3f392fa0d3bd855ab7c010c54c804b`; the current-state
+  assessment has been re-checked against the newer baseline, which added the
+  usage ledger discussed in section 12.
 - Origin: the owner's “Harness engineering for Forge” conversation and request
   for a reviewable architecture proposal for a generic software factory.
 - Scope of this change: documentation only. All new modules, fields, formats,
@@ -61,14 +64,22 @@ every consumer has enabled every workflow.
 | Deterministic risk | [`policy.py`](../../src/agentic_sdlc/policy.py): forbidden paths deny, protected paths imply high risk, all-low-risk paths imply low risk, other diffs medium; limits can deny | Versioned per-path minimum-risk rules plus task/capability signals, checked before dispatch and on every actual patch |
 | Verification and publication | [`gates.py`](../../src/agentic_sdlc/gates.py), [`reusable-implement.yml`](../../.github/workflows/reusable-implement.yml), [security](../security.md): separate generation, verifier, non-executing attestation, publisher | Carry harness identity through the existing evidence chain; skills cannot substitute for mandatory checks |
 | Failure handling | [orchestration](../orchestration.md), [`review_continuation.py`](../../src/agentic_sdlc/review_continuation.py), reusable repair and transient-retry workflows | Add narrow diagnosis packets and specialist selection; reuse failure classes, counters, and stale-head checks |
-| Learning and provenance | [`efficacy.py`](../../src/agentic_sdlc/efficacy.py), [efficacy](../efficacy.md), [`event_ledger.py`](../../src/agentic_sdlc/event_ledger.py), [`project_registry.py`](../../src/agentic_sdlc/project_registry.py) | Attribute outcomes to harness/skill/cache versions; human-approved, out-of-sample comparisons |
+| Learning and provenance | [`efficacy.py`](../../src/agentic_sdlc/efficacy.py), [efficacy](../efficacy.md), [`event_ledger.py`](../../src/agentic_sdlc/event_ledger.py), [`usage_ledger.py`](../../src/agentic_sdlc/usage_ledger.py), [usage accounting](../usage-accounting.md), [`project_registry.py`](../../src/agentic_sdlc/project_registry.py) | Attribute outcomes to harness/skill/cache versions; human-approved, out-of-sample comparisons |
 
 ### Existing boundaries that must survive integration
 
 `MissionRegistry` already rejects critical-risk missions for autonomous
 dispatch. A model with a critical-risk routing preference does not override
 that rejection. `Orchestrator` requires human merge and rejects configuration
-that disables it. Separately, [`autonomy.py`](../../src/agentic_sdlc/autonomy.py)
+that disables it. That hard lock is distinct from
+`ProjectPolicy.human_merge_required` in [`policy.py`](../../src/agentic_sdlc/policy.py),
+a consumer-configurable flag `Orchestrator` never reads: when it is false,
+`evaluate_diff` may report `automatic_merge_allowed` and omits
+`human-merge-approval` from `required_gates`. Nothing consumes
+`automatic_merge_allowed` today, so the flag is currently inert, but any
+manifest deriving its mandatory gate set from `PolicyDecision.required_gates`
+would inherit that omission. Open question 4 records the decision.
+Separately, [`autonomy.py`](../../src/agentic_sdlc/autonomy.py)
 and [`merge_executor.py`](../../src/agentic_sdlc/merge_executor.py) implement a
 fail-closed protected-merge boundary with trusted gate evidence and an exact
 head SHA; the repository also ships its reusable workflow. Their existence
@@ -160,6 +171,15 @@ policy, never from the candidate patch.
 | `budget` | `{maxCostUsd, maxTotalTokens, maxRuntimeSeconds, maxModelCalls, maxRepairCycles, maxConcurrentMissions}`; positive finite ceilings except zero repairs permitted; effective minima with remaining shared budget |
 | `verification` | `{requiredGateIds, additionalGateIds, requiredArtifactTypes}`; union with existing gates; cannot remove, replace, skip, or redefine a mandatory gate |
 | `escalation` | `{failurePolicyId, maxContextExpansions, terminalAction}`; bounded approved policy; terminal action `block-and-escalate` |
+
+"Mandatory" in the `verification` row is not left to the validator to infer.
+Phase 1 must name a single source of truth — the expectation is the union of
+`PolicyDecision.required_gates` and the risk-tier additions in section 8 — and
+a manifest schema validator must reject any manifest whose `requiredGateIds`
+omits a member of that set. Because a consumer can currently switch
+`human-merge-approval` out of `required_gates` (section 2), that derivation
+must also state whether the policy-level opt-out is permitted to reach a
+manifest at all.
 
 Every object is closed to extra keys, including nested ones. Path lists use
 repository-relative normalized paths/patterns, checked against actual file
@@ -622,9 +642,19 @@ cached tokens, index/retrieval/verification costs, failed calls, retries,
 latency, review outcomes, later defects/reopens and human intervention.
 Use compatible versioned readers; historical outcomes with missing attribution
 remain visible as unknown, not retrospectively assigned to the new harness.
-The current `RunOutcome` has aggregate token/runtime fields, but no monetary
-spend field. Full-cost capture and harness attribution must exist before the
-pilot, not wait for learned routing.
+Monetary capture is no longer missing. Since this proposal's original
+baseline, [`usage_ledger.py`](../../src/agentic_sdlc/usage_ledger.py)
+([usage accounting](../usage-accounting.md)) has landed on `main`: every
+dispatched activity gets one immutable `UsageRecord` carrying an optional
+pre-dispatch estimate, post-run actual and infrastructure usage, with versioned
+pricing snapshots, explicit unknowns rather than fabricated numbers, and
+subscription capacity kept separate from billed dollars. Two gaps remain for
+this design. `RunOutcome` in `efficacy.py` still carries only aggregate
+token/runtime fields and no monetary field. Neither ledger records harness
+attribution: `UsageRecord` keys on work unit, stage, mission, run and attempt,
+but has no manifest, recipe, skill or cache-version field. The increment here
+is that attribution plus a versioned join between the usage and outcome
+ledgers, which must exist before the pilot, not wait for learned routing.
 
 Late reviews, billing reconciliation, merges, defects and reopens are new
 immutable observation events referencing a stable run/outcome and work-unit
@@ -651,7 +681,14 @@ Report several measures, not a single model leaderboard:
 Budget enforcement uses finite hard ceilings for calls, tokens, elapsed time,
 concurrency and cumulative spend. Preflight estimates alone are not a hard
 dollar cap: reserve worst-case request cost from versioned approved rates and
-output limits; keep unknown usage reserved and stop additional calls. Report
+output limits; keep unknown usage reserved and stop additional calls. Compute
+the reservation after routing has selected a candidate and against that
+candidate's rate, not a generic default. The router already carries a static
+`expected_mission_cost` per executor, refuses any candidate whose cost exceeds
+the request budget, and sorts eligible candidates by configured alias
+preference before expected cost per success (section 9). What it does not
+carry is a per-request pinned rate, so binding the reservation to a versioned
+`PricingSnapshot` is new Phase 1 work rather than an existing seam. Report
 provider billing lag/variance. Subscription capacity and estimated opportunity
 cost must be shown separately from API cash spend, not treated as free.
 
@@ -739,7 +776,10 @@ fixtures.
    what deterministic approved scope establishes that without trusting labels?
 4. How should active consumers document the relationship between the human-merge
    orchestration path and the separate protected-merge executor? This proposal
-   neither enables nor expands the latter.
+   neither enables nor expands the latter. The same question covers the two
+   distinct `human_merge_required` flags (section 2): whether a manifest's
+   mandatory gate set may ever be derived from a `PolicyDecision` whose
+   `required_gates` omits `human-merge-approval`.
 5. Which tokenizer/rate source is authoritative per executor, and what upper
    bound or stop policy applies when cost/usage information is missing?
 6. Is a local content-addressed index enough for initial consumers? What access,
