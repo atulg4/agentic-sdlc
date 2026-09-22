@@ -1,5 +1,10 @@
 # Architecture
 
+For a proposed extension that composes existing missions, knowledge, routing,
+and verification into task-specific harnesses, see the
+[Forge Harness Plane design](design/forge-harness-plane.md) (**Draft / Proposal**).
+It does not change the current authority or execution model.
+
 ## Responsibilities
 
 | Role | Responsibility | Authority |
