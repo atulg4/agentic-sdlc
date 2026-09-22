@@ -31,6 +31,8 @@ remain in MarketMaestro; reusable orchestration lives here.
 - A provider-neutral usage ledger with estimate-versus-actual accounting for
   tokens, time, model, worker and cost, subscription-aware and never
   fabricating unknown figures.
+- Parallelism, queueing, runner and subscription-capacity measurement with
+  explainable bottlenecks, reported against a caller-supplied window.
 - Security, operations, onboarding, and phone-control documentation.
 - Offline unit tests for the core policy behavior.
 
