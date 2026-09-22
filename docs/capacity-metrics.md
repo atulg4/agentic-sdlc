@@ -31,6 +31,12 @@ A run with no recorded start and finish is counted as unobserved rather than
 assumed to have run. A run that started the instant it was queued waited zero
 seconds, which is an observation and is counted as one.
 
+Durations keep their sub-second part. RFC 3339 permits fractional seconds, and
+truncating each interval on its own would erase real time: three back-to-back
+runs of six tenths of a second would each measure zero and a fully occupied
+window would read as idle. Seconds are carried as floats and rounded only when
+reported, staying integers wherever they really are whole.
+
 ## Concurrency and queueing
 
 `concurrency_timeline` sweeps the busy intervals into contiguous segments of
@@ -64,8 +70,10 @@ being attributed to the nearest plausible cause:
 3. **Unclassified**, with its seconds reported plainly.
 
 `wait.handoff` measures a different loss: the gap between one stage finishing
-and the next being queued for the same work unit. That time belongs to no run
-at all, and is usually a trigger or polling delay rather than a shortage.
+and a **different** stage being queued for the same work unit. That time
+belongs to no run at all, and is usually a trigger or polling delay rather than
+a shortage. A retry of the same stage is not a handoff; it is rework, which the
+useful-work figures already account for.
 
 ## Runners, models and plan capacity
 
@@ -91,8 +99,15 @@ Pools are declared, because slots are what make utilization computable:
 A pool reports busy seconds against `slots × window`, plus the seconds it spent
 with every slot full. A declaration that contradicts the evidence fails closed:
 if more runs were active at once than the pool declares slots, the report is
-refused rather than showing an impossible utilization. Workers belonging to no
-declared pool are listed, and their pool utilization reads `unknown`.
+refused rather than showing an impossible utilization. Two observations for the
+same provider are refused for the same reason: which one applies cannot be
+decided by input order.
+
+A worker's utilization appears only when a declaration grounds its capacity.
+Workers belonging to no declared pool are listed, their `utilization` is `null`
+and their `utilizationStatus` reads `unknown`, because a share of the window
+for an ungrounded worker would be exactly the invented percentage this report
+promises never to show.
 
 Models and providers get the same concurrency treatment plus a stage mix, so a
 model saturated by reviews looks different from one saturated by builds.
@@ -106,9 +121,21 @@ percentage:
 | `partial` | only one of the two was reported | `null` |
 | `unknown` | no observation was supplied | `null` |
 
+`exhausted` is decided from the raw `unitsUsed` and `unitsTotal`, never from
+`usedFraction`, which is rounded for display. A plan with a fraction of a unit
+left would otherwise read as exactly `1.0` and be reported as fully consumed.
+
 Every state carries `usageProxies`: peak concurrent runs, busy seconds, run
-count, the plan capacity units the usage ledger actually recorded, and how many
-runs reported none. Those are observations, not estimates of the plan.
+count, and the plan capacity units the usage ledger recorded. Those units are
+split in two, because they do not carry the same weight:
+
+- `observedCapacityUnits`, which the provider reported;
+- `estimatedCapacityUnits`, which this platform derived from token counts and a
+  snapshot's `capacityUnitsPerMillionTokens`.
+
+`runsWithUnknownCapacityUnits` counts the subscription runs that reported
+neither, so silence never reads as complete coverage. Pay-as-you-go runs are
+excluded, since they consume no plan capacity to begin with.
 
 ## Useful work versus busy time
 
@@ -130,7 +157,9 @@ Detectors name what the numbers show and attach the seconds that show it. Each
 finding carries a kind, a scope, the time it cost, an explanation and its
 evidence; findings are ordered by cost.
 
-- **runner-shortage**: a pool at all slots while its own work sat queued.
+- **runner-shortage**: a pool at all slots while work it was classified as
+  blocking sat queued. Only resource-classified waits count, so a wait with
+  explicit dependency evidence is never charged to a shortage as well.
 - **serialized-concurrency-group**: a group that never exceeded one run while
   its own work waited.
 - **model-capacity-throttling**: a provider at its declared concurrent-run
