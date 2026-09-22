@@ -54,7 +54,9 @@ __all__ = [
     "WorkUnitRef",
     "events_from_orchestrator_document",
     "factory_state",
+    "load_event_actor",
     "load_lifecycle_event",
+    "load_work_unit_ref",
     "migrate_event_document",
     "secret_bearing_event_fields",
 ]
@@ -527,6 +529,16 @@ def _load_provenance(raw: Any) -> EventProvenance:
         policy_version=_text(entry, "policyVersion", label),
         evidence_refs=_string_tuple(entry.get("evidenceRefs"), f"{label}: evidenceRefs"),
     )
+
+
+def load_work_unit_ref(document: Any) -> WorkUnitRef:
+    """Parse one ``WorkUnitRef`` document fail-closed (shared with the usage ledger)."""
+    return _load_work_unit(document)
+
+
+def load_event_actor(document: Any) -> EventActor:
+    """Parse one ``EventActor`` document fail-closed (shared with the usage ledger)."""
+    return _load_actor(document)
 
 
 def load_lifecycle_event(document: Any) -> LifecycleEvent:

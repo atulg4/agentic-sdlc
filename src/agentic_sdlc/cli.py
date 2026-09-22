@@ -11,7 +11,7 @@ from typing import Any
 
 from .artifact import ArtifactError, create_manifest, verify_manifest, write_manifest
 from .dashboard_efficiency import build_infrastructure_blocker_panel
-from .event_ledger import EventLedger, LedgerError, load_lifecycle_event
+from .event_ledger import EventLedger, LedgerError, LifecycleStage, load_lifecycle_event
 from .events import EventError, normalize_event
 from .executors import (
     ExecutorError,
@@ -50,6 +50,14 @@ from .project_registry import (
 )
 from .scaffold import ScaffoldError, scaffold_project
 from .task_spec import TaskSpecError, parse_task, render_prompt
+from .usage_ledger import (
+    EstimatorCalibration,
+    TokenCounts,
+    UsageError,
+    UsageLedger,
+    load_pricing_document,
+    load_usage_record,
+)
 
 
 def _budget_usd(value: str) -> float:
@@ -384,6 +392,109 @@ def _project_state(args: argparse.Namespace) -> int:
     return 0
 
 
+def _read_usage_ledger(path: str, registry_path: str | None, *, create: bool) -> UsageLedger:
+    registry = read_optional_project_registry(registry_path)
+    ledger_path = Path(path)
+    if ledger_path.is_file():
+        return UsageLedger.from_dict(
+            json.loads(ledger_path.read_text(encoding="utf-8")), registry=registry
+        )
+    if not create:
+        raise UsageError(f"usage ledger not found: {path}")
+    return UsageLedger(registry=registry)
+
+
+def _record_usage(args: argparse.Namespace) -> int:
+    ledger = _read_usage_ledger(args.ledger, args.registry, create=True)
+    document = json.loads(Path(args.record).read_text(encoding="utf-8"))
+    record = ledger.append(load_usage_record(document))
+    _write(ledger.as_dict(), args.ledger)
+    if args.output:
+        _write(record.as_dict(), args.output)
+    if args.error_output:
+        _write(record.estimate_error.as_dict(), args.error_output)
+    return 0
+
+
+def _usage_report(args: argparse.Namespace) -> int:
+    ledger = _read_usage_ledger(args.ledger, args.registry, create=False)
+    _write(
+        ledger.aggregate(
+            group_by=tuple(args.group_by) or ("project",),
+            project_ids=tuple(args.project_id) or None,
+            since=args.since,
+            until=args.until,
+        ),
+        args.output,
+    )
+    return 0
+
+
+def _read_calibration(path: str | None, *, min_samples: int | None) -> EstimatorCalibration:
+    if path and Path(path).is_file():
+        calibration = EstimatorCalibration.from_dict(
+            json.loads(Path(path).read_text(encoding="utf-8"))
+        )
+        if min_samples is not None:
+            calibration.min_samples = min_samples
+        return calibration
+    return EstimatorCalibration(min_samples=min_samples if min_samples is not None else 3)
+
+
+def _calibrate_usage(args: argparse.Namespace) -> int:
+    ledger = _read_usage_ledger(args.ledger, args.registry, create=False)
+    calibration = _read_calibration(args.calibration, min_samples=args.min_samples)
+    learned = calibration.observe_all(ledger.records)
+    _write(calibration.as_dict(), args.calibration)
+    _write(
+        {
+            "schemaVersion": 1,
+            "learnedRecords": learned,
+            "observedRecords": len(calibration.observed_usage_ids),
+            "ledgerRecords": len(ledger),
+        },
+        args.output,
+    )
+    return 0
+
+
+def _estimate_usage(args: argparse.Namespace) -> int:
+    calibration = _read_calibration(args.calibration, min_samples=None)
+    pricing = None
+    if args.pricing_id:
+        if not args.pricing:
+            raise UsageError("--pricing-id requires --pricing")
+        snapshots = load_pricing_document(
+            json.loads(Path(args.pricing).read_text(encoding="utf-8"))
+        )
+        if args.pricing_id not in snapshots:
+            raise UsageError(f"unknown pricingId: {args.pricing_id}")
+        pricing = snapshots[args.pricing_id]
+        if pricing.model != args.model:
+            raise UsageError(
+                f"pricing snapshot {args.pricing_id} prices model {pricing.model}, "
+                f"not {args.model}; an estimate priced at another model's rates is "
+                "not a cost for this run"
+            )
+    estimate = calibration.estimate(
+        baseline_tokens=TokenCounts(
+            input=args.baseline_input_tokens,
+            output=args.baseline_output_tokens,
+            cache_read=args.baseline_cache_read_tokens,
+            cache_write=args.baseline_cache_write_tokens,
+        ),
+        baseline_runtime_seconds=args.baseline_runtime_seconds,
+        model=args.model,
+        stage=LifecycleStage(args.stage),
+        task_class=args.task_class,
+        complexity=args.complexity,
+        pricing=pricing,
+        plan_capacity_units=args.plan_capacity_units,
+    )
+    _write(estimate.as_dict(), args.output)
+    return 0
+
+
 def _validate_knowledge(args: argparse.Namespace) -> int:
     sources = load_sources(args.knowledge)
     _write(
@@ -640,6 +751,51 @@ def build_parser() -> argparse.ArgumentParser:
     project_state.add_argument("--output")
     project_state.set_defaults(handler=_project_state)
 
+    record_usage = commands.add_parser("record-usage")
+    record_usage.add_argument("--ledger", required=True)
+    record_usage.add_argument("--record", required=True)
+    record_usage.add_argument("--registry")
+    record_usage.add_argument("--error-output")
+    record_usage.add_argument("--output")
+    record_usage.set_defaults(handler=_record_usage)
+
+    usage_report = commands.add_parser("usage-report")
+    usage_report.add_argument("--ledger", required=True)
+    usage_report.add_argument("--registry")
+    usage_report.add_argument("--project-id", action="append", default=[])
+    usage_report.add_argument("--group-by", action="append", default=[])
+    usage_report.add_argument("--since")
+    usage_report.add_argument("--until")
+    usage_report.add_argument("--output")
+    usage_report.set_defaults(handler=_usage_report)
+
+    calibrate_usage = commands.add_parser("calibrate-usage")
+    calibrate_usage.add_argument("--ledger", required=True)
+    calibrate_usage.add_argument("--calibration", required=True)
+    calibrate_usage.add_argument("--registry")
+    calibrate_usage.add_argument("--min-samples", type=int)
+    calibrate_usage.add_argument("--output")
+    calibrate_usage.set_defaults(handler=_calibrate_usage)
+
+    estimate_usage = commands.add_parser("estimate-usage")
+    estimate_usage.add_argument("--calibration")
+    estimate_usage.add_argument("--pricing")
+    estimate_usage.add_argument("--pricing-id")
+    estimate_usage.add_argument("--model", required=True)
+    estimate_usage.add_argument(
+        "--stage", choices=tuple(item.value for item in LifecycleStage), required=True
+    )
+    estimate_usage.add_argument("--task-class", default="")
+    estimate_usage.add_argument("--complexity", default="")
+    estimate_usage.add_argument("--baseline-input-tokens", type=int)
+    estimate_usage.add_argument("--baseline-output-tokens", type=int)
+    estimate_usage.add_argument("--baseline-cache-read-tokens", type=int)
+    estimate_usage.add_argument("--baseline-cache-write-tokens", type=int)
+    estimate_usage.add_argument("--baseline-runtime-seconds", type=int)
+    estimate_usage.add_argument("--plan-capacity-units", type=float)
+    estimate_usage.add_argument("--output")
+    estimate_usage.set_defaults(handler=_estimate_usage)
+
     knowledge = commands.add_parser("validate-knowledge")
     knowledge.add_argument("--knowledge", required=True)
     knowledge.add_argument("--output")
@@ -714,6 +870,7 @@ def main(argv: list[str] | None = None) -> int:
         OrchestrationError,
         ProjectRegistryError,
         ScaffoldError,
+        UsageError,
         OSError,
         ValueError,
         json.JSONDecodeError,
