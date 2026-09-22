@@ -993,6 +993,18 @@ class UsageRecord:
     infrastructure: InfrastructureUsage | None = None
     schema_version: int = USAGE_SCHEMA_VERSION
 
+    def __post_init__(self) -> None:
+        """Reject an unusable record at construction, not deep inside an aggregate."""
+        _require(bool(self.usage_id.strip()), "usage record: usageId is required")
+        _require(bool(self.run_id.strip()), "usage record: runId is required")
+        _require(
+            isinstance(self.attempt, int)
+            and not isinstance(self.attempt, bool)
+            and self.attempt >= 1,
+            "usage record: attempt numbers start at 1",
+        )
+        _timestamp(self.recorded_at, "usage record: recordedAt")
+
     @property
     def project_id(self) -> str:
         return self.work_unit.project_id
@@ -1336,17 +1348,17 @@ class _Bucket:
 # -- ledger -------------------------------------------------------------------
 
 
-def _merge_section(existing: Any, incoming: Any, usage_id: str, section: str) -> tuple[Any, bool]:
+def _merge_section(existing: Any, incoming: Any, usage_id: str, section: str) -> Any:
     """A section can be filled once; it can never be changed or blanked."""
     if incoming is None:
-        return existing, False
+        return existing
     if existing is None:
-        return incoming, True
+        return incoming
     _require(
         existing.as_dict() == incoming.as_dict(),
         f"usage record {usage_id}: {section} is immutable once recorded",
     )
-    return existing, False
+    return existing
 
 
 class UsageLedger:
@@ -1396,11 +1408,9 @@ class UsageLedger:
             == replace(record, estimate=None, actual=None, infrastructure=None).as_dict(),
             f"usage record {record.usage_id}: identity and references are immutable",
         )
-        estimate, _ = _merge_section(
-            existing.estimate, record.estimate, record.usage_id, "estimate"
-        )
-        actual, _ = _merge_section(existing.actual, record.actual, record.usage_id, "actual")
-        infrastructure, _ = _merge_section(
+        estimate = _merge_section(existing.estimate, record.estimate, record.usage_id, "estimate")
+        actual = _merge_section(existing.actual, record.actual, record.usage_id, "actual")
+        infrastructure = _merge_section(
             existing.infrastructure, record.infrastructure, record.usage_id, "infrastructure"
         )
         merged = replace(existing, estimate=estimate, actual=actual, infrastructure=infrastructure)
@@ -1573,11 +1583,23 @@ class EstimatorCalibration:
         min_samples: int = 3,
         estimator_version: str = ESTIMATOR_VERSION,
     ) -> None:
-        _require(min_samples >= 1, "min_samples must be at least 1")
         self.min_samples = min_samples
         self.estimator_version = estimator_version
         self._coefficients: dict[str, dict[str, _Coefficient]] = {}
         self._observed: set[str] = set()
+
+    @property
+    def min_samples(self) -> int:
+        """How many observations a calibration key needs before it corrects anything."""
+        return self._min_samples
+
+    @min_samples.setter
+    def min_samples(self, value: int) -> None:
+        _require(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 1,
+            "min_samples must be an integer >= 1",
+        )
+        self._min_samples = value
 
     @property
     def observed_usage_ids(self) -> frozenset[str]:

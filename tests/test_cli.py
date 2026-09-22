@@ -1239,6 +1239,13 @@ def test_usage_cli_calibrates_and_applies_learned_coefficients(tmp_path: Path) -
     assert learned["monetary"]["billedUsd"] is None
     assert learned["monetary"]["planCapacityUnits"] == 0.1
 
+    # An out-of-range --min-samples must never overwrite a stored calibration with a
+    # document the loader would then refuse to read back.
+    stored = calibration.read_text(encoding="utf-8")
+    assert main([*command, "--min-samples", "0"]) == 2
+    assert calibration.read_text(encoding="utf-8") == stored
+    assert main([*command, "--output", str(summary)]) == 0
+
     assert _estimate_cli(tmp_path, estimate, "--pricing-id", "claude-max") == 2
     assert _estimate_cli(tmp_path, estimate, "--pricing", str(pricing), "--pricing-id", "nope") == 2
     assert main([*command[:-2], "--calibration", str(tmp_path / "missing" / "c.json")]) == 2
