@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import sys
@@ -47,6 +48,7 @@ from .missions import (
     load_agents,
     load_registry,
 )
+from .models import RiskLevel
 from .orchestration import OrchestrationError, Orchestrator
 from .policy import evaluate_diff, evaluate_task, load_policy
 from .project_registry import (
@@ -228,6 +230,61 @@ def _verify_artifact(args: argparse.Namespace) -> int:
 def _validate_missions(args: argparse.Namespace) -> int:
     registry = load_registry(args.missions, load_policy(args.config))
     _write(registry.as_dict(), args.output)
+    return 0
+
+
+def _validate_harness(args: argparse.Namespace) -> int:
+    # Source-only reusable jobs must not acquire dependencies for unrelated CLI paths.
+    from .harness import (
+        HarnessError,
+        document_digest,
+        executor_profile_snapshot,
+        load_manifest,
+        validate_effective_risk,
+        validate_executor_binding,
+    )
+
+    manifest = load_manifest(Path(args.manifest).read_bytes())
+    data = manifest.as_dict()
+    policy_bytes = Path(args.config).read_bytes()
+    policy = load_policy(args.config)
+    if policy_bytes != Path(args.config).read_bytes():
+        raise HarnessError("project policy changed during validation")
+    if hashlib.sha256(policy_bytes).hexdigest() != data["policy"]["projectPolicyDigest"]:
+        raise HarnessError("project policy digest mismatch")
+    if policy.project_id != data["work"]["projectId"]:
+        raise HarnessError("project policy repository mismatch")
+    registry = load_registry(args.missions, policy)
+    if document_digest(registry.as_dict()) != data["policy"]["missionRegistryDigest"]:
+        raise HarnessError("mission registry digest mismatch")
+    mission = registry.get(data["mission"]["id"])
+    validate_effective_risk(manifest, mission, expected_risk=RiskLevel(args.effective_risk))
+    executor = validate_executor_binding(manifest, Path(args.executors).read_bytes())
+    _write(
+        {
+            "schemaVersion": 1,
+            "manifestDigest": manifest.digest,
+            "canonicalization": "RFC8785",
+            "dispatchAuthorized": False,
+            "checks": [
+                "manifest-schema-and-semantics",
+                "project-policy-and-mission-bindings",
+                "caller-supplied-effective-risk",
+                "executor-registry-and-profile-bindings",
+            ],
+            "notVerified": [
+                "approval-and-source-provenance",
+                "task-path-risk-computation",
+                "skill-recipe-context-and-tool-profile-bindings",
+                "actual-path-permissions-and-reviewer-independence",
+                "routing-policy-and-live-capacity",
+                "shared-budget-reservations-and-usage-recording",
+                "patch-verification-attestation-and-review",
+            ],
+            "executorProfileSnapshot": executor_profile_snapshot(executor),
+        },
+        args.output,
+    )
     return 0
 
 
@@ -691,6 +748,17 @@ def build_parser() -> argparse.ArgumentParser:
     missions.add_argument("--missions")
     missions.add_argument("--output")
     missions.set_defaults(handler=_validate_missions)
+
+    harness = commands.add_parser("validate-harness")
+    harness.add_argument("--manifest", required=True)
+    harness.add_argument("--config", required=True)
+    harness.add_argument("--missions")
+    harness.add_argument("--executors", required=True)
+    harness.add_argument(
+        "--effective-risk", choices=tuple(item.value for item in RiskLevel), required=True
+    )
+    harness.add_argument("--output")
+    harness.set_defaults(handler=_validate_harness)
 
     dispatch = commands.add_parser("dispatch-mission")
     dispatch.add_argument("--config", required=True)
