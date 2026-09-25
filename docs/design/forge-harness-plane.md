@@ -3,12 +3,14 @@
 **Status: Draft / Proposal — not approved, implemented, or enabled.**
 
 - Date: 2026-09-19.
+- Review follow-up: 2026-09-25; addresses the four post-merge findings on
+  [PR #122](https://github.com/atulg4/agentic-sdlc/pull/122).
 - Decision owner: repository owner; architecture and security review required.
 - Baseline inspected: `atulg4/agentic-sdlc` at
-  `89c8dadffc8e83fad5316951bafc6d79e3d0c18c`. The original draft was written
+  `b95cd08b94172cbe2ae41cfe190704ffa7d9a029`. The original draft was written
   against `d91b31aabf3f392fa0d3bd855ab7c010c54c804b`; the current-state
-  assessment has been re-checked against the newer baseline, which added the
-  usage ledger discussed in section 12.
+  assessment has been re-checked against the newer baseline, including usage
+  recording call sites, effective-risk propagation and executor profile fields.
 - Origin: the owner's “Harness engineering for Forge” conversation and request
   for a reviewable architecture proposal for a generic software factory.
 - Scope of this change: documentation only. All new modules, fields, formats,
@@ -64,20 +66,24 @@ every consumer has enabled every workflow.
 | Deterministic risk | [`policy.py`](../../src/agentic_sdlc/policy.py): forbidden paths deny, protected paths imply high risk, all-low-risk paths imply low risk, other diffs medium; limits can deny | Versioned per-path minimum-risk rules plus task/capability signals, checked before dispatch and on every actual patch |
 | Verification and publication | [`gates.py`](../../src/agentic_sdlc/gates.py), [`reusable-implement.yml`](../../.github/workflows/reusable-implement.yml), [security](../security.md): separate generation, verifier, non-executing attestation, publisher | Carry harness identity through the existing evidence chain; skills cannot substitute for mandatory checks |
 | Failure handling | [orchestration](../orchestration.md), [`review_continuation.py`](../../src/agentic_sdlc/review_continuation.py), reusable repair and transient-retry workflows | Add narrow diagnosis packets and specialist selection; reuse failure classes, counters, and stale-head checks |
-| Learning and provenance | [`efficacy.py`](../../src/agentic_sdlc/efficacy.py), [efficacy](../efficacy.md), [`event_ledger.py`](../../src/agentic_sdlc/event_ledger.py), [`usage_ledger.py`](../../src/agentic_sdlc/usage_ledger.py), [usage accounting](../usage-accounting.md), [`project_registry.py`](../../src/agentic_sdlc/project_registry.py) | Attribute outcomes to harness/skill/cache versions; human-approved, out-of-sample comparisons |
+| Learning and provenance | [`efficacy.py`](../../src/agentic_sdlc/efficacy.py), [efficacy](../efficacy.md), [`event_ledger.py`](../../src/agentic_sdlc/event_ledger.py), [`usage_ledger.py`](../../src/agentic_sdlc/usage_ledger.py), [usage accounting](../usage-accounting.md), [`project_registry.py`](../../src/agentic_sdlc/project_registry.py): usage schemas/CLI and report readers exist; automatic dispatch recording is not wired | Connect pre-dispatch and post-run usage recording before measurement; attribute outcomes to harness/skill/cache versions; human-approved, out-of-sample comparisons |
 
 ### Existing boundaries that must survive integration
 
-`MissionRegistry` already rejects critical-risk missions for autonomous
-dispatch. A model with a critical-risk routing preference does not override
-that rejection. `Orchestrator` requires human merge and rejects configuration
-that disables it. That hard lock is distinct from
+Mission validation already rejects a `MissionSpec` whose static `mission.risk`
+is critical. `MissionRegistry.select_agent` checks that static risk, not a
+separately computed work-unit risk; `request_from_mission` likewise copies
+`mission.risk` into the executor request. They do not yet enforce the proposed
+`risk.effective`. Section 8 therefore requires a new trusted dispatch check and
+explicit propagation of effective risk; a model's critical-risk clearance is
+never permission to dispatch critical work. `Orchestrator` requires human merge
+and rejects configuration that disables it. That hard lock is distinct from
 `ProjectPolicy.human_merge_required` in [`policy.py`](../../src/agentic_sdlc/policy.py),
 a consumer-configurable flag `Orchestrator` never reads: when it is false,
 `evaluate_diff` may report `automatic_merge_allowed` and omits
 `human-merge-approval` from `required_gates`. Nothing consumes
-`automatic_merge_allowed` today, so the flag is currently inert, but any
-manifest deriving its mandatory gate set from `PolicyDecision.required_gates`
+`automatic_merge_allowed` today, so that return value alone grants no merge
+authority, but any manifest deriving its mandatory gate set from `PolicyDecision.required_gates`
 would inherit that omission. Open question 4 records the decision.
 Separately, [`autonomy.py`](../../src/agentic_sdlc/autonomy.py)
 and [`merge_executor.py`](../../src/agentic_sdlc/merge_executor.py) implement a
@@ -160,14 +166,14 @@ policy, never from the candidate patch.
 | `harness` | `{id, version, recipeDigest}`; stable ID, semantic version, SHA-256 of approved recipe |
 | `work` | `{projectId, workRef, unitId, taskSpecDigest, baseCommit, candidateTree, publishedHeadCommit, patchDigest}`; exact repository/task; generation uses explicit null tree/head/patch, pre-publication verification binds tree/patch, PR review additionally binds published head |
 | `lineage` | `{attemptId, parentManifestDigest, budgetLedgerId}`; unique attempt, nullable parent only for initial attempt, shared durable ledger |
-| `policy` | `{platformCommit, projectPolicyCommit, projectPolicyDigest, missionRegistryDigest, skillRegistryDigest, routingPolicyDigest, riskPolicyDigest}`; immutable approved inputs, no branch names as identities |
+| `policy` | `{platformCommit, projectPolicyCommit, projectPolicyDigest, missionRegistryDigest, skillRegistryDigest, executorRegistryDigest, routingPolicyDigest, riskPolicyDigest}`; immutable approved inputs, no branch names as identities; executor registry digest pins the exact approved registry artifact |
 | `classification` | `{taskType, domains, complexity, evidenceRefs}`; bounded enums/tags, cited evidence; uncertainty represented explicitly |
 | `risk` | `{effective, ruleMatches, decisionDigest}`; `low/medium/high/critical`, all matched rule IDs, digest of deterministic assessment |
 | `mission` | `{id, version, contractDigest, requiredCapabilities, independentOf}`; resolves to an existing or separately approved `MissionSpec` and its constraints |
 | `skills` | Array of `{id, version, contentDigest}` in explicit application order; pinned dependency closure, no floating versions |
 | `context` | `{packDigest, renderedInputDigest, indexSnapshotDigest, sourceRevisionDigest, tokenizerId, inputTokenLimit, outputTokenReserve, requiredEvidenceRefs, exclusions}`; index may be null on a cold build; no omitted mandatory evidence |
 | `permissions` | `{readPaths, writePaths, toolProfileId, networkProfileId, commandProfileIds, denyCapabilities}`; approved references, not arbitrary commands; empty write list means read-only |
-| `executor` | `{executorId, adapterVersion, provider, model, modelAlias, routeDecisionDigest}`; resolved identity selected by existing router; no secrets or credential references |
+| `executor` | `{executorId, profileDigest, adapter, adapterVersion, executionType, authMode, provider, model, modelAlias, routeDecisionDigest}`; content-addressed full resolved profile and selected identity; auth mode is an enum, never a secret or credential reference |
 | `budget` | `{maxCostUsd, maxTotalTokens, maxRuntimeSeconds, maxModelCalls, maxRepairCycles, maxConcurrentMissions}`; positive finite ceilings except zero repairs permitted; effective minima with remaining shared budget |
 | `verification` | `{requiredGateIds, additionalGateIds, requiredArtifactTypes}`; union with existing gates; cannot remove, replace, skip, or redefine a mandatory gate |
 | `escalation` | `{failurePolicyId, maxContextExpansions, terminalAction}`; bounded approved policy; terminal action `block-and-escalate` |
@@ -189,13 +195,53 @@ object format (currently 40-hex in Forge's merge contract). `workRef` must
 resolve inside `projectId`; source/patch/pack/route references must belong to
 the same work unit and approved repository scope.
 
-Serialize the resolved JSON with sorted object keys, UTF-8, no insignificant
-whitespace or non-finite numbers. Preserve semantically ordered arrays; sort
-set-valued fields during normalization. Hash these bytes as `manifestDigest`
-in an outer artifact envelope, avoiding a self-referential hash. Store creation
-time and producer identity in that envelope; timestamps do not affect replay.
+For this proposed manifest schema, encode the resolved JSON using
+[RFC 8785 JSON Canonicalization Scheme (JCS)](https://www.rfc-editor.org/rfc/rfc8785)
+and hash its UTF-8 bytes with SHA-256. Use JCS number/string serialization and
+recursive property sorting, including its UTF-16 ordering; a generic
+`sort_keys` serializer is insufficient. Reject duplicate names, invalid Unicode,
+non-finite numbers and values outside the schema's numeric bounds. Strings
+retain their Unicode code points without normalization; escaped and literal
+spellings of the same string canonicalize alike. Integers are restricted to
+the exactly representable range `[-(2^53-1), 2^53-1]` and tighter field limits;
+numeric fields use finite binary64 semantics. JCS serializes `2` and `2.0`
+identically. An exact-decimal monetary contract would require a separately
+versioned schema, not a serializer-specific rounding rule.
+
+Before JCS serialization, preserve ordered arrays, including skill application
+order. For schema-declared sets, reject duplicates and sort elements by their
+individual JCS byte encodings in unsigned lexicographic order. The schema must
+declare every array as ordered or set-valued. This normalization is part of the
+new manifest contract; do not reinterpret legacy envelope or pack digests.
+Store `manifestDigest` in an outer artifact envelope, avoiding a
+self-referential hash. Store creation time and producer identity there too;
+timestamps do not affect replay.
 Validation must recompute the hash and verify the producing workflow/run and
 approved policy provenance. A hash alone is integrity, not authorization.
+
+### Executor registry and profile binding
+
+`policy.executorRegistryDigest` is the SHA-256 of the exact approved registry
+artifact bytes, resolved from the pinned protected configuration. Resolve
+`executorId` only within that artifact. `executor.profileDigest` addresses a
+persisted, schema-versioned full resolved profile snapshot, encoded using the
+same JCS rules as the new manifest. Include every `ExecutorProfile.as_dict`
+field, including adapter/auth mode, execution type, capability/tool sets,
+repository scope, risk ceiling, residency, training-data policy, context window,
+cost inputs and the runtime/capacity state used for selection. Retain registry
+approval provenance and the snapshot; a digest or ID alone is not enough.
+
+The duplicated identity fields in the manifest must exactly match the snapshot.
+Validate the profile against the approved registry and any separately recorded
+trusted runtime observations; those observations cannot change configuration
+or expand authority. Recheck live availability and atomically reserve capacity
+before execution: the pinned historical capacity snapshot proves how selection
+was made, not that capacity is still available. Fresh runtime evidence may deny
+or narrow eligibility; a changed configuration/profile or a different fallback
+executor requires re-selection, new pinned evidence and a new manifest.
+`routeDecisionDigest` remains useful decision evidence but does not replace
+either registry or profile binding. No worker may supply another registry path
+or reuse the same executor ID to substitute a different execution boundary.
 
 ### Example: illustrative Python bug-fix attempt
 
@@ -229,6 +275,7 @@ policy:
   projectPolicyDigest: <project-policy-sha256>
   missionRegistryDigest: <mission-registry-sha256>
   skillRegistryDigest: <skill-registry-sha256>
+  executorRegistryDigest: <approved-executor-registry-sha256>
   routingPolicyDigest: <routing-policy-sha256>
   riskPolicyDigest: <risk-policy-sha256>
 classification:
@@ -269,7 +316,11 @@ permissions:
   denyCapabilities: [merge, deploy, production-secrets, edit-governance]
 executor:
   executorId: <eligible-registry-executor>
+  profileDigest: <full-resolved-executor-profile-sha256>
+  adapter: <approved-adapter>
   adapterVersion: <pinned-adapter-version>
+  executionType: <approved-execution-type>
+  authMode: <approved-auth-mode-enum>
   provider: <approved-provider>
   model: <configured-provider-model>
   modelAlias: <stable-alias>
@@ -496,8 +547,26 @@ when base/policy changes. A newly higher floor suspends the current attempt,
 invalidates incompatible route/review evidence and requires a new manifest,
 appropriately cleared worker and required approvals. Preserve the original
 patch for audit. Never relabel a high-risk edit as low to save cost. Critical
-risk remains non-autonomous under the current mission validator; a stronger
-model is not a bypass. Risk-rule changes need a human-controlled policy review.
+risk remains non-autonomous by the proposed dispatch guard below; the current
+static mission validator alone cannot enforce an assembled risk floor. Risk-rule
+changes need a human-controlled policy review.
+
+The trusted Harness Plane dispatch boundary must recompute and validate
+`risk.effective` before **every** initial dispatch, retry, repair, resume and
+provider fallback. Reject missing, invalid or stale risk evidence; if the
+effective value is critical, block before launching a worker or making a model
+call, regardless of `mission.risk`, worker clearance or model availability.
+A human disposition cannot silently waive this guard inside the harness.
+
+For allowed lower tiers, propagate that same effective risk to worker-clearance
+checks, `RouteRequest.risk`, context freshness rules and mandatory review/gate
+derivation. Until those integration points accept effective risk explicitly,
+the assembler must perform equivalent trusted checks; calling today's
+`select_agent` or `request_from_mission` unchanged is insufficient. Keep the
+pinned mission's static risk as a floor and preserve its original digest.
+For example, a medium-risk `implementation-worker` touching a critical path
+must be denied, while one elevated to high requires a high-cleared worker,
+the high-risk executor quality floor, complete context and additional gates.
 
 ## 9. Specialist missions and four routing layers
 
@@ -642,19 +711,55 @@ cached tokens, index/retrieval/verification costs, failed calls, retries,
 latency, review outcomes, later defects/reopens and human intervention.
 Use compatible versioned readers; historical outcomes with missing attribution
 remain visible as unknown, not retrospectively assigned to the new harness.
-Monetary capture is no longer missing. Since this proposal's original
-baseline, [`usage_ledger.py`](../../src/agentic_sdlc/usage_ledger.py)
-([usage accounting](../usage-accounting.md)) has landed on `main`: every
-dispatched activity gets one immutable `UsageRecord` carrying an optional
-pre-dispatch estimate, post-run actual and infrastructure usage, with versioned
-pricing snapshots, explicit unknowns rather than fabricated numbers, and
-subscription capacity kept separate from billed dollars. Two gaps remain for
-this design. `RunOutcome` in `efficacy.py` still carries only aggregate
-token/runtime fields and no monetary field. Neither ledger records harness
-attribution: `UsageRecord` keys on work unit, stage, mission, run and attempt,
-but has no manifest, recipe, skill or cache-version field. The increment here
-is that attribution plus a versioned join between the usage and outcome
-ledgers, which must exist before the pilot, not wait for learned routing.
+Monetary accounting primitives now exist in
+[`usage_ledger.py`](../../src/agentic_sdlc/usage_ledger.py)
+([usage accounting](../usage-accounting.md)): a `UsageRecord` supports optional
+estimate, actual and infrastructure sections, each immutable once populated,
+versioned pricing, explicit unknowns and separate subscription capacity. The
+`record-usage` CLI can append records, and reporting/capacity readers consume
+them. At the inspected baseline, neither orchestration, dispatch nor reusable
+workflows automatically record their activities in this ledger. Its schema/CLI
+therefore does **not** establish complete run coverage or a measured baseline.
+
+Automatic accounting integration is a prerequisite, alongside attribution and
+the versioned outcome join. `RunOutcome` still lacks a monetary field; neither
+ledger has manifest, recipe, skill or cache-version attribution. Before making
+baseline/pilot cost comparisons, implement and verify the following:
+
+1. Persist a stable usage/attempt identity and available estimate **before**
+   each dispatch/model call, linked to the work unit, manifest, selected profile,
+   pricing snapshot and budget reservation. A recording failure blocks new work.
+   Include planning, context building, implementation, verification assistance,
+   review, repair and every separately billable fallback attempt.
+   Give each billable invocation a distinct, namespaced accounting `runId` and
+   explicit parent orchestration-run/mission-attempt and call identity in the
+   versioned attribution record. Replays reuse that invocation key; a real new
+   call gets a new key. These accounting IDs are not `AgentRunRecord` IDs.
+2. On completion, record actual usage/result and infrastructure observations
+   through the existing append/fill-absent-section semantics, including failed,
+   cancelled, abandoned and inconclusive attempts. Keep an unavailable actual
+   section absent rather than sealing a temporary unknown that cannot be
+   reconciled later; record the unresolved outcome as a separate observation.
+3. Recover missing terminal records after interruption from trusted dispatch
+   identities and provider/runner evidence. Replays must not duplicate usage;
+   unresolved spend remains reserved and visibly unknown. Late corrections to
+   already-populated sections use linked observation events, not overwrites.
+4. Reconcile expected attempts from the durable dispatch/reservation ledger
+   against recorded usage. Report missing attempts independently of unknown
+   fields in records that do exist, and block pilot readiness when attempts are
+   unaccounted for. A successful-run-only ledger is not a cost baseline.
+
+These hooks, durable reconciliation and attribution are proposed work, not
+side effects of calling today's router or constructing a `UsageRecord`.
+The existing ledger still stores one actual per accounting run attempt; do not
+fill it repeatedly with successive calls. Compute mission totals over the child
+invocation records and do not also bill a duplicate parent total. Record
+verifier/index infrastructure in non-overlapping records. Mission outcome,
+execution and retry denominators group by the parent identity; model-call counts
+group by invocation identity. An extra model call does not increment a mission
+repair/retry counter, while genuine repair/retry events retain their existing
+counters. Raw usage-ledger run counts are not interchangeable with these parent
+mission metrics; the new projection must distinguish them explicitly.
 
 Late reviews, billing reconciliation, merges, defects and reopens are new
 immutable observation events referencing a stable run/outcome and work-unit
@@ -714,9 +819,9 @@ adversarial fixtures and migration evidence. Do not add every specialist at once
 
 | Phase | Work and existing integration points | Exit evidence |
 |---|---|---|
-| 0 — Baseline and decisions | Inventory active consumer controls; resolve schema/risk semantics; capture comparable task corpus and current cost/quality; approve protected paths and measurements | Owner-approved ADR, threat model and evaluation plan; no runtime change |
-| 1 — Manifest and registry in shadow | Strict schema/semantic validator; approved recipe and skill registry; extend envelope/run readers compatibly; add harness attribution and append-only observation/projection contracts; protect new configuration paths | Reproducible manifests, denied malformed/unapproved inputs, old records readable, no duplicated outcome denominators; shadow assembly has no execution authority |
-| 2 — Context and repository index | Extend knowledge pipeline with deterministic retrieval, cold-cache fallback, token accounting, access/revocation handling; capture full cost including failed calls and indexing | Required-context coverage, no cross-scope leakage, reproducible invalidation; complete pilot-ready cost/quality baseline with missing-data indicators |
+| 0 — Baseline and decisions | Inventory active consumer controls and accounting coverage; resolve schema/risk semantics; select comparable task corpus and measurement plan; approve protected paths | Owner-approved ADR, threat model and evaluation plan; existing measurements labeled partial where dispatch coverage is unproven; no runtime change |
+| 1 — Manifest and registry in shadow | Strict schema/JCS conformance; approved recipes/skills and executor registry/profile binding; trusted effective-risk dispatch guard; compatible readers; pre-dispatch/post-run accounting hooks and interruption reconciliation; attribution/observation contracts; selected-profile pricing reservations; protect new configuration paths | Cross-implementation canonical digests, substituted profiles denied, medium mission/critical work denied, complete attempt inventory including failures, no duplicated denominators, selected-model rates pinned; shadow assembly has no execution authority |
+| 2 — Context and repository index | Extend knowledge pipeline with deterministic retrieval, cold-cache fallback, token accounting, access/revocation handling; measure full cost including failed calls and indexing using phase-1 recording | Required-context coverage, no cross-scope leakage, reproducible invalidation; pilot-ready cost/quality baseline reconciled against every dispatch, with missing-data indicators |
 | 3 — One bounded pilot | Enable documentation and Python bug-fix recipes for approved units; integrate risk rechecks, narrow tool profiles, cumulative reservations and existing gates | End-to-end exact-candidate evidence; all permission/repair/restart fixtures pass; existing approval and merge boundaries unchanged |
 | 4 — Targeted specialists and diagnostic repair | Add test/diagnosis/security bundles only where pilot shows need; use existing scheduler; expand provider fallback tests | Independent reviewer history, no budget multiplication, conflict handling and full combined-patch verification |
 | 5 — Evaluated optimization | Use already-collected harness-attributed outcomes for held-out experiments through existing efficacy machinery | Adequate comparable sample, approved quality/safety bounds and cost benefit, named promotion approval and tested rollback |
@@ -804,6 +909,9 @@ Future implementation must demonstrate the following before phase-3 opt-in:
 
 - [ ] Identical pinned inputs yield identical manifests and rendered-input
   digests; changed skill/policy/pack/patch produces a different identity.
+- [ ] Independent serializers pass shared RFC 8785 vectors, including equivalent
+  numeric/escaped-string spellings, supplementary Unicode property ordering,
+  invalid Unicode rejection and declared array ordering; legacy hashes stay intact.
 - [ ] Unknown/duplicate schema fields, malformed paths, unsupported versions,
   unapproved recipes, cycles and non-finite budgets fail closed.
 - [ ] New registry/control paths are denied to ordinary workers; a modified
@@ -816,8 +924,14 @@ Future implementation must demonstrate the following before phase-3 opt-in:
   paths and misleading task labels cannot lower risk or remove gates.
 - [ ] Critical-risk work cannot dispatch autonomously; forbidden paths remain
   forbidden regardless of risk, mission, skill or available model.
+- [ ] A medium static mission elevated to critical is denied on initial dispatch,
+  retry, repair, resume and fallback; high effective risk reaches worker, executor,
+  context and gate checks without changing the pinned mission contract.
 - [ ] Worker/executor identities agree; writer/test-author/repair history bars
   self-review across aliases and restarts; fallback retains all constraints.
+- [ ] Reusing an executor ID with altered registry/profile, adapter/auth mode,
+  residency, training-data policy, scope or tools invalidates the manifest;
+  fresh runtime eligibility is checked independently of the recorded snapshot.
 - [ ] Verifier tests cannot alter the attested original patch, obtain AI/write
   credentials or forge publication evidence; every gate binds the exact candidate.
 - [ ] Different verifier/publisher commit SHAs are linked through attested
@@ -832,6 +946,12 @@ Future implementation must demonstrate the following before phase-3 opt-in:
   are exercised with in-flight work and preserved audit evidence.
 - [ ] Comparable held-out evaluation reports quality, safety, complete cost,
   sample sizes and uncertainty; no cost claim uses only successful runs.
+- [ ] Dispatch hooks record each attempt before execution and reconcile terminal
+  usage after success/failure/cancellation/interruption; missing attempts block
+  pilot readiness, and duplicate events neither lose nor double-count spend.
+- [ ] A multi-call mission with a provider fallback and replay counts each
+  invocation's usage once, one parent mission execution, and only genuine mission
+  retry/repair events; no parent/child cost is counted twice.
 - [ ] Late billing/review/defect events do not rewrite outcomes, duplicate
   execution/change denominators or turn missing observations into success.
 
