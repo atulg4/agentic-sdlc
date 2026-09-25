@@ -1,14 +1,23 @@
 # Usage, cost and capacity accounting
 
-`src/agentic_sdlc/usage_ledger.py` accounts for every AI or agent activity
-Forge dispatches: which project, work unit, issue and change request it served,
-at which lifecycle stage, in which run and attempt, under which mission, by
-which agent, model, provider and worker, and what it was expected to consume
+`src/agentic_sdlc/usage_ledger.py` provides accounting records for AI or agent
+activities supplied by a caller: which project, work unit, issue and change
+request each activity served, at which lifecycle stage, in which run and
+attempt, under which mission, by which agent, model, provider and worker,
+and what it was expected to consume
 versus what it actually consumed. It builds on the multi-project registry and
 the lifecycle event ledger (`docs/project-registry.md`): the same `WorkUnitRef`
 and `EventActor` vocabulary, the same project scoping, the same fail-closed
 loaders, and an optional `lifecycleEventId` that ties a usage record to the
 event it accounts for.
+
+The schema, `record-usage` CLI and reporting readers are implemented. At the
+inspected baseline `b95cd08b94172cbe2ae41cfe190704ffa7d9a029`, the orchestrator,
+dispatcher and reusable workflows do not automatically append usage records.
+An empty or partially populated ledger therefore does not prove zero cost or
+complete dispatch coverage. Automatic pre-dispatch/post-run recording and
+reconciliation after interruption are prerequisites in the
+[Harness Plane proposal](design/forge-harness-plane.md#12-efficacy-cost-and-learning-loop).
 
 Three rules keep the numbers honest.
 
