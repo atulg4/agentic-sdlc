@@ -44,7 +44,7 @@ def test_sandbox_is_prepared_and_verified_before_isolated_claude_review() -> Non
     invoke = "Independently review the exact diff with Claude Max OAuth"
 
     assert install in review
-    assert "sudo apt-get install -y -q bubblewrap socat" in review
+    assert "sudo apt-get -o DPkg::Lock::Timeout=300 install -y -q bubblewrap socat" in review
     assert "command -v bwrap >/dev/null" in review
     assert "command -v socat >/dev/null" in review
     assert "apparmor_restrict_unprivileged_userns" in review
@@ -53,6 +53,26 @@ def test_sandbox_is_prepared_and_verified_before_isolated_claude_review() -> Non
     assert 'CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"' in review
     assert 'CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "0"' not in review
     assert review.index(install) < review.index(invoke)
+
+
+def test_sandbox_verification_survives_an_apt_lock_collision() -> None:
+    # bubblewrap and socat are already on the runner images, so the install is a
+    # no-op that still contends for the apt/dpkg locks with sibling runners and
+    # unattended-upgrades. A lock collision must not be reported as a sandbox
+    # failure: skip apt when the binaries are present, wait for the lock when an
+    # install is genuinely needed, and verify the sandbox either way.
+    review = _review_job()
+    guard = review.index("if command -v bwrap >/dev/null")
+    update = review.index("sudo apt-get -o DPkg::Lock::Timeout=300 update -q")
+    install = review.index("sudo apt-get -o DPkg::Lock::Timeout=300 install -y -q bubblewrap socat")
+    smoke = review.index("bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / /bin/true")
+
+    assert guard < update < install < smoke
+    assert "skipping apt" in review[guard:update]
+    # Verification runs outside the conditional, so a skipped install still
+    # fails closed when a sandbox binary is missing.
+    assert install < review.rindex("command -v bwrap >/dev/null") < smoke
+    assert install < review.rindex("command -v socat >/dev/null") < smoke
 
 
 def test_claude_reviews_materialized_diff_without_shell_access() -> None:

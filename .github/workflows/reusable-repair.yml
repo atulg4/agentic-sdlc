@@ -220,8 +220,21 @@ jobs:
       - name: Install and verify Claude subprocess isolation
         run: |
           set -euo pipefail
-          sudo apt-get update -q
-          sudo apt-get install -y -q bubblewrap socat
+          # bubblewrap and socat are baked into the self-hosted runner images, so
+          # this install is normally a no-op that still contends for the apt and
+          # dpkg locks. Several runners share each VM and unattended-upgrades runs
+          # there too, so taking those locks turns an unnecessary install into an
+          # apt exit-100 failure that reads as a sandbox failure. Touch apt only
+          # when a binary is genuinely missing, and then wait for the lock.
+          if command -v bwrap >/dev/null && command -v socat >/dev/null; then
+            echo "bubblewrap and socat already installed; skipping apt"
+          else
+            sudo apt-get -o DPkg::Lock::Timeout=300 update -q
+            sudo apt-get -o DPkg::Lock::Timeout=300 install -y -q bubblewrap socat
+          fi
+
+          # Verification stays outside the conditional: isolation still fails
+          # closed when a sandbox binary is missing after the branch above.
           command -v bwrap >/dev/null
           command -v socat >/dev/null
           if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
