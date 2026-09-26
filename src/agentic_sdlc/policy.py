@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .models import PolicyDecision, RiskLevel, TaskSpec
+from .spec_stage import spec_review_block
 
 _PROJECT_ID = re.compile(r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+$")
 _BRANCH = re.compile(r"^[A-Za-z0-9._/-]+$")
@@ -176,6 +177,10 @@ def evaluate_task(
     missing = required_labels - set(task.labels)
     if missing:
         reasons.append("missing required labels: " + ", ".join(sorted(missing)))
+    if mode == "implement":
+        held = spec_review_block(task.labels)
+        if held:
+            reasons.append(held)
 
     text = f"{task.title}\n{task.raw_body}"
     for pattern in policy.forbidden_task_patterns:

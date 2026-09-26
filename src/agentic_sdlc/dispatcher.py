@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from .checkpoints import CheckpointError, CheckpointRecord, CheckpointStore
 from .models import WorkEvent
 from .orchestration import OrchestrationError, Orchestrator, WorkUnitState
+from .spec_stage import spec_review_block
 
 __all__ = [
     "AutonomousIntakeDispatcher",
@@ -140,6 +141,12 @@ class AutonomousIntakeDispatcher:
                 "blocked",
                 "autonomous intake blocked by label: " + ", ".join(blocked),
             )
+            self._persist(decision, timestamp=timestamp)
+            return decision
+
+        held = spec_review_block(labels)
+        if held:
+            decision = DispatchDecision(False, "", key, "blocked", held)
             self._persist(decision, timestamp=timestamp)
             return decision
 
