@@ -4,7 +4,7 @@ name: Reusable spec stage
 # for owner review. The executor only reads the repository and writes a draft
 # artifact; a separate no-AI job merges it deterministically, labels the issue
 # `spec-drafted` BEFORE writing the body, and never adds `agent-ready` or
-# `implementation-approved`. Implementation stays blocked until a human removes
+# `implementation-approved`. Planning and implementation stay blocked until a human removes
 # `spec-drafted` or adds `spec-approved` (see agentic_sdlc.spec_stage).
 
 on:
@@ -516,6 +516,6 @@ jobs:
                 '',
                 `Drafted sections: ${result.draftedSections.join(', ')}.`,
                 'Existing text was left unchanged; the draft is appended under the review marker.',
-                'Implementation stays blocked until a maintainer removes `spec-drafted` or adds `spec-approved`.',
+                'Planning and implementation stay blocked until a maintainer removes `spec-drafted` or adds `spec-approved`.',
               ].join('\n'),
             });

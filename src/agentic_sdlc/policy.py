@@ -177,7 +177,7 @@ def evaluate_task(
     missing = required_labels - set(task.labels)
     if missing:
         reasons.append("missing required labels: " + ", ".join(sorted(missing)))
-    if mode == "implement":
+    if mode in {"plan", "implement"}:
         held = spec_review_block(task.labels)
         if held:
             reasons.append(held)

@@ -6,8 +6,8 @@ parses it deterministically, appends only the sections intake rejected beneath
 a visible owner-review marker, and never edits the existing request text.
 
 A drafted specification is not an approved one. ``spec_review_block`` is the
-deterministic gate that keeps a ``spec-drafted`` request out of implementation
-and autonomous dispatch until a human removes that label or adds
+deterministic gate that keeps a ``spec-drafted`` request out of planning,
+implementation and autonomous dispatch until a human removes that label or adds
 ``spec-approved``.
 """
 
@@ -63,8 +63,8 @@ class SpecStageError(TaskSpecError):
 def spec_review_block(labels: Iterable[str]) -> str | None:
     """Return why a request is held for spec review, or ``None`` when it is not.
 
-    A ``spec-drafted`` request stays ineligible for implementation and
-    autonomous dispatch until a human removes the label or adds
+    A ``spec-drafted`` request stays ineligible for planning, implementation
+    and autonomous dispatch until a human removes the label or adds
     ``spec-approved``.
     """
     present = set(labels)
@@ -170,8 +170,8 @@ def _render_block(
             "> Forge drafted the sections below because this issue did not satisfy the "
             f"intake contract (incomplete: {', '.join(missing)}). The text above is "
             f"unchanged. Review and edit them, then remove the `{SPEC_DRAFTED_LABEL}` label "
-            f"or add `{SPEC_APPROVED_LABEL}`; until then the issue cannot be dispatched for "
-            "implementation."
+            f"or add `{SPEC_APPROVED_LABEL}`; until then the issue cannot be planned or "
+            "implemented."
         ),
     ]
     for key in REQUIRED_SECTIONS:

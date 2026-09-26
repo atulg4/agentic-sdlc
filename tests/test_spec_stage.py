@@ -388,6 +388,18 @@ def test_spec_drafted_issue_is_not_eligible_for_implementation(policy_file: Path
     assert evaluate_task(_drafted_task(approved), policy, "implement").allowed is True
 
 
+def test_spec_drafted_issue_is_not_eligible_for_planning(policy_file: Path) -> None:
+    policy = load_policy(policy_file)
+
+    held = evaluate_task(_drafted_task(SPEC_DRAFTED_LABEL), policy, "plan")
+    assert held.allowed is False
+    assert any("spec-drafted" in reason for reason in held.reasons)
+
+    released = evaluate_task(_drafted_task(SPEC_DRAFTED_LABEL, SPEC_APPROVED_LABEL), policy, "plan")
+    assert released.allowed is True
+    assert evaluate_task(_drafted_task(), policy, "plan").allowed is True
+
+
 def test_prepare_request_refuses_spec_drafted_implementation(
     tmp_path: Path, policy_file: Path
 ) -> None:

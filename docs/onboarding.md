@@ -66,8 +66,8 @@ things:
 - it comments to say which sections it drafted; open questions sit in the drafted block.
 
 Review the draft and edit it if needed. Then remove `spec-drafted` or add
-`spec-approved`. Until you do, implementation is refused even if
-`implementation-approved` is present. The spec stage never adds `agent-ready`
+`spec-approved`. Until you do, planning and implementation are refused even if
+`agent-ready` or `implementation-approved` is present. The spec stage never adds `agent-ready`
 or `implementation-approved`. See [Intake: spec stage](intake.md#spec-stage).
 
 The platform read token is used only to retrieve the pinned policy engine in a

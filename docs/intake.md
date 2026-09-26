@@ -143,14 +143,15 @@ then holds the issue for owner review.
 `spec-drafted` stays ineligible until a human either removes `spec-drafted`
 or adds `spec-approved`. The gate is enforced in two places:
 
-- `policy.evaluate_task(..., mode="implement")`, which `prepare-request` runs
-  before any implementation executor, so `reusable-implement.yml` fails
-  closed even when `implementation-approved` is present;
+- `policy.evaluate_task(...)` in `plan` and `implement` modes, which
+  `prepare-request` runs before any planning or implementation executor, so
+  `reusable-plan.yml` and `reusable-implement.yml` fail closed even when
+  `agent-ready` or `implementation-approved` is present;
 - `AutonomousIntakeDispatcher.dispatch`, which records the event as `blocked`
   instead of admitting it to orchestration.
 
-Planning is read-only and stays available, so an owner can still request a
-plan while reviewing a drafted spec.
+A plan built on an unreviewed draft would anchor implementation on text no
+human has accepted, so planning waits for the owner's release too.
 
 ### Triggers
 
