@@ -382,8 +382,17 @@ jobs:
         # scrubbing is enabled (CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 below);
         # without it the CLI refuses to start and the install step fails.
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q bubblewrap
+          # bubblewrap is baked into the self-hosted runner images, so this
+          # install is normally a no-op that still contends for the apt and dpkg
+          # locks with sibling runners on the same VM and with
+          # unattended-upgrades. Touch apt only when bwrap is genuinely missing,
+          # and then wait for the lock instead of failing on it.
+          if command -v bwrap >/dev/null; then
+            echo "bubblewrap already installed; skipping apt"
+          else
+            sudo apt-get -o DPkg::Lock::Timeout=300 update -q
+            sudo apt-get -o DPkg::Lock::Timeout=300 install -y -q bubblewrap
+          fi
       - name: Generate patch with Claude Code using Max/Pro OAuth
         id: claude-oauth
         if: needs.prepare.outputs.selected_provider == 'anthropic' && needs.prepare.outputs.selected_auth_mode == 'oauth'

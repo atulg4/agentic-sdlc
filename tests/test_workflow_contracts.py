@@ -252,3 +252,36 @@ def test_orchestrate_consumer_fixture_is_thin_and_sha_pinned() -> None:
     assert "python" not in document
     assert "sdlcctl" not in document
     assert "repair" not in document
+
+
+# Sandbox binaries are baked into the self-hosted runner images, so every apt
+# invocation in the platform workflows is normally a no-op that still contends
+# for the apt/dpkg locks with sibling runners on the same VM and with
+# unattended-upgrades. Both pins below keep a lock collision from being reported
+# as a sandbox failure.
+SANDBOX_INSTALL_WORKFLOWS = (
+    "reusable-review.yml",
+    "reusable-repair.yml",
+    "reusable-ci-repair.yml",
+    "reusable-implement.yml",
+)
+
+
+def test_platform_workflows_give_apt_a_lock_timeout() -> None:
+    pattern = re.compile(r"^[ \t]*sudo apt-get .*$", re.MULTILINE)
+    invocations = 0
+    for workflow in WORKFLOWS.glob("*.yml"):
+        for invocation in pattern.findall(workflow.read_text(encoding="utf-8")):
+            invocations += 1
+            assert "-o DPkg::Lock::Timeout=300" in invocation, f"{workflow.name}: {invocation}"
+    assert invocations, "no apt invocations found to pin"
+
+
+def test_sandbox_install_is_skipped_when_the_binaries_are_already_present() -> None:
+    for name in SANDBOX_INSTALL_WORKFLOWS:
+        document = (WORKFLOWS / name).read_text(encoding="utf-8")
+        install = document.index("sudo apt-get -o DPkg::Lock::Timeout=300 install")
+        guard = document.rindex("if command -v bwrap >/dev/null", 0, install)
+
+        assert guard < install, name
+        assert "skipping apt" in document[guard:install], name
