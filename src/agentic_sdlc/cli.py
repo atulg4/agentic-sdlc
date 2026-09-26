@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import sys
@@ -55,7 +56,8 @@ from .project_registry import (
     read_project_registry,
 )
 from .scaffold import ScaffoldError, scaffold_project
-from .task_spec import TaskSpecError, parse_task, render_prompt
+from .spec_stage import merge_spec, parse_draft
+from .task_spec import TaskSpecError, check_task_spec, draft_request, parse_task, render_prompt
 from .usage_ledger import (
     EstimatorCalibration,
     TokenCounts,
@@ -117,9 +119,60 @@ def _normalize_event(args: argparse.Namespace) -> int:
 
 def _render_prompt(args: argparse.Namespace) -> int:
     body = Path(args.task).read_text(encoding="utf-8")
-    task = parse_task(args.title, body, tuple(args.label))
+    if args.mode == "spec":
+        # Spec mode exists precisely for requests that fail the section contract.
+        task = draft_request(args.title, body, tuple(args.label))
+    else:
+        task = parse_task(args.title, body, tuple(args.label))
     rendered = render_prompt(task, args.mode)
     Path(args.output).write_text(rendered + "\n", encoding="utf-8")
+    return 0
+
+
+def _spec_input(args: argparse.Namespace) -> tuple[str, str, tuple[str, ...]]:
+    if args.request:
+        document = json.loads(Path(args.request).read_text(encoding="utf-8"))
+        return _request_fields(args.provider, document)
+    if not args.task or args.title is None:
+        raise ValueError("spec commands need --request, or --task with --title")
+    return args.title, Path(args.task).read_text(encoding="utf-8"), tuple(args.label)
+
+
+def _body_sha256(body: str) -> str:
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _spec_check(args: argparse.Namespace) -> int:
+    """Diagnose the intake contract; exit 0 when ready, 1 when sections are deficient."""
+    title, body, labels = _spec_input(args)
+    check = check_task_spec(title, body)
+    document = check.as_dict()
+    document["bodySha256"] = _body_sha256(body)
+    _write(document, args.output)
+    if args.prompt_output and check.draftable:
+        prompt = render_prompt(draft_request(title, body, labels), "spec")
+        Path(args.prompt_output).write_text(prompt + "\n", encoding="utf-8")
+    return 0 if check.ready else 1
+
+
+def _merge_spec(args: argparse.Namespace) -> int:
+    """Merge a spec-mode draft into the issue body it was drafted from."""
+    title, body, _ = _spec_input(args)
+    if args.expected_body_sha256 and _body_sha256(body) != args.expected_body_sha256:
+        raise ValueError("issue body changed after the spec draft was requested")
+    draft = parse_draft(Path(args.draft).read_text(encoding="utf-8"))
+    if draft.verdict != "drafted":
+        _write({"schemaVersion": 1, **draft.as_dict(), "changed": False}, args.result)
+        return 0
+    merged = merge_spec(
+        title,
+        body,
+        draft.sections,
+        open_questions=draft.open_questions,
+        issue_number=args.issue_number,
+    )
+    Path(args.output).write_text(merged.body, encoding="utf-8")
+    _write(merged.as_dict(), args.result)
     return 0
 
 
@@ -644,9 +697,32 @@ def build_parser() -> argparse.ArgumentParser:
     prompt.add_argument("--task", required=True)
     prompt.add_argument("--title", required=True)
     prompt.add_argument("--label", action="append", default=[])
-    prompt.add_argument("--mode", choices=("plan", "implement", "review"), required=True)
+    prompt.add_argument("--mode", choices=("plan", "implement", "review", "spec"), required=True)
     prompt.add_argument("--output", required=True)
     prompt.set_defaults(handler=_render_prompt)
+
+    spec_check = commands.add_parser("spec-check")
+    spec_check.add_argument("--provider", choices=("github", "gitlab"), default="github")
+    spec_check.add_argument("--request")
+    spec_check.add_argument("--task")
+    spec_check.add_argument("--title")
+    spec_check.add_argument("--label", action="append", default=[])
+    spec_check.add_argument("--prompt-output")
+    spec_check.add_argument("--output")
+    spec_check.set_defaults(handler=_spec_check)
+
+    merge = commands.add_parser("merge-spec")
+    merge.add_argument("--provider", choices=("github", "gitlab"), default="github")
+    merge.add_argument("--request")
+    merge.add_argument("--task")
+    merge.add_argument("--title")
+    merge.add_argument("--label", action="append", default=[])
+    merge.add_argument("--draft", required=True)
+    merge.add_argument("--issue-number", type=int)
+    merge.add_argument("--expected-body-sha256")
+    merge.add_argument("--output", required=True)
+    merge.add_argument("--result")
+    merge.set_defaults(handler=_merge_spec)
 
     prepare = commands.add_parser("prepare-request")
     prepare.add_argument("--provider", choices=("github", "gitlab"), required=True)
