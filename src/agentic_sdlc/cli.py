@@ -43,6 +43,15 @@ from .infra_recovery import (
     write_retry_state,
 )
 from .knowledge import KnowledgeError, load_sources
+from .leases import (
+    DEFAULT_TTL_MINUTES,
+    LeaseError,
+    claim,
+    list_claims,
+    release,
+    render_claims,
+    renew,
+)
 from .missions import (
     MissionError,
     create_dispatch_envelope,
@@ -56,6 +65,7 @@ from .onboard import (
     copy_variables,
     doctor,
     resolve_platform_ref,
+    run_gh,
     write_onboarding,
 )
 from .orchestration import OrchestrationError, Orchestrator
@@ -739,6 +749,79 @@ def _doctor(args: argparse.Namespace) -> int:
     return 0 if report.ok else 2
 
 
+def _lease_ttl(args: argparse.Namespace) -> int:
+    if args.ttl_minutes:
+        return args.ttl_minutes
+    config = Path(args.config) if args.config else Path("agentic-sdlc.toml")
+    if config.exists():
+        return load_policy(config).lease_ttl_minutes
+    return DEFAULT_TTL_MINUTES
+
+
+def _claim(args: argparse.Namespace) -> int:
+    result = claim(
+        args.project,
+        args.issue,
+        agent=args.agent,
+        session=args.session,
+        branch=args.branch,
+        ttl_minutes=_lease_ttl(args),
+        gh=run_gh,
+        assignee=args.assignee,
+    )
+    _write(result.as_dict(), args.output)
+    if not result.ok:
+        print(f"REFUSED: {result.reason}", file=sys.stderr)
+        return 2
+    verb = "renewed" if result.renewed else "claimed"
+    print(
+        f"{verb} #{args.issue} for session {args.session} until {result.lease.expires.isoformat()}"
+    )
+    return 0
+
+
+def _renew(args: argparse.Namespace) -> int:
+    lease = renew(
+        args.project, args.issue, session=args.session, ttl_minutes=_lease_ttl(args), gh=run_gh
+    )
+    print(f"renewed #{args.issue} until {lease.expires.isoformat()}")
+    return 0
+
+
+def _release(args: argparse.Namespace) -> int:
+    release(
+        args.project,
+        args.issue,
+        session=args.session,
+        gh=run_gh,
+        force=args.force,
+        note=args.note or "",
+    )
+    print(f"released #{args.issue}")
+    return 0
+
+
+def _claims(args: argparse.Namespace) -> int:
+    rows = list_claims(args.project, run_gh)
+    print(render_claims(rows))
+    if args.output:
+        _write(
+            [
+                {
+                    "issue": r.lease.issue,
+                    "agent": r.lease.agent,
+                    "session": r.lease.session,
+                    "branch": r.lease.branch,
+                    "expires": r.lease.expires.isoformat(),
+                    "expired": r.expired,
+                }
+                for r in rows
+            ],
+            args.output,
+        )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="sdlcctl")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -1079,6 +1162,44 @@ def build_parser() -> argparse.ArgumentParser:
     doc.add_argument("--local", action="store_true", help="skip GitHub API checks")
     doc.add_argument("--output")
     doc.set_defaults(handler=_doctor)
+
+    def _lease_args(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument("--project", required=True, help="owner/name on GitHub")
+        parser.add_argument("--issue", type=int, required=True)
+        parser.add_argument("--session", required=True, help="unique id of this agent run/session")
+        parser.add_argument("--config", help="agentic-sdlc.toml (for lease_ttl_minutes)")
+        parser.add_argument("--ttl-minutes", type=int)
+        parser.add_argument("--output")
+
+    lease_claim = commands.add_parser(
+        "claim", help="lease an issue for this agent/session; exit 2 if taken"
+    )
+    _lease_args(lease_claim)
+    lease_claim.add_argument(
+        "--agent", required=True, help="who is working, e.g. forge-actions, cloud-routine"
+    )
+    lease_claim.add_argument(
+        "--branch", required=True, help="branch the work lands on, e.g. forge/issue-12"
+    )
+    lease_claim.add_argument("--assignee", help="GitHub login to assign (optional)")
+    lease_claim.set_defaults(handler=_claim)
+
+    lease_renew = commands.add_parser("renew", help="extend a lease held by this session")
+    _lease_args(lease_renew)
+    lease_renew.set_defaults(handler=_renew)
+
+    lease_release = commands.add_parser("release", help="release a lease held by this session")
+    _lease_args(lease_release)
+    lease_release.add_argument(
+        "--force", action="store_true", help="release another session's lease"
+    )
+    lease_release.add_argument("--note")
+    lease_release.set_defaults(handler=_release)
+
+    lease_list = commands.add_parser("claims", help="list live and expired leases in a repository")
+    lease_list.add_argument("--project", required=True)
+    lease_list.add_argument("--output")
+    lease_list.set_defaults(handler=_claims)
     return parser
 
 
@@ -1101,6 +1222,7 @@ def main(argv: list[str] | None = None) -> int:
         OrchestrationError,
         ProjectRegistryError,
         ScaffoldError,
+        LeaseError,
         UsageError,
         OSError,
         ValueError,

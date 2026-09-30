@@ -56,6 +56,7 @@ class ProjectPolicy:
     protected_paths: tuple[str, ...]
     low_risk_paths: tuple[str, ...]
     forbidden_task_patterns: tuple[str, ...]
+    lease_ttl_minutes: int = 240
 
 
 def _table(document: dict[str, object], name: str) -> dict[str, object]:
@@ -157,6 +158,7 @@ def load_policy(path: str | Path) -> ProjectPolicy:
         protected_paths=_patterns(policy, "protected_paths"),
         low_risk_paths=_patterns(policy, "low_risk_paths", ("docs/**", "**/*.md")),
         forbidden_task_patterns=forbidden_task_patterns,
+        lease_ttl_minutes=_integer(automation, "lease_ttl_minutes", 240, maximum=7 * 24 * 60),
     )
 
 

@@ -113,6 +113,26 @@ sdlcctl doctor --destination /path/to/consumer-repository   # exit 2 until READY
 generated `.github/ISSUE_TEMPLATE/agent-work-request.md`: `## Summary`, `## Acceptance
 Criteria`, `## Required Tests`, `## Non-Goals`, `## Dependencies`, the last two as lists.
 
+### Issue leases: one agent per ticket
+
+Actions jobs, cloud routines and interactive Claude Code sessions all coordinate through a
+GitHub-native lease on the issue (`in-progress` label + assignee + a machine-readable
+`<!-- forge-claim … expires=… -->` comment; default TTL 4 h via `[automation] lease_ttl_minutes`).
+
+```bash
+sdlcctl claim   --project owner/repo --issue 12 --agent claude-code --session "$SESSION" --branch forge/issue-12
+sdlcctl renew   --project owner/repo --issue 12 --session "$SESSION"
+sdlcctl release --project owner/repo --issue 12 --session "$SESSION"
+sdlcctl claims  --project owner/repo          # live + expired leases
+```
+
+`claim` exits 2, changing nothing, when another live lease or an open PR for the issue exists;
+expired leases can be taken over (the takeover is commented). `reusable-implement.yml` claims in
+`prepare` (with an App-minted, issues-only token) and releases after the draft PR exists or on
+failure. `sdlcctl onboard` installs two Claude Code hooks in the consumer repo: a SessionStart
+hook that fetches origin and lists PRs and leased issues, and a PreToolUse guard that blocks
+`git commit` on `*/issue-N` branches unless the session holds the lease.
+
 ### Generic profile: `sdlcctl scaffold`
 
 The scaffold command refuses to overwrite existing files and requires an

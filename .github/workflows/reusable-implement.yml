@@ -304,6 +304,28 @@ jobs:
             printf 'An open pull request already implements this issue: %s\n' "$existing" >&2
             exit 2
           fi
+      - name: Create short-lived issue-lease token (publisher App, issues only)
+        id: lease-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ inputs.publisher_app_client_id }}
+          private-key: ${{ secrets.PUBLISHER_APP_PRIVATE_KEY }}
+          permission-issues: write
+      - name: Lease the issue for this run (refuse if another agent holds it)
+        env:
+          GH_TOKEN: ${{ steps.lease-token.outputs.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          CONFIG_PATH: ${{ inputs.config_path }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH="${GITHUB_WORKSPACE}/.agentic-platform/src" \
+            python3 -m agentic_sdlc claim \
+              --project "$GITHUB_REPOSITORY" \
+              --issue "$ISSUE_NUMBER" \
+              --agent forge-actions \
+              --session "run-${GITHUB_RUN_ID}" \
+              --branch "agent/issue-${ISSUE_NUMBER}-${GITHUB_RUN_ID}" \
+              --config "$CONFIG_PATH"
       - name: Store validated implementation request
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -641,6 +663,7 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+
   publish_draft:
     needs: [prepare, attest_patch]
     runs-on: ${{ fromJSON(inputs.runs_on) }}
@@ -732,3 +755,57 @@ jobs:
             --title "Agent implementation for issue #${ISSUE_NUMBER}" \
             --body "$body")"
           gh issue comment "$ISSUE_NUMBER" --body "Verified draft pull request: ${pr_url}"
+      - name: Restore pinned policy engine for lease release
+        if: always()
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: policy-engine-${{ github.run_id }}
+          path: .agentic-platform/src/agentic_sdlc
+      - name: Release the issue lease (the draft PR now marks the work)
+        if: always()
+        env:
+          GH_TOKEN: ${{ steps.publisher-token.outputs.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH="${GITHUB_WORKSPACE}/.agentic-platform/src" \
+            python3 -m agentic_sdlc release \
+              --project "$GITHUB_REPOSITORY" \
+              --issue "$ISSUE_NUMBER" \
+              --session "run-${GITHUB_RUN_ID}" \
+              --note "Draft pull request opened by this run." || true
+
+  release_lease_on_failure:
+    needs: [prepare, generate_patch, verify, attest_patch, publish_draft]
+    if: >-
+      ${{ always() && needs.prepare.result == 'success' &&
+      (needs.generate_patch.result != 'success' || needs.verify.result != 'success' ||
+       needs.attest_patch.result != 'success' || needs.publish_draft.result != 'success') }}
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Create short-lived issue-lease token (publisher App, issues only)
+        id: lease-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ inputs.publisher_app_client_id }}
+          private-key: ${{ secrets.PUBLISHER_APP_PRIVATE_KEY }}
+          permission-issues: write
+      - name: Restore pinned policy engine
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: policy-engine-${{ github.run_id }}
+          path: .agentic-platform/src/agentic_sdlc
+      - name: Release the issue lease so another agent can retry
+        env:
+          GH_TOKEN: ${{ steps.lease-token.outputs.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH="${GITHUB_WORKSPACE}/.agentic-platform/src" \
+            python3 -m agentic_sdlc release \
+              --project "$GITHUB_REPOSITORY" \
+              --issue "$ISSUE_NUMBER" \
+              --session "run-${GITHUB_RUN_ID}" \
+              --note "Run did not produce a draft PR: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
