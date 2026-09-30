@@ -1,5 +1,21 @@
 # Project Onboarding
 
+## Fast path
+
+```bash
+pip install -e /path/to/agentic-sdlc          # provides `sdlcctl`
+sdlcctl onboard --destination . --project-id owner/repo --test "pytest -q" \
+  --implementer cloud-routine --runs-on ubuntu-latest --apply
+sdlcctl doctor --destination .
+```
+
+`onboard --apply` writes the policy, guides, issue template, CI and Forge workflows, creates the
+labels/ruleset/variables, and runs `doctor`. `doctor` lists the owner-only steps that remain:
+`gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo owner/repo` (plus `PUBLISHER_APP_PRIVATE_KEY` and
+`DEEPSEEK_API_KEY` for Actions/routed implementers), installing the Publisher GitHub App, and
+registering a self-hosted runner when `--runs-on` is `self-hosted,...`. Everything below is the
+manual procedure `onboard` automates.
+
 ## Required repository state
 
 - protected default branch;

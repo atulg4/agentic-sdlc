@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import math
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -47,6 +48,15 @@ from .missions import (
     create_dispatch_envelope,
     load_agents,
     load_registry,
+)
+from .onboard import (
+    OnboardError,
+    OnboardSpec,
+    apply_repo_settings,
+    copy_variables,
+    doctor,
+    resolve_platform_ref,
+    write_onboarding,
 )
 from .orchestration import OrchestrationError, Orchestrator
 from .policy import evaluate_diff, evaluate_task, load_policy
@@ -665,6 +675,70 @@ def _scaffold(args: argparse.Namespace) -> int:
     return 0
 
 
+def _onboard(args: argparse.Namespace) -> int:
+    destination = Path(args.destination).resolve()
+    platform_ref = resolve_platform_ref(args.platform_repository, args.platform_ref)
+    spec = OnboardSpec(
+        project_id=args.project_id,
+        platform_repository=args.platform_repository,
+        platform_ref=platform_ref,
+        test_command=args.test,
+        setup_command=args.setup,
+        quality_command=args.quality,
+        implementer=args.implementer,
+        runs_on=tuple(args.runs_on.split(",")),
+        default_branch=args.default_branch,
+        forbidden_paths=tuple(args.forbidden or ()),
+        protected_paths=tuple(args.protected or ()),
+    )
+    written = write_onboarding(destination, spec, force=args.force)
+    result: dict[str, Any] = {
+        "platform_ref": platform_ref,
+        "written": [str(path.relative_to(destination)) for path in written],
+    }
+    if args.apply:
+        variables: dict[str, str] = {}
+        if args.copy_vars_from:
+            names = ["PUBLISHER_APP_CLIENT_ID"]
+            if spec.routed:
+                names += ["DEEPSEEK_MODEL_FLASH", "DEEPSEEK_MODEL_PRO"]
+            variables.update(copy_variables(args.copy_vars_from, names))
+        for item in args.var or ():
+            key, sep, value = item.partition("=")
+            if not sep:
+                raise OnboardError(f"--var expects KEY=VALUE, got {item!r}")
+            variables[key] = value
+        result["applied"] = apply_repo_settings(spec, variables=variables)
+        report = doctor(destination, spec.project_id, spec.platform_repository)
+        result["doctor"] = report.as_dict()
+        print(report.render(), file=sys.stderr)
+    _write(result, args.output)
+    return 0
+
+
+def _doctor(args: argparse.Namespace) -> int:
+    destination = Path(args.destination).resolve()
+    project_id = args.project_id
+    platform = args.platform_repository
+    if not project_id or not platform:
+        policy = load_policy(destination / "agentic-sdlc.toml")
+        project_id = project_id or policy.project_id
+        if not platform:
+            plan = (destination / ".github/workflows/agent-plan.yml").read_text(encoding="utf-8")
+            found = re.search(
+                r"uses:\s*([^/\s]+/[^/\s]+)/\.github/workflows/reusable-plan\.yml@", plan
+            )
+            if not found:
+                raise OnboardError(
+                    "cannot infer the platform repository; pass --platform-repository"
+                )
+            platform = found.group(1)
+    report = doctor(destination, project_id, platform, remote=not args.local)
+    print(report.render())
+    _write(report.as_dict(), args.output) if args.output else None
+    return 0 if report.ok else 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="sdlcctl")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -958,6 +1032,53 @@ def build_parser() -> argparse.ArgumentParser:
     scaffold.add_argument("--automation-level", choices=(1, 2, 3), type=int, default=1)
     scaffold.add_argument("--output")
     scaffold.set_defaults(handler=_scaffold)
+
+    onboard = commands.add_parser(
+        "onboard",
+        help="install the production Forge profile and (optionally) configure the GitHub repo",
+    )
+    onboard.add_argument("--destination", required=True, help="path to the consumer git checkout")
+    onboard.add_argument("--project-id", required=True, help="owner/name on GitHub")
+    onboard.add_argument("--platform-repository", default="atulg4/agentic-sdlc")
+    onboard.add_argument(
+        "--platform-ref", default="main", help="branch, tag or 40-char SHA; branches are resolved"
+    )
+    onboard.add_argument("--test", required=True, help="test command run as the verification gate")
+    onboard.add_argument("--setup", default="python -m pip install -r requirements.txt")
+    onboard.add_argument("--quality", default="python -m ruff check --select E9,F63,F7,F82 .")
+    onboard.add_argument(
+        "--implementer", choices=("route", "claude", "codex", "cloud-routine"), default="route"
+    )
+    onboard.add_argument(
+        "--runs-on", default="self-hosted,linux,x64", help="comma-separated runner labels"
+    )
+    onboard.add_argument("--default-branch", default="main")
+    onboard.add_argument(
+        "--forbidden", action="append", help="extra forbidden path glob (repeatable)"
+    )
+    onboard.add_argument("--protected", action="append", help="protected path glob (repeatable)")
+    onboard.add_argument("--force", action="store_true", help="overwrite files the profile owns")
+    onboard.add_argument(
+        "--apply", action="store_true", help="create labels, ruleset and variables via gh"
+    )
+    onboard.add_argument(
+        "--copy-vars-from", help="owner/name of an onboarded repo to copy non-secret variables from"
+    )
+    onboard.add_argument(
+        "--var", action="append", help="repo variable KEY=VALUE to set (repeatable)"
+    )
+    onboard.add_argument("--output")
+    onboard.set_defaults(handler=_onboard)
+
+    doc = commands.add_parser(
+        "doctor", help="verify a consumer repo is ready for Forge; exit 2 if not"
+    )
+    doc.add_argument("--destination", default=".")
+    doc.add_argument("--project-id", help="defaults to [project].id in agentic-sdlc.toml")
+    doc.add_argument("--platform-repository", help="defaults to the repo pinned in agent-plan.yml")
+    doc.add_argument("--local", action="store_true", help="skip GitHub API checks")
+    doc.add_argument("--output")
+    doc.set_defaults(handler=_doctor)
     return parser
 
 
