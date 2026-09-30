@@ -81,6 +81,40 @@ sdlcctl evaluate-diff \
 
 ## Onboard another repository
 
+### Fast path: `sdlcctl onboard` (production profile)
+
+`onboard` installs the shape the real consumer repos run — self-hosted or hosted
+runners, preflight + failure-notify jobs, `claude-ready` labels, optional provider
+routing — with the platform pinned to the current `main` SHA, and (with `--apply`)
+configures the GitHub repo itself: labels, the "Protect main" ruleset (review-thread
+resolution + required `test` check) and repo variables. `doctor` then reports what
+is still missing and which steps only the owner can do (secrets, GitHub App, runner).
+
+```bash
+# implementer = Claude Code cloud routine, CI on GitHub-hosted runners (no runner to register)
+sdlcctl onboard \
+  --destination /path/to/consumer-repository \
+  --project-id owner/consumer-repository \
+  --test "pytest tests -q" \
+  --implementer cloud-routine --runs-on ubuntu-latest \
+  --forbidden "data/**" --protected "app/server.py" \
+  --apply
+
+# implementer = GitHub Actions with provider routing on self-hosted runners (MusicMaestro shape)
+sdlcctl onboard --destination ... --project-id owner/repo --test "pytest -q" \
+  --implementer route --apply --copy-vars-from atulg4/MusicMaestro
+
+sdlcctl doctor --destination /path/to/consumer-repository   # exit 2 until READY
+```
+
+`--implementer` is one of `route` (multi-provider, needs `.forge/` + DeepSeek secrets),
+`claude`, `codex`, or `cloud-routine` (no Actions implementer; see the generated
+`docs/forge/cloud-implementer.md` for the routine prompt). Work requests must follow the
+generated `.github/ISSUE_TEMPLATE/agent-work-request.md`: `## Summary`, `## Acceptance
+Criteria`, `## Required Tests`, `## Non-Goals`, `## Dependencies`, the last two as lists.
+
+### Generic profile: `sdlcctl scaffold`
+
 The scaffold command refuses to overwrite existing files and requires an
 immutable platform commit SHA. Level 1 installs manual plan-only automation.
 Level 2 adds manually approved draft-PR generation and automatic independent
