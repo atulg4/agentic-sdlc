@@ -41,6 +41,7 @@ LABELS = {
     IMPLEMENTATION_LABEL: ("1d76db", "Owner explicitly approved agent implementation"),
     "agentic-sdlc": ("0052cc", "Managed by the Forge agentic SDLC"),
     "claude-blocked": ("b60205", "Agent could not proceed; needs the owner"),
+    "in-progress": ("fbca04", "Leased: an agent/session is actively implementing this"),
 }
 
 BASE_FORBIDDEN = (
@@ -218,6 +219,7 @@ default_mode = "plan"
 ready_label = "{spec.ready_label}"
 human_review_label = "{HUMAN_REVIEW_LABEL}"
 implementation_label = "{IMPLEMENTATION_LABEL}"
+lease_ttl_minutes = 240
 {routing}
 [policy]
 human_merge_required = true
@@ -252,7 +254,12 @@ Codex is the primary architect, planner, and independent reviewer. The routed im
 
 ## Required Workflow
 
-1. Read the relevant code and repository instructions before proposing changes.
+0. **Claim before you code.** Every change maps to an issue. Lease it first
+   (`sdlcctl claim --project {spec.project_id} --issue <N> --agent <you> --session <id>
+   --branch forge/issue-<N>`);
+   if the claim is refused, another agent owns it — pick different work. Never work on an
+   `in-progress` issue you do not hold. Release (or let the draft PR stand in) when done.
+1. Read the relevant code and repository instructions before proposing changes; `git fetch` first.
 2. Require complete acceptance criteria, tests, non-goals, and dependencies in the issue.
 3. Plan before implementation.
 4. Add or update deterministic tests for changed behavior (tests first).
@@ -283,6 +290,9 @@ def render_claude_md(spec: OnboardSpec) -> str:
 
 Read `AGENTS.md` first; it is the authoritative agent guide. Highlights:
 
+- **Claim first.** Work only on an issue you lease (`sdlcctl claim … --session <your session id>`);
+  the SessionStart hook prints the id and which issues other agents hold. The commit guard blocks
+  commits on `*/issue-N` branches without your lease.
 - **Tests first.** Every change ships with tests. Run `{spec.test_command}` before
   proposing a change.
 - **Merge authority is the repository owner.** Agents open draft PRs only; never merge,
@@ -309,6 +319,10 @@ Repository: {spec.project_id}. Every run:
 1. List open issues that carry ALL of: `{spec.ready_label}`, `{HUMAN_REVIEW_LABEL}`,
    `{IMPLEMENTATION_LABEL}`
    and have no open PR referencing them. Take the oldest one; if none, stop.
+1b. Claim it before touching code:
+   `sdlcctl claim --project {spec.project_id} --issue <n> --agent cloud-routine
+    --session <run id> --branch forge/issue-<n>`.
+   If the claim is refused (exit 2), skip that issue and take the next one.
 2. Validate the issue body has the required sections (Summary, Acceptance Criteria, Required Tests,
    Non-Goals, Dependencies). If not, comment what is missing, add label `claude-blocked`, stop.
 3. On a new branch `forge/issue-<n>`, implement the smallest change that satisfies the acceptance
@@ -316,7 +330,8 @@ Repository: {spec.project_id}. Every run:
    max_changed_files={spec.max_changed_files} and max_diff_lines={spec.max_diff_lines}.
 4. Run: {spec.setup_command} && {spec.quality_command} && {spec.test_command}. All must pass.
 5. Open a DRAFT pull request titled "<issue title> (#<n>)" with a summary and test plan;
-   link the issue.
+   link the issue. Then `sdlcctl release` the lease (the open PR now marks the work); on any
+   failure, release it too so another run can retry.
    Never merge, approve, deploy, or edit workflows/policy files.
 ```
 
@@ -528,10 +543,51 @@ def _render_workflow(name: str, spec: OnboardSpec, issue_expr: str | None = None
     return text
 
 
+def render_hooks(spec: OnboardSpec) -> dict[str, str]:
+    """Claude Code hooks: fetch-and-report at session start; block commits without a lease."""
+    settings = {
+        "hooks": {
+            "SessionStart": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "python3 .claude/hooks/forge_session_start.py",
+                        }
+                    ]
+                }
+            ],
+            "PreToolUse": [
+                {
+                    "matcher": "Bash",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "python3 .claude/hooks/forge_commit_guard.py",
+                        }
+                    ],
+                }
+            ],
+        }
+    }
+    guard = _resource("hooks/forge_commit_guard.py").replace("PROJECT_ID", spec.project_id)
+    start = (
+        _resource("hooks/forge_session_start.py")
+        .replace("PROJECT_ID", spec.project_id)
+        .replace("DEFAULT_BRANCH_NAME", spec.default_branch)
+    )
+    return {
+        ".claude/settings.json": json.dumps(settings, indent=2) + "\n",
+        ".claude/hooks/forge_commit_guard.py": guard,
+        ".claude/hooks/forge_session_start.py": start,
+    }
+
+
 def render_onboarding(spec: OnboardSpec) -> dict[str, str]:
     """Return {relative path: content} for everything the consumer repo needs."""
     auto_issue = "${{ format('{0}', github.event.issue.number) }}"
     files = {
+        **render_hooks(spec),
         "agentic-sdlc.toml": render_policy(spec),
         "AGENTS.md": render_agents_md(spec),
         "CLAUDE.md": render_claude_md(spec),

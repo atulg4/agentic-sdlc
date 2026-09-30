@@ -446,3 +446,59 @@ def test_cli_onboard_and_doctor_local(tmp_path, monkeypatch, capsys):
         == 2
     )
     assert "refusing to overwrite" in capsys.readouterr().err
+
+
+def test_onboarding_installs_claim_first_rule_and_claude_code_hooks(tmp_path):
+    files = render_onboarding(spec())
+    settings = json.loads(files[".claude/settings.json"])
+    assert settings["hooks"]["PreToolUse"][0]["matcher"] == "Bash"
+    assert "forge_commit_guard.py" in settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert "forge_session_start.py" in settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+    guard = files[".claude/hooks/forge_commit_guard.py"]
+    assert 'PROJECT = "owner/comic"' in guard and "PROJECT_ID" not in guard
+    start = files[".claude/hooks/forge_session_start.py"]
+    assert 'DEFAULT_BRANCH = "main"' in start
+    assert "Claim before you code" in files["AGENTS.md"]
+    assert "sdlcctl claim" in files["CLAUDE.md"]
+    assert "lease_ttl_minutes = 240" in files["agentic-sdlc.toml"]
+    routine = render_onboarding(spec(implementer="cloud-routine"))[
+        "docs/forge/cloud-implementer.md"
+    ]
+    assert "sdlcctl claim" in routine and "sdlcctl release" in routine
+
+
+def test_commit_guard_blocks_only_unleased_issue_branch_commits(tmp_path):
+    import importlib.util
+
+    path = tmp_path / "guard.py"
+    path.write_text(render_onboarding(spec())[".claude/hooks/forge_commit_guard.py"])
+    module_spec = importlib.util.spec_from_file_location("guard", path)
+    guard = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(guard)
+    from datetime import UTC, datetime, timedelta
+
+    live_mine = {
+        "agent": "claude-code",
+        "session": "s1",
+        "expires": datetime.now(UTC) + timedelta(hours=1),
+    }
+    live_other = {
+        "agent": "cloud-routine",
+        "session": "r9",
+        "expires": datetime.now(UTC) + timedelta(hours=1),
+    }
+    commit = {"tool_name": "Bash", "session_id": "s1", "tool_input": {"command": "git commit -m x"}}
+
+    assert guard.decide(commit, "main", lambda n: None) == (0, "")  # not an issue branch
+    assert (
+        guard.decide(
+            {**commit, "tool_input": {"command": "git status"}}, "forge/issue-7", lambda n: None
+        )[0]
+        == 0
+    )
+    assert guard.decide(commit, "forge/issue-7", lambda n: live_mine)[0] == 0  # my lease
+    code, msg = guard.decide(commit, "forge/issue-7", lambda n: None)
+    assert code == 2 and "sdlcctl claim" in msg and "--issue 7" in msg  # no lease
+    code, msg = guard.decide(commit, "claude/issue-7-thing", lambda n: live_other)
+    assert code == 2 and "r9" in msg  # someone else's
+    assert guard.decide({**commit, "tool_name": "Edit"}, "forge/issue-7", lambda n: None)[0] == 0
