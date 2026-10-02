@@ -6,7 +6,7 @@ USER root
 COPY --from=node /usr/local/ /usr/local/
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        bubblewrap socat gh jq python3-pip python3-venv build-essential \
+        bubblewrap socat gh jq ripgrep python3-pip python3-venv build-essential \
         curl unzip zip rsync \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m venv /opt/forge-venv \
@@ -17,4 +17,4 @@ ENV PATH="/opt/forge-venv/bin:${PATH}"
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 USER runner
 RUN python3 --version && node --version && npm --version && gh --version \
-    && git --version && jq --version && bwrap --version && socat -V
+    && git --version && jq --version && rg --version && bwrap --version && socat -V

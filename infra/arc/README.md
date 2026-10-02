@@ -6,7 +6,7 @@ This fleet serves `atulg4/marketmaestro`, `MusicMaestro`, `MarketingMaestro`,
 
 ## Rollout status: blocked on sandbox compatibility
 
-On 2026-10-02, the live pinned image passed the toolchain and user-namespace
+On 2026-10-02, the first image revision passed the toolchain and user-namespace
 probe on GKE Sandbox/Balanced, but the network-namespace probe failed:
 `bwrap: loopback: Failed RTM_NEWADDR: No child processes`. This reproduces
 [upstream gVisor issue 13438](https://github.com/google/gvisor/issues/13438).
@@ -15,9 +15,16 @@ apply `worker.yaml` or merge consumer cutovers until the probe passes.
 
 Controller/listener and cert-manager resource reductions were applied and
 verified healthy. Worker image/runtime upgrades and the two missing pools
-remain unapplied. The image build succeeded; the default Autopilot runtime
+remain unapplied. Both image builds succeeded (the second adds ripgrep and verifies it during
+the build); the first revision was tested live. The default Autopilot runtime
 also failed the basic user-namespace probe. E2 sandbox nodes encountered
 regional capacity shortages, so the final probe used Balanced (N2/N2D).
+
+The final VM audit found both `mm-runner` and `mm-runner-b` running again.
+Cloud Audit Logs show a separate local gcloud invocation restarted them at
+09:03 PDT; several legacy runners were busy. VM compute charges continue until
+the replacement is validated and those jobs are drained. `mm-terminal` remains
+the application host.
 
 A supported runtime fix or a separately reviewed GKE Standard runner pool with
 an appropriate seccomp profile is required. Do not remove network isolation,

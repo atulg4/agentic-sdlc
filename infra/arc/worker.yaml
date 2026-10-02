@@ -8,7 +8,7 @@ template:
     automountServiceAccountToken: false
     containers:
       - name: runner
-        image: gcr.io/marketmaestro-463502/forge-runner@sha256:08081bf8a34132a5ab513b4c4082bc046e1169132855dfbd5af877270b14581e
+        image: gcr.io/marketmaestro-463502/forge-runner@sha256:fab30ce988fbc67d156fc8898bda67880a9f49573da5d729aaa1e3188f97ef2b
         command: ["/home/runner/run.sh"]
         resources:
           requests:
