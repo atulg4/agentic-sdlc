@@ -26,6 +26,11 @@ Cloud Audit Logs show a separate local gcloud invocation restarted them at
 the replacement is validated and those jobs are drained. `mm-terminal` remains
 the application host.
 
+The MusicMaestro draft CI run was canceled after its stock runner was evicted
+for exceeding the default **1Gi ephemeral-storage limit**. The proposed worker
+values request/limit 8Gi, but the full dependency install still needs validation.
+Do not leave a failing job repeatedly creating replacement pods.
+
 A supported runtime fix or a separately reviewed GKE Standard runner pool with
 an appropriate seccomp profile is required. Do not remove network isolation,
 ignore the bubblewrap error, or turn off environment scrubbing as a workaround.
