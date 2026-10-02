@@ -1,0 +1,51 @@
+# Must pass before worker.yaml is applied. No credentials or Kubernetes token.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: forge-runner-sandbox-probe
+  namespace: arc-runners
+  labels:
+    app.kubernetes.io/part-of: forge-migration-audit
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      containers:
+      - name: probe
+        image: gcr.io/marketmaestro-463502/forge-runner@sha256:08081bf8a34132a5ab513b4c4082bc046e1169132855dfbd5af877270b14581e
+        command:
+        - /bin/bash
+        - -c
+        args:
+        - 'set -euo pipefail
+
+          for tool in python3 git gh jq node npm bwrap socat sudo; do command -v "$tool";
+          done
+
+          python3 --version
+
+          node --version
+
+          gh --version
+
+          bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / /bin/true
+
+          bwrap --unshare-user --unshare-pid --unshare-net --ro-bind / / --proc /proc
+          --dev /dev /bin/true
+
+          echo FORGE_SANDBOX_OK'
+        resources:
+          requests:
+            cpu: '1'
+            memory: 2Gi
+            ephemeral-storage: 1Gi
+          limits:
+            memory: 2Gi
+            ephemeral-storage: 2Gi
+      runtimeClassName: gvisor
+      nodeSelector:
+        cloud.google.com/compute-class: Balanced

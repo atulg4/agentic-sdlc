@@ -1,0 +1,20 @@
+# GKE Sandbox preserves the host boundary while permitting nested agent sandboxes.
+# Apply only after the credential-free smoke test passes on the target cluster.
+template:
+  spec:
+    runtimeClassName: gvisor
+    nodeSelector:
+      cloud.google.com/compute-class: Balanced
+    automountServiceAccountToken: false
+    containers:
+      - name: runner
+        image: gcr.io/marketmaestro-463502/forge-runner@sha256:08081bf8a34132a5ab513b4c4082bc046e1169132855dfbd5af877270b14581e
+        command: ["/home/runner/run.sh"]
+        resources:
+          requests:
+            cpu: "1"
+            memory: 2Gi
+            ephemeral-storage: 8Gi
+          limits:
+            memory: 8Gi
+            ephemeral-storage: 8Gi

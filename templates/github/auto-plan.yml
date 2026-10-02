@@ -18,6 +18,7 @@ jobs:
       issues: write
     uses: PLATFORM_REPOSITORY/.github/workflows/reusable-plan.yml@PLATFORM_COMMIT_SHA
     with:
+      runs_on: ${{ toJSON(vars.FORGE_RUNNER || 'ubuntu-latest') }}
       issue_number: ${{ format('{0}', github.event.issue.number) }}
       trigger_actor: ${{ github.actor }}
       config_path: agentic-sdlc.toml
