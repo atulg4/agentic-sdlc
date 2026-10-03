@@ -81,6 +81,62 @@ sdlcctl evaluate-diff \
 
 ## Onboard another repository
 
+### Fast path: `sdlcctl onboard` (production profile)
+
+`onboard` installs the shape the real consumer repos run — self-hosted or hosted
+runners, preflight + failure-notify jobs, `claude-ready` labels, optional provider
+routing — with the platform pinned to the current `main` SHA, and (with `--apply`)
+configures the GitHub repo itself: labels, the "Protect main" ruleset (review-thread
+resolution + required `test` check) and repo variables. `doctor` then reports what
+is still missing and which steps only the owner can do (secrets, GitHub App, runner).
+
+```bash
+# implementer = Claude Code cloud routine, CI on GitHub-hosted runners (no runner to register)
+sdlcctl onboard \
+  --destination /path/to/consumer-repository \
+  --project-id owner/consumer-repository \
+  --test "pytest tests -q" \
+  --implementer cloud-routine --runs-on ubuntu-latest \
+  --forbidden "data/**" --protected "app/server.py" \
+  --apply
+
+# implementer = GitHub Actions with provider routing on self-hosted runners (MusicMaestro shape)
+sdlcctl onboard --destination ... --project-id owner/repo --test "pytest -q" \
+  --implementer route --apply --copy-vars-from atulg4/MusicMaestro
+
+sdlcctl doctor --destination /path/to/consumer-repository   # exit 2 until READY
+```
+
+`--implementer` is one of `route` (multi-provider, needs `.forge/` + DeepSeek secrets),
+`claude`, `codex`, or `cloud-routine` (no Actions implementer; see the generated
+`docs/forge/cloud-implementer.md` for the routine prompt). Work requests must follow the
+generated `.github/ISSUE_TEMPLATE/agent-work-request.md`: `## Summary`, `## Acceptance
+Criteria`, `## Required Tests`, `## Non-Goals`, `## Dependencies`, the last two as lists.
+
+### Issue leases: one agent per ticket
+
+Actions jobs, cloud routines and interactive Claude Code sessions all coordinate through a
+GitHub-native lease on the issue (`in-progress` label + assignee + a machine-readable
+`<!-- forge-claim … expires=… -->` comment; default TTL 4 h via `[automation] lease_ttl_minutes`).
+
+```bash
+sdlcctl claim   --project owner/repo --issue 12 --agent claude-code --session "$SESSION" --branch forge/issue-12
+sdlcctl renew   --project owner/repo --issue 12 --session "$SESSION"
+sdlcctl release --project owner/repo --issue 12 --session "$SESSION"
+sdlcctl claims  --project owner/repo          # live + expired leases
+```
+
+`claim` exits 2, changing nothing, when another live lease or an open PR for the issue exists;
+expired leases can be taken over (the takeover is commented). Markers count only when posted by
+an OWNER/MEMBER/COLLABORATOR or a GitHub App, and an expiry is capped at post time + 7 days, so
+an outside commenter cannot forge or free a lease. `reusable-implement.yml` claims as the last
+step of `prepare` (with an App-minted token: issues write, pull requests read) and releases after
+the draft PR exists or on failure. `sdlcctl onboard` installs two Claude Code hooks in the consumer repo: a SessionStart
+hook that fetches origin and lists PRs and leased issues, and a PreToolUse guard that blocks
+`git commit` on `*/issue-N` branches unless the session holds the lease.
+
+### Generic profile: `sdlcctl scaffold`
+
 The scaffold command refuses to overwrite existing files and requires an
 immutable platform commit SHA. Level 1 installs manual plan-only automation.
 Level 2 adds manually approved draft-PR generation and automatic independent

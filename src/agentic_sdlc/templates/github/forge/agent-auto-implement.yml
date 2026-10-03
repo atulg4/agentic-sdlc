@@ -1,0 +1,14 @@
+name: Automatic approved implementation
+
+on:
+  issues:
+    types: [labeled]
+
+permissions: {}
+
+concurrency:
+  group: forge-auto-implement-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+IMPLEMENT_JOBS

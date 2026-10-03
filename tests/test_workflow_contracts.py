@@ -252,3 +252,38 @@ def test_orchestrate_consumer_fixture_is_thin_and_sha_pinned() -> None:
     assert "python" not in document
     assert "sdlcctl" not in document
     assert "repair" not in document
+
+
+def test_implementation_leases_the_issue_before_generating_and_releases_after() -> None:
+    document = (WORKFLOWS / "reusable-implement.yml").read_text(encoding="utf-8")
+    preparer = _job(document, "prepare", "generate_patch")
+    publisher = _job(document, "publish_draft", "release_lease_on_failure")
+    failure = _job(document, "release_lease_on_failure")
+
+    assert (
+        "      issues: read" in preparer
+    )  # native token stays read-only; the App token writes the lease
+    assert "permission-issues: write" in preparer and "actions/create-github-app-token@" in preparer
+    assert "GH_TOKEN: ${{ steps.lease-token.outputs.token }}" in preparer
+    assert "python3 -m agentic_sdlc claim" in preparer
+    assert preparer.index("Refuse a duplicate open pull request") < preparer.index(
+        "agentic_sdlc claim"
+    )
+    # Claim is the LAST step of prepare: a prepare that fails after claiming would skip
+    # release_lease_on_failure (gated on prepare success) and strand the lease until it expires.
+    assert preparer.index("Store validated implementation request") < preparer.index(
+        "agentic_sdlc claim"
+    )
+    assert preparer.index("Store pinned policy engine") < preparer.index("agentic_sdlc claim")
+    assert "\n      - " not in preparer[preparer.index("agentic_sdlc claim") :]
+    # claim() lists open PRs, which an installation token may only do with pull-requests: read.
+    lease_token = preparer[preparer.index("id: lease-token") :]
+    lease_token = lease_token[: lease_token.index("\n      - ")]
+    assert "permission-pull-requests: read" in lease_token
+    assert '--session "run-${GITHUB_RUN_ID}"' in preparer
+    assert "python3 -m agentic_sdlc release" in publisher
+    assert publisher.index("gh pr create") < publisher.index("agentic_sdlc release")
+    assert "python3 -m agentic_sdlc release" in failure
+    assert "needs.prepare.result == 'success'" in failure
+    assert "permission-issues: write" in failure and "contents: write" not in failure
+    assert "GH_TOKEN: ${{ github.token }}" not in failure
