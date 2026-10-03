@@ -264,6 +264,7 @@ SANDBOX_INSTALL_WORKFLOWS = (
     "reusable-repair.yml",
     "reusable-ci-repair.yml",
     "reusable-implement.yml",
+    "reusable-spec.yml",
 )
 
 
