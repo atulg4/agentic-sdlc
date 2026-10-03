@@ -31,7 +31,7 @@ from agentic_sdlc.harness import (
 from agentic_sdlc.missions import load_registry
 from agentic_sdlc.models import RiskLevel, WorkEvent, WorkKind
 from agentic_sdlc.orchestration import Orchestrator
-from agentic_sdlc.policy import load_policy
+from agentic_sdlc.policy import load_policy, load_policy_bytes
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "examples/harness"
 
@@ -269,6 +269,18 @@ def test_executor_binding_pins_raw_registry_bytes(manifest: dict) -> None:
         validate_executor_binding(validate_manifest(manifest), raw + b" ")
 
 
+def test_executor_binding_rejects_mutable_or_subclassed_buffers(manifest: dict) -> None:
+    raw = (EXAMPLE / "executors.json").read_bytes()
+
+    class Forged(bytearray):
+        def decode(self, *args, **kwargs):  # parses something other than what is hashed
+            return json.dumps({"schemaVersion": 1, "executors": []})
+
+    for buffer in (bytearray(raw), Forged(raw)):
+        with pytest.raises(HarnessError, match="immutable bytes"):
+            validate_executor_binding(validate_manifest(manifest), buffer)
+
+
 @pytest.mark.parametrize(
     "field,value",
     [
@@ -332,6 +344,24 @@ def test_cli_example_validates_but_never_authorizes_dispatch(tmp_path: Path) -> 
         document_digest(report["executorProfileSnapshot"])
         == json.loads((EXAMPLE / "manifest.json").read_bytes())["executor"]["profileDigest"]
     )
+
+
+def test_cli_parses_the_same_policy_snapshot_it_hashes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A second, path-based read could return different bytes (A->B->A replacement) from
+    # the ones whose digest was checked; the CLI must parse the hashed snapshot only.
+    import agentic_sdlc.cli as cli
+
+    def no_second_read(*_args, **_kwargs):
+        raise AssertionError("validate-harness re-read the policy from its path")
+
+    monkeypatch.setattr(cli, "load_policy", no_second_read)
+    assert main(_args(EXAMPLE / "manifest.json", tmp_path / "report.json")) == 0
+    raw = (EXAMPLE / "agentic-sdlc.toml").read_bytes()
+    assert load_policy_bytes(raw) == load_policy(EXAMPLE / "agentic-sdlc.toml")
+    with pytest.raises(TypeError, match="immutable bytes"):
+        load_policy_bytes(bytearray(raw))
 
 
 @pytest.mark.parametrize("field", ["projectPolicyDigest", "missionRegistryDigest"])

@@ -278,6 +278,7 @@ def validate_executor_binding(manifest: HarnessManifest, registry_bytes: bytes) 
     This proves consistency with supplied bytes, not approval of those bytes or
     current capacity. The caller must obtain artifacts from a trusted source.
     """
+    _require(type(registry_bytes) is bytes, "executor registry input must be immutable bytes")
     data = manifest.as_dict()
     _require(
         hashlib.sha256(registry_bytes).hexdigest() == data["policy"]["executorRegistryDigest"],

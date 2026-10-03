@@ -50,7 +50,7 @@ from .missions import (
 )
 from .models import RiskLevel
 from .orchestration import OrchestrationError, Orchestrator
-from .policy import evaluate_diff, evaluate_task, load_policy
+from .policy import evaluate_diff, evaluate_task, load_policy, load_policy_bytes
 from .project_registry import (
     ProjectRegistryError,
     read_optional_project_registry,
@@ -298,10 +298,9 @@ def _validate_harness(args: argparse.Namespace) -> int:
 
     manifest = load_manifest(Path(args.manifest).read_bytes())
     data = manifest.as_dict()
+    # One snapshot is both hashed and parsed, so the checked digest is the enforced policy.
     policy_bytes = Path(args.config).read_bytes()
-    policy = load_policy(args.config)
-    if policy_bytes != Path(args.config).read_bytes():
-        raise HarnessError("project policy changed during validation")
+    policy = load_policy_bytes(policy_bytes)
     if hashlib.sha256(policy_bytes).hexdigest() != data["policy"]["projectPolicyDigest"]:
         raise HarnessError("project policy digest mismatch")
     if policy.project_id != data["work"]["projectId"]:
