@@ -7,6 +7,7 @@ import pytest
 
 from agentic_sdlc.leases import (
     IN_PROGRESS_LABEL,
+    MAX_TTL_MINUTES,
     Lease,
     LeaseError,
     claim,
@@ -20,6 +21,17 @@ from agentic_sdlc.leases import (
 
 NOW = datetime(2026, 9, 30, 12, 0, tzinfo=UTC)
 PROJECT = "owner/repo"
+PAGE = 30
+
+
+def _comment_row(cid, body, created_at, login="atulg4", kind="User", association="OWNER"):
+    return {
+        "id": cid,
+        "body": body,
+        "created_at": created_at,
+        "user": {"login": login, "type": kind},
+        "author_association": association,
+    }
 
 
 class FakeGh:
@@ -30,6 +42,7 @@ class FakeGh:
         self.prs: list[dict] = []
         self.calls: list[tuple[str, ...]] = []
         self._next_comment = 100
+        self.poster: dict = {}  # who posts comments made through this fake (default: OWNER)
 
     def issue(self, number, labels=(), assignees=(), comments=()):
         self.issues[number] = {
@@ -37,11 +50,18 @@ class FakeGh:
             "labels": [{"name": n} for n in labels],
             "assignees": [{"login": a} for a in assignees],
             "comments": [
-                {"id": 1 + i, "body": b, "created_at": "2026-09-30T00:00:00Z"}
-                for i, b in enumerate(comments)
+                _comment_row(1 + i, b, "2026-09-30T00:00:00Z") for i, b in enumerate(comments)
             ],
         }
         return self
+
+    @staticmethod
+    def _pages(items, args):
+        """`gh api --paginate`: one JSON document per page, wrapped only with --slurp."""
+        pages = [items[i : i + PAGE] for i in range(0, len(items), PAGE)] or [[]]
+        if "--slurp" in args:
+            return json.dumps(pages)
+        return "".join(json.dumps(page) for page in pages)
 
     def __call__(self, args, input=None):
         args = tuple(args)
@@ -52,16 +72,16 @@ class FakeGh:
                 for i in self.issues.values()
                 if any(lbl["name"] == IN_PROGRESS_LABEL for lbl in i["labels"])
             ]
-            return json.dumps(labelled)
-        if args[0] == "api" and args[1].endswith("/comments") and "-X" not in args:
+            return self._pages(labelled, args)
+        if args[0] == "api" and args[1].split("?")[0].endswith("/comments") and "-X" not in args:
             n = int(args[1].split("/")[4])
-            return json.dumps(self.issues[n]["comments"])
+            return self._pages(self.issues[n]["comments"], args)
         if args[:3] == ("api", "-X", "POST") and args[3].endswith("/comments"):
             n = int(args[3].split("/")[4])
             body = json.loads(input)["body"]
             self._next_comment += 1
             self.issues[n]["comments"].append(
-                {"id": self._next_comment, "body": body, "created_at": NOW.isoformat()}
+                _comment_row(self._next_comment, body, NOW.isoformat(), **self.poster)
             )
             return json.dumps({"id": self._next_comment})
         if args[:2] == ("issue", "edit"):
@@ -116,7 +136,7 @@ def test_current_lease_takes_the_latest_claim_unless_released():
     )
     assert current_lease(PROJECT, 7, gh).session == "s2"
     gh.issues[7]["comments"].append(
-        {"id": 9, "body": "<!-- forge-release session=s2 -->", "created_at": "x"}
+        _comment_row(9, "<!-- forge-release session=s2 -->", "2026-09-30T01:00:00Z")
     )
     assert current_lease(PROJECT, 7, gh) is None
 
@@ -241,3 +261,70 @@ def test_list_claims_reports_live_and_expired():
     gh.issue(3, labels=["bug"])
     rows = list_claims(PROJECT, gh, now=NOW)
     assert [(r.lease.issue, r.expired) for r in rows] == [(1, False), (2, True)]
+
+
+# ---------------------------------------------------------------- review follow-ups
+
+
+def test_lease_history_spanning_several_api_pages_is_read():
+    chatter = [f"comment {i}" for i in range(PAGE + 5)]
+    mine = format_claim_marker(Lease(7, "me", "s1", "b", NOW + timedelta(hours=1)))
+    gh = FakeGh().issue(7, labels=[IN_PROGRESS_LABEL], comments=[*chatter, mine])
+    assert current_lease(PROJECT, 7, gh).session == "s1"
+    assert [(r.lease.issue, r.expired) for r in list_claims(PROJECT, gh, now=NOW)] == [(7, False)]
+
+
+def test_markers_from_untrusted_commenters_are_ignored():
+    live = format_claim_marker(Lease(7, "me", "s1", "b", NOW + timedelta(hours=1)))
+    gh = FakeGh().issue(7, labels=[IN_PROGRESS_LABEL], comments=[live])
+    forged_release = _comment_row(
+        50, "<!-- forge-release session=s1 -->", "2026-09-30T01:00:00Z", "rando", "User", "NONE"
+    )
+    gh.issues[7]["comments"].append(forged_release)
+    assert current_lease(PROJECT, 7, gh).session == "s1"  # forged release does not end it
+
+    forged_claim = format_claim_marker(Lease(8, "x", "evil", "b", NOW + timedelta(days=3650)))
+    gh.issue(8)
+    gh.issues[8]["comments"].append(
+        _comment_row(51, forged_claim, "2026-09-30T01:00:00Z", "rando", "User", "CONTRIBUTOR")
+    )
+    assert current_lease(PROJECT, 8, gh) is None
+    assert claim(PROJECT, 8, agent="me", session="s2", branch="b", gh=gh, now=NOW).ok
+
+
+def test_markers_from_a_github_app_bot_are_trusted():
+    bot_claim = format_claim_marker(
+        Lease(7, "forge-actions", "run-1", "b", NOW + timedelta(hours=1))
+    )
+    gh = FakeGh().issue(7)
+    gh.issues[7]["comments"].append(
+        _comment_row(60, bot_claim, "2026-09-30T01:00:00Z", "publisher[bot]", "Bot", "NONE")
+    )
+    assert current_lease(PROJECT, 7, gh).session == "run-1"
+
+
+def test_accepted_expiry_is_bounded_by_the_maximum_ttl():
+    far = format_claim_marker(Lease(7, "me", "s1", "b", NOW + timedelta(days=3650)))
+    gh = FakeGh().issue(7, labels=[IN_PROGRESS_LABEL], comments=[far])
+    lease = current_lease(PROJECT, 7, gh)
+    posted = datetime(2026, 9, 30, tzinfo=UTC)
+    assert lease.expires == posted + timedelta(minutes=MAX_TTL_MINUTES)
+    with pytest.raises(LeaseError):
+        claim(
+            PROJECT,
+            9,
+            agent="me",
+            session="s",
+            branch="b",
+            gh=gh,
+            now=NOW,
+            ttl_minutes=MAX_TTL_MINUTES + 1,
+        )
+
+
+def test_invalid_claim_fields_are_refused_before_any_github_edit():
+    gh = FakeGh().issue(7)
+    with pytest.raises(LeaseError):
+        claim(PROJECT, 7, agent="Claude Code", session="s1", branch="b", gh=gh, now=NOW)
+    assert not any(c[:2] == ("issue", "edit") for c in gh.calls)
+    assert gh.issues[7]["labels"] == [] and gh.issues[7]["comments"] == []

@@ -283,6 +283,13 @@ def test_copy_variables_skips_missing_ones():
 # ---------------------------------------------------------------- doctor
 
 
+def _secret_pages(*names: str, per_page: int = 30) -> str:
+    """`gh api .../actions/secrets --paginate --slurp`: an array of {"secrets": [...]} pages."""
+    rows = [{"name": n} for n in names]
+    pages = [rows[i : i + per_page] for i in range(0, len(rows), per_page)] or [[]]
+    return json.dumps([{"total_count": len(rows), "secrets": page} for page in pages])
+
+
 def _healthy_gh() -> FakeGh:
     return FakeGh(
         {
@@ -307,15 +314,8 @@ def _healthy_gh() -> FakeGh:
                     )
                 ]
             ),
-            "api repos/owner/comic/actions/secrets": json.dumps(
-                [
-                    {"name": n}
-                    for n in (
-                        "PUBLISHER_APP_PRIVATE_KEY",
-                        "CLAUDE_CODE_OAUTH_TOKEN",
-                        "DEEPSEEK_API_KEY",
-                    )
-                ]
+            "api repos/owner/comic/actions/secrets": _secret_pages(
+                "PUBLISHER_APP_PRIVATE_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "DEEPSEEK_API_KEY"
             ),
             "api repos/owner/comic/actions/runners": json.dumps(
                 [
@@ -351,7 +351,7 @@ def test_doctor_flags_missing_secrets_runner_and_app_as_manual_todos(tmp_path):
     repo = _repo(tmp_path)
     write_onboarding(repo, spec())
     gh = _healthy_gh()
-    gh.answers["api repos/owner/comic/actions/secrets"] = "[]"
+    gh.answers["api repos/owner/comic/actions/secrets"] = _secret_pages()
     gh.answers["api repos/owner/comic/actions/runners"] = "[]"
     gh.answers["api /user/installations/"] = json.dumps(
         [{"repositories": [{"full_name": "owner/music"}]}]
@@ -403,9 +403,7 @@ def test_doctor_in_cloud_routine_mode_needs_no_runner_app_or_publisher_secret(tm
     repo = _repo(tmp_path)
     write_onboarding(repo, spec(implementer="cloud-routine", runs_on=("ubuntu-latest",)))
     gh = _healthy_gh()
-    gh.answers["api repos/owner/comic/actions/secrets"] = json.dumps(
-        [{"name": "CLAUDE_CODE_OAUTH_TOKEN"}]
-    )
+    gh.answers["api repos/owner/comic/actions/secrets"] = _secret_pages("CLAUDE_CODE_OAUTH_TOKEN")
     gh.answers["api repos/owner/comic/actions/variables"] = "[]"
     gh.answers["api repos/owner/comic/actions/runners"] = "[]"
     gh.answers["api /user/installations"] = "[]"
@@ -677,3 +675,81 @@ def test_doctor_requires_every_caller_to_pin_the_same_platform_sha(tmp_path):
     report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
     pin = next(c for c in report.checks if c.name == "workflows pin the platform to a commit SHA")
     assert not pin.ok and "agent-auto-implement.yml" in pin.detail
+
+
+def test_workflow_commands_with_yaml_significant_text_stay_valid_yaml():
+    test = "python -c \"print('key: value')\" # not a comment"
+    setup = "- echo {a: [b]} & echo *star"
+    doc = yaml.safe_load(
+        render_onboarding(spec(test_command=test, setup_command=setup))[".github/workflows/ci.yml"]
+    )
+    steps = {s["name"]: s.get("run") for s in doc["jobs"]["test"]["steps"] if "name" in s}
+    assert steps["Test"] == test and steps["Setup"] == setup
+
+
+def test_ruleset_without_strict_status_checks_is_a_mismatch():
+    lax = ruleset_payload(spec())
+    lax["rules"][-1]["parameters"]["strict_required_status_checks_policy"] = False
+    assert "status checks are not strict (branch must be up to date)" in ruleset_mismatches(
+        lax, spec()
+    )
+    assert ruleset_mismatches(ruleset_payload(spec()), spec()) == []
+
+
+def test_doctor_requires_the_auto_plan_workflow(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    (repo / ".github/workflows/agent-auto-plan.yml").unlink()
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh())
+    files = next(c for c in report.checks if c.name == "required files present")
+    assert not report.ok and not files.ok and "agent-auto-plan.yml" in files.detail
+
+
+def test_doctor_flags_a_policy_project_id_for_another_repository(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(project_id="owner/other"))
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    check = next(c for c in report.checks if c.name == "policy project id matches the repository")
+    assert not check.ok and "owner/other" in check.detail and not report.ok
+
+
+def test_doctor_reads_every_page_of_repository_secrets(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _healthy_gh()
+    filler = [f"SECRET_{i:02d}" for i in range(30)]
+    gh.answers["api repos/owner/comic/actions/secrets"] = _secret_pages(
+        *filler, "PUBLISHER_APP_PRIVATE_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "DEEPSEEK_API_KEY"
+    )
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    assert report.ok, report.render()
+    call = next(c for c, _ in gh.calls if c[1].startswith("repos/owner/comic/actions/secrets"))
+    assert "--slurp" in call and "--paginate" in call
+
+
+def test_commit_guard_reads_paginated_comments_and_ignores_untrusted_markers(tmp_path, monkeypatch):
+    import importlib.util
+    import subprocess
+    from datetime import UTC, datetime, timedelta
+
+    path = tmp_path / "guard.py"
+    path.write_text(render_onboarding(spec())[".claude/hooks/forge_commit_guard.py"])
+    module_spec = importlib.util.spec_from_file_location("guard_pages", path)
+    guard = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(guard)
+    expires = (datetime.now(UTC) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def row(body, association="OWNER"):
+        return {"body": body, "author_association": association, "user": {"type": "User"}}
+
+    mine = row(f"<!-- forge-claim agent=a session=s1 branch=b expires={expires} -->")
+    forged = row("<!-- forge-release session=s1 -->", association="NONE")
+    pages = [[row("chatter")] * 30, [mine, forged]]
+
+    def fake_run(args, **kwargs):
+        out = json.dumps(pages) if "--slurp" in args else "".join(json.dumps(p) for p in pages)
+        return subprocess.CompletedProcess(args, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(guard.subprocess, "run", fake_run)
+    lease = guard.lease_for(7)
+    assert lease is not None and lease["session"] == "s1"
