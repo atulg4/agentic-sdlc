@@ -242,6 +242,13 @@ def claim(
     _check_ttl(ttl_minutes)
     lease = Lease(issue, agent, session, branch, now + timedelta(minutes=ttl_minutes))
     marker = format_claim_marker(lease)  # validate before reading or writing anything
+    target = json.loads(gh(["api", f"repos/{project}/issues/{issue}"]) or "{}")
+    if target.get("pull_request"):
+        return ClaimResult(False, None, reason=f"#{issue} is a pull request, not an issue")
+    if target.get("state") != "open":
+        return ClaimResult(
+            False, None, reason=f"issue #{issue} is {target.get('state', 'unknown')}"
+        )
     existing = current_lease(project, issue, gh)
     took_over = None
     if existing is not None and existing.live(now):
@@ -314,18 +321,20 @@ def release(
         return
     if existing.session != session and not force:
         raise LeaseError(f"issue #{issue} is leased by session {existing.session}, not {session}")
-    _edit(project, issue, gh, "--remove-label", IN_PROGRESS_LABEL)
     who = (
         session
         if existing.session == session
         else f"{session} (forced; holder was {existing.session})"
     )
+    # The marker is authoritative; post it first so a failed label cleanup cannot leave the
+    # lease live (and the issue unclaimable) until its TTL runs out.
     _comment(
         project,
         issue,
         format_release_marker(existing.session) + f"\nLease released by `{who}`. {note}".rstrip(),
         gh,
     )
+    _edit(project, issue, gh, "--remove-label", IN_PROGRESS_LABEL)
 
 
 def list_claims(project: str, gh: GhRunner, now: datetime | None = None) -> list[ClaimRow]:

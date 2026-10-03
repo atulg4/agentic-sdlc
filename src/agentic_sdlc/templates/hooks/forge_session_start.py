@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from pathlib import Path
 
 PROJECT = "PROJECT_ID"
 DEFAULT_BRANCH = "DEFAULT_BRANCH_NAME"
@@ -23,6 +24,27 @@ def run(cmd: list[str]) -> str:
         ).stdout.strip()
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return ""
+
+
+def _lease_lookup():
+    """The commit guard's lease reader (same trust/expiry rules), from the sibling hook file."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        from forge_commit_guard import lease_for
+    except ImportError:  # guard missing: treat every labelled issue as held (fail safe)
+        return lambda number: {}
+    return lease_for
+
+
+def classify_leased(issues: list, lease_lookup) -> tuple[list[str], list[str]]:
+    """Split `in-progress` issues into live leases and expired/released ones (label left over)."""
+    live: list[str] = []
+    stale: list[str] = []
+    for issue in issues:
+        who = ",".join(a.get("login", "") for a in issue.get("assignees") or [])
+        line = f"#{issue.get('number')} {issue.get('title', '')} (assignee: {who})"
+        (live if lease_lookup(int(issue.get("number"))) is not None else stale).append(line)
+    return live, stale
 
 
 def main() -> int:
@@ -51,7 +73,7 @@ def main() -> int:
             '.[] | "#\\(.number) \\(.title) [\\(.headRefName)]"',
         ]
     )
-    leased = run(
+    raw = run(
         [
             "gh",
             "issue",
@@ -64,17 +86,28 @@ def main() -> int:
             "open",
             "--json",
             "number,title,assignees",
-            "--jq",
-            '.[] | "#\\(.number) \\(.title) (assignee: \\(.assignees | map(.login) | join(",")))"',
         ]
     )
+    try:
+        issues = json.loads(raw or "[]")
+    except json.JSONDecodeError:
+        issues = []
+    live, stale = classify_leased(issues, _lease_lookup())
     print(
         f"[Forge] {PROJECT}: HEAD is {behind} commit(s) behind origin/{DEFAULT_BRANCH}. "
         "Recent on main:"
     )
     print(recent or "  (unavailable)")
     print("[Forge] Open PRs:\n" + (prs or "  none"))
-    print("[Forge] Issues leased by other agents (do NOT work on these):\n" + (leased or "  none"))
+    print(
+        "[Forge] Issues leased by other agents (do NOT work on these):\n"
+        + ("\n".join(live) or "  none")
+    )
+    if stale:
+        print(
+            "[Forge] Labelled in-progress but no live lease (expired, released, or unreadable; "
+            "an expired lease may be taken over with sdlcctl claim):\n" + "\n".join(stale)
+        )
     print(
         f"[Forge] Rule: every change maps to an issue. Before implementing one, claim it: "
         f"sdlcctl claim --project {PROJECT} --issue <N> --agent claude-code "
