@@ -359,7 +359,15 @@ jobs:
           if command -v bwrap >/dev/null; then
             echo "bubblewrap already installed; skipping apt"
           else
-            sudo apt-get -o DPkg::Lock::Timeout=300 update -q
+            # DPkg::Lock::Timeout covers the dpkg locks only; `update` takes the
+            # apt lists lock once and exits 100 if another process holds it.
+            # Retry it for the same ~5 minutes the dpkg timeout allows.
+            for attempt in 1 2 3 4 5 6 7 8 9 10; do
+              sudo apt-get -o DPkg::Lock::Timeout=300 update -q && break
+              if [ "$attempt" = 10 ]; then exit 1; fi
+              echo "apt-get update failed (attempt $attempt); retrying in 30s"
+              sleep 30
+            done
             sudo apt-get -o DPkg::Lock::Timeout=300 install -y -q bubblewrap
           fi
           command -v bwrap >/dev/null

@@ -286,3 +286,18 @@ def test_sandbox_install_is_skipped_when_the_binaries_are_already_present() -> N
 
         assert guard < install, name
         assert "skipping apt" in document[guard:install], name
+
+
+def test_apt_update_retries_the_lists_lock() -> None:
+    # DPkg::Lock::Timeout is honoured for the dpkg locks only; apt-get update
+    # acquires /var/lib/apt/lists/lock once and fails at once if it is held,
+    # so every update must sit inside a bounded retry loop.
+    for name in SANDBOX_INSTALL_WORKFLOWS:
+        document = (WORKFLOWS / name).read_text(encoding="utf-8")
+        update = document.index("sudo apt-get -o DPkg::Lock::Timeout=300 update -q && break")
+        loop = document.rindex("for attempt in ", 0, update)
+        assert update - loop < 200, name
+        done = document.index("done", update)
+        assert "sleep" in document[update:done], name
+        assert "exit 1" in document[update:done], name
+        assert document.count("update -q") == 1, name
