@@ -198,6 +198,12 @@ def _validated_manifest_bytes(document: Any) -> bytes:
     for key in ("readPaths", "writePaths"):
         for pattern in document["permissions"][key]:
             _path(pattern)
+    context = document["context"]
+    _require(
+        context["inputTokenLimit"] + context["outputTokenReserve"]
+        <= document["budget"]["maxTotalTokens"],
+        "rendered input and output reserve exceed the manifest token budget",
+    )
     gates = set(document["verification"]["requiredGateIds"])
     _require(
         gates >= _BASE_GATES, "foundation manifests require CI, independent review and human merge"

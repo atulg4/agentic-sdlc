@@ -205,6 +205,18 @@ def test_rejects_invalid_semantics(manifest: dict, change: tuple) -> None:
         validate_manifest(manifest)
 
 
+def test_context_must_fit_the_manifest_token_budget(manifest: dict) -> None:
+    # One model call reserving input + output cannot fit a smaller total budget,
+    # even when the executor's context window is large enough for it.
+    context = manifest["context"]
+    needed = context["inputTokenLimit"] + context["outputTokenReserve"]
+    manifest["budget"]["maxTotalTokens"] = needed
+    validate_manifest(manifest)
+    manifest["budget"]["maxTotalTokens"] = needed - 1
+    with pytest.raises(HarnessError, match="manifest token budget"):
+        validate_manifest(manifest)
+
+
 def test_rejects_duplicate_skill_identity_and_missing_merge_gate(manifest: dict) -> None:
     other = copy.deepcopy(manifest)
     other["skills"].append({**other["skills"][0], "version": "2.0.0"})
