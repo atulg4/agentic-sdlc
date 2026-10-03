@@ -292,11 +292,12 @@ def _validate_harness(args: argparse.Namespace) -> int:
         document_digest,
         executor_profile_snapshot,
         load_manifest,
+        read_document,
         validate_effective_risk,
         validate_executor_binding,
     )
 
-    manifest = load_manifest(Path(args.manifest).read_bytes())
+    manifest = load_manifest(read_document(args.manifest))
     data = manifest.as_dict()
     # One snapshot is both hashed and parsed, so the checked digest is the enforced policy.
     policy_bytes = Path(args.config).read_bytes()
@@ -310,7 +311,7 @@ def _validate_harness(args: argparse.Namespace) -> int:
         raise HarnessError("mission registry digest mismatch")
     mission = registry.get(data["mission"]["id"])
     validate_effective_risk(manifest, mission, expected_risk=RiskLevel(args.effective_risk))
-    executor = validate_executor_binding(manifest, Path(args.executors).read_bytes())
+    executor = validate_executor_binding(manifest, read_document(args.executors))
     _write(
         {
             "schemaVersion": 1,

@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 from dataclasses import dataclass
 from importlib.resources import files
@@ -91,6 +92,15 @@ def _object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         _require(key not in result, "duplicate JSON key")
         result[key] = value
     return result
+
+
+def read_document(path: str | os.PathLike[str]) -> bytes:
+    """Read at most one byte past the size limit, so an oversized file or an
+    endless FIFO is refused without first being buffered in full."""
+    with open(path, "rb") as handle:
+        raw = handle.read(MAX_DOCUMENT_BYTES + 1)
+    _require(len(raw) <= MAX_DOCUMENT_BYTES, "JSON document exceeds size limit")
+    return raw
 
 
 def load_json(raw: bytes) -> Any:

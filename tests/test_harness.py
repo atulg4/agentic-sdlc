@@ -16,6 +16,7 @@ from agentic_sdlc.cli import main
 from agentic_sdlc.dispatcher import AutonomousIntakeDispatcher
 from agentic_sdlc.executors import load_executors
 from agentic_sdlc.harness import (
+    MAX_DOCUMENT_BYTES,
     HarnessError,
     HarnessManifest,
     canonical_json,
@@ -24,6 +25,7 @@ from agentic_sdlc.harness import (
     load_json,
     load_manifest,
     manifest_schema,
+    read_document,
     validate_effective_risk,
     validate_executor_binding,
     validate_manifest,
@@ -341,6 +343,27 @@ def _args(manifest_path: Path, output: Path | None = None) -> list[str]:
         "medium",
     ]
     return args + (["--output", str(output)] if output else [])
+
+
+def test_cli_never_buffers_an_unbounded_input(tmp_path: Path, monkeypatch) -> None:
+    # Manifest and registry are read through a bounded reader: an oversized file
+    # (or an endless FIFO) is refused after MAX_DOCUMENT_BYTES + 1 bytes, never
+    # read in full first.
+    real_read_bytes = Path.read_bytes
+    json_inputs = {EXAMPLE / "manifest.json", EXAMPLE / "executors.json"}
+
+    def unbounded(self):
+        if self in json_inputs:
+            raise AssertionError(f"unbounded read of {self}")
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", unbounded)
+    assert main(_args(EXAMPLE / "manifest.json", tmp_path / "report.json")) == 0
+    monkeypatch.undo()
+    oversized = tmp_path / "manifest.json"
+    oversized.write_bytes(b" " * (MAX_DOCUMENT_BYTES + 10))
+    with pytest.raises(HarnessError, match="size limit"):
+        read_document(oversized)
 
 
 def test_cli_example_validates_but_never_authorizes_dispatch(tmp_path: Path) -> None:
