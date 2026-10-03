@@ -18,6 +18,13 @@ PROJECT = "PROJECT_ID"
 ISSUE_BRANCH = re.compile(r"(?:^|/)issue-(\d+)(?:$|[^0-9])")
 CLAIM = re.compile(r"<!--\s*forge-claim\s+([^>]*?)\s*-->")
 RELEASE = re.compile(r"<!--\s*forge-release\s+([^>]*?)\s*-->")
+# `git [global options] commit`: -C/-c/--git-dir/... take the NEXT word as their value, so
+# `git -C . commit` and `git -c k=v commit` are commits too. `commit.gpgsign=false` is not.
+_GIT_VALUE_OPTS = r"(?:-C|-c|--git-dir|--work-tree|--namespace|--super-prefix|--config-env)"
+_WORD = r"(?:'[^']*'|\"[^\"]*\"|\S+)"
+GIT_COMMIT = re.compile(
+    rf"(?:^|[\s;&|(])git(?:\s+(?:{_GIT_VALUE_OPTS}\s+{_WORD}|-\S+))*\s+commit(?=$|[\s;&|)])"
+)
 TRUSTED = {"OWNER", "MEMBER", "COLLABORATOR"}  # plus GitHub Apps (user.type == "Bot")
 
 
@@ -87,7 +94,7 @@ def decide(payload: dict, branch: str, lease_lookup=lease_for) -> tuple[int, str
     if payload.get("tool_name") != "Bash":
         return 0, ""
     command = str((payload.get("tool_input") or {}).get("command", ""))
-    if not re.search(r"\bgit\s+(?:-\S+\s+)*commit\b", command):
+    if not GIT_COMMIT.search(command):
         return 0, ""
     m = ISSUE_BRANCH.search(branch or "")
     if not m:

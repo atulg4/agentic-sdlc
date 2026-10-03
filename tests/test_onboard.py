@@ -290,6 +290,13 @@ def _secret_pages(*names: str, per_page: int = 30) -> str:
     return json.dumps([{"total_count": len(rows), "secrets": page} for page in pages])
 
 
+def _var_pages(*names: str, per_page: int = 30) -> str:
+    """`gh api .../actions/variables --paginate --slurp`: an array of {"variables": [...]}."""
+    rows = [{"name": n} for n in names]
+    pages = [rows[i : i + per_page] for i in range(0, len(rows), per_page)] or [[]]
+    return json.dumps([{"total_count": len(rows), "variables": page} for page in pages])
+
+
 def _healthy_gh() -> FakeGh:
     return FakeGh(
         {
@@ -298,21 +305,19 @@ def _healthy_gh() -> FakeGh:
             "label list": json.dumps(
                 [
                     {"name": n}
-                    for n in ("claude-ready", "human-review-required", IMPLEMENTATION_LABEL)
+                    for n in (
+                        "claude-ready",
+                        "human-review-required",
+                        IMPLEMENTATION_LABEL,
+                        "in-progress",
+                    )
                 ]
             ),
             "api repos/owner/comic/rulesets": json.dumps(
                 [{"id": 11, "name": RULESET_NAME, "enforcement": "active"}]
             ),
-            "api repos/owner/comic/actions/variables": json.dumps(
-                [
-                    {"name": n}
-                    for n in (
-                        "PUBLISHER_APP_CLIENT_ID",
-                        "DEEPSEEK_MODEL_FLASH",
-                        "DEEPSEEK_MODEL_PRO",
-                    )
-                ]
+            "api repos/owner/comic/actions/variables": _var_pages(
+                "PUBLISHER_APP_CLIENT_ID", "DEEPSEEK_MODEL_FLASH", "DEEPSEEK_MODEL_PRO"
             ),
             "api repos/owner/comic/actions/secrets": _secret_pages(
                 "PUBLISHER_APP_PRIVATE_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "DEEPSEEK_API_KEY"
@@ -404,7 +409,7 @@ def test_doctor_in_cloud_routine_mode_needs_no_runner_app_or_publisher_secret(tm
     write_onboarding(repo, spec(implementer="cloud-routine", runs_on=("ubuntu-latest",)))
     gh = _healthy_gh()
     gh.answers["api repos/owner/comic/actions/secrets"] = _secret_pages("CLAUDE_CODE_OAUTH_TOKEN")
-    gh.answers["api repos/owner/comic/actions/variables"] = "[]"
+    gh.answers["api repos/owner/comic/actions/variables"] = _var_pages()
     gh.answers["api repos/owner/comic/actions/runners"] = "[]"
     gh.answers["api /user/installations"] = "[]"
     report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
@@ -753,3 +758,109 @@ def test_commit_guard_reads_paginated_comments_and_ignores_untrusted_markers(tmp
     monkeypatch.setattr(guard.subprocess, "run", fake_run)
     lease = guard.lease_for(7)
     assert lease is not None and lease["session"] == "s1"
+
+
+def test_ruleset_excluding_the_default_branch_is_a_mismatch():
+    excluding = ruleset_payload(spec())
+    excluding["conditions"]["ref_name"]["exclude"] = ["refs/heads/main"]
+    assert "excludes refs/heads/main" in ruleset_mismatches(excluding, spec())
+
+
+def test_doctor_reads_every_page_of_repository_variables(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _healthy_gh()
+    filler = [f"VAR_{i:02d}" for i in range(30)]
+    gh.answers["api repos/owner/comic/actions/variables"] = _var_pages(
+        *filler, "PUBLISHER_APP_CLIENT_ID", "DEEPSEEK_MODEL_FLASH", "DEEPSEEK_MODEL_PRO"
+    )
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    assert report.ok, report.render()
+    call = next(c for c, _ in gh.calls if c[1].startswith("repos/owner/comic/actions/variables"))
+    assert "--slurp" in call and "--paginate" in call
+
+
+def test_doctor_checks_every_matching_publisher_installation(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _healthy_gh()
+    del gh.answers["api /user/installations/"]
+    gh.answers = {
+        "api /user/installations/7/": json.dumps([{"repositories": [{"full_name": "a/x"}]}]),
+        "api /user/installations/8/": json.dumps(
+            [{"repositories": [{"full_name": "owner/comic"}]}]
+        ),
+        **gh.answers,
+    }
+    gh.answers["api /user/installations"] = json.dumps(
+        [
+            {"id": 7, "app_slug": "agentic-sdlc-publisher"},
+            {"id": 8, "app_slug": "agentic-sdlc-publisher"},
+        ]
+    )
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    assert report.ok, report.render()
+
+
+def test_doctor_requires_routing_files_when_the_repo_is_routed(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())  # default profile routes
+    (repo / ".forge/executors.json").unlink()
+    (repo / ".forge/routing-policy.json").unlink()
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    check = next(c for c in report.checks if c.name == "routing files valid and permit this repo")
+    assert (
+        not check.ok and "executors.json" in check.detail and "routing-policy.json" in check.detail
+    )
+
+
+def test_doctor_requires_the_in_progress_lease_label(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _healthy_gh()
+    gh.answers["label list"] = json.dumps(
+        [{"name": n} for n in ("claude-ready", "human-review-required", IMPLEMENTATION_LABEL)]
+    )
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    failed = {c.name: c for c in report.checks if not c.ok}
+    assert (
+        set(failed) == {"Forge labels exist"}
+        and "in-progress" in failed["Forge labels exist"].detail
+    )
+
+
+def test_auto_plan_reports_failures_on_the_issue():
+    doc = yaml.safe_load(render_onboarding(spec())[".github/workflows/agent-auto-plan.yml"])
+    notify = doc["jobs"]["notify_failure"]
+    assert notify["needs"] == ["plan"] or notify["needs"] == "plan"
+    assert "always()" in notify["if"] and "needs.plan.result == 'failure'" in notify["if"]
+    assert notify["permissions"] == {"issues": "write"}
+    step = notify["steps"][0]
+    assert step["env"]["ISSUE_NUMBER"] == "${{ github.event.issue.number }}"
+    assert "planning did not complete" in step["with"]["script"]
+
+
+def test_commit_guard_sees_commit_after_value_taking_git_options(tmp_path):
+    import importlib.util
+
+    path = tmp_path / "guard.py"
+    path.write_text(render_onboarding(spec())[".claude/hooks/forge_commit_guard.py"])
+    module_spec = importlib.util.spec_from_file_location("guard_opts", path)
+    guard = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(guard)
+
+    def code(command):
+        payload = {"tool_name": "Bash", "session_id": "s1", "tool_input": {"command": command}}
+        return guard.decide(payload, "forge/issue-7", lambda n: None)[0]
+
+    for blocked in (
+        "git -C . commit -m x",
+        "git -c user.name=bot commit -m x",
+        'git -C "my dir" -c a.b=c commit -m x',
+        "git --git-dir .git --work-tree . commit -m x",
+        "git --namespace ns --exec-path=/usr/lib/git-core commit",
+        "cd sub && git --no-pager -C .. commit -am x",
+    ):
+        assert code(blocked) == 2, blocked
+    for allowed in ("git -C . status", "git -c commit.gpgsign=false log", "git log --grep commit"):
+        assert code(allowed) == 0, allowed

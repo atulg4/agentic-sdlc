@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .executors import ExecutorError, load_executors, load_routing_policy
+from .leases import IN_PROGRESS_LABEL
 from .policy import load_policy
 
 GhRunner = Callable[..., str]  # (args: Sequence[str], input: str | None = None) -> stdout
@@ -736,6 +737,9 @@ def ruleset_mismatches(actual: dict, spec: OnboardSpec) -> list[str]:
     include = ((actual.get("conditions") or {}).get("ref_name") or {}).get("include") or []
     if "~DEFAULT_BRANCH" not in include and f"refs/heads/{spec.default_branch}" not in include:
         problems.append("does not target the default branch")
+    exclude = ((actual.get("conditions") or {}).get("ref_name") or {}).get("exclude") or []
+    if exclude:  # an exclusion match makes the condition fail; the payload excludes nothing
+        problems.append("excludes " + ", ".join(map(str, exclude)))
     rules = {r.get("type"): r.get("parameters") or {} for r in actual.get("rules") or []}
     for rule in want["rules"]:
         if rule["type"] not in rules:
@@ -867,6 +871,18 @@ def _safe_json(gh: GhRunner, args: Sequence[str]):
         return None
 
 
+def _paged_names(gh: GhRunner, path: str, key: str) -> set[str]:
+    """Names from every page of a list endpoint; --slurp wraps the pages, each {key: [...]}."""
+    pages = _safe_json(gh, ["api", path, "--paginate", "--slurp"])
+    return {
+        str(item.get("name"))
+        for page in (pages if isinstance(pages, list) else [])
+        if isinstance(page, dict)
+        for item in page.get(key) or []
+        if isinstance(item, dict)
+    }
+
+
 def doctor(
     root: str | Path,
     project_id: str,
@@ -921,8 +937,30 @@ def doctor(
             )
         )
 
-    routed = (base / ".forge/executors.json").exists()
-    if routed:
+    routing_files = (".forge/executors.json", ".forge/routing-policy.json")
+    toml_path = base / "agentic-sdlc.toml"
+    implement_callers = [
+        base / ".github/workflows" / n for n in ("agent-implement.yml", "agent-auto-implement.yml")
+    ]
+    # Route mode is what the installed callers/policy ask for, not whether the registry exists.
+    routed = (
+        any((base / f).exists() for f in routing_files)
+        or (toml_path.exists() and re.search(r"^\[routing\]", toml_path.read_text(), re.M))
+        or any(
+            c.exists() and re.search(r"^\s*agent:\s*route\s*$", c.read_text(), re.M)
+            for c in implement_callers
+        )
+    )
+    missing_routing = [f for f in routing_files if not (base / f).exists()]
+    if routed and missing_routing:
+        add(
+            Check(
+                "routing files valid and permit this repo",
+                False,
+                "route mode but missing " + ", ".join(missing_routing),
+            )
+        )
+    elif routed:
         try:
             executors = load_executors(json.loads((base / ".forge/executors.json").read_text()))
             load_routing_policy(json.loads((base / ".forge/routing-policy.json").read_text()))
@@ -1041,7 +1079,7 @@ def doctor(
         {policy.ready_label, policy.human_review_label, policy.implementation_label}
         if policy
         else {"claude-ready", HUMAN_REVIEW_LABEL, IMPLEMENTATION_LABEL}
-    )
+    ) | {IN_PROGRESS_LABEL}  # claim() adds it; a missing label fails every lease
     lacking = sorted(want - names)
     add(
         Check(
@@ -1082,24 +1120,8 @@ def doctor(
         )
 
     # --- variables & secrets (names only)
-    variables = {
-        v.get("name")
-        for v in (
-            _safe_json(gh, ["api", f"repos/{project_id}/actions/variables", "--jq", ".variables"])
-            or []
-        )
-    }
-    secret_pages = _safe_json(
-        gh, ["api", f"repos/{project_id}/actions/secrets", "--paginate", "--slurp"]
-    )
-    # --slurp wraps every page in one outer array; each page is {"secrets": [...]}.
-    secrets = {
-        str(s.get("name"))
-        for page in (secret_pages if isinstance(secret_pages, list) else [])
-        if isinstance(page, dict)
-        for s in page.get("secrets") or []
-        if isinstance(s, dict)
-    }
+    variables = _paged_names(gh, f"repos/{project_id}/actions/variables", "variables")
+    secrets = _paged_names(gh, f"repos/{project_id}/actions/secrets", "secrets")
     need_vars = set() if cloud else {"PUBLISHER_APP_CLIENT_ID"}
     need_secrets = {"CLAUDE_CODE_OAUTH_TOKEN"} | (set() if cloud else {"PUBLISHER_APP_PRIVATE_KEY"})
     if routed:
@@ -1167,10 +1189,8 @@ def doctor(
         )
         return rep
     installs = _safe_json(gh, ["api", "/user/installations", "--jq", ".installations"]) or []
-    app = next(
-        (i for i in installs if PUBLISHER_APP_SLUG_HINT in str(i.get("app_slug", "")).lower()), None
-    )
-    if app is None:
+    apps = [i for i in installs if PUBLISHER_APP_SLUG_HINT in str(i.get("app_slug", "")).lower()]
+    if not apps:
         add(
             Check(
                 "Publisher GitHub App installed on this repo",
@@ -1180,26 +1200,29 @@ def doctor(
             )
         )
     else:
-        repos = (
-            _safe_json(
-                gh,
-                [
-                    "api",
-                    f"/user/installations/{app['id']}/repositories",
-                    "--paginate",
-                    "--slurp",
-                ],
+        # The app may be installed on several accounts; the repo can be under any of them.
+        flat: list[str] = []
+        for app in apps:
+            repos = (
+                _safe_json(
+                    gh,
+                    [
+                        "api",
+                        f"/user/installations/{app['id']}/repositories",
+                        "--paginate",
+                        "--slurp",
+                    ],
+                )
+                or []
             )
-            or []
-        )
-        # --slurp wraps every page in one outer array; each page is {"repositories": [...]}.
-        flat = [
-            str(r.get("full_name"))
-            for page in (repos if isinstance(repos, list) else [])
-            if isinstance(page, dict)
-            for r in page.get("repositories") or []
-            if isinstance(r, dict)
-        ]
+            # --slurp wraps every page in one outer array; each page is {"repositories": [...]}.
+            flat += [
+                str(r.get("full_name"))
+                for page in (repos if isinstance(repos, list) else [])
+                if isinstance(page, dict)
+                for r in page.get("repositories") or []
+                if isinstance(r, dict)
+            ]
         ok = project_id in flat
         add(
             Check(
