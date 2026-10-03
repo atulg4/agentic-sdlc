@@ -6,6 +6,7 @@
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           DEEPSEEK_MODEL_FLASH: ${{ vars.DEEPSEEK_MODEL_FLASH }}
           DEEPSEEK_MODEL_PRO: ${{ vars.DEEPSEEK_MODEL_PRO }}
           PUBLISHER_APP_CLIENT_ID: ${{ vars.PUBLISHER_APP_CLIENT_ID }}
@@ -36,6 +37,7 @@ PREFLIGHT_EXTRA
       executor_registry_path: 'EXECUTOR_REGISTRY_PATH'
       routing_policy_path: 'ROUTING_POLICY_PATH'
     secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
       ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
       KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}

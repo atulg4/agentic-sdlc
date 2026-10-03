@@ -168,6 +168,14 @@ def resolve_platform_ref(platform_repository: str, ref: str, gh: GhRunner = run_
     return sha
 
 
+def repository_default_branch(project_id: str, gh: GhRunner = run_gh) -> str:
+    """The repository's default branch as GitHub reports it (the workflows compare against it)."""
+    branch = gh(["api", f"repos/{project_id}", "--jq", ".default_branch"]).strip()
+    if not branch:
+        raise OnboardError(f"could not read the default branch of {project_id}")
+    return branch
+
+
 # ---------------------------------------------------------------- rendering
 
 
@@ -176,10 +184,15 @@ def _resource(relative: str) -> str:
     return root.joinpath("templates", *relative.split("/")).read_text(encoding="utf-8")
 
 
+def _toml_str(value: str) -> str:
+    """A valid TOML basic string (JSON string escapes are a subset TOML accepts)."""
+    return json.dumps(value, ensure_ascii=False)
+
+
 def _toml_list(items: Sequence[str], indent: str = "  ") -> str:
     if not items:
         return "[]"
-    body = "".join(f'{indent}"{item}",\n' for item in items)
+    body = "".join(f"{indent}{_toml_str(item)},\n" for item in items)
     return f"[\n{body}]"
 
 
@@ -233,9 +246,9 @@ forbidden_task_patterns = [
 {patterns}]
 
 [commands]
-setup = "{spec.setup_command}"
-quality = "{spec.quality_command}"
-test = "{spec.test_command}"
+setup = {_toml_str(spec.setup_command)}
+quality = {_toml_str(spec.quality_command)}
+test = {_toml_str(spec.test_command)}
 
 [verification]
 gates = ["setup", "quality", "test"]
@@ -502,6 +515,8 @@ def _render_workflow(name: str, spec: OnboardSpec, issue_expr: str | None = None
             )
         elif spec.implementer == "claude":
             extra = '          test -n "$CLAUDE_CODE_OAUTH_TOKEN"\n'
+        elif spec.implementer == "codex":
+            extra = '          test -n "$OPENAI_API_KEY"\n'
         jobs = jobs.replace("PREFLIGHT_EXTRA\n", extra)
         if issue_expr is None:
             issue_expr = "${{ inputs.issue_number }}"
@@ -541,6 +556,21 @@ def _render_workflow(name: str, spec: OnboardSpec, issue_expr: str | None = None
     for key, value in replacements.items():
         text = text.replace(key, value)
     return text
+
+
+def render_work_request(spec: OnboardSpec) -> str:
+    """The generic work-request template, labelled with this profile's ready label."""
+    text = _resource("work-request.md")
+    rendered, count = re.subn(
+        r"^labels: .*$",
+        f"labels: {spec.ready_label}, {HUMAN_REVIEW_LABEL}",
+        text,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    if count != 1:
+        raise OnboardError("work-request template has no labels line")
+    return rendered
 
 
 def render_hooks(spec: OnboardSpec) -> dict[str, str]:
@@ -591,7 +621,7 @@ def render_onboarding(spec: OnboardSpec) -> dict[str, str]:
         "agentic-sdlc.toml": render_policy(spec),
         "AGENTS.md": render_agents_md(spec),
         "CLAUDE.md": render_claude_md(spec),
-        ".github/ISSUE_TEMPLATE/agent-work-request.md": _resource("work-request.md"),
+        ".github/ISSUE_TEMPLATE/agent-work-request.md": render_work_request(spec),
         ".github/workflows/ci.yml": _render_workflow("ci.yml", spec),
         ".github/workflows/agent-plan.yml": _render_workflow("agent-plan.yml", spec),
         ".github/workflows/agent-auto-plan.yml": _render_workflow("agent-auto-plan.yml", spec),
@@ -620,6 +650,18 @@ def render_onboarding(spec: OnboardSpec) -> dict[str, str]:
     return files
 
 
+# Files only some implementer modes install. On a forced re-onboard into a different mode the
+# ones the new mode does not render are removed, so a stale workflow cannot keep an Actions
+# implementer live under `cloud-routine`, nor a stale routine doc make doctor misread the mode.
+MODE_OWNED_FILES = (
+    ".github/workflows/agent-implement.yml",
+    ".github/workflows/agent-auto-implement.yml",
+    "docs/forge/cloud-implementer.md",
+    ".forge/executors.json",
+    ".forge/routing-policy.json",
+)
+
+
 def write_onboarding(
     root: str | Path, spec: OnboardSpec, *, force: bool = False
 ) -> tuple[Path, ...]:
@@ -638,6 +680,10 @@ def write_onboarding(
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         written.append(path)
+    if force:
+        for rel in MODE_OWNED_FILES:
+            if rel not in files and (base / rel).is_file():
+                (base / rel).unlink()
     return tuple(sorted(written))
 
 
@@ -675,6 +721,37 @@ def ruleset_payload(spec: OnboardSpec) -> dict:
     }
 
 
+def ruleset_mismatches(actual: dict, spec: OnboardSpec) -> list[str]:
+    """What an existing ruleset lacks relative to `ruleset_payload` (empty = it enforces it)."""
+    want = ruleset_payload(spec)
+    problems: list[str] = []
+    if actual.get("target") != want["target"]:
+        problems.append(f"target is {actual.get('target')!r}")
+    if actual.get("enforcement") != "active":
+        problems.append(f"enforcement is {actual.get('enforcement')!r}")
+    if actual.get("bypass_actors"):
+        problems.append("has bypass actors")
+    include = ((actual.get("conditions") or {}).get("ref_name") or {}).get("include") or []
+    if "~DEFAULT_BRANCH" not in include and f"refs/heads/{spec.default_branch}" not in include:
+        problems.append("does not target the default branch")
+    rules = {r.get("type"): r.get("parameters") or {} for r in actual.get("rules") or []}
+    for rule in want["rules"]:
+        if rule["type"] not in rules:
+            problems.append(f"missing rule {rule['type']}")
+    if "pull_request" in rules and not rules["pull_request"].get(
+        "required_review_thread_resolution"
+    ):
+        problems.append("review-thread resolution not required")
+    if "required_status_checks" in rules:
+        contexts = {
+            c.get("context")
+            for c in rules["required_status_checks"].get("required_status_checks") or []
+        }
+        if REQUIRED_CHECK not in contexts:
+            problems.append(f"status check '{REQUIRED_CHECK}' not required")
+    return problems
+
+
 def apply_repo_settings(
     spec: OnboardSpec, gh: GhRunner = run_gh, *, variables: dict[str, str] | None = None
 ) -> list[str]:
@@ -697,8 +774,27 @@ def apply_repo_settings(
         )
         log.append(f"label {name}")
     existing = json.loads(gh(["api", f"repos/{spec.project_id}/rulesets"]) or "[]")
-    if any(r.get("name") == RULESET_NAME for r in existing):
-        log.append(f"ruleset '{RULESET_NAME}' already present")
+    current = next((r for r in existing if r.get("name") == RULESET_NAME), None)
+    if current is not None:
+        detail = json.loads(
+            gh(["api", f"repos/{spec.project_id}/rulesets/{current.get('id')}"]) or "{}"
+        )
+        problems = ruleset_mismatches(detail, spec)
+        if problems:
+            gh(
+                [
+                    "api",
+                    "-X",
+                    "PUT",
+                    f"repos/{spec.project_id}/rulesets/{current.get('id')}",
+                    "--input",
+                    "-",
+                ],
+                input=json.dumps(ruleset_payload(spec)),
+            )
+            log.append(f"ruleset '{RULESET_NAME}' updated ({'; '.join(problems)})")
+        else:
+            log.append(f"ruleset '{RULESET_NAME}' already present")
     else:
         gh(
             ["api", "-X", "POST", f"repos/{spec.project_id}/rulesets", "--input", "-"],
@@ -828,13 +924,44 @@ def doctor(
 
     ref = None
     plan = base / ".github/workflows/agent-plan.yml"
-    if plan.exists():
-        m = re.search(
-            rf"{re.escape(platform_repository)}/\.github/workflows/reusable-plan\.yml@([0-9a-f]{{40}})",
-            plan.read_text(),
+    callers = [
+        base / ".github/workflows" / name
+        for name in (
+            "agent-plan.yml",
+            "agent-auto-plan.yml",
+            "agent-implement.yml",
+            "agent-auto-implement.yml",
         )
-        ref = m.group(1) if m else None
-        add(Check("workflows pin the platform to a commit SHA", ref is not None))
+        if (base / ".github/workflows" / name).exists()
+    ]
+    if plan.exists():
+        pins: set[str] = set()
+        problems: list[str] = []
+        for caller in callers:
+            uses = re.findall(
+                r"uses:\s*(\S+/\.github/workflows/reusable-[\w-]+\.yml@\S+)", caller.read_text()
+            )
+            if not uses:
+                problems.append(f"{caller.name} calls no reusable workflow")
+            for target in uses:
+                repo_part = target.partition("/.github/workflows/")[0]
+                pin = target.rsplit("@", 1)[1]
+                if repo_part != platform_repository or not _SHA.fullmatch(pin):
+                    problems.append(f"{caller.name} uses {target}")
+                else:
+                    pins.add(pin)
+        if len(pins) > 1:
+            problems.append(
+                "callers pin different SHAs: " + ", ".join(sorted(p[:12] for p in pins))
+            )
+        ref = next(iter(pins)) if len(pins) == 1 and not problems else None
+        add(
+            Check(
+                "workflows pin the platform to a commit SHA",
+                ref is not None,
+                "; ".join(problems),
+            )
+        )
         if policy is not None:
             auto = base / ".github/workflows/agent-auto-implement.yml"
             if auto.exists():
@@ -853,17 +980,40 @@ def doctor(
 
     # --- platform reachable at that pin
     if ref:
-        found = _safe_json(
-            gh,
-            [
-                "api",
-                f"repos/{platform_repository}/contents/.github/workflows/reusable-implement.yml?ref={ref}",
-                "--jq",
-                "{path: .path}",
-            ],
-        )
+        probes = ["reusable-plan.yml"]
+        if not cloud:
+            probes.append("reusable-implement.yml")
+        absent = [
+            name
+            for name in probes
+            if not _safe_json(
+                gh,
+                [
+                    "api",
+                    f"repos/{platform_repository}/contents/.github/workflows/{name}?ref={ref}",
+                    "--jq",
+                    "{path: .path}",
+                ],
+            )
+        ]
         add(
-            Check("platform ref reachable (reusable workflows exist at pin)", bool(found), ref[:12])
+            Check(
+                "platform ref reachable (reusable workflows exist at pin)",
+                not absent,
+                ref[:12] + (f": missing {', '.join(absent)}" if absent else ""),
+            )
+        )
+
+    # --- default branch in the policy is the repository's actual default branch
+    if policy is not None:
+        repo_info = _safe_json(gh, ["api", f"repos/{project_id}"])
+        actual_branch = repo_info.get("default_branch") if isinstance(repo_info, dict) else None
+        add(
+            Check(
+                "policy default_branch matches the repository",
+                actual_branch == policy.default_branch,
+                f"policy {policy.default_branch!r}, GitHub {actual_branch!r}",
+            )
         )
 
     # --- labels
@@ -888,11 +1038,33 @@ def doctor(
 
     # --- ruleset
     rulesets = _safe_json(gh, ["api", f"repos/{project_id}/rulesets"]) or []
-    protect = next(
-        (r for r in rulesets if r.get("name") == RULESET_NAME and r.get("enforcement") == "active"),
-        None,
-    )
-    add(Check(f"ruleset '{RULESET_NAME}' active on default branch", protect is not None))
+    protect = next((r for r in rulesets if r.get("name") == RULESET_NAME), None)
+    if protect is None:
+        add(Check(f"ruleset '{RULESET_NAME}' active on default branch", False, "not found"))
+    else:
+        detail = _safe_json(gh, ["api", f"repos/{project_id}/rulesets/{protect.get('id')}"])
+        branch = policy.default_branch if policy else "main"
+        problems = (
+            ruleset_mismatches(
+                detail,
+                OnboardSpec(
+                    project_id=project_id,
+                    platform_repository=platform_repository,
+                    platform_ref="0" * 40,
+                    test_command="-",
+                    default_branch=branch,
+                ),
+            )
+            if isinstance(detail, dict)
+            else ["could not read the ruleset"]
+        )
+        add(
+            Check(
+                f"ruleset '{RULESET_NAME}' active on default branch",
+                not problems,
+                "; ".join(problems),
+            )
+        )
 
     # --- variables & secrets (names only)
     variables = {
@@ -913,6 +1085,11 @@ def doctor(
     if routed:
         need_vars |= {"DEEPSEEK_MODEL_FLASH", "DEEPSEEK_MODEL_PRO"}
         need_secrets |= {"DEEPSEEK_API_KEY"}
+    implement_wf = base / ".github/workflows/agent-implement.yml"
+    if implement_wf.exists() and re.search(
+        r"^\s*agent:\s*codex\s*$", implement_wf.read_text(), re.MULTILINE
+    ):
+        need_secrets |= {"OPENAI_API_KEY"}
     mv, ms = sorted(need_vars - variables), sorted(need_secrets - secrets)
     add(Check("repo variables set", not mv, ", ".join(mv) if mv else ", ".join(sorted(need_vars))))
     add(
@@ -927,13 +1104,23 @@ def doctor(
     )
 
     # --- runner (only when workflows target self-hosted labels)
-    self_hosted = "self-hosted" in plan.read_text() if plan.exists() else True
+    plan_text = plan.read_text() if plan.exists() else ""
+    self_hosted = "self-hosted" in plan_text if plan.exists() else True
+    wanted_labels: set[str] = set()
+    m = re.search(r"^\s*runs-on:\s*\[([^\]]*)\]", plan_text, re.MULTILINE)
+    if m:
+        wanted_labels = {x.strip().strip("'\"") for x in m.group(1).split(",") if x.strip()}
     runners = (
         (_safe_json(gh, ["api", f"repos/{project_id}/actions/runners", "--jq", ".runners"]) or [])
         if self_hosted
         else []
     )
-    online = [r for r in runners if r.get("status") == "online"]
+    online = [
+        r
+        for r in runners
+        if r.get("status") == "online"
+        and wanted_labels <= {str(lbl.get("name")) for lbl in r.get("labels") or []}
+    ]
     if not self_hosted:
         add(Check("runner", True, "GitHub-hosted runners (billed minutes on private repos)"))
     else:
@@ -941,7 +1128,8 @@ def doctor(
             Check(
                 "self-hosted runner online for this repo",
                 bool(online),
-                f"{len(online)} online / {len(runners)} registered"
+                f"{len(online)} online with labels {sorted(wanted_labels)} / "
+                f"{len(runners)} registered"
                 if runners
                 else "none registered → gh api -X POST "
                 f"repos/{project_id}/actions/runners/registration-token, "
@@ -979,16 +1167,18 @@ def doctor(
                     "api",
                     f"/user/installations/{app['id']}/repositories",
                     "--paginate",
-                    "--jq",
-                    "[.repositories[].full_name]",
+                    "--slurp",
                 ],
             )
             or []
         )
+        # --slurp wraps every page in one outer array; each page is {"repositories": [...]}.
         flat = [
-            x
-            for item in (repos if isinstance(repos, list) else [])
-            for x in (item if isinstance(item, list) else [item])
+            str(r.get("full_name"))
+            for page in (repos if isinstance(repos, list) else [])
+            if isinstance(page, dict)
+            for r in page.get("repositories") or []
+            if isinstance(r, dict)
         ]
         ok = project_id in flat
         add(

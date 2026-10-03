@@ -16,7 +16,9 @@ from agentic_sdlc.onboard import (
     copy_variables,
     doctor,
     render_onboarding,
+    repository_default_branch,
     resolve_platform_ref,
+    ruleset_mismatches,
     ruleset_payload,
     write_onboarding,
 )
@@ -246,7 +248,12 @@ def test_apply_repo_settings_creates_labels_ruleset_and_variables_idempotently()
     ) in [c for c, _ in gh.calls]
     assert any("created" in line for line in log)
 
-    gh2 = FakeGh({"api repos/owner/comic/rulesets": json.dumps([{"name": RULESET_NAME}])})
+    gh2 = FakeGh(
+        {
+            "api repos/owner/comic/rulesets/5": json.dumps({"id": 5, **ruleset_payload(spec())}),
+            "api repos/owner/comic/rulesets": json.dumps([{"id": 5, "name": RULESET_NAME}]),
+        }
+    )
     log2 = apply_repo_settings(spec(), gh2)
     assert not any(c[:3] == ("api", "-X", "POST") for c, _ in gh2.calls)
     assert any("already present" in line for line in log2)
@@ -280,6 +287,7 @@ def _healthy_gh() -> FakeGh:
     return FakeGh(
         {
             "api repos/owner/agentic-sdlc/contents": '{"path": "reusable-implement.yml"}',
+            "api repos/owner/comic/rulesets/11": json.dumps({"id": 11, **ruleset_payload(spec())}),
             "label list": json.dumps(
                 [
                     {"name": n}
@@ -287,7 +295,7 @@ def _healthy_gh() -> FakeGh:
                 ]
             ),
             "api repos/owner/comic/rulesets": json.dumps(
-                [{"name": RULESET_NAME, "enforcement": "active"}]
+                [{"id": 11, "name": RULESET_NAME, "enforcement": "active"}]
             ),
             "api repos/owner/comic/actions/variables": json.dumps(
                 [
@@ -310,9 +318,20 @@ def _healthy_gh() -> FakeGh:
                 ]
             ),
             "api repos/owner/comic/actions/runners": json.dumps(
-                [{"status": "online", "labels": []}]
+                [
+                    {
+                        "status": "online",
+                        "labels": [{"name": n} for n in ("self-hosted", "linux", "x64")],
+                    }
+                ]
             ),
-            "api /user/installations/": json.dumps(["owner/comic", "owner/music"]),
+            "api /user/installations/": json.dumps(
+                [
+                    {"repositories": [{"full_name": "owner/comic"}]},
+                    {"repositories": [{"full_name": "owner/music"}]},
+                ]
+            ),
+            "api repos/owner/comic": json.dumps({"default_branch": "main"}),
             "api /user/installations": json.dumps(
                 [{"id": 7, "app_slug": "agentic-sdlc-publisher"}]
             ),
@@ -334,7 +353,9 @@ def test_doctor_flags_missing_secrets_runner_and_app_as_manual_todos(tmp_path):
     gh = _healthy_gh()
     gh.answers["api repos/owner/comic/actions/secrets"] = "[]"
     gh.answers["api repos/owner/comic/actions/runners"] = "[]"
-    gh.answers["api /user/installations/"] = json.dumps(["owner/music"])
+    gh.answers["api /user/installations/"] = json.dumps(
+        [{"repositories": [{"full_name": "owner/music"}]}]
+    )
     report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
     assert not report.ok
     failed = {c.name: c for c in report.checks if not c.ok}
@@ -502,3 +523,157 @@ def test_commit_guard_blocks_only_unleased_issue_branch_commits(tmp_path):
     code, msg = guard.decide(commit, "claude/issue-7-thing", lambda n: live_other)
     assert code == 2 and "r9" in msg  # someone else's
     assert guard.decide({**commit, "tool_name": "Edit"}, "forge/issue-7", lambda n: None)[0] == 0
+
+
+# ---------------------------------------------------------------- review follow-ups
+
+
+def test_commands_with_quotes_and_backslashes_render_a_loadable_policy(tmp_path):
+    test = 'pytest -k "happy path" tests\\unit'
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(test_command=test, forbidden_paths=('data/"x"/**',)))
+    import tomllib
+
+    doc = tomllib.loads((repo / "agentic-sdlc.toml").read_text())
+    assert doc["commands"]["test"] == test
+    assert 'data/"x"/**' in doc["policy"]["forbidden_paths"]
+    load_policy(repo / "agentic-sdlc.toml")
+
+
+def test_codex_implementer_forwards_and_requires_openai_key(tmp_path):
+    files = render_onboarding(spec(implementer="codex"))
+    implement = yaml.safe_load(files[".github/workflows/agent-implement.yml"])
+    assert implement["jobs"]["implement"]["secrets"]["OPENAI_API_KEY"] == (
+        "${{ secrets.OPENAI_API_KEY }}"
+    )
+    assert 'test -n "$OPENAI_API_KEY"' in files[".github/workflows/agent-implement.yml"]
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(implementer="codex"))
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh())
+    secrets = next(c for c in report.checks if c.name == "repo secrets set (by name)")
+    assert not secrets.ok and "OPENAI_API_KEY" in secrets.detail
+
+
+def test_issue_template_carries_the_profile_ready_label():
+    template = render_onboarding(spec(ready_label="forge-ready"))[
+        ".github/ISSUE_TEMPLATE/agent-work-request.md"
+    ]
+    assert "labels: forge-ready, human-review-required" in template
+    assert "agent-ready" not in template
+
+
+def test_forced_mode_switch_removes_the_previous_modes_files(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    assert (repo / ".github/workflows/agent-auto-implement.yml").exists()
+    write_onboarding(repo, spec(implementer="cloud-routine"), force=True)
+    assert not (repo / ".github/workflows/agent-auto-implement.yml").exists()
+    assert not (repo / ".github/workflows/agent-implement.yml").exists()
+    assert not (repo / ".forge/executors.json").exists()
+    write_onboarding(repo, spec(implementer="claude"), force=True)
+    assert not (repo / "docs/forge/cloud-implementer.md").exists()
+    assert (repo / ".github/workflows/agent-auto-implement.yml").exists()
+
+
+def test_incomplete_same_name_ruleset_is_updated_and_fails_doctor(tmp_path):
+    stale = {"id": 5, "name": RULESET_NAME, "target": "branch", "enforcement": "active"}
+    stale["conditions"] = {"ref_name": {"include": ["~DEFAULT_BRANCH"]}}
+    stale["rules"] = [{"type": "deletion"}]
+    assert "missing rule required_status_checks" in ruleset_mismatches(stale, spec())
+    gh = FakeGh(
+        {
+            "api repos/owner/comic/rulesets/5": json.dumps(stale),
+            "api repos/owner/comic/rulesets": json.dumps([stale]),
+        }
+    )
+    log = apply_repo_settings(spec(), gh)
+    put = [(c, i) for c, i in gh.calls if c[:3] == ("api", "-X", "PUT")]
+    assert put and put[0][0][3] == "repos/owner/comic/rulesets/5"
+    assert json.loads(put[0][1]) == ruleset_payload(spec())
+    assert any("updated" in line for line in log)
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    healthy = _healthy_gh()
+    healthy.answers["api repos/owner/comic/rulesets/11"] = json.dumps(stale)
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", healthy)
+    failed = {c.name for c in report.checks if not c.ok}
+    assert failed == {f"ruleset '{RULESET_NAME}' active on default branch"}
+
+
+def test_doctor_probes_the_plan_workflow_and_implement_only_when_installed(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(implementer="cloud-routine", runs_on=("ubuntu-latest",)))
+    gh = _healthy_gh()
+    doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    probes = [c[1] for c, _ in gh.calls if c[1].startswith("repos/owner/agentic-sdlc/contents")]
+    assert len(probes) == 1 and "reusable-plan.yml" in probes[0]
+
+    repo2 = _repo(tmp_path / "two")
+    write_onboarding(repo2, spec())
+    gh2 = _healthy_gh()
+    del gh2.answers["api repos/owner/agentic-sdlc/contents"]
+    gh2.answers["api repos/owner/agentic-sdlc/contents/.github/workflows/reusable-plan.yml"] = (
+        '{"path": "x"}'
+    )
+    report = doctor(repo2, "owner/comic", "owner/agentic-sdlc", gh2)
+    reach = next(c for c in report.checks if c.name.startswith("platform ref reachable"))
+    assert not reach.ok and "reusable-implement.yml" in reach.detail
+
+
+def test_doctor_reads_every_installation_page(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _healthy_gh()
+    gh.answers["api /user/installations/"] = json.dumps(
+        [
+            {"repositories": [{"full_name": "owner/music"}]},
+            {"repositories": [{"full_name": "owner/comic"}]},
+        ]
+    )
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    assert report.ok, report.render()
+    call = next(c for c, _ in gh.calls if c[1].startswith("/user/installations/"))
+    assert "--slurp" in call and "--paginate" in call and "--jq" not in call
+
+
+def test_doctor_flags_a_policy_branch_that_is_not_the_repo_default(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _healthy_gh()
+    gh.answers["api repos/owner/comic"] = json.dumps({"default_branch": "master"})
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    failed = {c.name: c for c in report.checks if not c.ok}
+    assert set(failed) == {"policy default_branch matches the repository"}
+    assert "master" in failed["policy default_branch matches the repository"].detail
+
+
+def test_repository_default_branch_reads_github():
+    gh = FakeGh({"api repos/owner/comic --jq .default_branch": "master\n"})
+    assert repository_default_branch("owner/comic", gh) == "master"
+    with pytest.raises(OnboardError):
+        repository_default_branch("owner/comic", FakeGh())
+
+
+def test_doctor_requires_a_runner_carrying_every_workflow_label(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _healthy_gh()
+    gh.answers["api repos/owner/comic/actions/runners"] = json.dumps(
+        [{"status": "online", "labels": [{"name": n} for n in ("self-hosted", "linux", "ARM64")]}]
+    )
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    failed = {c.name for c in report.checks if not c.ok}
+    assert failed == {"self-hosted runner online for this repo"}
+
+
+def test_doctor_requires_every_caller_to_pin_the_same_platform_sha(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    auto = repo / ".github/workflows/agent-auto-implement.yml"
+    auto.write_text(
+        auto.read_text().replace(f"reusable-implement.yml@{SHA}", "reusable-implement.yml@main")
+    )
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    pin = next(c for c in report.checks if c.name == "workflows pin the platform to a commit SHA")
+    assert not pin.ok and "agent-auto-implement.yml" in pin.detail
