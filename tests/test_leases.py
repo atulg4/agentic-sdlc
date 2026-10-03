@@ -328,3 +328,35 @@ def test_invalid_claim_fields_are_refused_before_any_github_edit():
         claim(PROJECT, 7, agent="Claude Code", session="s1", branch="b", gh=gh, now=NOW)
     assert not any(c[:2] == ("issue", "edit") for c in gh.calls)
     assert gh.issues[7]["labels"] == [] and gh.issues[7]["comments"] == []
+
+
+def test_cli_rejects_an_explicit_zero_ttl(monkeypatch):
+    import argparse
+
+    from agentic_sdlc import cli
+
+    args = argparse.Namespace(ttl_minutes=0, config=None)
+    assert cli._lease_ttl(args) == 0
+    gh = FakeGh().issue(7)
+    monkeypatch.setattr(cli, "run_gh", gh)
+    assert (
+        cli.main(
+            [
+                "claim",
+                "--project",
+                PROJECT,
+                "--issue",
+                "7",
+                "--agent",
+                "me",
+                "--session",
+                "s1",
+                "--branch",
+                "b",
+                "--ttl-minutes",
+                "0",
+            ]
+        )
+        != 0
+    )
+    assert gh.issues[7]["comments"] == [] and gh.issues[7]["labels"] == []

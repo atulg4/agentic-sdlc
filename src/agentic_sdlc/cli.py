@@ -754,7 +754,7 @@ def _doctor(args: argparse.Namespace) -> int:
 
 
 def _lease_ttl(args: argparse.Namespace) -> int:
-    if args.ttl_minutes:
+    if args.ttl_minutes is not None:  # an explicit 0 must reach validation, not the default
         return args.ttl_minutes
     config = Path(args.config) if args.config else Path("agentic-sdlc.toml")
     if config.exists():
