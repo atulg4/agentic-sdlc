@@ -127,9 +127,11 @@ sdlcctl claims  --project owner/repo          # live + expired leases
 ```
 
 `claim` exits 2, changing nothing, when another live lease or an open PR for the issue exists;
-expired leases can be taken over (the takeover is commented). `reusable-implement.yml` claims in
-`prepare` (with an App-minted, issues-only token) and releases after the draft PR exists or on
-failure. `sdlcctl onboard` installs two Claude Code hooks in the consumer repo: a SessionStart
+expired leases can be taken over (the takeover is commented). Markers count only when posted by
+an OWNER/MEMBER/COLLABORATOR or a GitHub App, and an expiry is capped at post time + 7 days, so
+an outside commenter cannot forge or free a lease. `reusable-implement.yml` claims as the last
+step of `prepare` (with an App-minted token: issues write, pull requests read) and releases after
+the draft PR exists or on failure. `sdlcctl onboard` installs two Claude Code hooks in the consumer repo: a SessionStart
 hook that fetches origin and lists PRs and leased issues, and a PreToolUse guard that blocks
 `git commit` on `*/issue-N` branches unless the session holds the lease.
 

@@ -197,7 +197,9 @@ def _toml_list(items: Sequence[str], indent: str = "  ") -> str:
 
 
 def _yaml_run(command: str) -> str:
-    return command.replace("\n", " ").strip()
+    """A double-quoted YAML scalar (JSON strings are valid YAML), so `: `, `#`, `{`, `*` etc.
+    in a shell command cannot change the workflow's structure."""
+    return json.dumps(command.replace("\n", " ").strip())
 
 
 def render_policy(spec: OnboardSpec) -> str:
@@ -749,6 +751,8 @@ def ruleset_mismatches(actual: dict, spec: OnboardSpec) -> list[str]:
         }
         if REQUIRED_CHECK not in contexts:
             problems.append(f"status check '{REQUIRED_CHECK}' not required")
+        if not rules["required_status_checks"].get("strict_required_status_checks_policy"):
+            problems.append("status checks are not strict (branch must be up to date)")
     return problems
 
 
@@ -881,6 +885,7 @@ def doctor(
         "AGENTS.md",
         ".github/ISSUE_TEMPLATE/agent-work-request.md",
         ".github/workflows/agent-plan.yml",
+        ".github/workflows/agent-auto-plan.yml",
         ".github/workflows/ci.yml",
     ]
     cloud = (base / "docs/forge/cloud-implementer.md").exists()
@@ -905,6 +910,16 @@ def doctor(
         )
     except Exception as exc:  # noqa: BLE001 - report any loader failure
         add(Check("agentic-sdlc.toml loads", False, str(exc)[:200]))
+    if policy is not None:
+        # Every plan/implement run passes $GITHUB_REPOSITORY as --expected-project-id.
+        same = policy.project_id == project_id
+        add(
+            Check(
+                "policy project id matches the repository",
+                same,
+                "" if same else f"policy names {policy.project_id}, not {project_id}",
+            )
+        )
 
     routed = (base / ".forge/executors.json").exists()
     if routed:
@@ -1074,11 +1089,16 @@ def doctor(
             or []
         )
     }
+    secret_pages = _safe_json(
+        gh, ["api", f"repos/{project_id}/actions/secrets", "--paginate", "--slurp"]
+    )
+    # --slurp wraps every page in one outer array; each page is {"secrets": [...]}.
     secrets = {
-        s.get("name")
-        for s in (
-            _safe_json(gh, ["api", f"repos/{project_id}/actions/secrets", "--jq", ".secrets"]) or []
-        )
+        str(s.get("name"))
+        for page in (secret_pages if isinstance(secret_pages, list) else [])
+        if isinstance(page, dict)
+        for s in page.get("secrets") or []
+        if isinstance(s, dict)
     }
     need_vars = set() if cloud else {"PUBLISHER_APP_CLIENT_ID"}
     need_secrets = {"CLAUDE_CODE_OAUTH_TOKEN"} | (set() if cloud else {"PUBLISHER_APP_PRIVATE_KEY"})

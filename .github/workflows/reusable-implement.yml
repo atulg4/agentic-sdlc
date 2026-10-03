@@ -304,28 +304,6 @@ jobs:
             printf 'An open pull request already implements this issue: %s\n' "$existing" >&2
             exit 2
           fi
-      - name: Create short-lived issue-lease token (publisher App, issues only)
-        id: lease-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
-        with:
-          client-id: ${{ inputs.publisher_app_client_id }}
-          private-key: ${{ secrets.PUBLISHER_APP_PRIVATE_KEY }}
-          permission-issues: write
-      - name: Lease the issue for this run (refuse if another agent holds it)
-        env:
-          GH_TOKEN: ${{ steps.lease-token.outputs.token }}
-          ISSUE_NUMBER: ${{ inputs.issue_number }}
-          CONFIG_PATH: ${{ inputs.config_path }}
-        run: |
-          set -euo pipefail
-          PYTHONPATH="${GITHUB_WORKSPACE}/.agentic-platform/src" \
-            python3 -m agentic_sdlc claim \
-              --project "$GITHUB_REPOSITORY" \
-              --issue "$ISSUE_NUMBER" \
-              --agent forge-actions \
-              --session "run-${GITHUB_RUN_ID}" \
-              --branch "agent/issue-${ISSUE_NUMBER}-${GITHUB_RUN_ID}" \
-              --config "$CONFIG_PATH"
       - name: Store validated implementation request
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -348,6 +326,30 @@ jobs:
           if-no-files-found: error
           include-hidden-files: true
           retention-days: 3
+      # Claim LAST: a prepare that fails after claiming would skip release_lease_on_failure.
+      - name: Create short-lived issue-lease token (publisher App, issues + PR read)
+        id: lease-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ inputs.publisher_app_client_id }}
+          private-key: ${{ secrets.PUBLISHER_APP_PRIVATE_KEY }}
+          permission-issues: write
+          permission-pull-requests: read
+      - name: Lease the issue for this run (refuse if another agent holds it)
+        env:
+          GH_TOKEN: ${{ steps.lease-token.outputs.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          CONFIG_PATH: ${{ inputs.config_path }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH="${GITHUB_WORKSPACE}/.agentic-platform/src" \
+            python3 -m agentic_sdlc claim \
+              --project "$GITHUB_REPOSITORY" \
+              --issue "$ISSUE_NUMBER" \
+              --agent forge-actions \
+              --session "run-${GITHUB_RUN_ID}" \
+              --branch "agent/issue-${ISSUE_NUMBER}-${GITHUB_RUN_ID}" \
+              --config "$CONFIG_PATH"
 
   generate_patch:
     needs: prepare

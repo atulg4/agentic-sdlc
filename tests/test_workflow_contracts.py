@@ -269,9 +269,17 @@ def test_implementation_leases_the_issue_before_generating_and_releases_after() 
     assert preparer.index("Refuse a duplicate open pull request") < preparer.index(
         "agentic_sdlc claim"
     )
-    assert preparer.index("agentic_sdlc claim") < preparer.index(
-        "Store validated implementation request"
+    # Claim is the LAST step of prepare: a prepare that fails after claiming would skip
+    # release_lease_on_failure (gated on prepare success) and strand the lease until it expires.
+    assert preparer.index("Store validated implementation request") < preparer.index(
+        "agentic_sdlc claim"
     )
+    assert preparer.index("Store pinned policy engine") < preparer.index("agentic_sdlc claim")
+    assert "\n      - " not in preparer[preparer.index("agentic_sdlc claim") :]
+    # claim() lists open PRs, which an installation token may only do with pull-requests: read.
+    lease_token = preparer[preparer.index("id: lease-token") :]
+    lease_token = lease_token[: lease_token.index("\n      - ")]
+    assert "permission-pull-requests: read" in lease_token
     assert '--session "run-${GITHUB_RUN_ID}"' in preparer
     assert "python3 -m agentic_sdlc release" in publisher
     assert publisher.index("gh pr create") < publisher.index("agentic_sdlc release")

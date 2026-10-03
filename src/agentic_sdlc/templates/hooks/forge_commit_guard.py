@@ -18,6 +18,7 @@ PROJECT = "PROJECT_ID"
 ISSUE_BRANCH = re.compile(r"(?:^|/)issue-(\d+)(?:$|[^0-9])")
 CLAIM = re.compile(r"<!--\s*forge-claim\s+([^>]*?)\s*-->")
 RELEASE = re.compile(r"<!--\s*forge-release\s+([^>]*?)\s*-->")
+TRUSTED = {"OWNER", "MEMBER", "COLLABORATOR"}  # plus GitHub Apps (user.type == "Bot")
 
 
 def current_branch(cwd: str | None) -> str:
@@ -37,16 +38,28 @@ def lease_for(issue: int) -> dict | None:
     """Latest live claim marker on the issue (None if none/released/expired/unreachable)."""
     try:
         out = subprocess.run(
-            ["gh", "api", f"repos/{PROJECT}/issues/{issue}/comments", "--paginate"],
+            [
+                "gh",
+                "api",
+                f"repos/{PROJECT}/issues/{issue}/comments?per_page=100",
+                "--paginate",
+                "--slurp",
+            ],
             capture_output=True,
             text=True,
             check=True,
         ).stdout
-        comments = json.loads(out or "[]")
+        pages = json.loads(out or "[]")
     except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
         return None
+    comments = [c for page in pages if isinstance(page, list) for c in page if isinstance(c, dict)]
     lease = None
     for c in comments:
+        if (
+            c.get("author_association") not in TRUSTED
+            and (c.get("user") or {}).get("type") != "Bot"
+        ):
+            continue  # markers only count from members/collaborators and GitHub Apps
         body = c.get("body") or ""
         found = list(CLAIM.finditer(body))
         m = found[-1] if found else None

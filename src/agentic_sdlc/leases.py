@@ -12,13 +12,15 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
 GhRunner = Callable[..., str]
 
 IN_PROGRESS_LABEL = "in-progress"
 DEFAULT_TTL_MINUTES = 240
+MAX_TTL_MINUTES = 7 * 24 * 60  # policy.lease_ttl_minutes maximum
+TRUSTED_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 CLAIM_MARKER = "forge-claim"
 RELEASE_MARKER = "forge-release"
 _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@+-]{0,120}$")
@@ -128,24 +130,44 @@ def _release_session(body: str) -> str | None:
 # ---------------------------------------------------------------- GitHub reads
 
 
+def _paged(path: str, gh: GhRunner) -> list[dict]:
+    """Every item of a paginated list endpoint (--slurp wraps the pages in one outer array)."""
+    data = json.loads(gh(["api", path, "--paginate", "--slurp"]) or "[]")
+    if not isinstance(data, list):
+        return []
+    items = [item for page in data for item in (page if isinstance(page, list) else [page])]
+    return [item for item in items if isinstance(item, dict)]
+
+
 def _comments(project: str, issue: int, gh: GhRunner) -> list[dict]:
-    raw = gh(["api", f"repos/{project}/issues/{issue}/comments", "--paginate"]) or "[]"
-    data = json.loads(raw)
-    if (
-        isinstance(data, list) and data and isinstance(data[0], list)
-    ):  # --paginate may concatenate pages
-        data = [item for page in data for item in page]
-    return data if isinstance(data, list) else []
+    return _paged(f"repos/{project}/issues/{issue}/comments?per_page=100", gh)
+
+
+def _trusted(comment: dict) -> bool:
+    """Only repository members/collaborators and GitHub Apps (installed by an admin) may post
+    lease markers; anyone else commenting on a public issue must not block or free a ticket."""
+    if comment.get("author_association") in TRUSTED_ASSOCIATIONS:
+        return True
+    return (comment.get("user") or {}).get("type") == "Bot"
 
 
 def current_lease(project: str, issue: int, gh: GhRunner) -> Lease | None:
-    """Latest claim not followed by a release from the same session (comments are chronological)."""
+    """Latest trusted claim not followed by a trusted release from the same session.
+
+    Comments are chronological. A marker's expiry is capped at its post time + MAX_TTL_MINUTES.
+    """
     lease: Lease | None = None
     for comment in _comments(project, issue, gh):
+        if not _trusted(comment):
+            continue
         body = comment.get("body") or ""
         parsed = parse_marker(body, issue)
         if parsed is not None:
-            lease = parsed
+            posted = _parse_iso(comment.get("created_at") or "")
+            if posted is None:
+                continue
+            cap = posted + timedelta(minutes=MAX_TTL_MINUTES)
+            lease = parsed if parsed.expires <= cap else replace(parsed, expires=cap)
             continue
         released = _release_session(body)
         if released and lease is not None and released == lease.session:
@@ -198,6 +220,11 @@ def _edit(project: str, issue: int, gh: GhRunner, *flags: str) -> None:
 # ---------------------------------------------------------------- operations
 
 
+def _check_ttl(ttl_minutes: int) -> None:
+    if not 1 <= ttl_minutes <= MAX_TTL_MINUTES:
+        raise LeaseError(f"ttl_minutes must be between 1 and {MAX_TTL_MINUTES}")
+
+
 def claim(
     project: str,
     issue: int,
@@ -212,8 +239,9 @@ def claim(
 ) -> ClaimResult:
     """Take the lease if free (or expired, or already ours). Never mutates on refusal."""
     now = now or datetime.now(UTC)
-    if ttl_minutes < 1:
-        raise LeaseError("ttl_minutes must be positive")
+    _check_ttl(ttl_minutes)
+    lease = Lease(issue, agent, session, branch, now + timedelta(minutes=ttl_minutes))
+    marker = format_claim_marker(lease)  # validate before reading or writing anything
     existing = current_lease(project, issue, gh)
     took_over = None
     if existing is not None and existing.live(now):
@@ -227,14 +255,8 @@ def claim(
                     f"on {existing.branch} until {_iso(existing.expires)}"
                 ),
             )
-        renewed = Lease(issue, agent, session, branch, now + timedelta(minutes=ttl_minutes))
-        _comment(
-            project,
-            issue,
-            format_claim_marker(renewed) + f"\nLease renewed until {_iso(renewed.expires)}.",
-            gh,
-        )
-        return ClaimResult(True, renewed, renewed=True)
+        _comment(project, issue, marker + f"\nLease renewed until {_iso(lease.expires)}.", gh)
+        return ClaimResult(True, lease, renewed=True)
     if existing is not None:
         took_over = existing.session
     prs = open_prs_for_issue(project, issue, gh)
@@ -243,7 +265,6 @@ def claim(
         return ClaimResult(
             False, None, reason=f"issue #{issue} already has an open pull request: {urls}"
         )
-    lease = Lease(issue, agent, session, branch, now + timedelta(minutes=ttl_minutes))
     flags = ["--add-label", IN_PROGRESS_LABEL]
     if assignee:
         flags += ["--add-assignee", assignee]
@@ -254,7 +275,7 @@ def claim(
     )
     if took_over:
         note = f"Took over an expired lease from session `{took_over}`. " + note
-    _comment(project, issue, format_claim_marker(lease) + "\n" + note, gh)
+    _comment(project, issue, marker + "\n" + note, gh)
     return ClaimResult(True, lease, took_over_from=took_over)
 
 
@@ -268,6 +289,7 @@ def renew(
     now: datetime | None = None,
 ) -> Lease:
     now = now or datetime.now(UTC)
+    _check_ttl(ttl_minutes)
     existing = current_lease(project, issue, gh)
     if existing is None or existing.session != session:
         raise LeaseError(f"issue #{issue} is not leased by session {session}")
@@ -308,19 +330,9 @@ def release(
 
 def list_claims(project: str, gh: GhRunner, now: datetime | None = None) -> list[ClaimRow]:
     now = now or datetime.now(UTC)
-    raw = (
-        gh(
-            [
-                "api",
-                f"repos/{project}/issues?labels={IN_PROGRESS_LABEL}&state=open&per_page=100",
-                "--paginate",
-            ]
-        )
-        or "[]"
+    issues = _paged(
+        f"repos/{project}/issues?labels={IN_PROGRESS_LABEL}&state=open&per_page=100", gh
     )
-    issues = json.loads(raw)
-    if issues and isinstance(issues[0], list):
-        issues = [i for page in issues for i in page]
     rows = []
     for item in issues:
         if item.get("pull_request"):
