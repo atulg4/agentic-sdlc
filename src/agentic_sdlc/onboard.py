@@ -13,9 +13,12 @@ import json
 import re
 import shlex
 import subprocess
+import tomllib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+
+import yaml
 
 from .executors import ExecutorError, load_executors, load_routing_policy
 from .leases import IN_PROGRESS_LABEL
@@ -781,7 +784,7 @@ def apply_repo_settings(
             ]
         )
         log.append(f"label {name}")
-    existing = json.loads(gh(["api", f"repos/{spec.project_id}/rulesets"]) or "[]")
+    existing = _repo_rulesets(spec.project_id, gh)
     current = next((r for r in existing if r.get("name") == RULESET_NAME), None)
     if current is not None:
         detail = json.loads(
@@ -871,16 +874,74 @@ def _safe_json(gh: GhRunner, args: Sequence[str]):
         return None
 
 
-def _paged_names(gh: GhRunner, path: str, key: str) -> set[str]:
-    """Names from every page of a list endpoint; --slurp wraps the pages, each {key: [...]}."""
+def _paged_items(gh: GhRunner, path: str, key: str | None = None) -> list[dict]:
+    """Every item of a paginated list endpoint. --slurp wraps the pages in one array; each page
+    is either a JSON array (key=None) or an object carrying the items under `key`."""
     pages = _safe_json(gh, ["api", path, "--paginate", "--slurp"])
-    return {
-        str(item.get("name"))
-        for page in (pages if isinstance(pages, list) else [])
-        if isinstance(page, dict)
-        for item in page.get(key) or []
-        if isinstance(item, dict)
-    }
+    items: list = []
+    for page in pages if isinstance(pages, list) else []:
+        if key is None:
+            items += page if isinstance(page, list) else [page]
+        elif isinstance(page, dict):
+            items += page.get(key) or []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _paged_names(gh: GhRunner, path: str, key: str) -> set[str]:
+    return {str(item.get("name")) for item in _paged_items(gh, path, key)}
+
+
+def _repo_rulesets(project_id: str, gh: GhRunner) -> list[dict]:
+    """Rulesets owned by the repository itself: every page, without inherited org rulesets
+    (a repository admin cannot update those through the repository endpoint)."""
+    rows = _paged_items(gh, f"repos/{project_id}/rulesets?includes_parents=false")
+    return [r for r in rows if r.get("source_type", "Repository") == "Repository"]
+
+
+# What each generated caller must call.
+CALLER_TARGETS = {
+    "agent-plan.yml": "reusable-plan.yml",
+    "agent-auto-plan.yml": "reusable-plan.yml",
+    "agent-implement.yml": "reusable-implement.yml",
+    "agent-auto-implement.yml": "reusable-implement.yml",
+}
+# Installation permissions the publisher/lease tokens request in reusable-implement.yml.
+PUBLISHER_PERMISSIONS = {
+    "contents": ("read", "write"),
+    "issues": ("write",),
+    "pull_requests": ("write",),
+}
+
+
+def _ci_problems(base: Path) -> list[str]:
+    """ci.yml must run on pull_request, as a job named `test`, the policy's three commands."""
+    try:
+        doc = yaml.safe_load((base / ".github/workflows/ci.yml").read_text())
+        commands = tomllib.loads((base / "agentic-sdlc.toml").read_text()).get("commands") or {}
+    except (OSError, yaml.YAMLError, tomllib.TOMLDecodeError) as exc:
+        return [str(exc)[:200]]
+    if not isinstance(doc, dict):
+        return ["not a workflow mapping"]
+    triggers = doc.get("on", doc.get(True))  # YAML 1.1 reads a bare `on` key as True
+    problems = []
+    if not (
+        triggers == "pull_request"
+        or (isinstance(triggers, list | dict) and "pull_request" in triggers)
+    ):
+        problems.append("not triggered on pull_request")
+    job = (doc.get("jobs") or {}).get(REQUIRED_CHECK)
+    if not isinstance(job, dict):
+        return [*problems, f"no '{REQUIRED_CHECK}' job"]
+    runs = " \n".join(
+        str(step.get("run", "")) for step in job.get("steps") or [] if isinstance(step, dict)
+    )
+    for gate in ("setup", "quality", "test"):
+        command = str(commands.get(gate, "")).replace("\n", " ").strip()
+        if not command:
+            problems.append(f"policy has no [commands] {gate}")
+        elif command not in runs:
+            problems.append(f"'{REQUIRED_CHECK}' job does not run the {gate} command {command!r}")
+    return problems
 
 
 def doctor(
@@ -903,6 +964,10 @@ def doctor(
         ".github/workflows/agent-plan.yml",
         ".github/workflows/agent-auto-plan.yml",
         ".github/workflows/ci.yml",
+        "CLAUDE.md",
+        ".claude/settings.json",
+        ".claude/hooks/forge_commit_guard.py",
+        ".claude/hooks/forge_session_start.py",
     ]
     cloud = (base / "docs/forge/cloud-implementer.md").exists()
     if not cloud:
@@ -911,7 +976,18 @@ def doctor(
             ".github/workflows/agent-auto-implement.yml",
         ]
     missing = [r for r in required if not (base / r).exists()]
+    settings = base / ".claude/settings.json"
+    if settings.exists():
+        text = settings.read_text()
+        missing += [
+            f".claude/settings.json does not run {hook}"
+            for hook in ("forge_session_start.py", "forge_commit_guard.py")
+            if hook not in text
+        ]
     add(Check("required files present", not missing, ", ".join(missing) if missing else ""))
+    if (base / ".github/workflows/ci.yml").exists() and (base / "agentic-sdlc.toml").exists():
+        ci = _ci_problems(base)
+        add(Check(f"ci.yml runs the policy gates as '{REQUIRED_CHECK}'", not ci, "; ".join(ci)))
 
     policy = None
     try:
@@ -997,9 +1073,12 @@ def doctor(
             if not uses:
                 problems.append(f"{caller.name} calls no reusable workflow")
             for target in uses:
-                repo_part = target.partition("/.github/workflows/")[0]
-                pin = target.rsplit("@", 1)[1]
-                if repo_part != platform_repository or not _SHA.fullmatch(pin):
+                repo_part, _, rest = target.partition("/.github/workflows/")
+                workflow, _, pin = rest.rpartition("@")
+                expected = CALLER_TARGETS.get(caller.name)
+                if expected and workflow != expected:
+                    problems.append(f"{caller.name} calls {workflow}, expected {expected}")
+                elif repo_part != platform_repository or not _SHA.fullmatch(pin):
                     problems.append(f"{caller.name} uses {target}")
                 else:
                     pins.add(pin)
@@ -1018,14 +1097,30 @@ def doctor(
         if policy is not None:
             auto = base / ".github/workflows/agent-auto-implement.yml"
             if auto.exists():
-                consistent = f"'{policy.ready_label}'" in auto.read_text()
+                try:
+                    preflight = (yaml.safe_load(auto.read_text()) or {})["jobs"]["preflight"]
+                    condition = str(preflight.get("if", ""))
+                except (yaml.YAMLError, KeyError, TypeError, AttributeError):
+                    condition = ""
+                # Every approval label must both trigger and be required on the issue, or a
+                # ready label alone could start credentialed implementation.
+                lacking = [
+                    label
+                    for label in (
+                        policy.ready_label,
+                        policy.human_review_label,
+                        policy.implementation_label,
+                    )
+                    if f"github.event.label.name == '{label}'" not in condition
+                    or f"contains(github.event.issue.labels.*.name, '{label}')" not in condition
+                ]
                 add(
                     Check(
                         "workflow label conditions match the policy labels",
-                        consistent,
+                        not lacking,
                         ""
-                        if consistent
-                        else f"auto-implement does not reference '{policy.ready_label}'",
+                        if not lacking
+                        else "auto-implement preflight does not require " + ", ".join(lacking),
                     )
                 )
     if not remote:
@@ -1090,7 +1185,7 @@ def doctor(
     )
 
     # --- ruleset
-    rulesets = _safe_json(gh, ["api", f"repos/{project_id}/rulesets"]) or []
+    rulesets = _repo_rulesets(project_id, gh)
     protect = next((r for r in rulesets if r.get("name") == RULESET_NAME), None)
     if protect is None:
         add(Check(f"ruleset '{RULESET_NAME}' active on default branch", False, "not found"))
@@ -1124,6 +1219,9 @@ def doctor(
     secrets = _paged_names(gh, f"repos/{project_id}/actions/secrets", "secrets")
     need_vars = set() if cloud else {"PUBLISHER_APP_CLIENT_ID"}
     need_secrets = {"CLAUDE_CODE_OAUTH_TOKEN"} | (set() if cloud else {"PUBLISHER_APP_PRIVATE_KEY"})
+    platform_private = _safe_json(gh, ["api", f"repos/{platform_repository}", "--jq", ".private"])
+    if platform_private is True:  # GITHUB_TOKEN cannot check out another private repository
+        need_secrets |= {"PLATFORM_READ_TOKEN"}
     if routed:
         need_vars |= {"DEEPSEEK_MODEL_FLASH", "DEEPSEEK_MODEL_PRO"}
         need_secrets |= {"DEEPSEEK_API_KEY"}
@@ -1153,9 +1251,7 @@ def doctor(
     if m:
         wanted_labels = {x.strip().strip("'\"") for x in m.group(1).split(",") if x.strip()}
     runners = (
-        (_safe_json(gh, ["api", f"repos/{project_id}/actions/runners", "--jq", ".runners"]) or [])
-        if self_hosted
-        else []
+        _paged_items(gh, f"repos/{project_id}/actions/runners", "runners") if self_hosted else []
     )
     online = [
         r
@@ -1188,7 +1284,7 @@ def doctor(
             )
         )
         return rep
-    installs = _safe_json(gh, ["api", "/user/installations", "--jq", ".installations"]) or []
+    installs = _paged_items(gh, "/user/installations", "installations")
     apps = [i for i in installs if PUBLISHER_APP_SLUG_HINT in str(i.get("app_slug", "")).lower()]
     if not apps:
         add(
@@ -1201,34 +1297,37 @@ def doctor(
         )
     else:
         # The app may be installed on several accounts; the repo can be under any of them.
-        flat: list[str] = []
-        for app in apps:
-            repos = (
-                _safe_json(
-                    gh,
-                    [
-                        "api",
-                        f"/user/installations/{app['id']}/repositories",
-                        "--paginate",
-                        "--slurp",
-                    ],
-                )
-                or []
-            )
-            # --slurp wraps every page in one outer array; each page is {"repositories": [...]}.
-            flat += [
+        holding = [
+            app
+            for app in apps
+            if project_id
+            in {
                 str(r.get("full_name"))
-                for page in (repos if isinstance(repos, list) else [])
-                if isinstance(page, dict)
-                for r in page.get("repositories") or []
-                if isinstance(r, dict)
-            ]
-        ok = project_id in flat
+                for r in _paged_items(
+                    gh, f"/user/installations/{app['id']}/repositories", "repositories"
+                )
+            }
+        ]
+        if not holding:
+            detail = f"add {project_id} under the app's 'Only select repositories'"
+        else:
+            shortfalls = []
+            for app in holding:
+                perms = app.get("permissions") or {}
+                shortfalls.append(
+                    [
+                        f"{name}: {perms.get(name, 'none')} (needs {'/'.join(allowed)})"
+                        for name, allowed in PUBLISHER_PERMISSIONS.items()
+                        if perms.get(name) not in allowed
+                    ]
+                )
+            weak = min(shortfalls, key=len)
+            detail = ("grant the app " + "; ".join(weak)) if weak else ""
         add(
             Check(
                 "Publisher GitHub App installed on this repo",
-                ok,
-                "" if ok else f"add {project_id} under the app's 'Only select repositories'",
+                bool(holding) and not detail,
+                detail,
                 manual=True,
             )
         )

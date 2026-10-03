@@ -98,6 +98,16 @@ class FakeGh:
                     {"login": args[args.index("--add-assignee") + 1]}
                 )
             return ""
+        if (
+            args[0] == "api"
+            and args[1].startswith(f"repos/{PROJECT}/issues/")
+            and (args[1].count("/") == 4)
+        ):
+            n = int(args[1].split("/")[4])
+            issue = self.issues[n]
+            return json.dumps(
+                {"number": n, "state": issue.get("state", "open"), **issue.get("extra", {})}
+            )
         if args[:2] == ("pr", "list"):
             return json.dumps(self.prs)
         raise AssertionError(f"unexpected gh call: {' '.join(args)}")
@@ -360,3 +370,44 @@ def test_cli_rejects_an_explicit_zero_ttl(monkeypatch):
         != 0
     )
     assert gh.issues[7]["comments"] == [] and gh.issues[7]["labels"] == []
+
+
+def test_release_marker_is_posted_before_the_label_is_removed():
+    mine = format_claim_marker(Lease(7, "me", "s1", "b", NOW + timedelta(minutes=5)))
+    gh = FakeGh().issue(7, labels=[IN_PROGRESS_LABEL], comments=[mine])
+    real = gh.__call__
+
+    def failing_label(args, input=None):
+        if tuple(args[:2]) == ("issue", "edit") and "--remove-label" in args:
+            raise RuntimeError("label edit failed")
+        return real(args, input=input)
+
+    with pytest.raises(RuntimeError):
+        release(PROJECT, 7, session="s1", gh=failing_label)
+    assert current_lease(PROJECT, 7, gh) is None  # the lease is ended even though cleanup failed
+
+
+def test_claim_refuses_closed_issues_and_pull_requests_without_writing():
+    gh = FakeGh().issue(7).issue(8)
+    gh.issues[7]["state"] = "closed"
+    gh.issues[8]["extra"] = {"pull_request": {"url": "https://x/pulls/8"}}
+    for number, word in ((7, "closed"), (8, "pull request")):
+        result = claim(PROJECT, number, agent="me", session="s1", branch="b", gh=gh, now=NOW)
+        assert not result.ok and word in result.reason
+    assert not any(c[:2] == ("issue", "edit") for c in gh.calls)
+    assert gh.issues[7]["comments"] == [] and gh.issues[8]["comments"] == []
+
+
+def test_cli_renew_and_release_honor_output(tmp_path, monkeypatch):
+    from agentic_sdlc import cli
+
+    mine = format_claim_marker(Lease(7, "me", "s1", "b", NOW + timedelta(hours=1)))
+    gh = FakeGh().issue(7, labels=[IN_PROGRESS_LABEL], comments=[mine])
+    monkeypatch.setattr(cli, "run_gh", gh)
+    base = ["--project", PROJECT, "--issue", "7", "--session", "s1"]
+    out = tmp_path / "renew.json"
+    assert cli.main(["renew", *base, "--ttl-minutes", "60", "--output", str(out)]) == 0
+    assert json.loads(out.read_text())["lease"]["session"] == "s1"
+    out = tmp_path / "release.json"
+    assert cli.main(["release", *base, "--output", str(out)]) == 0
+    assert json.loads(out.read_text()) == {"issue": 7, "released": True, "session": "s1"}

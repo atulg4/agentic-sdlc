@@ -45,6 +45,7 @@ from .infra_recovery import (
 from .knowledge import KnowledgeError, load_sources
 from .leases import (
     DEFAULT_TTL_MINUTES,
+    ClaimResult,
     LeaseError,
     claim,
     list_claims,
@@ -705,6 +706,12 @@ def _onboard(args: argparse.Namespace) -> int:
         forbidden_paths=tuple(args.forbidden or ()),
         protected_paths=tuple(args.protected or ()),
     )
+    assignments: dict[str, str] = {}
+    for item in args.var or ():  # validate CLI input before any file is written
+        key, sep, value = item.partition("=")
+        if not sep:
+            raise OnboardError(f"--var expects KEY=VALUE, got {item!r}")
+        assignments[key] = value
     written = write_onboarding(destination, spec, force=args.force)
     result: dict[str, Any] = {
         "platform_ref": platform_ref,
@@ -717,11 +724,7 @@ def _onboard(args: argparse.Namespace) -> int:
             if spec.routed:
                 names += ["DEEPSEEK_MODEL_FLASH", "DEEPSEEK_MODEL_PRO"]
             variables.update(copy_variables(args.copy_vars_from, names))
-        for item in args.var or ():
-            key, sep, value = item.partition("=")
-            if not sep:
-                raise OnboardError(f"--var expects KEY=VALUE, got {item!r}")
-            variables[key] = value
+        variables.update(assignments)
         result["applied"] = apply_repo_settings(spec, variables=variables)
         report = doctor(destination, spec.project_id, spec.platform_repository)
         result["doctor"] = report.as_dict()
@@ -788,6 +791,8 @@ def _renew(args: argparse.Namespace) -> int:
     lease = renew(
         args.project, args.issue, session=args.session, ttl_minutes=_lease_ttl(args), gh=run_gh
     )
+    if args.output:
+        _write(ClaimResult(True, lease, renewed=True).as_dict(), args.output)
     print(f"renewed #{args.issue} until {lease.expires.isoformat()}")
     return 0
 
@@ -801,6 +806,8 @@ def _release(args: argparse.Namespace) -> int:
         force=args.force,
         note=args.note or "",
     )
+    if args.output:
+        _write({"issue": args.issue, "released": True, "session": args.session}, args.output)
     print(f"released #{args.issue}")
     return 0
 

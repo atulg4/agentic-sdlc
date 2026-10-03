@@ -76,6 +76,8 @@ def lease_for(issue: int) -> dict | None:
                 exp = datetime.fromisoformat(fields.get("expires", "").replace("Z", "+00:00"))
             except ValueError:
                 continue
+            if exp.tzinfo is None:  # same rule as leases._parse_iso: naive means UTC
+                exp = exp.replace(tzinfo=UTC)
             lease = {**fields, "expires": exp}
             continue
         r = RELEASE.search(body)
