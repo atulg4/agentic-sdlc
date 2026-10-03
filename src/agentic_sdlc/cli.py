@@ -64,6 +64,7 @@ from .onboard import (
     apply_repo_settings,
     copy_variables,
     doctor,
+    repository_default_branch,
     resolve_platform_ref,
     run_gh,
     write_onboarding,
@@ -688,6 +689,9 @@ def _scaffold(args: argparse.Namespace) -> int:
 def _onboard(args: argparse.Namespace) -> int:
     destination = Path(args.destination).resolve()
     platform_ref = resolve_platform_ref(args.platform_repository, args.platform_ref)
+    default_branch = args.default_branch
+    if not default_branch:
+        default_branch = repository_default_branch(args.project_id) if args.apply else "main"
     spec = OnboardSpec(
         project_id=args.project_id,
         platform_repository=args.platform_repository,
@@ -697,7 +701,7 @@ def _onboard(args: argparse.Namespace) -> int:
         quality_command=args.quality,
         implementer=args.implementer,
         runs_on=tuple(args.runs_on.split(",")),
-        default_branch=args.default_branch,
+        default_branch=default_branch,
         forbidden_paths=tuple(args.forbidden or ()),
         protected_paths=tuple(args.protected or ()),
     )
@@ -1135,7 +1139,10 @@ def build_parser() -> argparse.ArgumentParser:
     onboard.add_argument(
         "--runs-on", default="self-hosted,linux,x64", help="comma-separated runner labels"
     )
-    onboard.add_argument("--default-branch", default="main")
+    onboard.add_argument(
+        "--default-branch",
+        help="defaults to the repository's GitHub default branch with --apply, else main",
+    )
     onboard.add_argument(
         "--forbidden", action="append", help="extra forbidden path glob (repeatable)"
     )
