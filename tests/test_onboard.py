@@ -50,6 +50,15 @@ def spec(**overrides) -> OnboardSpec:
 
 _CONSUMER: dict[str, Path] = {}  # the consumer checkout the current test created
 CONSUMER_CONTENTS = "api repos/owner/comic/contents/"
+PLATFORM_CONTENTS = "api repos/owner/agentic-sdlc/contents/"
+PLATFORM_WORKFLOWS = Path(__file__).resolve().parents[1] / ".github/workflows"
+
+
+def _blob(data: bytes) -> str:
+    """The contents API's answer for a regular file."""
+    return json.dumps(
+        {"type": "file", "encoding": "base64", "content": base64.b64encode(data).decode()}
+    )
 
 
 def _repo(tmp_path: Path) -> Path:
@@ -63,7 +72,9 @@ class FakeGh:
     """Records gh invocations and answers from a canned table keyed by the first few args.
 
     Unless the table answers it, the consumer's contents API serves the files of the test's
-    checkout: by default everything doctor checks locally has also been pushed."""
+    checkout: by default everything doctor checks locally has also been pushed. The platform's
+    contents API serves this repository's own reusable workflows (the real contract) unless the
+    table answers or `fail` fails the path."""
 
     def __init__(self, answers: dict[str, str] | None = None, fail: set[str] | None = None):
         self.calls: list[tuple[tuple[str, ...], str | None]] = []
@@ -91,8 +102,18 @@ class FakeGh:
                 )
             if not path.is_file():
                 raise OnboardError("gh: Not Found (HTTP 404)")
-            content = base64.b64encode(path.read_bytes()).decode()
-            return json.dumps({"encoding": "base64", "content": content})
+            return _blob(path.read_bytes())
+        if key.startswith(PLATFORM_CONTENTS):
+            for prefix, value in self.answers.items():
+                if prefix.startswith(PLATFORM_CONTENTS) and key.startswith(prefix):
+                    return value
+            if any(key.startswith(prefix) for prefix in self.fail):
+                raise OnboardError("gh: Not Found (HTTP 404)")
+            name = key[len(PLATFORM_CONTENTS) :].split("?")[0].removeprefix(".github/workflows/")
+            path = PLATFORM_WORKFLOWS / name
+            if "/" in name or not path.is_file():
+                raise OnboardError("gh: Not Found (HTTP 404)")
+            return _blob(path.read_bytes())
         for prefix, value in self.answers.items():
             if key.startswith(prefix):
                 return value
@@ -361,7 +382,6 @@ def _var_pages(*names: str, per_page: int = 30) -> str:
 def _healthy_gh() -> FakeGh:
     return FakeGh(
         {
-            "api repos/owner/agentic-sdlc/contents": '{"path": "reusable-implement.yml"}',
             "api repos/owner/comic/rulesets/11": json.dumps({"id": 11, **ruleset_payload(spec())}),
             "api repos/owner/comic/labels": json.dumps(
                 [
@@ -409,7 +429,12 @@ def _healthy_gh() -> FakeGh:
                     {"repositories": [{"full_name": "owner/music"}]},
                 ]
             ),
-            "api repos/owner/comic": json.dumps({"default_branch": "main"}),
+            "api repos/owner/comic/actions/permissions": json.dumps(
+                {"enabled": True, "allowed_actions": "all"}
+            ),
+            "api repos/owner/comic": json.dumps(
+                {"default_branch": "main", "visibility": "private"}
+            ),
             "api /user/installations": _installs(7),
             "api apps/agentic-sdlc-publisher": json.dumps(
                 {"slug": "agentic-sdlc-publisher", "client_id": "publisher_app_client_id-value"}
@@ -694,10 +719,7 @@ def test_doctor_probes_the_plan_workflow_and_implement_only_when_installed(tmp_p
     repo2 = _repo(tmp_path / "two")
     write_onboarding(repo2, spec())
     gh2 = _healthy_gh()
-    del gh2.answers["api repos/owner/agentic-sdlc/contents"]
-    gh2.answers["api repos/owner/agentic-sdlc/contents/.github/workflows/reusable-plan.yml"] = (
-        '{"path": "x"}'
-    )
+    gh2.fail = {PLATFORM_CONTENTS + ".github/workflows/reusable-implement.yml"}
     report = doctor(repo2, "owner/comic", "owner/agentic-sdlc", gh2)
     reach = next(c for c in report.checks if c.name.startswith("platform ref reachable"))
     assert not reach.ok and "reusable-implement.yml" in reach.detail
@@ -1696,7 +1718,11 @@ def test_doctor_requires_the_managed_files_on_the_remote_default_branch(tmp_path
     gh = _healthy_gh()
     plan = repo / ".github/workflows/agent-plan.yml"
     gh.answers[CONSUMER_CONTENTS + ".github/workflows/agent-plan.yml"] = json.dumps(
-        {"encoding": "base64", "content": base64.b64encode(plan.read_bytes()).decode()}
+        {
+            "type": "file",
+            "encoding": "base64",
+            "content": base64.b64encode(plan.read_bytes()).decode(),
+        }
     )
     plan.write_text(plan.read_text() + "# edited, not pushed\n")
     failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))
@@ -3446,7 +3472,11 @@ def _remote_workflows(gh: FakeGh, files: dict[str, str]) -> None:
     gh.answers[CONSUMER_CONTENTS + ".github/workflows?ref=main"] = json.dumps(listing)
     for name, text in files.items():
         gh.answers[CONSUMER_CONTENTS + f".github/workflows/{name}?ref=main"] = json.dumps(
-            {"encoding": "base64", "content": base64.b64encode(text.encode()).decode()}
+            {
+                "type": "file",
+                "encoding": "base64",
+                "content": base64.b64encode(text.encode()).decode(),
+            }
         )
 
 
@@ -3518,7 +3548,7 @@ def test_doctor_flags_a_remote_only_disabled_session_start_hook(tmp_path):
     write_onboarding(repo, spec())
     gh = _healthy_gh()
     gh.answers[CONSUMER_CONTENTS + ".claude/hooks/forge_session_start.py"] = json.dumps(
-        {"encoding": "base64", "content": base64.b64encode(b"pass\n").decode()}
+        {"type": "file", "encoding": "base64", "content": base64.b64encode(b"pass\n").decode()}
     )
     failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))
     assert FILES_CHECK not in failed
@@ -3668,7 +3698,9 @@ def test_doctor_flags_a_stale_remote_implement_workflow_after_switching_to_cloud
     gh = _healthy_gh()
     # the deletion was never pushed: the default branch still launches the Actions implementer
     gh.answers[CONSUMER_CONTENTS + ".github/workflows/agent-auto-implement.yml?ref=main"] = (
-        json.dumps({"encoding": "base64", "content": base64.b64encode(stale).decode()})
+        json.dumps(
+            {"type": "file", "encoding": "base64", "content": base64.b64encode(stale).decode()}
+        )
     )
     detail = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))[PUSHED_CHECK].detail
     assert ".github/workflows/agent-auto-implement.yml (present" in detail
@@ -3696,7 +3728,7 @@ def test_doctor_flags_a_stale_remote_routine_doc_after_switching_to_actions(tmp_
     write_onboarding(repo, spec(), force=True)
     gh = _healthy_gh()
     gh.answers[CONSUMER_CONTENTS + "docs/forge/cloud-implementer.md?ref=main"] = json.dumps(
-        {"encoding": "base64", "content": base64.b64encode(doc).decode()}
+        {"type": "file", "encoding": "base64", "content": base64.b64encode(doc).decode()}
     )
     detail = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))[PUSHED_CHECK].detail
     assert "docs/forge/cloud-implementer.md (present, but the actions mode" in detail
@@ -4142,3 +4174,311 @@ def test_doctor_skips_the_access_check_for_a_public_platform(tmp_path):
     write_onboarding(repo, spec())
     report = doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh())
     assert all(c.name != PLATFORM_ACCESS for c in report.checks)
+
+
+# ---------------------------------------------------------------- Codex 4205853966
+
+
+def test_session_start_reports_an_unreadable_lease_inventory_not_none(tmp_path, monkeypatch):
+    import io
+
+    start = _guard_module(tmp_path, "forge_session_start")
+    for listing in (None, "not json", '{"message": "Bad credentials"}'):
+        monkeypatch.setattr(start, "run", lambda cmd, out=listing: out)  # every call fails
+        monkeypatch.setattr(start, "_lease_lookup", lambda: lambda n: None)
+        monkeypatch.setattr(start.sys, "stdin", io.StringIO("{}"))
+        out = io.StringIO()
+        monkeypatch.setattr(start.sys, "stdout", out)
+        assert start.main() == 0
+        text = out.getvalue()
+        assert "lease inventory unavailable -- do not start issue work until it can be checked" in (
+            text
+        )
+        others = text.split("other agents (do NOT work on these):\n")[1].split("[Forge]")[0]
+        assert "UNAVAILABLE" in others and "  none" not in others
+        if listing is None:
+            assert "Open PRs:\n  (unavailable" in text
+
+
+def test_session_start_lists_an_unreadable_lease_as_held(tmp_path, monkeypatch):
+    import io
+
+    start = _guard_module(tmp_path, "forge_session_start")
+    issues = [{"number": 4, "title": "t", "assignees": []}]
+    live, stale, mine = start.classify_leased(issues, lambda n: {"unavailable": True})
+    assert [x.split()[0] for x in live] == ["#4"] and "treat as held" in live[0]
+    assert stale == [] and mine == []
+    monkeypatch.setattr(
+        start, "run", lambda cmd: json.dumps(issues) if cmd[:3] == ["gh", "issue", "list"] else ""
+    )
+    monkeypatch.setattr(start, "_lease_lookup", lambda: lambda n: {"unavailable": True})
+    monkeypatch.setattr(start.sys, "stdin", io.StringIO("{}"))
+    out = io.StringIO()
+    monkeypatch.setattr(start.sys, "stdout", out)
+    start.main()
+    assert "lease inventory unavailable" in out.getvalue()
+
+
+def test_commit_guard_treats_an_unreadable_lease_as_unavailable_not_free(tmp_path, monkeypatch):
+    import subprocess
+
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+
+    def down(args, **kwargs):
+        raise subprocess.CalledProcessError(1, args, stderr="gh: Bad Gateway (HTTP 502)")
+
+    monkeypatch.setattr(guard.subprocess, "run", down)
+    lease = guard.lease_for(7)
+    assert lease is not None and guard.lease_unavailable(lease)
+    commit = {"tool_name": "Bash", "session_id": "s1", "tool_input": {"command": "git commit"}}
+    code, message = guard.decide(commit, "forge/issue-7", guard.lease_for, lambda b: False)
+    assert code == 2 and "Lease inventory unavailable" in message
+    # The open-PR lookup failing is not "no PR" either (and blocks, naming why).
+    code, message = guard.decide(commit, "forge/issue-7", lambda n: None, guard.open_pr_for)
+    assert code == 2 and "could not be read" in message
+
+
+def test_commit_guard_permission_failure_is_unavailable_and_404_is_untrusted(tmp_path, monkeypatch):
+    import subprocess
+    from datetime import UTC, datetime, timedelta
+
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    expires = (datetime.now(UTC) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    claim = f"<!-- forge-claim agent=a session=s1 branch=b expires={expires} -->"
+    pages = [[{"body": claim, "user": {"login": "owner", "type": "User"}}]]
+    permission = {"stderr": "gh: Bad Gateway (HTTP 502)", "code": 1}
+
+    def fake_run(args, **kwargs):
+        if args[2].endswith("/permission"):
+            return subprocess.CompletedProcess(
+                args, permission["code"], stdout="", stderr=permission["stderr"]
+            )
+        return subprocess.CompletedProcess(args, 0, stdout=json.dumps(pages), stderr="")
+
+    monkeypatch.setattr(guard.subprocess, "run", fake_run)
+    monkeypatch.setattr(guard, "_PERMISSIONS", {})
+    assert guard.lease_unavailable(guard.lease_for(7))
+    permission.update(stderr="gh: Not Found (HTTP 404)")
+    monkeypatch.setattr(guard, "_PERMISSIONS", {})
+    assert guard.lease_for(7) is None  # no permission at all: the marker is not trusted
+
+
+# ---------------------------------------------------------------- Codex 4205853961
+
+
+def test_doctor_fails_a_private_platform_for_a_public_consumer(tmp_path):
+    from agentic_sdlc.onboard import platform_access_check
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _private_platform_gh("organization")
+    gh.answers["api repos/owner/comic"] = json.dumps(
+        {"default_branch": "main", "visibility": "public"}
+    )
+    check = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))[PLATFORM_ACCESS]
+    assert not check.manual and "public" in check.detail and "PUBLIC reusable" in check.detail
+    access = {"api repos/plat/forge/actions/permissions/access": '{"access_level": "user"}'}
+    unknown = platform_access_check(FakeGh(dict(access)), "plat/comic", "plat/forge")
+    assert not unknown.ok and unknown.manual and "visibility" in unknown.detail
+    private = FakeGh({**access, "api repos/plat/comic": '{"private": true}'})
+    assert platform_access_check(private, "plat/comic", "plat/forge").ok
+
+
+# ---------------------------------------------------------------- Codex 4205853956
+
+ACTIONS_POLICY = "repository Actions policy allows the generated workflows"
+
+
+def _actions_policy_gh(perms: object, selected: object = None) -> FakeGh:
+    gh = _healthy_gh()
+    del gh.answers["api repos/owner/comic/actions/permissions"]
+    head = {  # unanswered (""): unreadable, not the permissions prefix's answer
+        "api repos/owner/comic/actions/permissions/selected-actions": json.dumps(selected)
+        if selected is not None
+        else ""
+    }
+    if perms is not None:
+        head["api repos/owner/comic/actions/permissions"] = json.dumps(perms)
+    gh.answers = {**head, **gh.answers}
+    return gh
+
+
+def _actions_check(tmp_path, perms, selected=None):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", _actions_policy_gh(perms, selected))
+    return next(c for c in report.checks if c.name == ACTIONS_POLICY), report
+
+
+SELECTED = {"enabled": True, "allowed_actions": "selected"}
+ALLOWLIST = {
+    "github_owned_allowed": True,
+    "verified_allowed": False,
+    "patterns_allowed": ["anthropics/claude-code-action@*", "openai/*"],
+}
+
+
+def test_doctor_accepts_all_actions_and_a_complete_selected_allowlist(tmp_path):
+    check, report = _actions_check(tmp_path / "a", {"enabled": True, "allowed_actions": "all"})
+    assert check.ok and report.ok
+    check, report = _actions_check(tmp_path / "s", SELECTED, ALLOWLIST)
+    assert check.ok and report.ok, report.render()
+
+
+@pytest.mark.parametrize(
+    ("perms", "selected", "manual", "needle"),
+    [
+        ({"enabled": False}, None, False, "disabled"),
+        ({"enabled": True, "allowed_actions": "local_only"}, None, False, "local_only"),
+        (None, None, True, "could not read the Actions permissions"),
+        (SELECTED, None, True, "allowlist of owner/comic could not be read"),
+        (
+            SELECTED,
+            {**ALLOWLIST, "patterns_allowed": ["openai/*"]},
+            False,
+            "anthropics/claude-code-action@",
+        ),
+        (SELECTED, {**ALLOWLIST, "github_owned_allowed": False}, False, "actions/checkout@"),
+        (
+            SELECTED,
+            {**ALLOWLIST, "patterns_allowed": [], "verified_allowed": True},
+            True,
+            "Marketplace-verified",
+        ),
+    ],
+)
+def test_doctor_fails_an_actions_policy_the_generated_workflows_cannot_run_under(
+    tmp_path, perms, selected, manual, needle
+):
+    check, report = _actions_check(tmp_path, perms, selected)
+    assert not check.ok and not report.ok and check.manual == manual
+    assert needle in check.detail
+
+
+def test_selected_actions_patterns_match_like_github():
+    from agentic_sdlc.onboard import _action_pattern_matches, actions_permissions_check
+
+    sha = "a" * 40
+    action = f"Anthropics/claude-code-action@{sha}"
+    assert _action_pattern_matches("anthropics/*", action)
+    assert _action_pattern_matches("anthropics/claude-code-action@*", action)
+    assert _action_pattern_matches("anthropics/claude-code-action", action)
+    assert _action_pattern_matches(f"anthropics/claude-code-action@{sha}", action)
+    assert not _action_pattern_matches("anthropics/claude-code-action@v1", action)
+    assert not _action_pattern_matches("anthropics/claude-*-x@*", action)
+    assert not _action_pattern_matches("anthropic/*", action)
+    reusable = f"plat/forge/.github/workflows/reusable-plan.yml@{sha}"
+    assert _action_pattern_matches("plat/forge/.github/workflows/*", reusable)
+    gh = FakeGh(
+        {
+            "api repos/owner/comic/actions/permissions/selected-actions": json.dumps(
+                {"github_owned_allowed": True, "patterns_allowed": ["plat/other@*"]}
+            ),
+            "api repos/owner/comic/actions/permissions": json.dumps(SELECTED),
+        }
+    )
+    check = actions_permissions_check(gh, "owner/comic", {reusable, f"actions/checkout@{sha}"})
+    assert not check.ok and reusable in check.detail and "actions/checkout" not in check.detail
+    own = actions_permissions_check(gh, "plat/comic", {reusable})  # the owner's own workflows
+    assert not own.ok  # unreadable for plat/comic in this fake: never READY
+
+
+# ---------------------------------------------------------------- Codex 4205853975
+
+
+def test_doctor_requires_required_managed_paths_to_be_regular_files(tmp_path):
+    import shutil
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    guard = repo / ".claude/hooks/forge_commit_guard.py"
+    guard.unlink()
+    guard.mkdir()
+    (guard / "x.py").write_text("pass\n")
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh()))
+    assert "forge_commit_guard.py (not a regular file)" in failed["required files present"].detail
+    assert "forge_commit_guard.py (a directory, not a file)" in failed[PUSHED_CHECK].detail
+    # A symlink leaving the repository is not the managed file either.
+    shutil.rmtree(guard)
+    outside = tmp_path / "elsewhere.py"
+    outside.write_text(render_onboarding(spec())[".claude/hooks/forge_commit_guard.py"])
+    guard.symlink_to(outside)
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh()))
+    assert "(resolves outside the repository)" in failed["required files present"].detail
+
+
+def test_doctor_requires_required_managed_paths_to_be_files_on_the_default_branch(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _healthy_gh()
+    gh.answers[CONSUMER_CONTENTS + ".claude/hooks/forge_session_start.py"] = json.dumps(
+        [{"name": "x.py", "path": ".claude/hooks/forge_session_start.py/x.py", "type": "file"}]
+    )
+    gh.answers[CONSUMER_CONTENTS + ".claude/hooks/forge_commit_guard.py"] = json.dumps(
+        {"type": "symlink", "target": "../../outside.py", "encoding": "base64", "content": ""}
+    )
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))
+    assert "required files present" not in failed
+    detail = failed[PUSHED_CHECK].detail
+    assert "forge_session_start.py (a directory, not a file)" in detail
+    assert "forge_commit_guard.py (not a regular file: type 'symlink')" in detail
+
+
+# ---------------------------------------------------------------- Codex 4205853985
+
+CONTRACT = "pinned reusable workflows accept the generated calls"
+
+
+def _older_plan_workflow() -> str:
+    """reusable-plan.yml as an older platform revision had it: no runs_on input, and the
+    OpenAI key required instead of the Claude OAuth token."""
+    doc = yaml.safe_load((PLATFORM_WORKFLOWS / "reusable-plan.yml").read_text())
+    call = doc.get("on", doc.get(True))["workflow_call"]
+    del call["inputs"]["runs_on"]
+    call["secrets"] = {"OPENAI_API_KEY": {"required": True}}
+    return yaml.safe_dump(doc)
+
+
+def test_doctor_validates_the_pinned_reusable_workflow_contract(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _healthy_gh()
+    gh.answers[PLATFORM_CONTENTS + ".github/workflows/reusable-plan.yml"] = _blob(
+        _older_plan_workflow().encode()
+    )
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    failed = _failed(report)
+    assert "platform ref reachable (reusable workflows exist at pin)" not in failed
+    detail = failed[CONTRACT].detail
+    assert "agent-plan.yml:plan: passes input 'runs_on', which reusable-plan.yml does not" in (
+        detail
+    )
+    assert "does not pass secret 'OPENAI_API_KEY', which reusable-plan.yml requires" in detail
+    assert "passes secret 'CLAUDE_CODE_OAUTH_TOKEN'" in detail
+    assert "reusable-implement.yml" not in detail  # that callee still matches
+
+
+def test_reusable_call_contract_rules():
+    from agentic_sdlc.onboard import reusable_call_mismatches
+
+    callee = {
+        "on": {
+            "workflow_call": {
+                "inputs": {"a": {"required": True}, "b": {"required": False}},
+                "secrets": {"S": {"required": True}, "T": {}},
+            }
+        }
+    }
+    ok = {"with": {"a": "1"}, "secrets": {"S": "${{ secrets.S }}"}}
+    assert reusable_call_mismatches("c:j", ok, "x.yml", callee) == []
+    assert (
+        reusable_call_mismatches("c:j", {"with": {"a": 1}, "secrets": "inherit"}, "x.yml", callee)
+        == []
+    )
+    gaps = reusable_call_mismatches("c:j", {"with": {"b": 2, "z": 3}}, "x.yml", callee)
+    assert gaps == [
+        "c:j: passes input 'z', which x.yml does not declare",
+        "c:j: does not pass input 'a', which x.yml requires",
+        "c:j: does not pass secret 'S', which x.yml requires",
+    ]
+    assert "no on.workflow_call" in reusable_call_mismatches("c:j", {}, "x.yml", {"on": "push"})[0]

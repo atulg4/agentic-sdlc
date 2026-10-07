@@ -1444,13 +1444,44 @@ def _remote_file_state(gh: GhRunner, args: Sequence[str]) -> str:
 PLATFORM_ACCESS_CHECK = "private platform lets this repository call its workflows"
 
 
-def platform_access_check(gh: GhRunner, project_id: str, platform_repository: str) -> Check:
+def _visibility(repo_info: object) -> str | None:
+    """The visibility GitHub reports (public, private or internal); None if unknown."""
+    if not isinstance(repo_info, dict):
+        return None
+    if isinstance(repo_info.get("visibility"), str):
+        return str(repo_info["visibility"]).lower()
+    if isinstance(repo_info.get("private"), bool):
+        return "private" if repo_info["private"] else "public"
+    return None
+
+
+def platform_access_check(
+    gh: GhRunner,
+    project_id: str,
+    platform_repository: str,
+    consumer_info: dict | None = None,
+) -> Check:
     """A private (or internal) platform repository's reusable workflows can be called only from
     the repositories its Actions access setting admits: `user` (repositories of the same user),
-    `organization` (of the same organization) or `enterprise` (of the same enterprise). Reading
-    the workflow file proves only that the reviewer can; `PLATFORM_READ_TOKEN` is used after a
-    called workflow starts and cannot resolve the caller's `uses:`. Unreadable (403/404: it needs
-    admin on the platform) or unverifiable is an unmet MANUAL requirement, never READY."""
+    `organization` (of the same organization) or `enterprise` (of the same enterprise) -- and
+    never from a PUBLIC repository, whatever the setting: public callers can use only public
+    reusable workflows. Reading the workflow file proves only that the reviewer can;
+    `PLATFORM_READ_TOKEN` is used after a called workflow starts and cannot resolve the caller's
+    `uses:`. Unreadable (403/404: it needs admin on the platform) or unverifiable is an unmet
+    MANUAL requirement, never READY. `consumer_info` is `GET repos/{project_id}` (read when
+    omitted)."""
+    if consumer_info is None:
+        consumer_info = _safe_json(gh, ["api", f"repos/{project_id}"])
+    visibility = _visibility(consumer_info)
+    if visibility == "public":
+        return Check(
+            PLATFORM_ACCESS_CHECK,
+            False,
+            f"{project_id} is public and {platform_repository} is not: GitHub lets a public "
+            "repository call only PUBLIC reusable workflows, so every platform call is rejected "
+            "before any job starts, whatever the access setting → make the platform public, or "
+            f"make {project_id} private",
+        )
     consumer_owner = project_id.split("/")[0]
     platform_owner = platform_repository.split("/")[0]
     same_owner = consumer_owner.casefold() == platform_owner.casefold()
@@ -1474,7 +1505,16 @@ def platform_access_check(gh: GhRunner, project_id: str, platform_repository: st
             manual=True,
         )
     if same_owner and level in {"user", "organization", "enterprise"}:
-        return Check(PLATFORM_ACCESS_CHECK, True, f"access_level {level}")
+        if visibility is None:
+            return Check(
+                PLATFORM_ACCESS_CHECK,
+                False,
+                f"access_level {level}, but the visibility of {project_id} could not be read: a "
+                "PUBLIC caller cannot use a private platform's reusable workflows → confirm "
+                f"{project_id} is private or internal",
+                manual=True,
+            )
+        return Check(PLATFORM_ACCESS_CHECK, True, f"access_level {level} ({visibility} caller)")
     if not same_owner and level == "enterprise":
         return Check(
             PLATFORM_ACCESS_CHECK,
@@ -1508,6 +1548,193 @@ def _paged_items(gh: GhRunner, path: str, key: str | None = None) -> list[dict]:
 
 def _paged_names(gh: GhRunner, path: str, key: str) -> set[str]:
     return {str(item.get("name")) for item in _paged_items(gh, path, key)}
+
+
+ACTIONS_PERMISSIONS_CHECK = "repository Actions policy allows the generated workflows"
+GITHUB_OWNED_ACTION_OWNERS = frozenset({"actions", "github"})
+
+
+def workflow_uses(doc: object) -> set[str]:
+    """Every remote action and reusable workflow a parsed workflow names in `uses:` (job-level
+    calls and step actions); local `./` paths and `docker://` images are not policy-checked."""
+    found: set[str] = set()
+    jobs = doc.get("jobs") if isinstance(doc, dict) else None
+    for job in jobs.values() if isinstance(jobs, dict) else ():
+        if not isinstance(job, dict):
+            continue
+        values = [job.get("uses")]
+        steps = job.get("steps")
+        values += (
+            [st.get("uses") for st in steps if isinstance(st, dict)]
+            if isinstance(steps, list)
+            else []
+        )
+        for value in values:
+            text = str(value or "").strip()
+            if text and not text.startswith(("./", "docker://")):
+                found.add(text)
+    return found
+
+
+def _action_pattern_matches(pattern: str, action: str) -> bool:
+    """GitHub's allowed-actions pattern (`owner/*`, `owner/repo@*`, `owner/repo@v1`,
+    `owner/repo/.github/workflows/x.yml@*`): `*` is the only wildcard; a pattern without `@`
+    names the action at any ref. Owners and repositories are case-insensitive."""
+    pattern = pattern.strip()
+    if not pattern:
+        return False
+    target = action if "@" in pattern else action.split("@", 1)[0]
+    regex = ".*".join(re.escape(part) for part in pattern.casefold().split("*"))
+    return re.fullmatch(regex, target.casefold()) is not None
+
+
+def _action_allowed(action: str, selected: dict, consumer_owner: str) -> bool | None:
+    """Is `action` allowed by a `selected` policy? None when only a verified-creator allowance
+    could admit it, which the API does not let doctor verify."""
+    owner = action.split("/", 1)[0].casefold()
+    if owner == consumer_owner.casefold():
+        return True  # the repository owner's own actions and workflows are always allowed
+    if selected.get("github_owned_allowed") is True and owner in GITHUB_OWNED_ACTION_OWNERS:
+        return True
+    patterns = selected.get("patterns_allowed")
+    if any(
+        _action_pattern_matches(str(p), action)
+        for p in (patterns if isinstance(patterns, list) else [])
+    ):
+        return True
+    return None if selected.get("verified_allowed") is True else False
+
+
+def actions_permissions_check(gh: GhRunner, project_id: str, uses: set[str]) -> Check:
+    """The consumer's own Actions policy (`GET repos/{o}/{r}/actions/permissions`) must let every
+    generated workflow run: Actions enabled, and `all` actions allowed -- or `selected` with an
+    allowlist that admits every action and reusable workflow in `uses`. `local_only` cannot run
+    them (they use GitHub's and third-party actions). Unreadable is a manual TODO, never READY."""
+    fix = f"Settings → Actions → General on {project_id}"
+    perms = _safe_json(gh, ["api", f"repos/{project_id}/actions/permissions"])
+    if not isinstance(perms, dict) or not isinstance(perms.get("enabled"), bool):
+        return Check(
+            ACTIONS_PERMISSIONS_CHECK,
+            False,
+            f"could not read the Actions permissions of {project_id} → confirm in {fix} that "
+            "Actions are enabled and allow: " + ", ".join(sorted(uses)),
+            manual=True,
+        )
+    if not perms["enabled"]:
+        return Check(
+            ACTIONS_PERMISSIONS_CHECK, False, f"Actions are disabled → enable them in {fix}"
+        )
+    allowed = perms.get("allowed_actions")
+    if allowed == "all":
+        return Check(ACTIONS_PERMISSIONS_CHECK, True, "Actions enabled, all actions allowed")
+    if allowed == "local_only":
+        return Check(
+            ACTIONS_PERMISSIONS_CHECK,
+            False,
+            "allowed_actions local_only: the generated workflows use "
+            + ", ".join(sorted(uses))
+            + f" → allow them in {fix}",
+        )
+    if allowed != "selected":
+        return Check(
+            ACTIONS_PERMISSIONS_CHECK,
+            False,
+            f"allowed_actions {allowed!r} is not one doctor can evaluate → confirm in {fix}",
+            manual=True,
+        )
+    selected = _safe_json(gh, ["api", f"repos/{project_id}/actions/permissions/selected-actions"])
+    if not isinstance(selected, dict):
+        return Check(
+            ACTIONS_PERMISSIONS_CHECK,
+            False,
+            f"allowed_actions selected, but the allowlist of {project_id} could not be read → "
+            "confirm it allows: " + ", ".join(sorted(uses)),
+            manual=True,
+        )
+    owner = project_id.split("/")[0]
+    verdicts = {action: _action_allowed(action, selected, owner) for action in sorted(uses)}
+    denied = [a for a, ok in verdicts.items() if ok is False]
+    unverified = [a for a, ok in verdicts.items() if ok is None]
+    if denied:
+        return Check(
+            ACTIONS_PERMISSIONS_CHECK,
+            False,
+            "not allowed by the selected-actions policy: "
+            + ", ".join(denied)
+            + f" → add them to the allowlist in {fix}",
+        )
+    if unverified:
+        return Check(
+            ACTIONS_PERMISSIONS_CHECK,
+            False,
+            "admitted only if their creators are Marketplace-verified (doctor cannot check): "
+            + ", ".join(unverified)
+            + f" → confirm, or add them to the allowlist in {fix}",
+            manual=True,
+        )
+    return Check(
+        ACTIONS_PERMISSIONS_CHECK, True, f"selected actions allow all {len(uses)} dependencies"
+    )
+
+
+PLATFORM_CONTRACT_CHECK = "pinned reusable workflows accept the generated calls"
+
+
+def _workflow_call_interface(doc: object) -> tuple[dict, dict] | None:
+    """(inputs, secrets) a reusable workflow declares under `on.workflow_call`; None if it
+    declares no `workflow_call` trigger (it cannot be called at all)."""
+    if not isinstance(doc, dict):
+        return None
+    triggers = doc.get("on", doc.get(True))
+    if isinstance(triggers, str):
+        triggers = {triggers: None}
+    elif isinstance(triggers, list):
+        triggers = {str(t): None for t in triggers}
+    if not isinstance(triggers, dict) or "workflow_call" not in triggers:
+        return None
+    call = triggers.get("workflow_call")
+    call = call if isinstance(call, dict) else {}
+    inputs = call.get("inputs") if isinstance(call.get("inputs"), dict) else {}
+    secrets = call.get("secrets") if isinstance(call.get("secrets"), dict) else {}
+    return {str(k): v for k, v in inputs.items()}, {str(k): v for k, v in secrets.items()}
+
+
+def reusable_call_mismatches(where: str, job: dict, callee: str, callee_doc: object) -> list[str]:
+    """Why GitHub would reject `job`'s call of `callee` (parsed `callee_doc`): an input or secret
+    the caller passes that the callee does not declare, or one the callee requires that the
+    caller does not pass (`secrets: inherit` passes every secret)."""
+    interface = _workflow_call_interface(callee_doc)
+    if interface is None:
+        return [f"{where}: {callee} at the pin has no on.workflow_call trigger"]
+    inputs, secrets = interface
+    problems = []
+    passed = job.get("with") if isinstance(job.get("with"), dict) else {}
+    for name in sorted(str(k) for k in passed):
+        if name not in inputs:
+            problems.append(f"{where}: passes input {name!r}, which {callee} does not declare")
+    for name, spec in sorted(inputs.items()):
+        if isinstance(spec, dict) and spec.get("required") is True and name not in passed:
+            problems.append(f"{where}: does not pass input {name!r}, which {callee} requires")
+    given = job.get("secrets")
+    if given != "inherit":
+        given = given if isinstance(given, dict) else {}
+        for name in sorted(str(k) for k in given):
+            if name not in secrets:
+                problems.append(f"{where}: passes secret {name!r}, which {callee} does not declare")
+        for name, spec in sorted(secrets.items()):
+            if isinstance(spec, dict) and spec.get("required") is True and name not in given:
+                problems.append(f"{where}: does not pass secret {name!r}, which {callee} requires")
+    return problems
+
+
+def _decoded_blob(blob: object) -> bytes | None:
+    """The bytes of a contents-API answer for a regular file (None otherwise)."""
+    if not isinstance(blob, dict) or blob.get("encoding") != "base64":
+        return None
+    try:
+        return base64.b64decode(str(blob.get("content") or ""))
+    except ValueError:
+        return None
 
 
 def _repo_rulesets(project_id: str, gh: GhRunner) -> list[dict]:
@@ -3238,6 +3465,68 @@ def implementation_mode(toml_path: Path, actions_callers: Sequence[str]) -> tupl
     )
 
 
+def _regular_file_problem(base: Path, relative: str) -> str | None:
+    """Why `relative` is not a regular file inside the checkout `base` (None when it is): a
+    directory, a dangling symlink or one resolving outside the repository is not the file."""
+    path = base / relative
+    try:
+        resolved = path.resolve(strict=path.is_symlink())
+    except (OSError, RuntimeError):
+        return f"{relative} (dangling symlink)"
+    if not resolved.is_relative_to(base):
+        return f"{relative} (resolves outside the repository)"
+    if not path.exists():
+        return relative
+    if not path.is_file():
+        return f"{relative} (not a regular file)"
+    return None
+
+
+def _generated_workflows(
+    base: Path,
+    policy_doc: dict,
+    project_id: str,
+    platform_repository: str,
+    *,
+    cloud: bool,
+    default_branch: str,
+    pin: str,
+) -> dict[str, dict]:
+    """{name: parsed workflow} of what `onboard` renders for this policy at `pin`; the installed
+    managed workflows when the templates cannot be rebuilt (no readable policy)."""
+    import yaml  # deferred: the CLI must import without site dependencies
+
+    names = MANAGED_WORKFLOWS + (() if cloud else MANAGED_IMPLEMENT_WORKFLOWS)
+    agents = policy_doc.get("agents") if isinstance(policy_doc.get("agents"), dict) else {}
+    implementer = (
+        "cloud-routine" if cloud else POLICY_IMPLEMENTERS.get(str(agents.get("implementer")))
+    )
+    if implementer is not None and policy_doc:
+        try:
+            spec = _template_spec(
+                policy_doc,
+                project_id=project_id,
+                platform_repository=platform_repository,
+                platform_ref=pin,
+                implementer=implementer,
+                default_branch=default_branch,
+            )
+            rendered = render_onboarding(spec)
+            return {
+                name: yaml.safe_load(rendered[f".github/workflows/{name}"])
+                for name in names
+                if f".github/workflows/{name}" in rendered
+            }
+        except (OnboardError, KeyError, yaml.YAMLError):
+            pass
+    docs = {}
+    for name in names:
+        doc = _workflow_doc(base / ".github/workflows" / name)
+        if doc is not None:
+            docs[name] = doc
+    return docs
+
+
 def doctor(
     root: str | Path,
     project_id: str,
@@ -3287,7 +3576,7 @@ def doctor(
             ".github/workflows/agent-implement.yml",
             ".github/workflows/agent-auto-implement.yml",
         ]
-    missing = [r for r in required if not (base / r).exists()]
+    missing = [problem for r in required if (problem := _regular_file_problem(base, r))]
     settings = base / ".claude/settings.json"
     if settings.exists():
         missing += hook_problems(settings)
@@ -3625,24 +3914,57 @@ def doctor(
     if not remote:
         return rep
 
-    # --- platform reachable at that pin
+    # --- platform reachable at that pin, and its reusable workflows accept the generated calls
+    generated = _generated_workflows(
+        base,
+        policy_doc,
+        project_id,
+        platform_repository,
+        cloud=cloud,
+        default_branch=policy.default_branch if policy is not None else "main",
+        pin=ref or "0" * 40,
+    )
+    dependencies: set[str] = set()
+    caller_docs = [(f"{name} (generated)", doc) for name, doc in generated.items()]
+    caller_docs += [(c.name, _workflow_doc(c) or {}) for c in callers]
+    for _, doc in caller_docs:
+        dependencies |= {u for u in workflow_uses(doc) if not u.endswith("@" + "0" * 40)}
     if ref:
         probes = ["reusable-plan.yml"]
         if not cloud:
             probes.append("reusable-implement.yml")
-        absent = [
-            name
-            for name in probes
-            if not _safe_json(
+        calls: list[tuple[str, dict, str]] = []  # (where, job, callee file)
+        for label, doc in caller_docs:
+            jobs = doc.get("jobs") if isinstance(doc, dict) else None
+            for job_name, job in jobs.items() if isinstance(jobs, dict) else ():
+                found = _REMOTE_REUSABLE.fullmatch(str((job or {}).get("uses", "")).strip())
+                if isinstance(job, dict) and found and found.group(1) == platform_repository:
+                    calls.append((f"{label}:{job_name}", job, found.group(2)))
+                    if found.group(2) not in probes:
+                        probes.append(found.group(2))
+        callees: dict[str, object] = {}
+        absent = []
+        for name in probes:
+            blob = _safe_json(
                 gh,
                 [
                     "api",
                     f"repos/{platform_repository}/contents/.github/workflows/{name}?ref={ref}",
-                    "--jq",
-                    "{path: .path}",
                 ],
             )
-        ]
+            if not blob:
+                absent.append(name)
+                continue
+            raw = _decoded_blob(blob)
+            if raw is None:
+                callees[name] = None
+                continue
+            import yaml  # deferred: the CLI must import without site dependencies
+
+            try:
+                callees[name] = yaml.safe_load(raw.decode("utf-8", "replace"))
+            except yaml.YAMLError:
+                callees[name] = None
         add(
             Check(
                 "platform ref reachable (reusable workflows exist at pin)",
@@ -3650,14 +3972,51 @@ def doctor(
                 ref[:12] + (f": missing {', '.join(absent)}" if absent else ""),
             )
         )
+        for doc in callees.values():
+            dependencies |= workflow_uses(doc)
+        mismatches: list[str] = []
+        for where, job, callee in calls:
+            if callee in absent:
+                continue  # reported above
+            if callees.get(callee) is None:
+                mismatches.append(f"{where}: could not read {callee} at {ref[:12]}")
+                continue
+            mismatches += reusable_call_mismatches(where, job, callee, callees[callee])
+        mismatches = list(dict.fromkeys(mismatches))
+        add(
+            Check(
+                PLATFORM_CONTRACT_CHECK,
+                not mismatches,
+                "; ".join(mismatches)
+                + " → pin a platform ref whose reusable workflows match (onboard --platform-ref)"
+                if mismatches
+                else "every generated and installed call matches the inputs and secrets "
+                f"declared at {ref[:12]}",
+            )
+        )
 
     # --- a private platform must also admit this repository as a caller (Actions access)
+    repo_info = _safe_json(gh, ["api", f"repos/{project_id}"])
     platform_private = _safe_json(gh, ["api", f"repos/{platform_repository}", "--jq", ".private"])
     if platform_private is True:
-        add(platform_access_check(gh, project_id, platform_repository))
+        add(
+            platform_access_check(
+                gh,
+                project_id,
+                platform_repository,
+                repo_info if isinstance(repo_info, dict) else {},
+            )
+        )
+
+    # --- this repository's own Actions policy must let every generated workflow run
+    if ref:
+        dependencies |= {
+            f"{platform_repository}/.github/workflows/{name}@{ref}"
+            for name in ("reusable-plan.yml", *(() if cloud else ("reusable-implement.yml",)))
+        }
+    add(actions_permissions_check(gh, project_id, dependencies))
 
     # --- default branch in the policy is the repository's actual default branch
-    repo_info = _safe_json(gh, ["api", f"repos/{project_id}"])
     actual_branch = repo_info.get("default_branch") if isinstance(repo_info, dict) else None
     if policy is not None:
         add(
@@ -3671,12 +4030,14 @@ def doctor(
     # --- the managed files must be on the default branch: the workflows, CI and hooks GitHub
     # runs are the pushed ones, not this checkout (`onboard --apply` writes them locally only).
     remote_branch = actual_branch
+    # Every required path is checked remotely even when it is not a file here (the local
+    # check fails it already): it must be a regular file on the default branch too.
     managed = [
         r
         for r in dict.fromkeys(
             [*required, *(routing_files if routed else ()), "docs/forge/cloud-implementer.md"]
         )
-        if (base / r).is_file()
+        if r in required or (base / r).is_file()
     ]
     # The remote copies are also compared with their rendered form directly (not only with
     # this checkout), so a disabled hook on the default branch fails even if it was never pulled.
@@ -3690,14 +4051,17 @@ def doctor(
         blob = _safe_json(
             gh, ["api", f"repos/{project_id}/contents/{relative}?ref={remote_branch or 'HEAD'}"]
         )
-        remote_bytes = None
-        if isinstance(blob, dict) and blob.get("encoding") == "base64":
-            try:
-                remote_bytes = base64.b64decode(str(blob.get("content") or ""))
-            except ValueError:
-                remote_bytes = None
+        if isinstance(blob, list):
+            unpushed.append(f"{relative} (a directory, not a file)")
+            continue
+        if isinstance(blob, dict) and blob.get("type") != "file":
+            unpushed.append(f"{relative} (not a regular file: type {blob.get('type')!r})")
+            continue
+        remote_bytes = _decoded_blob(blob)
         if remote_bytes is None:
             unpushed.append(f"{relative} (missing)")
+        elif _regular_file_problem(base, relative):
+            unpushed.append(f"{relative} (not a regular file in this checkout)")
         elif remote_bytes != (base / relative).read_bytes():
             unpushed.append(f"{relative} (differs)")
         elif managed_file_problem(relative, remote_bytes, remote_rendered):

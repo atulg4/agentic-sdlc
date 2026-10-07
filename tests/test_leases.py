@@ -313,10 +313,10 @@ def test_release_removes_label_and_marks_release():
 def test_release_by_non_holder_is_refused_unless_forced():
     mine = format_claim_marker(Lease(7, "me", "s1", "b", NOW + timedelta(minutes=5)))
     gh = FakeGh().issue(7, labels=[IN_PROGRESS_LABEL], comments=[mine])
-    with pytest.raises(LeaseError):
-        release(PROJECT, 7, session="s2", gh=gh)
-    release(PROJECT, 7, session="s2", gh=gh, force=True)
-    assert current_lease(PROJECT, 7, gh) is None
+    with pytest.raises(LeaseError):  # a LIVE holder (pinned clock: the lease is live at NOW)
+        release(PROJECT, 7, session="s2", gh=gh, now=NOW)
+    release(PROJECT, 7, session="s2", gh=gh, force=True, now=NOW)
+    assert current_lease(PROJECT, 7, gh, now=NOW) is None
 
 
 def test_list_claims_reports_live_and_expired():
@@ -1414,3 +1414,81 @@ def test_unreadable_events_keep_the_owned_assignee_and_leave_the_cleanup_pending
     assert gh.issues[7]["comments"][-1]["body"] == (
         "<!-- forge-cleanup session=s1 assignee=alice -->"
     )
+
+
+# ---------------------------------------------------------------- Codex 4205853970
+
+
+def test_cleanup_restores_an_assignment_a_maintainer_made_between_check_and_removal():
+    """The history check and the removal are not atomic: an `assigned` event that appears after
+    the pre-removal snapshot is a maintainer's, and the login is given back."""
+    gh = FakeGh().issue(7)
+    assert claim(
+        PROJECT, 7, agent="a", session="s1", branch="b", gh=gh, now=NOW, assignee="alice"
+    ).ok
+    real = gh.__call__
+
+    def racing(args, input=None):
+        if tuple(args[:2]) == ("issue", "edit") and "--remove-assignee" in args:
+            gh.events[7].append(  # the maintainer assigns alice just before our edit lands
+                {
+                    "id": 9001,
+                    "event": "assigned",
+                    "assignee": {"login": "Alice"},
+                    "created_at": (NOW + timedelta(minutes=2)).isoformat(),
+                }
+            )
+        return real(args, input=input)
+
+    release(PROJECT, 7, session="s1", gh=racing, now=NOW + timedelta(minutes=2))
+    assert _logins(gh) == ["alice"]
+    edits = [c for c in gh.calls if c[:2] == ("issue", "edit") and "alice" in c]
+    assert "--remove-assignee" in edits[-2] and "--add-assignee" in edits[-1]
+    # ownership ended: recorded, so no retry removes the maintainer's assignment again
+    assert gh.issues[7]["comments"][-1]["body"] == (
+        "<!-- forge-cleanup session=s1 assignee=alice -->"
+    )
+
+
+def test_cleanup_without_a_racing_assignment_stays_removed():
+    gh = FakeGh().issue(7)
+    assert claim(
+        PROJECT, 7, agent="a", session="s1", branch="b", gh=gh, now=NOW, assignee="alice"
+    ).ok
+    release(PROJECT, 7, session="s1", gh=gh, now=NOW + timedelta(minutes=2))
+    assert _logins(gh) == []
+    assert not any(c[:2] == ("issue", "edit") and "--add-assignee" in c for c in gh.calls[-6:])
+
+
+# ---------------------------------------------------------------- Codex 4205853990
+
+
+def test_release_retry_reconciles_despite_another_sessions_expired_marker():
+    """Session B holds an unreleased EXPIRED claim; A took over, released, and its assignee
+    cleanup failed. B is no live holder: retrying A's release must finish the cleanup."""
+    stale = Lease(7, "b", "sB", "b", NOW - timedelta(minutes=1))
+    gh = FakeGh().issue(7, comments=[format_claim_marker(stale)])
+    assert claim(
+        PROJECT, 7, agent="a", session="sA", branch="b", gh=gh, now=NOW, assignee="alice"
+    ).ok
+    real = gh.__call__
+
+    def failing(args, input=None):
+        if tuple(args[:2]) == ("issue", "edit") and "--remove-assignee" in args:
+            raise RuntimeError("gh: Bad Gateway (HTTP 502)")
+        return real(args, input=input)
+
+    later = NOW + timedelta(minutes=5)
+    with pytest.raises(RuntimeError):
+        release(PROJECT, 7, session="sA", gh=failing, now=later)
+    remaining = current_lease(PROJECT, 7, gh, now=later)
+    assert remaining is not None and remaining.session == "sB" and not remaining.live(later)
+    release(PROJECT, 7, session="sA", gh=gh, now=later)  # the retry: no LeaseError
+    assert _logins(gh) == []
+    assert gh.issues[7]["comments"][-1]["body"] == (
+        "<!-- forge-cleanup session=sA assignee=alice -->"
+    )
+    # A LIVE lease of another session still refuses a non-forced release.
+    gh2 = FakeGh().issue(7, comments=[format_claim_marker(replace(stale, expires=later))])
+    with pytest.raises(LeaseError):
+        release(PROJECT, 7, session="sA", gh=gh2, now=NOW)
