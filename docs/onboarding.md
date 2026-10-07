@@ -63,12 +63,15 @@ macOS targets only: a GitHub-hosted `ubuntu-*`/`macos-*` label from GitHub's doc
 rejected), or a self-hosted runner's labels. Windows labels are refused by `onboard` and failed by
 `doctor`.
 
-Implementation is Linux-only, whatever the implementer: `reusable-implement.yml` installs
-bubblewrap for Claude Code with `apt-get`, which macOS has neither of, and a routed or Claude
-implementation reaches that step. With an Actions implementer, `--runs-on` must therefore be a
-GitHub-hosted `ubuntu-*` label or a self-hosted label set that includes `linux` (the OS label
-every self-hosted Linux runner carries); `doctor` fails an implement call whose `runs_on` is not.
-macOS remains fine for `ci.yml` (`--ci-runs-on macos-15`) and for a `cloud-routine` profile.
+Every Forge plan and implementation workflow is Linux-only, whatever the implementer and in both
+implementation modes: `reusable-implement.yml` installs bubblewrap for Claude Code with `apt-get`,
+and `reusable-plan.yml` hashes the checkout with GNU `sha256sum`, neither of which macOS has. A
+`cloud-routine` profile still runs the plan callers, so it is no exception. `--runs-on` must
+therefore be a GitHub-hosted `ubuntu-*` label or a self-hosted label set that includes `linux` (the
+OS label every self-hosted Linux runner carries); `onboard` refuses anything else, and `doctor`
+fails ("Forge workflows run on Linux runners") any job of a plan or implement caller, or any
+`runs_on` it hands a platform workflow, that is not Linux. macOS remains fine for `ci.yml` only
+(`--ci-runs-on macos-15`).
 
 ### Managed workflows
 
@@ -108,6 +111,13 @@ both in the checkout and on the default branch:
 | `.claude/settings.json` | structurally: the Forge hooks must be configured (other settings are yours) |
 | `.forge/executors.json`, `.forge/routing-policy.json` | semantically: loaded and routed on |
 | `agentic-sdlc.toml` | the policy itself: loaded and checked against the repository |
+
+Every policy field `onboard` writes from its options -- `[project] id`/`default_branch`,
+`[automation] ready_label`, `[commands]` `setup`/`quality`/`test`, `[ci] python_version`,
+`[policy] forbidden_paths`/`protected_paths`/`max_changed_files`/`max_diff_lines` -- is checked by
+ONE validator (`POLICY_FIELDS` in `onboard.py`) on both sides: `onboard` refuses a value it
+rejects, and `doctor` fails a policy holding one ("policy values are ones onboard accepts"). So
+`--setup ""` is refused up front instead of writing a profile doctor then calls not ready.
 
 A difference fails "managed files match the generated files" (or, on the default branch,
 "managed files are on the default branch"); re-run `sdlcctl onboard --force`.
@@ -171,8 +181,12 @@ something that runs differently.
   through the repository API.
 - **Claude Code hooks** are read from the parsed `.claude/settings.json`: a `SessionStart` group
   firing on startup that runs `python3 .claude/hooks/forge_session_start.py`, and a `PreToolUse`
-  group whose matcher covers `Bash` running `python3 .claude/hooks/forge_commit_guard.py`. The
-  commit guard resolves git aliases before classifying a subcommand: inline `-c alias.X=...`,
+  group whose matcher covers `Bash` running `python3 .claude/hooks/forge_commit_guard.py`. Each
+  Forge handler must be exactly the one `onboard` writes (`{"type": "command", "command": ...}`,
+  only the command's spelling may vary: `python`, a `$CLAUDE_PROJECT_DIR` prefix); a handler
+  with any other field -- `"async": true` above all, which runs it in the background where its
+  exit 2 can no longer block the commit, or a `timeout` -- fails, wherever it sits. Unrelated
+  hooks may sit beside them. The commit guard resolves git aliases before classifying a subcommand: inline `-c alias.X=...`,
   then `git config --get alias.X` where the command runs (repository and global configuration,
   plus `GIT_CONFIG_*` set on the command line). A `!` shell alias or an alias set through
   `--config-env` cannot be classified and counts as a commit.

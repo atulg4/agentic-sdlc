@@ -106,7 +106,7 @@ def _budget_usd(value: str) -> float:
     return parsed
 
 
-def _write(data: dict[str, Any], output: str | None) -> None:
+def _write(data: Any, output: str | None) -> None:
     rendered = json.dumps(data, indent=2, sort_keys=True) + "\n"
     if output:
         Path(output).write_text(rendered, encoding="utf-8")
@@ -840,6 +840,14 @@ def _lease_ttl(args: argparse.Namespace) -> int:
     return DEFAULT_TTL_MINUTES
 
 
+# The lease subcommands follow the CLI's convention: the JSON result goes to stdout (or to
+# --output), and human status lines go to stderr, so stdout always parses as one JSON document.
+
+
+def _status(message: str) -> None:
+    print(message, file=sys.stderr)
+
+
 def _claim(args: argparse.Namespace) -> int:
     result = claim(
         args.project,
@@ -853,10 +861,10 @@ def _claim(args: argparse.Namespace) -> int:
     )
     _write(result.as_dict(), args.output)
     if not result.ok:
-        print(f"REFUSED: {result.reason}", file=sys.stderr)
+        _status(f"REFUSED: {result.reason}")
         return 2
     verb = "renewed" if result.renewed else "claimed"
-    print(
+    _status(
         f"{verb} #{args.issue} for session {args.session} until {result.lease.expires.isoformat()}"
     )
     return 0
@@ -866,9 +874,8 @@ def _renew(args: argparse.Namespace) -> int:
     lease = renew(
         args.project, args.issue, session=args.session, ttl_minutes=_lease_ttl(args), gh=run_gh
     )
-    if args.output:
-        _write(ClaimResult(True, lease, renewed=True).as_dict(), args.output)
-    print(f"renewed #{args.issue} until {lease.expires.isoformat()}")
+    _write(ClaimResult(True, lease, renewed=True).as_dict(), args.output)
+    _status(f"renewed #{args.issue} until {lease.expires.isoformat()}")
     return 0
 
 
@@ -881,30 +888,28 @@ def _release(args: argparse.Namespace) -> int:
         force=args.force,
         note=args.note or "",
     )
-    if args.output:
-        _write({"issue": args.issue, "released": True, "session": args.session}, args.output)
-    print(f"released #{args.issue}")
+    _write({"issue": args.issue, "released": True, "session": args.session}, args.output)
+    _status(f"released #{args.issue}")
     return 0
 
 
 def _claims(args: argparse.Namespace) -> int:
     rows = list_claims(args.project, run_gh)
-    print(render_claims(rows))
-    if args.output:
-        _write(
-            [
-                {
-                    "issue": r.lease.issue,
-                    "agent": r.lease.agent,
-                    "session": r.lease.session,
-                    "branch": r.lease.branch,
-                    "expires": r.lease.expires.isoformat(),
-                    "expired": r.expired,
-                }
-                for r in rows
-            ],
-            args.output,
-        )
+    _status(render_claims(rows))
+    _write(
+        [
+            {
+                "issue": r.lease.issue,
+                "agent": r.lease.agent,
+                "session": r.lease.session,
+                "branch": r.lease.branch,
+                "expires": r.lease.expires.isoformat(),
+                "expired": r.expired,
+            }
+            for r in rows
+        ],
+        args.output,
+    )
     return 0
 
 

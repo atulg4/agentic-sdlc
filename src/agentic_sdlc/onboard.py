@@ -16,6 +16,7 @@ import re
 import shlex
 import subprocess
 import tomllib
+import unicodedata
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -120,11 +121,151 @@ def gate_command_problem(command: object) -> str:
     text = str(command)
     if "\n" in text or "\r" in text:
         return "must be a single line (join commands with `&&` instead of newlines)"
-    if any(ord(c) < 32 and c != "\t" for c in text):
+    if _unrenderable_char(text):
         return "must not contain control characters"
     if "${{" in text:
         return "must not contain a GitHub expression (`${{`)"
     return ""
+
+
+def _unrenderable_char(text: str) -> bool:
+    """A character no generated file can carry verbatim: a control character other than tab
+    (TOML forbids DEL raw), a line or paragraph separator (YAML and `str.splitlines` break a line
+    there), or a lone surrogate (not encodable as UTF-8)."""
+    return any((unicodedata.category(c) in {"Cc", "Cs", "Zl", "Zp"} and c != "\t") for c in text)
+
+
+# ---------------------------------------------------------------- the policy fields
+# ONE validator per field onboard writes into agentic-sdlc.toml. `OnboardSpec` runs it on what
+# the caller passed, `doctor` on what the policy file holds (`policy_doc_values`), so a value
+# onboard accepts doctor accepts, and a value doctor rejects onboard never writes.
+
+
+def _str_problem(value: object) -> str:
+    if not isinstance(value, str):
+        return "must be a string"
+    if not value.strip():
+        return "must not be empty"
+    if _unrenderable_char(value):
+        return "must not contain control characters"
+    return ""
+
+
+def _project_id_problem(value: object) -> str:
+    return _str_problem(value) or (
+        "" if _PROJECT.fullmatch(str(value)) else "must use owner/name format"
+    )
+
+
+def _branch_problem(value: object) -> str:
+    return _str_problem(value) or (
+        "" if re.fullmatch(r"[A-Za-z0-9._/-]+", str(value)) else "contains unsupported characters"
+    )
+
+
+def _ready_label_problem(value: object) -> str:
+    problem = _str_problem(value)
+    if problem:
+        return problem
+    label = str(value)
+    if label != label.strip():
+        # load_policy strips it, so the label conditions would not match the written policy.
+        return "must not start or end with whitespace"
+    if len(label) > 50 or "," in label:
+        # GitHub's 50-character limit; a comma would split the work-request front matter.
+        return "must be 1-50 characters without commas"
+    if label in {HUMAN_REVIEW_LABEL, IMPLEMENTATION_LABEL}:
+        return "must differ from the review/approval labels"
+    return ""
+
+
+def _gate_problem(value: object) -> str:
+    """A gate command: required (an empty step is not a gate), one line (`gate_command_problem`)."""
+    return _str_problem(value) or gate_command_problem(value)
+
+
+def _python_version_problem(value: object) -> str:
+    if isinstance(value, str) and _PYTHON_VERSION.fullmatch(value):
+        return ""
+    return "must look like 3.12 or 3.12.4"
+
+
+def _paths_problem(value: object) -> str:
+    if not isinstance(value, (list, tuple)) or not all(
+        isinstance(item, str) and item and not _unrenderable_char(item) for item in value
+    ):
+        return "must be a list of non-empty strings without control characters"
+    return ""
+
+
+def _cap_problem(maximum: int) -> Callable[[object], str]:
+    def check(value: object) -> str:
+        if type(value) is not int or not 1 <= value <= maximum:
+            return f"must be an integer between 1 and {maximum}"
+        return ""
+
+    return check
+
+
+#: field -> (OnboardSpec attribute, policy table, policy key, validator). The caps' maxima are
+#: load_policy's (`policy.py`).
+POLICY_FIELDS: dict[str, tuple[str, str, str, Callable[[object], str]]] = {
+    "project id": ("project_id", "project", "id", _project_id_problem),
+    "default branch": ("default_branch", "project", "default_branch", _branch_problem),
+    "ready label": ("ready_label", "automation", "ready_label", _ready_label_problem),
+    "setup": ("setup_command", "commands", "setup", _gate_problem),
+    "quality": ("quality_command", "commands", "quality", _gate_problem),
+    "test": ("test_command", "commands", "test", _gate_problem),
+    "python version": ("python_version", "ci", "python_version", _python_version_problem),
+    "forbidden paths": ("forbidden_paths", "policy", "forbidden_paths", _paths_problem),
+    "protected paths": ("protected_paths", "policy", "protected_paths", _paths_problem),
+    "max changed files": (
+        "max_changed_files",
+        "policy",
+        "max_changed_files",
+        _cap_problem(10_000),
+    ),
+    "max diff lines": ("max_diff_lines", "policy", "max_diff_lines", _cap_problem(10_000_000)),
+}
+#: Policy fields a policy may omit (written before the field existed): their default.
+_POLICY_FIELD_DEFAULTS = {"python version": DEFAULT_PYTHON_VERSION}
+_MISSING = object()
+
+
+def policy_field_location(field: str) -> str:
+    """`[table] key` of a POLICY_FIELDS field, as problems name it."""
+    _, table, key, _ = POLICY_FIELDS[field]
+    return f"[{table}] {key}"
+
+
+def policy_field_problem(field: str, value: object = _MISSING) -> str:
+    """Why onboard cannot write `value` for a POLICY_FIELDS field ('' = it can), named by its
+    policy location. No value = missing."""
+    if value is _MISSING:
+        return f"policy has no {policy_field_location(field)}"
+    problem = POLICY_FIELDS[field][3](value)
+    return f"policy {policy_field_location(field)} {problem}" if problem else ""
+
+
+def policy_value_problems(values: dict[str, object]) -> list[str]:
+    """Every POLICY_FIELDS value that onboard cannot write (and doctor therefore rejects), one
+    problem each. A field absent from `values` is missing."""
+    found = (policy_field_problem(f, values.get(f, _MISSING)) for f in POLICY_FIELDS)
+    return [problem for problem in found if problem]
+
+
+def policy_doc_values(policy_doc: object) -> dict[str, object]:
+    """The POLICY_FIELDS values a parsed policy holds (absent fields omitted, defaulted ones
+    filled), for `policy_value_problems`."""
+    doc = policy_doc if isinstance(policy_doc, dict) else {}
+    values: dict[str, object] = {}
+    for name, (_, table, key, _) in POLICY_FIELDS.items():
+        section = doc.get(table)
+        if isinstance(section, dict) and key in section:
+            values[name] = section[key]
+        elif name in _POLICY_FIELD_DEFAULTS:
+            values[name] = _POLICY_FIELD_DEFAULTS[name]
+    return values
 
 
 @dataclass(frozen=True)
@@ -151,9 +292,7 @@ class OnboardSpec:
     python_version: str = DEFAULT_PYTHON_VERSION
 
     def __post_init__(self) -> None:
-        if not _PROJECT.fullmatch(self.project_id) or not _PROJECT.fullmatch(
-            self.platform_repository
-        ):
+        if not _PROJECT.fullmatch(self.platform_repository):
             raise OnboardError("project identifiers must use owner/name format")
         if not _SHA.fullmatch(self.platform_ref):
             raise OnboardError(
@@ -168,40 +307,23 @@ class OnboardSpec:
         windows = _windows_labels((*self.runs_on, *self.ci_runs_on))
         if windows:
             raise OnboardError(f"{WINDOWS_UNSUPPORTED} (got {', '.join(windows)})")
-        if self.actions_implement and not _linux_labels(self.runs_on):
-            raise OnboardError(
-                f"{LINUX_IMPLEMENTATION_REQUIRED} (got --runs-on {','.join(self.runs_on)})"
-            )
+        if not _linux_labels(self.runs_on):
+            raise OnboardError(f"{LINUX_RUNNER_REQUIRED} (got --runs-on {','.join(self.runs_on)})")
         if self.public and not _github_hosted(set(self.ci_labels)):
             raise OnboardError(
                 "a public repository's CI runs fork pull-request code: it must use a "
                 f"GitHub-hosted runner (e.g. --ci-runs-on {PUBLIC_CI_RUNS_ON[0]}), not "
                 + ",".join(self.ci_labels)
             )
-        if not self.test_command.strip():
-            raise OnboardError("a test command is required; the gate fails closed without one")
-        for gate, command in zip(
-            GATE_COMMANDS,
-            (self.setup_command, self.quality_command, self.test_command),
-            strict=True,
-        ):
-            problem = gate_command_problem(command)
-            if problem:
-                raise OnboardError(f"--{gate}: {problem}")
-        if not _PYTHON_VERSION.fullmatch(self.python_version):
-            raise OnboardError("python version must look like 3.12 or 3.12.4")
-        if (
-            not self.ready_label.strip()
-            or len(self.ready_label) > 50
-            or any(ord(c) < 32 or c == "," for c in self.ready_label)
-        ):
-            # GitHub's 50-character limit; a comma would split the work-request front matter
-            # and a control character the generated `if:` blocks.
-            raise OnboardError("ready label must be 1-50 characters without commas or controls")
-        if len({self.ready_label, HUMAN_REVIEW_LABEL, IMPLEMENTATION_LABEL}) != 3:
-            raise OnboardError("ready label must differ from the review/approval labels")
-        if not re.fullmatch(r"[A-Za-z0-9._/-]+", self.default_branch):
-            raise OnboardError("default branch contains unsupported characters")
+        # The SAME validator doctor runs on the written policy (POLICY_FIELDS).
+        values = self.policy_values()
+        problems = [f"{f}: {p}" for f in POLICY_FIELDS if (p := policy_field_problem(f, values[f]))]
+        if problems:
+            raise OnboardError("; ".join(problems))
+
+    def policy_values(self) -> dict[str, object]:
+        """The spec's value of every POLICY_FIELDS field (what `render_policy` writes)."""
+        return {field: getattr(self, spec[0]) for field, spec in POLICY_FIELDS.items()}
 
     @property
     def name(self) -> str:
@@ -797,26 +919,9 @@ def render_hooks(spec: OnboardSpec) -> dict[str, str]:
     """Claude Code hooks: fetch-and-report at session start; block commits without a lease."""
     settings = {
         "hooks": {
-            "SessionStart": [
-                {
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": "python3 .claude/hooks/forge_session_start.py",
-                        }
-                    ]
-                }
-            ],
+            "SessionStart": [{"hooks": [forge_hook_entry(HOOK_SCRIPTS["SessionStart"])]}],
             "PreToolUse": [
-                {
-                    "matcher": "Bash",
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": "python3 .claude/hooks/forge_commit_guard.py",
-                        }
-                    ],
-                }
+                {"matcher": "Bash", "hooks": [forge_hook_entry(HOOK_SCRIPTS["PreToolUse"])]}
             ],
         }
     }
@@ -1620,9 +1725,10 @@ WINDOWS_UNSUPPORTED = (
 )
 
 
-LINUX_IMPLEMENTATION_REQUIRED = (
-    "the implementation workflows run on Linux only: reusable-implement.yml installs bubblewrap "
-    "for Claude Code with apt-get, which macOS lacks; use a GitHub-hosted ubuntu-* label or "
+LINUX_RUNNER_REQUIRED = (
+    "the Forge plan and implementation workflows run on Linux only: reusable-implement.yml "
+    "installs bubblewrap for Claude Code with apt-get, and reusable-plan.yml hashes the checkout "
+    "with GNU `sha256sum`, neither of which macOS has; use a GitHub-hosted ubuntu-* label or "
     "self-hosted labels that include `linux` (macOS is fine for ci.yml via --ci-runs-on)"
 )
 
@@ -2007,21 +2113,17 @@ def _ci_runs_on(base: Path) -> RunnerTarget | None:
 
 def policy_gate_commands(policy_doc: dict) -> tuple[dict[str, str], list[str]]:
     """The policy's `[commands]` setup/quality/test, and why any cannot be rendered into ci.yml
-    (missing, or not a single line -- `gate_command_problem`). Never normalized."""
-    table = policy_doc.get("commands") if isinstance(policy_doc, dict) else None
-    table = table if isinstance(table, dict) else {}
+    (the shared POLICY_FIELDS validator: missing, empty, or not a single line). Never
+    normalized."""
+    values = policy_doc_values(policy_doc)
     commands: dict[str, str] = {}
     problems: list[str] = []
     for gate in GATE_COMMANDS:
-        value = table.get(gate)
-        if not isinstance(value, str) or not value.strip():
-            problems.append(f"policy has no [commands] {gate}")
-            continue
-        problem = gate_command_problem(value)
+        problem = policy_field_problem(gate, values.get(gate, _MISSING))
         if problem:
-            problems.append(f"policy [commands] {gate} {problem}")
-            continue
-        commands[gate] = value
+            problems.append(problem)
+        else:
+            commands[gate] = str(values[gate])
     return commands, problems
 
 
@@ -2586,6 +2688,20 @@ _HOOK_INTERPRETERS = {"python3", "python"}
 _HOOK_DIR_PREFIXES = ("", "$CLAUDE_PROJECT_DIR/", "${CLAUDE_PROJECT_DIR}/")
 
 
+def forge_hook_entry(script: str) -> dict[str, str]:
+    """THE hook handler `onboard` writes for a Forge script, and the only shape `doctor` accepts
+    for one: exactly these keys. Any other handler field changes how it runs -- `async` runs it
+    in the background, where it can no longer block (or report) anything; `timeout` lets the
+    tool call through when it fires; `once` stops it after one run -- so a Forge handler that
+    carries one is not the hook onboard installed."""
+    return {"type": "command", "command": f"python3 {script}"}
+
+
+#: The keys of the hook GROUP that holds a Forge handler (`matcher` is checked by
+#: `_matcher_covers`; a group carries no other field that onboard writes).
+_FORGE_HOOK_GROUP_KEYS = frozenset({"matcher", "hooks"})
+
+
 def _hook_runs(entry: object, script: str) -> bool:
     """A hook handler that runs `python3 <script>` (optionally under $CLAUDE_PROJECT_DIR)."""
     if not isinstance(entry, dict) or entry.get("type") != "command":
@@ -2616,11 +2732,23 @@ def _matcher_covers(matcher: object, tool: str | None) -> bool:
         return False
 
 
+def _forge_entry_deviation(group: dict, entry: dict, script: str) -> str:
+    """How a handler that runs a Forge script differs from `forge_hook_entry` ('' = it does
+    not): any extra handler or group field. Only the command's spelling may vary (`_hook_runs`:
+    `python`, a $CLAUDE_PROJECT_DIR prefix)."""
+    want = forge_hook_entry(script)
+    extra = sorted(str(k) for k in set(entry) - set(want))
+    extra += sorted(f"group {k}" for k in set(group) - _FORGE_HOOK_GROUP_KEYS)
+    return ", ".join(extra)
+
+
 def hook_problems(settings_path: Path) -> list[str]:
-    """Why Claude Code would NOT run the Forge hooks from this settings file (empty = it will):
-    the parsed `hooks` structure must hold a SessionStart group firing on startup that runs the
-    session-start script, and a PreToolUse group matching Bash that runs the commit guard. A
-    mention anywhere else in the file -- a string, a disabled or malformed entry -- is no hook."""
+    """Why Claude Code would NOT run the Forge hooks from this settings file as onboard installed
+    them (empty = it will): the parsed `hooks` structure must hold a SessionStart group firing on
+    startup that runs the session-start script, and a PreToolUse group matching Bash that runs the
+    commit guard, each handler exactly `forge_hook_entry` -- synchronous, so the guard's exit 2
+    blocks the commit. A mention anywhere else in the file -- a string, a disabled or malformed
+    entry -- is no hook. Unrelated hooks (other scripts, other events) may sit beside them."""
     try:
         settings = json.loads(settings_path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
@@ -2635,14 +2763,25 @@ def hook_problems(settings_path: Path) -> list[str]:
     for event, script in HOOK_SCRIPTS.items():
         tool = "Bash" if event == "PreToolUse" else None
         groups = hooks.get(event)
-        ok = isinstance(groups, list) and any(
-            isinstance(group, dict)
-            and _matcher_covers(group.get("matcher"), tool)
-            and isinstance(group.get("hooks"), list)
-            and any(_hook_runs(h, script) for h in group["hooks"])
-            for group in groups
-        )
-        if not ok:
+        groups = [g for g in groups if isinstance(g, dict)] if isinstance(groups, list) else []
+        found = False
+        for group in groups:
+            entries = group.get("hooks") if isinstance(group.get("hooks"), list) else []
+            for entry in entries:
+                if not _hook_runs(entry, script):
+                    continue
+                deviation = _forge_entry_deviation(group, entry, script)
+                if deviation:
+                    # Wherever it sits: an `async` guard never blocks, even beside a good one.
+                    problems.append(
+                        f".claude/settings.json {event} hook running python3 {script} carries "
+                        f"fields onboard does not write ({deviation}); it must be exactly the "
+                        "generated synchronous handler (an `async` hook cannot block)"
+                    )
+                    continue
+                if _matcher_covers(group.get("matcher"), tool):
+                    found = True
+        if not found:
             where = f"{event} (matcher Bash)" if tool else event
             problems.append(f".claude/settings.json has no {where} hook running python3 {script}")
     return problems
@@ -3127,6 +3266,18 @@ def doctor(
                 else "provider github, approval labels, implementer and routing paths",
             )
         )
+    if policy_doc:
+        # The validator OnboardSpec runs: a value onboard would refuse is never "ready".
+        value_problems = policy_value_problems(policy_doc_values(policy_doc))
+        add(
+            Check(
+                "policy values are ones onboard accepts",
+                not value_problems,
+                "; ".join(value_problems)
+                if value_problems
+                else ", ".join(policy_field_location(f) for f in POLICY_FIELDS),
+            )
+        )
     # Route mode is what the installed callers/policy ask for, not whether the registry exists;
     # an agent doctor cannot read may be `route`, so it is checked as one (fails closed).
     routed = (
@@ -3585,22 +3736,21 @@ def doctor(
                 + "; ".join(f"{w} {sorted(lbls)}" for w, lbls in sorted(on_windows.items())),
             )
         )
-    # reusable-implement.yml is Linux-only (bubblewrap via apt-get): the runner each implement
-    # caller hands it.
+    # Every Forge plan/implement workflow is Linux-only (reusable-implement.yml installs
+    # bubblewrap with apt-get, reusable-plan.yml hashes with GNU sha256sum), in both modes: each
+    # job of every caller, and the runner each hands a platform workflow. Only ci.yml (checked
+    # below) may run on macOS.
     off_linux = {
         where: lbls
         for where, lbls in label_targets.items()
-        if where.split(":", 1)[0] in MANAGED_IMPLEMENT_WORKFLOWS
-        and where.endswith(" (runs_on)")
-        and where not in on_windows
-        and not _linux_labels(lbls)
+        if where not in on_windows and not _linux_labels(lbls)
     }
-    if not cloud and off_linux:
+    if off_linux:
         add(
             Check(
-                "implementation runs on Linux runners",
+                "Forge workflows run on Linux runners",
                 False,
-                LINUX_IMPLEMENTATION_REQUIRED
+                LINUX_RUNNER_REQUIRED
                 + ": "
                 + "; ".join(f"{w} {sorted(lbls)}" for w, lbls in sorted(off_linux.items())),
             )
