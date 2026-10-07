@@ -63,6 +63,7 @@ from .onboard import (
     OnboardError,
     OnboardSpec,
     apply_repo_settings,
+    canonical_project_id,
     copy_variables,
     doctor,
     registry_model_vars,
@@ -223,6 +224,8 @@ def _prepare_request(args: argparse.Namespace) -> int:
     policy = load_policy(args.config)
     if policy.provider != args.provider:
         raise ValueError("policy provider does not match request provider")
+    # Exact on purpose: $GITHUB_REPOSITORY is GitHub's canonical spelling, onboard --apply
+    # writes that spelling, and doctor fails a policy id that differs from it even by case.
     if args.expected_project_id and policy.project_id != args.expected_project_id:
         raise ValueError("policy project ID does not match execution repository")
     if args.expected_default_branch and policy.default_branch != args.expected_default_branch:
@@ -747,13 +750,16 @@ def _scaffold(args: argparse.Namespace) -> int:
 
 def _onboard(args: argparse.Namespace) -> int:
     destination = Path(args.destination).resolve()
+    # The policy must name the repository as GitHub spells it ($GITHUB_REPOSITORY, compared
+    # exactly by prepare-request); --apply reads it anyway. Offline, doctor checks the spelling.
+    project_id = canonical_project_id(args.project_id) if args.apply else args.project_id
     platform_ref = resolve_platform_ref(args.platform_repository, args.platform_ref)
     default_branch = args.default_branch
     if not default_branch:
-        default_branch = repository_default_branch(args.project_id) if args.apply else "main"
+        default_branch = repository_default_branch(project_id) if args.apply else "main"
     if args.visibility == "auto":
         try:
-            fork_exposed = repository_fork_exposed(args.project_id)
+            fork_exposed = repository_fork_exposed(project_id)
         except OnboardError as exc:
             raise OnboardError(
                 f"{exc}; pass --visibility public|private (public keeps fork pull-request CI "
@@ -762,7 +768,7 @@ def _onboard(args: argparse.Namespace) -> int:
     else:
         fork_exposed = args.visibility == "public"
     spec = OnboardSpec(
-        project_id=args.project_id,
+        project_id=project_id,
         platform_repository=args.platform_repository,
         platform_ref=platform_ref,
         test_command=args.test,

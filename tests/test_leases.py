@@ -166,8 +166,9 @@ def test_marker_round_trips():
     )
     text = format_claim_marker(lease)
     assert text.startswith("<!-- forge-claim ") and text.endswith("-->")
-    parsed = parse_marker(f"some human text\n{text}\nmore", issue=7)
-    assert parsed == lease
+    assert parse_marker(f"{text}\nmore human text", issue=7) == lease
+    # a marker is read only from the first line, where the tool writes it
+    assert parse_marker(f"some human text\n{text}\nmore", issue=7) is None
 
 
 def test_parse_ignores_unrelated_and_malformed_comments():
@@ -1638,3 +1639,144 @@ def test_a_failed_hand_over_leaves_the_ended_leases_cleanup_pending():
     # a later operation (B's own release) finishes A's cleanup once nobody wants alice
     release(PROJECT, 7, session="B", gh=gh, now=NOW)
     assert _logins(gh) == []
+
+
+# ---------------------------------------------------------------- Codex 4206780262
+
+
+def _superseded_thread(*comments):
+    """`old` (expired, owning alice, claimed 00:00) whose alice a maintainer removed and re-added
+    at 01:00 -- while `old` was active."""
+    stale = Lease(7, "a", "old", "b", NOW - timedelta(minutes=1), "alice", True)
+    gh = FakeGh().issue(7, assignees=["alice"], comments=[format_claim_marker(stale), *comments])
+    gh.events[7] = [
+        {"event": "assigned", "assignee": {"login": "alice"}, "created_at": "2026-09-30T00:00:01Z"}
+    ]
+    _readd(gh, "alice", datetime(2026, 9, 30, 1, 0, tzinfo=UTC))
+    return gh
+
+
+def test_a_takeover_does_not_inherit_ownership_a_maintainer_superseded():
+    gh = _superseded_thread()
+    result = claim(
+        PROJECT, 7, agent="a", session="new", branch="b", gh=gh, now=NOW, assignee="alice"
+    )
+    assert result.ok and result.took_over_from == "old"
+    assert not result.lease.owns_assignee
+    assert not current_lease(PROJECT, 7, gh, now=NOW).owns_assignee
+    release(PROJECT, 7, session="new", gh=gh, now=NOW + timedelta(minutes=1))
+    assert _logins(gh) == ["alice"]  # the maintainer's assignment survives the new lease
+    assert not any("--remove-assignee" in c for c in gh.calls)
+
+
+def test_a_takeover_inherits_nothing_when_the_expired_leases_history_is_unreadable():
+    stale = Lease(7, "a", "old", "b", NOW - timedelta(minutes=1), "alice", True)
+    gh = FakeGh().issue(7, assignees=["alice"], comments=[format_claim_marker(stale)])
+    real = gh.__call__
+
+    def no_events(args, input=None):
+        if args[0] == "api" and args[1].split("?")[0].endswith("/events"):
+            raise RuntimeError("gh: Forbidden (HTTP 403)")
+        return real(args, input=input)
+
+    result = claim(
+        PROJECT, 7, agent="a", session="new", branch="b", gh=no_events, now=NOW, assignee="alice"
+    )
+    assert result.ok and not result.lease.owns_assignee
+    assert _logins(gh) == ["alice"]
+
+
+def test_reconciliation_disowns_a_live_lease_that_inherited_superseded_ownership():
+    # A live lease that inherited `old`'s ownership before the takeover check existed.
+    inherited = Lease(7, "a", "new", "b", NOW + timedelta(hours=1), "alice", True)
+    gh = _superseded_thread()
+    gh.issues[7]["comments"].append(
+        _comment_row(50, format_claim_marker(inherited), (NOW - timedelta(seconds=30)).isoformat())
+    )
+    assert current_lease(PROJECT, 7, gh, now=NOW).owns_assignee
+    # any reconciling operation (here the holder's own renewal) finds old's ownership superseded
+    assert claim(
+        PROJECT, 7, agent="a", session="new", branch="b", gh=gh, now=NOW, assignee="alice"
+    ).renewed
+    held = current_lease(PROJECT, 7, gh, now=NOW)
+    assert held.session == "new" and not held.owns_assignee
+    bodies = [c["body"] for c in gh.issues[7]["comments"]]
+    assert any("assignee=alice owns_assignee=0" in b for b in bodies)
+    assert "<!-- forge-cleanup session=old assignee=alice -->" in bodies
+    # a renewal from a stale read cannot re-own it within the run
+    gh.issues[7]["comments"].append(
+        _comment_row(901, format_claim_marker(inherited), NOW.isoformat())
+    )
+    assert not current_lease(PROJECT, 7, gh, now=NOW).owns_assignee
+    release(PROJECT, 7, session="new", gh=gh, now=NOW + timedelta(minutes=1))
+    assert _logins(gh) == ["alice"]
+
+
+# ---------------------------------------------------------------- Codex 4206780275
+
+
+def test_a_release_note_with_marker_syntax_cannot_keep_the_lease_live():
+    gh = FakeGh().issue(7)
+    assert claim(PROJECT, 7, agent="a", session="s1", branch="b", gh=gh, now=NOW).ok
+    forged = format_claim_marker(Lease(7, "x", "evil", "b", NOW + timedelta(hours=3)))
+    release(PROJECT, 7, session="s1", gh=gh, now=NOW, note=f"copied: {forged}")
+    body = gh.issues[7]["comments"][-1]["body"]
+    assert body.startswith("<!-- forge-release session=s1 -->\n")
+    assert "&lt;!-- forge-claim" in body and "--&gt;" in body
+    assert body.count("<!--") == 1
+    assert current_lease(PROJECT, 7, gh, now=NOW) is None
+
+
+def test_markers_count_only_alone_on_the_first_line():
+    from agentic_sdlc import leases
+
+    guard = _guard()
+    claim_ = format_claim_marker(Lease(7, "a", "s1", "b", NOW + timedelta(hours=1)))
+    release_ = "<!-- forge-release session=s1 -->"
+    cases = [
+        (claim_ + "\nnote", "s1"),  # the tool's own shape
+        ("quoting a claim:\n" + claim_, None),  # not on the first line
+        ("text " + claim_, None),  # not alone on the first line
+        (claim_ + "\n" + release_, None),  # two markers: invalid, neither counts
+        (release_ + "\n" + claim_, None),
+    ]
+    for body, expected in cases:
+        gh = FakeGh().issue(7)
+        gh.issues[7]["comments"] = [_comment_row(1, body, NOW.isoformat())]
+        mine = current_lease(PROJECT, 7, gh, now=NOW)
+        theirs = guard.lease_from_comments(gh.issues[7]["comments"], {"atulg4": "admin"}.get, NOW)
+        assert (mine.session if mine else None) == expected, body
+        assert (theirs["session"] if theirs else None) == expected, body
+    # a multi-marker release does not void the live claim before it
+    gh = FakeGh().issue(7, comments=[claim_])
+    gh.issues[7]["comments"].append(_comment_row(2, release_ + "\n" + claim_, NOW.isoformat()))
+    assert current_lease(PROJECT, 7, gh, now=NOW).session == "s1"
+    assert leases.sanitize_text("a <!-- b --> c") == "a &lt;!-- b --&gt; c"
+
+
+# ---------------------------------------------------------------- Codex 4206780290
+
+
+def test_a_session_retracts_its_own_queued_claim_without_touching_the_live_holder():
+    gh = FakeGh().issue(7)
+    assert claim(
+        PROJECT, 7, agent="a", session="A", branch="b", gh=gh, now=NOW, assignee="alice"
+    ).ok
+    # B lost the race behind A, and its retraction POST failed: its marker stays queued.
+    queued = Lease(7, "b", "B", "b2", NOW + timedelta(hours=2), "bob")
+    gh.issues[7]["comments"].append(_comment_row(800, format_claim_marker(queued), NOW.isoformat()))
+    edits_before = [c for c in gh.calls if c[:2] == ("issue", "edit")]
+    release(PROJECT, 7, session="B", gh=gh, now=NOW)
+    assert [c for c in gh.calls if c[:2] == ("issue", "edit")] == edits_before
+    assert gh.issues[7]["comments"][-1]["body"].startswith("<!-- forge-release session=B -->")
+    held = current_lease(PROJECT, 7, gh, now=NOW)
+    assert held.session == "A" and held.owns_assignee
+    assert any(lbl["name"] == IN_PROGRESS_LABEL for lbl in gh.issues[7]["labels"])
+    assert _logins(gh) == ["alice"]
+    # when A releases, B does not become authoritative
+    release(PROJECT, 7, session="A", gh=gh, now=NOW)
+    assert current_lease(PROJECT, 7, gh, now=NOW) is None
+    # a session with no open marker of its own still cannot release a live holder
+    assert claim(PROJECT, 7, agent="a", session="A2", branch="b", gh=gh, now=NOW).ok
+    with pytest.raises(LeaseError):
+        release(PROJECT, 7, session="C", gh=gh, now=NOW)

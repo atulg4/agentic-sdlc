@@ -446,7 +446,12 @@ def _healthy_gh() -> FakeGh:
                 {"enabled": True, "allowed_actions": "all"}
             ),
             "api repos/owner/comic": json.dumps(
-                {"default_branch": "main", "visibility": "private", "allow_forking": False}
+                {
+                    "full_name": "owner/comic",
+                    "default_branch": "main",
+                    "visibility": "private",
+                    "allow_forking": False,
+                }
             ),
             "api /user/installations": _installs(7),
             "api apps/agentic-sdlc-publisher": json.dumps(
@@ -1324,6 +1329,7 @@ def test_cli_onboard_validates_var_before_writing_any_file(tmp_path, monkeypatch
     from agentic_sdlc import cli
 
     monkeypatch.setattr(cli, "apply_repo_settings", lambda *a, **k: pytest.fail("applied"))
+    monkeypatch.setattr(cli, "canonical_project_id", lambda project: project)
     repo = _repo(tmp_path)
     code = cli.main(
         [
@@ -1521,6 +1527,7 @@ def test_cli_copy_vars_from_copies_every_registry_model_variable(tmp_path, monke
     monkeypatch.setattr(cli, "copy_variables", lambda src, names: copied.extend(names) or {})
     monkeypatch.setattr(cli, "apply_repo_settings", lambda *a, **k: {})
     monkeypatch.setattr(cli, "doctor", lambda *a, **k: DoctorReport())
+    monkeypatch.setattr(cli, "canonical_project_id", lambda project: project)
     repo = _repo(tmp_path)
     args = ["onboard", "--visibility", "private", "--destination", str(repo)]
     args += ["--project-id", "owner/comic"]
@@ -4879,6 +4886,34 @@ def test_doctor_accepts_an_inherited_required_check_an_installed_job_reports(tmp
     assert check.ok and "inherited from Organization owner" in check.detail
 
 
+def test_doctor_rejects_an_inherited_check_bound_to_a_foreign_integration(tmp_path):
+    from agentic_sdlc.onboard import GITHUB_ACTIONS_INTEGRATION_ID
+
+    gh = _healthy_gh()
+    gh.answers["api repos/owner/comic/rules/branches/main"] = _effective_rules(
+        _org_rule(
+            "required_status_checks",
+            required_status_checks=[{"context": "test", "integration_id": 424242}],
+        )
+    )
+    report, check = _effective_check(gh, tmp_path)
+    assert not report.ok and not check.ok and check.manual
+    assert "'test'" in check.detail and "424242" in check.detail
+    assert "Organization owner" in check.detail
+    # bound to GitHub Actions itself, the same inherited check is fine
+    gh.answers["api repos/owner/comic/rules/branches/main"] = _effective_rules(
+        _org_rule(
+            "required_status_checks",
+            required_status_checks=[
+                {"context": "test", "integration_id": GITHUB_ACTIONS_INTEGRATION_ID}
+            ],
+        )
+    )
+    (tmp_path / "actions").mkdir()
+    report, check = _effective_check(gh, tmp_path / "actions")
+    assert report.ok and check.ok, report.render()
+
+
 @pytest.mark.parametrize(
     ("rule", "words"),
     [
@@ -4912,3 +4947,56 @@ def test_apply_still_manages_only_the_repository_rulesets():
     called = [" ".join(c) for c, _ in gh.calls]
     assert any("rulesets?includes_parents=false" in c for c in called)
     assert not any("includes_parents=true" in c or "/rules/branches/" in c for c in called)
+
+
+# ---------------------------------------------------------------- Codex 4206780284
+
+
+def _any_case(gh):
+    """GitHub answers a repository path in any case (logins and names are case-insensitive)."""
+    return lambda args, input=None: gh(
+        [a.replace("Owner/Comic", "owner/comic") for a in args], input=input
+    )
+
+
+def test_doctor_requires_the_canonical_project_id_spelling(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(project_id="Owner/Comic"))
+    # doctor run from the policy's own (mis-cased) id: the API still answers every path...
+    report = doctor(repo, "Owner/Comic", "owner/agentic-sdlc", _any_case(_healthy_gh()))
+    failed = _failed(report)
+    # ...but every run passes the canonical $GITHUB_REPOSITORY, compared exactly
+    assert "policy project id matches the repository" in failed
+    assert "use owner/comic" in failed["policy project id matches the repository"].detail
+    assert not report.ok
+
+
+def test_canonical_project_id_takes_githubs_spelling_of_the_same_repository():
+    from agentic_sdlc.onboard import canonical_project_id
+
+    gh = FakeGh({"api repos/OWNER/Comic": json.dumps({"full_name": "owner/comic"})})
+    assert canonical_project_id("OWNER/Comic", gh) == "owner/comic"
+    renamed = FakeGh({"api repos/owner/old": json.dumps({"full_name": "owner/new"})})
+    assert canonical_project_id("owner/old", renamed) == "owner/old"  # doctor reports it
+    unreadable = FakeGh({"api repos/owner/comic": "not json"})
+    assert canonical_project_id("owner/comic", unreadable) == "owner/comic"
+
+
+def test_cli_onboard_apply_writes_the_canonical_project_id(tmp_path, monkeypatch):
+    from agentic_sdlc import cli
+    from agentic_sdlc.onboard import DoctorReport
+
+    seen: list[str] = []
+    monkeypatch.setattr(cli, "canonical_project_id", lambda project: "owner/comic")
+    monkeypatch.setattr(cli, "apply_repo_settings", lambda spec, **k: seen.append(spec.project_id))
+    monkeypatch.setattr(
+        cli, "doctor", lambda root, project, *a, **k: seen.append(project) or DoctorReport()
+    )
+    repo = _repo(tmp_path)
+    args = ["onboard", "--visibility", "private", "--destination", str(repo)]
+    args += ["--project-id", "OWNER/Comic"]
+    args += ["--platform-repository", "owner/agentic-sdlc", "--platform-ref", SHA]
+    args += ["--test", "pytest -q", "--default-branch", "main", "--apply"]
+    assert cli.main([*args, "--output", str(tmp_path / "o.json")]) == 0
+    assert 'id = "owner/comic"' in (repo / "agentic-sdlc.toml").read_text()
+    assert seen == ["owner/comic", "owner/comic"]

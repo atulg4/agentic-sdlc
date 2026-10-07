@@ -52,8 +52,24 @@ from datetime import UTC, datetime, timedelta
 
 PROJECT = "PROJECT_ID"
 ISSUE_BRANCH = re.compile(r"(?:^|/)issue-(\d+)(?:$|[^0-9])")
-CLAIM = re.compile(r"<!--\s*forge-claim\s+([^>]*?)\s*-->")
-RELEASE = re.compile(r"<!--\s*forge-release\s+([^>]*?)\s*-->")
+# A marker is the WHOLE first line of a comment, as leases.py writes and reads it; a comment with
+# marker syntax elsewhere, or more than one marker, carries none (same rule as leases._marker).
+MARKER_LINE = re.compile(r"^<!--\s*(forge-claim|forge-release|forge-cleanup)\s+([^>]*?)\s*-->$")
+ANY_MARKER = re.compile(r"<!--\s*forge-(?:claim|release|cleanup)\b")
+
+
+def comment_marker(body: str) -> tuple[str, dict] | None:
+    """(kind, fields) of the marker a comment carries, or None."""
+    body = body or ""
+    if len(ANY_MARKER.findall(body)) != 1:
+        return None
+    lines = body.splitlines()
+    m = MARKER_LINE.match(lines[0].strip()) if lines else None
+    if m is None:
+        return None
+    return m.group(1), dict(re.findall(r"(\w+)=(\S+)", m.group(2)))
+
+
 # What lease_for returns when GitHub could not be read. NEVER the same as "no lease" (None): a
 # failed read that looked like an empty inventory sent sessions into work owned elsewhere.
 UNAVAILABLE: dict = {"unavailable": True, "session": "", "agent": "unknown"}
@@ -886,15 +902,13 @@ def lease_from_comments(
     for position, c in enumerate(comments):
         if not isinstance(c, dict):
             continue
-        body = c.get("body") or ""
-        if not (CLAIM.search(body) or RELEASE.search(body)):
+        marker = comment_marker(c.get("body") or "")
+        if marker is None or marker[0] == "forge-cleanup":
             continue  # chatter: no permission read needed
         if not trusted_marker_author(c, permission):
             continue  # markers count only from writers and the trusted bots
-        found = list(CLAIM.finditer(body))
-        m = found[-1] if found else None
-        if m:
-            fields = dict(re.findall(r"(\w+)=(\S+)", m.group(1)))
+        kind, fields = marker
+        if kind == "forge-claim":
             exp = _parse_iso(fields.get("expires", ""))
             if exp is None or not all(k in fields for k in ("agent", "session", "branch")):
                 continue
@@ -907,8 +921,7 @@ def lease_from_comments(
             first_seen.setdefault(fields["session"], position)
             latest[fields["session"]] = {**fields, "expires": exp}
             continue
-        r = RELEASE.search(body)
-        released = dict(re.findall(r"(\w+)=(\S+)", r.group(1))).get("session") if r else None
+        released = fields.get("session")
         if released in latest:
             del latest[released]
             del first_seen[released]

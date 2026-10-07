@@ -25,7 +25,13 @@ marker re-posted with ``owns_assignee=1``, sticky for the rest of its run), so t
 release removes it; a hand-over that fails leaves the cleanup pending. Every removal path
 (release, takeover, retry) also reads the issue's events first: a login a maintainer removed and
 re-assigned WHILE the lease was active is the maintainer's now, so the lease's ownership ends and
-it stays; events that cannot be read keep it too (``reassigned_during``).
+it stays; events that cannot be read keep it too (``reassigned_during``). A takeover inherits
+the expired lease's ownership only when that check proves it was not superseded, and a live
+lease found holding superseded ownership is disowned (``owns_assignee=0``, sticky for its run).
+
+A marker is the whole first line of a comment, alone, exactly where this module writes it; a
+comment with marker syntax anywhere else, or with more than one marker, carries none. Free text
+in a marker comment (a release ``note``) has its ``<!--``/``-->`` escaped (``sanitize_text``).
 
 Markers count only from authors who can write to the repository (``trusted_marker_author``): a
 user whose repository permission is write/maintain/admin, `github-actions[bot]`, or the Forge
@@ -63,9 +69,13 @@ CLAIM_MARKER = "forge-claim"
 RELEASE_MARKER = "forge-release"
 CLEANUP_MARKER = "forge-cleanup"
 _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@+-]{0,120}$")
-_CLAIM = re.compile(r"<!--\s*forge-claim\s+(?P<fields>[^>]*?)\s*-->")
-_RELEASE = re.compile(r"<!--\s*forge-release\s+(?P<fields>[^>]*?)\s*-->")
-_CLEANUP = re.compile(r"<!--\s*forge-cleanup\s+(?P<fields>[^>]*?)\s*-->")
+#: A marker is the WHOLE first line of a comment, exactly where this module writes it; marker
+#: syntax anywhere else (a human note, a quoted marker) is never read.
+_MARKER_LINE = re.compile(
+    r"^<!--\s*(?P<kind>forge-claim|forge-release|forge-cleanup)\s+(?P<fields>[^>]*?)\s*-->$"
+)
+#: Any marker opening anywhere in a body: a comment holding more than one is invalid.
+_ANY_MARKER = re.compile(r"<!--\s*forge-(?:claim|release|cleanup)\b")
 _FIELD = re.compile(r"(\w+)=(\S+)")
 _PR_REF = re.compile(
     r"(?:\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*)"
@@ -94,6 +104,9 @@ class Lease:
     #: claim, server time; renewals keep it). Read from the thread, never written to a marker;
     #: None for a lease not read from the thread.
     claimed_at: datetime | None = field(default=None, compare=False)
+    #: The marker revokes `owns_assignee` (``owns_assignee=0``): the ownership this run held was
+    #: found superseded by a maintainer's re-assignment. Sticky for the rest of the run.
+    disowned: bool = field(default=False, compare=False)
 
     def live(self, now: datetime) -> bool:
         return self.expires > now
@@ -116,7 +129,11 @@ class ClaimResult:
             "lease": None
             if self.lease is None
             else {
-                **{k: v for k, v in self.lease.__dict__.items() if k != "claimed_at"},
+                **{
+                    k: v
+                    for k, v in self.lease.__dict__.items()
+                    if k not in ("claimed_at", "disowned")
+                },
                 "expires": self.lease.expires.isoformat(),
             },
         }
@@ -150,7 +167,12 @@ def format_claim_marker(lease: Lease) -> str:
             raise LeaseError(f"lease field contains unsupported characters: {value!r}")
     owner = ""
     if lease.assignee:
-        owner = f" assignee={lease.assignee}" + (" owns_assignee=1" if lease.owns_assignee else "")
+        owns = (
+            " owns_assignee=0"
+            if lease.disowned
+            else (" owns_assignee=1" if lease.owns_assignee else "")
+        )
+        owner = f" assignee={lease.assignee}" + owns
     return (
         f"<!-- {CLAIM_MARKER} agent={lease.agent} session={lease.session} "
         f"branch={lease.branch} expires={_iso(lease.expires)}{owner} -->"
@@ -166,16 +188,43 @@ def format_cleanup_marker(session: str, assignee: str) -> str:
     return f"<!-- {CLEANUP_MARKER} session={session} assignee={assignee} -->"
 
 
-def parse_marker(body: str, issue: int) -> Lease | None:
-    """Return the lease encoded in a comment body, or None when absent/malformed."""
-    matches = list(_CLAIM.finditer(body or ""))
-    match = matches[-1] if matches else None
+def sanitize_text(text: str) -> str:
+    """Free text placed in a marker comment, with HTML comment delimiters escaped: a note that
+    quotes `<!-- forge-claim ... -->` must never read as a marker (`_marker`)."""
+    return str(text or "").replace("<!--", "&lt;!--").replace("-->", "--&gt;")
+
+
+def _marker_comment(marker: str, text: str = "") -> str:
+    """A marker comment as this module posts it: the marker alone on the first line, then the
+    (sanitized) human text."""
+    text = sanitize_text(text).strip()
+    return f"{marker}\n{text}" if text else marker
+
+
+def _marker(body: str) -> tuple[str, dict[str, str]] | None:
+    """The marker a comment carries: its kind and fields, read ONLY from the comment's first line
+    (where every marker is written). A comment with marker syntax anywhere else, or with more
+    than one marker, carries none."""
+    body = body or ""
+    if len(_ANY_MARKER.findall(body)) != 1:
+        return None
+    lines = body.splitlines()
+    match = _MARKER_LINE.match(lines[0].strip()) if lines else None
     if match is None:
         return None
-    fields = dict(_FIELD.findall(match.group("fields")))
+    return match.group("kind"), dict(_FIELD.findall(match.group("fields")))
+
+
+def parse_marker(body: str, issue: int) -> Lease | None:
+    """Return the lease encoded in a comment body, or None when absent/malformed."""
+    marker = _marker(body)
+    if marker is None or marker[0] != CLAIM_MARKER:
+        return None
+    fields = marker[1]
     expires = _parse_iso(fields.get("expires", ""))
     if expires is None or not all(k in fields for k in ("agent", "session", "branch")):
         return None
+    owns = fields.get("owns_assignee")
     return Lease(
         issue=issue,
         agent=fields["agent"],
@@ -183,15 +232,23 @@ def parse_marker(body: str, issue: int) -> Lease | None:
         branch=fields["branch"],
         expires=expires,
         assignee=fields.get("assignee", ""),
-        owns_assignee=bool(fields.get("assignee")) and fields.get("owns_assignee") == "1",
+        owns_assignee=bool(fields.get("assignee")) and owns == "1",
+        disowned=bool(fields.get("assignee")) and owns == "0",
     )
 
 
 def _release_session(body: str) -> str | None:
-    match = _RELEASE.search(body or "")
-    if not match:
+    marker = _marker(body)
+    if marker is None or marker[0] != RELEASE_MARKER:
         return None
-    return dict(_FIELD.findall(match.group("fields"))).get("session")
+    return marker[1].get("session")
+
+
+def _cleanup_fields(body: str) -> dict[str, str] | None:
+    marker = _marker(body)
+    if marker is None or marker[0] != CLEANUP_MARKER:
+        return None
+    return marker[1]
 
 
 # ---------------------------------------------------------------- GitHub reads
@@ -364,7 +421,18 @@ def _keep_ownership(previous: Lease | None, lease: Lease) -> Lease:
     """Assignee ownership is sticky within one run of a session's markers: once a marker of the
     run records `owns_assignee` for a login, a later marker of that run for the same login keeps
     it. A renewal that read the thread before an ownership transfer (`_transfer_assignee`) was
-    posted would otherwise drop the transferred ownership again."""
+    posted would otherwise drop the transferred ownership again. A revocation
+    (``owns_assignee=0``, `_disown_superseded`) is sticky the same way and wins over ownership:
+    a marker posted later in the run from a stale read cannot re-own a maintainer's login."""
+    if lease.assignee and lease.disowned:
+        return replace(lease, owns_assignee=False)
+    if (
+        previous is not None
+        and previous.disowned
+        and lease.assignee
+        and same_login(previous.assignee, lease.assignee)
+    ):
+        return replace(lease, owns_assignee=False, disowned=True)
     if (
         previous is not None
         and previous.owns_assignee
@@ -415,9 +483,8 @@ def ended_leases(project: str, issue: int, gh: GhRunner) -> list[ReleasedLease]:
         if released in latest:
             ended.append(ReleasedLease(latest.pop(released), posted, cleaned=False))
             continue
-        done = _CLEANUP.search(body)
-        if done:
-            fields = dict(_FIELD.findall(done.group("fields")))
+        fields = _cleanup_fields(body)
+        if fields is not None:
             ended = [
                 replace(e, cleaned=True)
                 if e.lease.session == fields.get("session")
@@ -605,8 +672,10 @@ def _post_and_arbitrate(
         _comment(
             project,
             issue,
-            format_release_marker(session)
-            + f"\nLost the claim race to session `{getattr(winner, 'session', '?')}`; retracting.",
+            _marker_comment(
+                format_release_marker(session),
+                f"Lost the claim race to session `{getattr(winner, 'session', '?')}`; retracting.",
+            ),
             gh,
         )
     return winner
@@ -676,7 +745,8 @@ def _drop_owned_assignee(
         if superseded is None:
             return False
         if superseded:
-            return True
+            # The login is the maintainer's: no live lease may own it through this one either.
+            return _disown_superseded(project, issue, ended, gh, now)
     if not _sync_assignee(project, issue, ended.assignee, gh, now):
         # A live lease wants the login: it stays. The ended lease's cleanup is finished only
         # once that lease OWNS it (so its release removes it); otherwise it stays pending.
@@ -693,6 +763,43 @@ def _drop_owned_assignee(
     if _assigned_after(before, after, ended.assignee):
         _edit(project, issue, gh, "--add-assignee", ended.assignee)  # the maintainer's now
     return True
+
+
+def _disown_superseded(
+    project: str, issue: int, ended: Lease, gh: GhRunner, now: datetime | None
+) -> bool:
+    """An ended lease's ownership of its assignee was superseded by a maintainer's
+    re-assignment. A live lease that inherited that ownership (a takeover, a hand-over) holds
+    it on the same stale grounds, so its release would remove the maintainer's assignment:
+    post its marker again with ``owns_assignee=0`` (sticky for the rest of its run). True when
+    no live lease owns the login any more."""
+    now = now or datetime.now(UTC)
+    holder = current_lease(project, issue, gh, now)
+    if (
+        holder is None
+        or not holder.live(now)
+        or holder.session == ended.session
+        or not holder.owns_assignee
+        or not same_login(holder.assignee, ended.assignee)
+    ):
+        return True
+    _comment(
+        project,
+        issue,
+        _marker_comment(
+            format_claim_marker(replace(holder, owns_assignee=False, disowned=True)),
+            f"Assignee `{holder.assignee}` was re-assigned by a maintainer while the lease of "
+            f"session `{ended.session}` held it; this lease no longer owns it.",
+        ),
+        gh,
+    )
+    holder = current_lease(project, issue, gh, now)
+    return not (
+        holder is not None
+        and holder.live(now)
+        and holder.owns_assignee
+        and same_login(holder.assignee, ended.assignee)
+    )
 
 
 def _transfer_assignee(
@@ -713,9 +820,11 @@ def _transfer_assignee(
         _comment(
             project,
             issue,
-            format_claim_marker(owned)
-            + f"\nAssignee `{holder.assignee}` handed over from the ended lease of session "
-            f"`{ended.session}`; it is removed when this lease is released.",
+            _marker_comment(
+                format_claim_marker(owned),
+                f"Assignee `{holder.assignee}` handed over from the ended lease of session "
+                f"`{ended.session}`; it is removed when this lease is released.",
+            ),
             gh,
         )
         holder = current_lease(project, issue, gh, now)
@@ -729,7 +838,9 @@ def _transfer_assignee(
 
 def _record_cleanup(project: str, issue: int, ended: Lease, gh: GhRunner) -> None:
     """Mark the released lease's assignee cleanup done, so a later retry never repeats it."""
-    _comment(project, issue, format_cleanup_marker(ended.session, ended.assignee), gh)
+    _comment(
+        project, issue, _marker_comment(format_cleanup_marker(ended.session, ended.assignee)), gh
+    )
 
 
 def _reconcile_released_assignees(
@@ -888,12 +999,19 @@ def claim(
                 ),
             )
         # A renewal keeps the assignment bookkeeping of the lease it extends.
-        lease = replace(lease, assignee=existing.assignee, owns_assignee=existing.owns_assignee)
+        lease = replace(
+            lease,
+            assignee=existing.assignee,
+            owns_assignee=existing.owns_assignee,
+            disowned=existing.disowned,
+        )
         winner = _post_and_arbitrate(
             project,
             issue,
             session,
-            format_claim_marker(lease) + f"\nLease renewed until {_iso(lease.expires)}.",
+            _marker_comment(
+                format_claim_marker(lease), f"Lease renewed until {_iso(lease.expires)}."
+            ),
             gh,
             now,
         )
@@ -926,14 +1044,20 @@ def claim(
         # (`_confirm_own_assignment`): the issue read above is stale by then, and a maintainer
         # who assigns the login in between makes the add a no-op (Codex 4206173677). Until
         # proven, the marker claims no ownership -- a crash leaves an assignee, never removes one.
+        # The expired lease's ownership is inherited only when it was still its own: a
+        # maintainer who removed and re-added the login while that lease was active made the
+        # assignment theirs (`reassigned_during`; unknowable history inherits nothing either),
+        # and inheriting it anyway would let this lease's release remove it (Codex 4206780262).
         inherited = (
             existing is not None
             and existing.owns_assignee
             and same_login(existing.assignee, assignee)
+            and reassigned_during(project, issue, existing.assignee, existing.claimed_at, gh)
+            is False
         )
         lease = replace(lease, owns_assignee=inherited)
     marker = format_claim_marker(lease)
-    winner = _post_and_arbitrate(project, issue, session, marker + "\n" + note, gh, now)
+    winner = _post_and_arbitrate(project, issue, session, _marker_comment(marker, note), gh, now)
     if winner is None or winner.session != session:
         return ClaimResult(
             False,
@@ -965,8 +1089,10 @@ def claim(
             _comment(
                 project,
                 issue,
-                format_release_marker(session)
-                + "\nLabel/assignee bookkeeping failed; retracting the claim.",
+                _marker_comment(
+                    format_release_marker(session),
+                    "Label/assignee bookkeeping failed; retracting the claim.",
+                ),
                 gh,
             )
             _sync_label(project, issue, gh, now)
@@ -986,8 +1112,10 @@ def claim(
             _comment(
                 project,
                 issue,
-                format_claim_marker(owned)
-                + f"\nAssigned `{assignee}` for this lease; it is removed on release.",
+                _marker_comment(
+                    format_claim_marker(owned),
+                    f"Assigned `{assignee}` for this lease; it is removed on release.",
+                ),
                 gh,
             )
             lease = owned
@@ -1030,7 +1158,9 @@ def renew(
         # An expired lease is up for takeover; renewing it could race a new claimant. Claim again.
         raise LeaseError(f"issue #{issue}: the lease of session {session} has expired; claim again")
     lease = replace(existing, expires=now + timedelta(minutes=ttl_minutes))
-    body = format_claim_marker(lease) + f"\nLease renewed until {_iso(lease.expires)}."
+    body = _marker_comment(
+        format_claim_marker(lease), f"Lease renewed until {_iso(lease.expires)}."
+    )
     winner = _post_and_arbitrate(project, issue, session, body, gh, now)
     if winner is None or winner.session != session:
         raise LeaseError(
@@ -1068,7 +1198,28 @@ def release(
         _reconcile_released_assignees(project, issue, gh, now)
         return
     if existing.session != session and not force:
-        raise LeaseError(f"issue #{issue} is leased by session {existing.session}, not {session}")
+        queued = next(
+            (x for x in _open_leases(project, issue, gh) if x.session == session),
+            None,
+        )
+        if queued is None:
+            raise LeaseError(
+                f"issue #{issue} is leased by session {existing.session}, not {session}"
+            )
+        # This session's own claim is queued behind the live holder -- a race it lost whose
+        # retraction failed (Codex 4206780290). Left open it would become authoritative when
+        # the holder releases. Retract it; the label and the assignee are the holder's.
+        _comment(
+            project,
+            issue,
+            _marker_comment(
+                format_release_marker(session),
+                f"Queued claim retracted by `{session}`; the lease stays with session "
+                f"`{existing.session}`. {note}",
+            ),
+            gh,
+        )
+        return
     who = (
         session
         if existing.session == session
@@ -1079,7 +1230,9 @@ def release(
     _comment(
         project,
         issue,
-        format_release_marker(existing.session) + f"\nLease released by `{who}`. {note}".rstrip(),
+        _marker_comment(
+            format_release_marker(existing.session), f"Lease released by `{who}`. {note}"
+        ),
         gh,
     )
     # A new claimant may have taken the lease (and added the label) since we read it.
