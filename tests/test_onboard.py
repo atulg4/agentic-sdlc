@@ -1166,6 +1166,9 @@ def test_doctor_requires_platform_read_token_for_a_private_platform(tmp_path):
         "KIMI_API_KEY",
         "PLATFORM_READ_TOKEN",
     )
+    gh.answers["api repos/owner/agentic-sdlc/actions/permissions/access"] = json.dumps(
+        {"access_level": "user"}
+    )
     assert doctor(repo, "owner/comic", "owner/agentic-sdlc", gh).ok
 
 
@@ -1193,9 +1196,42 @@ def test_session_start_separates_expired_leases_from_live_ones(tmp_path):
         {"number": 1, "title": "live one", "assignees": [{"login": "a"}]},
         {"number": 2, "title": "crashed agent", "assignees": []},
     ]
-    live, stale = start.classify_leased(issues, lambda n: {"session": "s"} if n == 1 else None)
+    live, stale, mine = start.classify_leased(
+        issues, lambda n: {"session": "s"} if n == 1 else None
+    )
     assert [line.split()[0] for line in live] == ["#1"]
     assert [line.split()[0] for line in stale] == ["#2"]
+    assert mine == []
+
+
+def test_session_start_reports_its_own_lease_apart_from_other_agents(tmp_path, monkeypatch):
+    """Codex 4205654975: on a resume/clear/compaction the session's own live lease is not
+    another agent's."""
+    import io
+
+    start = _guard_module(tmp_path, "forge_session_start")
+    issues = [
+        {"number": 5, "title": "mine", "assignees": []},
+        {"number": 6, "title": "theirs", "assignees": []},
+    ]
+    leases = {5: {"session": "me"}, 6: {"session": "other"}}
+    live, stale, mine = start.classify_leased(issues, leases.get, "me")
+    assert [x.split()[0] for x in mine] == ["#5"] and [x.split()[0] for x in live] == ["#6"]
+    assert stale == []
+
+    def run(cmd):
+        return json.dumps(issues) if cmd[:3] == ["gh", "issue", "list"] else ""
+
+    monkeypatch.setattr(start, "run", run)
+    monkeypatch.setattr(start, "_lease_lookup", lambda: leases.get)
+    monkeypatch.setattr(start.sys, "stdin", io.StringIO(json.dumps({"session_id": "me"})))
+    out = io.StringIO()
+    monkeypatch.setattr(start.sys, "stdout", out)
+    assert start.main() == 0
+    text = out.getvalue()
+    others = text.split("other agents (do NOT work on these):\n")[1].split("[Forge]")[0]
+    assert "#6 theirs" in others and "#5" not in others
+    assert "Your current lease (this session, me): #5 mine" in text
 
 
 def test_session_start_lists_every_in_progress_issue_not_the_default_30(tmp_path, monkeypatch):
@@ -3737,6 +3773,8 @@ ONBOARD_EDGE_CASES = {
         "human-review-required",
         "implementation-approved",
         "in-progress",
+        "Implementation-Approved",
+        "Claude-Ready",
         "a'b",
         'a"b',
         "a #b: c",
@@ -3745,7 +3783,16 @@ ONBOARD_EDGE_CASES = {
         "x ",
         "ünï",
     ],
-    "default_branch": ["", "main", "feature/x", "a b", "release-1.2", "x\n"],
+    "default_branch": [
+        "",
+        "main",
+        "feature/x",
+        "a b",
+        "release-1.2",
+        "x\n",
+        "foo..bar",
+        "main.lock",
+    ],
     "python_version": ["", "3", "3.12", "3.12.4", "3.12 ", "3.12.4.1", 3.12],
     "forbidden_paths": [(), ("",), ("a\nb",), ("ok/**", "*.png"), ("x\x7f",), ("ü/**",)],
     "protected_paths": [(), ("",), ("src/app.py",), ("a ",)],
@@ -3905,3 +3952,193 @@ def test_doctor_fails_a_cloud_routine_plan_caller_on_macos(tmp_path):
     )
     failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh()))
     assert LINUX_CHECK not in failed
+
+
+# Codex 4205654928: the shell can ASSEMBLE `git` or `commit` from quote fragments, ANSI-C
+# quoting, escapes, braces and substitutions. Proof needs plain literal program/subcommand words.
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "g$'it' com$'mit' -m x",
+        '"g"it commit',
+        "\\git commit",
+        "gi\\t com\\mit",
+        "git co{m,}mit",
+        "$(echo git) commit",
+        "git $'commit' -m x",
+        "env g$'it' x",
+        "eval g${x}it com${x}mit",
+        "eval \"g\\$'it' com\\$'mit'\"",
+        "echo $(g$'it' status)",
+        "bash -c \"\\$'g'it commit\"",
+    ],
+)
+def test_commit_guard_treats_assembled_programs_as_unproven(tmp_path, command):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    assert guard.is_git_commit(command, cwd=str(tmp_path))
+    payload = {"tool_name": "Bash", "session_id": "s1", "tool_input": {"command": command}}
+    assert guard.decide(payload, "forge/issue-7", lambda n: None, lambda b: False)[0] == 2
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git log --grep commit",
+        "ls",
+        "ls -la && git status",
+        'git -C "$dir" status',
+        "# a note\nls",
+        "if [ -f x ]; then echo 'it''s'; fi",
+        "sh -e script.sh",
+    ],
+)
+def test_commit_guard_raw_proof_keeps_plain_non_commits(tmp_path, command):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    assert not guard.is_git_commit(command, cwd=str(tmp_path))
+
+
+def test_commit_guard_checks_an_assembled_commit_after_cd(tmp_path):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    targets = guard.commit_targets('cd ../wt && g"it" commit', cwd=str(tmp_path))
+    assert (("../wt",), (), ()) in targets and ((), (), ()) in targets
+
+
+# Codex 4205654958 / 4205654967: the shared POLICY_FIELDS validator (onboard and doctor).
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "Implementation-Approved",
+        "IMPLEMENTATION-APPROVED",
+        "Human-Review-Required",
+        "In-Progress",
+        "Agentic-SDLC",
+        "claude-BLOCKED",
+    ],
+)
+def test_ready_label_may_not_collide_case_insensitively_with_a_fixed_label(label):
+    from agentic_sdlc.onboard import policy_field_problem
+
+    assert "case-insensitively" in policy_field_problem("ready label", label)
+    with pytest.raises(OnboardError):
+        spec(ready_label=label)
+
+
+@pytest.mark.parametrize("label", ["claude-ready", "Claude-Ready", "forge-ready"])
+def test_ready_label_accepts_distinct_names(label):
+    from agentic_sdlc.onboard import policy_field_problem
+
+    assert policy_field_problem("ready label", label) == ""
+
+
+@pytest.mark.parametrize(
+    "branch",
+    ["foo..bar", "/main", "main/", "main.lock", "a//b", ".hidden", "a/.b", "a/b.lock/c"]
+    + [
+        "main.",
+        "-main",
+        "@",
+        "HEAD",
+        "a@{1}",
+        "a b",
+        "a~1",
+        "a^",
+        "a:b",
+        "a?",
+        "a*",
+        "a[b",
+        "a\\b",
+    ],
+)
+def test_default_branch_must_be_a_valid_git_branch_name(branch, monkeypatch):
+    from agentic_sdlc import onboard
+
+    monkeypatch.setattr(onboard, "_git_rejects_branch", lambda name: False)  # the rules alone
+    assert onboard.policy_field_problem("default branch", branch)
+    with pytest.raises(OnboardError):
+        spec(default_branch=branch)
+
+
+@pytest.mark.parametrize("branch", ["main", "feature/x", "release-1.2", "a.b/c_d", "v1.0-rc"])
+def test_default_branch_accepts_valid_git_branch_names(branch):
+    from agentic_sdlc.onboard import policy_field_problem
+
+    assert policy_field_problem("default branch", branch) == ""
+
+
+def test_default_branch_also_requires_the_installed_git_to_agree(monkeypatch):
+    from agentic_sdlc import onboard
+
+    monkeypatch.setattr(onboard, "_git_rejects_branch", lambda name: name == "trunk")
+    assert "check-ref-format" in onboard.policy_field_problem("default branch", "trunk")
+    assert onboard.policy_field_problem("default branch", "main") == ""
+
+
+# Codex 4205654942: a private platform must admit the consumer as a reusable-workflow caller.
+
+PLATFORM_ACCESS = "private platform lets this repository call its workflows"
+
+
+def _private_platform_gh(access: str | None):
+    gh = _healthy_gh()
+    gh.answers = {"api repos/owner/agentic-sdlc --jq": "true\n", **gh.answers}
+    secrets = ("PUBLISHER_APP_PRIVATE_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "DEEPSEEK_API_KEY")
+    gh.answers["api repos/owner/comic/actions/secrets"] = _secret_pages(
+        *secrets, "ZAI_API_KEY", "KIMI_API_KEY", "PLATFORM_READ_TOKEN"
+    )
+    key = "api repos/owner/agentic-sdlc/actions/permissions/access"
+    if access is None:
+        gh.fail = {*gh.fail, key}  # 403/404: the reviewer is not an admin of the platform
+    else:
+        gh.answers[key] = json.dumps({"access_level": access})
+    return gh
+
+
+@pytest.mark.parametrize("access", ["user", "organization"])
+def test_doctor_accepts_a_private_platform_shared_with_its_owner(tmp_path, access):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", _private_platform_gh(access))
+    assert report.ok, report.render()
+    assert next(c for c in report.checks if c.name == PLATFORM_ACCESS).ok
+
+
+@pytest.mark.parametrize("access", [None, "none"])
+def test_doctor_reports_an_unshared_or_unreadable_private_platform_as_manual(tmp_path, access):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", _private_platform_gh(access))
+    assert not report.ok
+    check = _failed(report)[PLATFORM_ACCESS]
+    assert check.manual
+    assert "Settings → Actions → General → Access" in check.detail
+    assert "access_level=organization" in check.detail
+    assert ("could not read" in check.detail) == (access is None)
+
+
+def test_doctor_cannot_verify_cross_owner_enterprise_sharing(tmp_path):
+    from agentic_sdlc.onboard import platform_access_check
+
+    gh = FakeGh(
+        {
+            "api repos/plat/forge/actions/permissions/access": json.dumps(
+                {"access_level": "enterprise"}
+            )
+        }
+    )
+    check = platform_access_check(gh, "owner/comic", "plat/forge")
+    assert not check.ok and check.manual and "same enterprise" in check.detail
+    gh.answers["api repos/plat/forge/actions/permissions/access"] = json.dumps(
+        {"access_level": "organization"}
+    )
+    assert not platform_access_check(gh, "owner/comic", "plat/forge").ok
+
+
+def test_doctor_skips_the_access_check_for_a_public_platform(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh())
+    assert all(c.name != PLATFORM_ACCESS for c in report.checks)

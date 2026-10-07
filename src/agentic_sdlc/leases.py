@@ -16,7 +16,10 @@ cleanup is not recorded, so a cleanup that failed after its marker was posted --
 a takeover's, which is best effort and never fails the claim -- is completed by a later one. A
 completed cleanup is recorded (``<!-- forge-cleanup session=… assignee=… -->``) and a retry also
 skips a login that was assigned again after the lease ended, so it can never undo a later human
-assignment.
+assignment. Every removal path (release, takeover, retry) also reads the issue's events first: a
+login a maintainer removed and re-assigned WHILE the lease was active is the maintainer's now, so
+the lease's ownership ends and it stays; events that cannot be read keep it too
+(``reassigned_during``).
 
 Markers count only from authors who can write to the repository (``trusted_marker_author``): a
 user whose repository permission is write/maintain/admin, `github-actions[bot]`, or the Forge
@@ -31,7 +34,7 @@ import logging
 import os
 import re
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 
 GhRunner = Callable[..., str]
@@ -81,6 +84,10 @@ class Lease:
     assignee: str = ""
     #: The lease added `assignee` to the issue (it was not already assigned), so release removes it.
     owns_assignee: bool = False
+    #: When this lease's run of claim markers began (the first marker of the session's current
+    #: claim, server time; renewals keep it). Read from the thread, never written to a marker;
+    #: None for a lease not read from the thread.
+    claimed_at: datetime | None = field(default=None, compare=False)
 
     def live(self, now: datetime) -> bool:
         return self.expires > now
@@ -102,7 +109,10 @@ class ClaimResult:
             "took_over_from": self.took_over_from,
             "lease": None
             if self.lease is None
-            else {**self.lease.__dict__, "expires": self.lease.expires.isoformat()},
+            else {
+                **{k: v for k, v in self.lease.__dict__.items() if k != "claimed_at"},
+                "expires": self.lease.expires.isoformat(),
+            },
         }
 
 
@@ -306,6 +316,7 @@ def current_lease(
     """
     now = now or datetime.now(UTC)
     first_seen: dict[str, int] = {}
+    started: dict[str, datetime] = {}
     latest: dict[str, Lease] = {}
     for position, comment in enumerate(_trusted_comments(project, issue, gh)):
         body = comment.get("body") or ""
@@ -319,13 +330,16 @@ def current_lease(
             previous = latest.get(lease.session)
             if previous is not None and not previous.live(posted):
                 first_seen[lease.session] = position  # lapsed: seniority is forfeited
+                started[lease.session] = posted
             first_seen.setdefault(lease.session, position)
-            latest[lease.session] = lease
+            started.setdefault(lease.session, posted)
+            latest[lease.session] = replace(lease, claimed_at=started[lease.session])
             continue
         released = _release_session(body)
         if released in latest:
             del latest[released]
             del first_seen[released]
+            del started[released]
     ordered = [latest[sess] for sess in sorted(latest, key=first_seen.__getitem__)]
     live = [lease for lease in ordered if lease.live(now)]
     if live:
@@ -364,7 +378,9 @@ def ended_leases(project: str, issue: int, gh: GhRunner) -> list[ReleasedLease]:
                 # replacing it below without recording it would lose its owned-assignee cleanup.
                 for other in [o for o in latest if not latest[o].live(posted)]:
                     ended.append(ReleasedLease(latest.pop(other), posted, cleaned=False))
-            latest[parsed.session] = parsed
+            previous = latest.get(parsed.session)
+            began = previous.claimed_at if previous is not None else posted
+            latest[parsed.session] = replace(parsed, claimed_at=began)
             continue
         released = _release_session(body)
         if released in latest:
@@ -398,6 +414,42 @@ def assigned_since(project: str, issue: int, login: str, since: datetime, gh: Gh
         at = _parse_iso(str(event.get("created_at") or ""))
         if same_login(who, login) and (at is None or at > since):
             return True
+    return False
+
+
+def reassigned_during(
+    project: str, issue: int, login: str, claimed_at: datetime | None, gh: GhRunner
+) -> bool | None:
+    """Was `login` assigned to the issue again -- by someone other than the lease's own claim --
+    after the lease claimed at `claimed_at`? From the issue's `assigned`/`unassigned` events since
+    the claim: the lease's own assignment is at most ONE `assigned` event, so a second one, or an
+    `assigned` after an `unassigned` (a maintainer removed and re-added the login), supersedes the
+    lease's ownership. None when it cannot be known (no claim time, unreadable events or times):
+    the caller then keeps the assignee."""
+    if claimed_at is None:
+        return None
+    try:
+        events = _paged(f"repos/{project}/issues/{issue}/events?per_page=100", gh)
+    except Exception:  # noqa: BLE001 -- unknown history: do not remove anyone
+        return None
+    assignments, removed = 0, False
+    for event in events:
+        kind = event.get("event")
+        if kind not in ("assigned", "unassigned"):
+            continue
+        if not same_login((event.get("assignee") or {}).get("login"), login):
+            continue
+        at = _parse_iso(str(event.get("created_at") or ""))
+        if at is None:
+            return None
+        if at < claimed_at:
+            continue
+        if kind == "unassigned":
+            removed = True
+        elif removed or assignments:
+            return True
+        else:
+            assignments += 1
     return False
 
 
@@ -533,14 +585,29 @@ def _sync_assignee(
 
 
 def _drop_owned_assignee(
-    project: str, issue: int, ended: Lease | None, gh: GhRunner, now: datetime | None
+    project: str,
+    issue: int,
+    ended: Lease | None,
+    gh: GhRunner,
+    now: datetime | None,
+    *,
+    check_history: bool = True,
 ) -> bool:
     """Undo the assignment an ended lease made (nothing when it did not make one). True when the
-    lease owned an assignee, so the caller can record the cleanup as done."""
-    if ended is not None and ended.owns_assignee and ended.assignee:
-        _sync_assignee(project, issue, ended.assignee, gh, now)
-        return True
-    return False
+    cleanup is finished, so the caller records it: the login was removed, or a maintainer
+    assigned it again while the lease was active (`reassigned_during`), which ends the lease's
+    ownership -- that newer assignment is the maintainer's and stays. Unknowable history keeps
+    the assignee and leaves the cleanup pending (False) for a later reconciliation."""
+    if ended is None or not ended.owns_assignee or not ended.assignee:
+        return False
+    if check_history:
+        superseded = reassigned_during(project, issue, ended.assignee, ended.claimed_at, gh)
+        if superseded is None:
+            return False
+        if superseded:
+            return True
+    _sync_assignee(project, issue, ended.assignee, gh, now)
+    return True
 
 
 def _record_cleanup(project: str, issue: int, ended: Lease, gh: GhRunner) -> None:
@@ -573,8 +640,8 @@ def _reconcile_released_assignees(
             project, issue, lease.assignee, ended.released_at, gh
         ):
             continue  # assigned again after the lease ended (or unknowable): a later owner's
-        _sync_assignee(project, issue, lease.assignee, gh, now)
-        _record_cleanup(project, issue, lease, gh)
+        if _drop_owned_assignee(project, issue, lease, gh, now):  # re-added while it was active?
+            _record_cleanup(project, issue, lease, gh)
 
 
 def _reconcile_best_effort(project: str, issue: int, gh: GhRunner, now: datetime | None) -> None:
@@ -704,7 +771,8 @@ def claim(
                 gh,
             )
             _sync_label(project, issue, gh, now)
-            if _drop_owned_assignee(project, issue, lease, gh, now):
+            # This claim's own assignment, seconds old: nobody can have re-added it yet.
+            if _drop_owned_assignee(project, issue, lease, gh, now, check_history=False):
                 _record_cleanup(project, issue, lease, gh)
         except Exception:  # noqa: BLE001 -- best effort; the original failure is what matters
             pass

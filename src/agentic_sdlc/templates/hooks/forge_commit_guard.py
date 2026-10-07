@@ -16,6 +16,11 @@ Posture: FAIL CLOSED. Two layers decide whether a command is a commit:
    (`_segment_proven`): it holds no `$`/backtick expansion or here-string, and it either lacks
    one of the two words, or is git itself running one of its own non-commit subcommands
    (`git log --grep commit`), or is a `sh -c` whose string is proven the same way.
+3. A raw-text proof (`_raw_unproven`), whatever words the text holds: the shell can ASSEMBLE a
+   program or subcommand (`g$'it' com$'mit'`, `"g"it`, `\\git`, `co{m,}mit`, `$(echo git)`) that
+   neither check above can see. Every simple command's program and git subcommand must be a plain
+   literal word in the raw text (`[A-Za-z0-9_./+-]+`), `eval`/`source` may take only plain words,
+   and `$'...'`/`$"..."` quoting next to the letters of `git` then `commit` is unproven outright.
 
 Anything the parser cannot prove is treated as a commit and goes to the lease check. Only an
 unleased issue branch is ever blocked, so over-blocking (`echo "git commit"`) costs nothing on a
@@ -460,6 +465,179 @@ def _unproven(command: str, depth: int, cwd: str | None) -> bool:
     return False
 
 
+# ---- The raw-text proof (Codex 4205654928). shlex cooks quotes away and does not know ANSI-C
+# quoting (`g$'it'` -> `g$it`), so a program or git subcommand ASSEMBLED by the shell from quote
+# fragments, escapes, braces or expansions looks like some other word to the parser. A simple
+# command is proven only when the words in those two positions are plain literals in the RAW text.
+_PLAIN_WORD = re.compile(r"^[A-Za-z0-9_./+-]+$")
+_PLAIN_PROGRAMS = frozenset({"[", "[[", ":"})  # test builtins and `:`: run nothing
+_EVAL_LIKE = frozenset({"eval", "source", "."})  # run their (assembled) arguments as code
+_ANSI_C_QUOTE = re.compile(r"\$['\"]")
+_SPELLED_GIT_COMMIT = re.compile(r"git.*commit")
+
+
+def _plain(word: str | None) -> bool:
+    return bool(word and _PLAIN_WORD.match(word))
+
+
+def _raw_span(text: str, index: int) -> int:
+    """The index just past the shell construct that starts at `index` (a quoted string, an
+    escape, `$(...)`, backticks, `${...}`, or a single character). ValueError when unclosed."""
+    end = len(text)
+    char = text[index]
+    if char == "\\":
+        return min(index + 2, end)
+    if char == "'":
+        close = text.find("'", index + 1)
+        if close == -1:
+            raise ValueError("unclosed '")
+        return close + 1
+    if text.startswith("$'", index) or char == "`":
+        quote, pos = text[index + 1] if char == "$" else "`", index + (2 if char == "$" else 1)
+        while pos < end:
+            if text[pos] == "\\":
+                pos += 2
+            elif text[pos] == quote:
+                return pos + 1
+            else:
+                pos += 1
+        raise ValueError(f"unclosed {quote}")
+    if char == '"' or text.startswith('$"', index):
+        pos = index + (2 if char == "$" else 1)
+        while pos < end:
+            if text[pos] == "\\":
+                pos += 2
+            elif text[pos] == '"':
+                return pos + 1
+            elif text.startswith("$(", pos) or text[pos] == "`":
+                pos = _raw_span(text, pos)
+            else:
+                pos += 1
+        raise ValueError('unclosed "')
+    if text.startswith("$(", index):
+        depth, pos = 1, index + 2
+        while pos < end:
+            if text[pos] in "\\'\"`" or text.startswith(("$(", "$'", '$"'), pos):
+                pos = _raw_span(text, pos)
+                continue
+            depth += {"(": 1, ")": -1}.get(text[pos], 0)
+            pos += 1
+            if not depth:
+                return pos
+        raise ValueError("unclosed $(")
+    if text.startswith("${", index):
+        close = text.find("}", index)
+        if close == -1:
+            raise ValueError("unclosed ${")
+        return close + 1
+    return index + 1
+
+
+def _raw_segments(command: str) -> list[list[str]]:
+    """Each simple command's words exactly as written (quotes, escapes and expansions kept),
+    split like `_segments`; a `#` opening a word comments out the rest of the line."""
+    segments: list[list[str]] = [[]]
+    word: list[str] = []
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if char in " \t\r\n;&|()":
+            if word:
+                segments[-1].append("".join(word))
+                word = []
+            if char not in " \t":
+                segments.append([])
+            index += 1
+        elif char == "#" and not word:
+            newline = command.find("\n", index)
+            index = len(command) if newline == -1 else newline
+        else:
+            end = _raw_span(command, index)
+            word.append(command[index:end])
+            index = end
+    if word:
+        segments[-1].append("".join(word))
+    return [seg for seg in segments if seg]
+
+
+def _raw_substitutions(word: str) -> list[str]:
+    """The bodies of the `$(...)` and backtick substitutions in one raw word (live inside double
+    quotes too, dead inside single quotes)."""
+    bodies: list[str] = []
+    index, in_double = 0, False
+    while index < len(word):
+        char = word[index]
+        if char == '"':
+            in_double = not in_double
+            index += 1
+        elif char == "\\":
+            index += 2
+        elif not in_double and (char == "'" or word.startswith("$'", index)):
+            index = _raw_span(word, index)
+        elif word.startswith("$(", index) or char == "`":
+            end = _raw_span(word, index)
+            bodies.append(word[index + (2 if char == "$" else 1) : end - 1])
+            index = end
+        else:
+            index += 1
+    return bodies
+
+
+def _cook(word: str) -> str:
+    """One raw word with its quoting removed, as the shell would pass it (best effort)."""
+    try:
+        return " ".join(shlex.split(word))
+    except ValueError:
+        return word
+
+
+def _raw_segment_proven(seg: list[str], depth: int) -> bool:
+    """Are the program and (for git) the subcommand of this raw simple command plain literals?"""
+    try:
+        words = _command_words(seg, [], [])
+    except ValueError:
+        return False
+    if not words:
+        return True
+    program = words[0]
+    if not (_plain(program) or program in _PLAIN_PROGRAMS):
+        return False
+    name = os.path.basename(program)
+    if name in ("git", "git.exe"):
+        sub = _git_subcommand(words)
+        return sub is None or _plain(sub)
+    if name in _EVAL_LIKE:
+        return all(_plain(word) for word in words[1:])
+    inner = _shell_command_string([_cook(word) for word in words])
+    if inner is not None:
+        return depth < MAX_SUBST_DEPTH and not _raw_unproven(inner, depth + 1)
+    return True
+
+
+def _raw_unproven(command: str, depth: int = 0) -> bool:
+    """Could the shell assemble a program or git subcommand in `command` that the parser cannot
+    see? True when any simple command (or substitution body, or `sh -c` string) has a program or
+    git subcommand that is not a plain literal word, when `eval`/`source` gets anything but
+    plain words, or when `$'...'`/`$"..."` quoting meets the letters of `git` then `commit`."""
+    if _ANSI_C_QUOTE.search(command) and _SPELLED_GIT_COMMIT.search(
+        re.sub(r"[^a-z]", "", command.lower())
+    ):
+        return True
+    try:
+        segments = _raw_segments(command)
+        for seg in segments:
+            for body in (body for word in seg for body in _raw_substitutions(word)):
+                if depth >= MAX_SUBST_DEPTH or _raw_unproven(body, depth + 1):
+                    return True
+            while seg and seg[0] in SHELL_KEYWORDS:
+                seg = seg[1:]
+            if seg and not _raw_segment_proven(seg, depth):
+                return True
+    except ValueError:
+        return True
+    return False
+
+
 def commit_targets(command: str, depth: int = 0, cwd: str | None = None) -> list[Target]:
     """Every `git ... commit` in `command` with the repository it commits to. `cd DIR` before it
     (`cd ../wt && git commit`) counts too. Fails closed: a simple command that is not proven
@@ -490,6 +668,9 @@ def commit_targets(command: str, depth: int = 0, cwd: str | None = None) -> list
             targets = [((), (), ())]  # unknown repository: checked from cwd and the `cd`s
         prefix = cds[:-1] if is_cd else cds
         found += [((*prefix, *dirs), opts, env) for dirs, opts, env in targets]
+    if depth == 0 and _raw_unproven(command):
+        # An assembled program/subcommand somewhere: unknown repository, so every `cd` prefix.
+        found += [(tuple(cds[:count]), (), ()) for count in range(len(cds) + 1)]
     return found
 
 
@@ -499,8 +680,8 @@ def is_git_commit(command: str, depth: int = 0, cwd: str | None = None) -> bool:
     global options precede the subcommand, and whatever alias (`git ci`) stands for it."""
     try:
         return bool(commit_targets(command, depth, cwd))
-    except ValueError:  # unparseable (unbalanced quotes): fail closed on the two words
-        return _mentions_commit(command)
+    except ValueError:  # unparseable to shlex: fail closed on the two words or the raw proof
+        return _mentions_commit(command) or _raw_unproven(command)
 
 
 def target_branch(target: Target, cwd: str | None) -> str:
