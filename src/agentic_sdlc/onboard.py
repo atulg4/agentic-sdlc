@@ -8,6 +8,7 @@ variables). `doctor` verifies a repository and lists the remaining manual steps.
 
 from __future__ import annotations
 
+import base64
 import importlib.resources
 import json
 import re
@@ -18,9 +19,18 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .executors import AuthMode, ExecutorError, TaskClass, load_executors, load_routing_policy
+from .executors import (
+    AuthMode,
+    ExecutorError,
+    RuntimeStatus,
+    TaskClass,
+    load_executors,
+    load_routing_policy,
+)
 from .leases import IN_PROGRESS_LABEL
+from .models import RiskLevel
 from .openai_compatible import PROVIDERS as OPENAI_COMPATIBLE_PROVIDERS
+from .openai_compatible import ROUTED_MIN_CONTEXT_WINDOW
 from .policy import load_policy
 
 GhRunner = Callable[..., str]  # (args: Sequence[str], input: str | None = None) -> stdout
@@ -918,11 +928,15 @@ CALLER_TARGETS = {
     "agent-auto-implement.yml": "reusable-implement.yml",
 }
 # Installation permissions the publisher/lease tokens request in reusable-implement.yml.
-#: API-key secret per routed provider (the Anthropic executor uses the OAuth token instead).
+#: API-key secret per routed provider: every OpenAI-compatible provider's own key, plus Codex.
+#: Anthropic depends on the executor's auth mode (`_executor_secret`).
 ROUTED_PROVIDER_SECRETS = {
-    "deepseek": "DEEPSEEK_API_KEY",
-    "zai": "ZAI_API_KEY",
-    "kimi": "KIMI_API_KEY",
+    "codex": "OPENAI_API_KEY",
+    **{name: config.api_key_env for name, config in OPENAI_COMPATIBLE_PROVIDERS.items()},
+}
+ANTHROPIC_AUTH_SECRETS = {
+    AuthMode.OAUTH: "CLAUDE_CODE_OAUTH_TOKEN",
+    AuthMode.API_KEY: "ANTHROPIC_API_KEY",
 }
 
 #: Standard GitHub-hosted runner labels (docs: "GitHub-hosted runners reference").
@@ -956,11 +970,168 @@ def _adapter_gap(executor) -> str:
     return ""
 
 
+#: What reusable-implement.yml asks `route-executor` for on every implementation run.
+ROUTE_TASK_CLASS = TaskClass.IMPLEMENTATION
+ROUTE_TOOL_CAPABILITIES = frozenset({"structured-output"})
+
+
+def _route_rejections(executor, routing_policy, project_id: str) -> list[str]:
+    """Why `route-executor` can never select this executor for this repository's implementation
+    runs: the request-independent predicates of `executors.route_executor()`, evaluated against
+    the request reusable-implement.yml sends. Risk, budget and live capacity vary per run and are
+    left to the router."""
+    reasons = []
+    if not executor.available:
+        reasons.append("unavailable")
+    if executor.runtime_status is not RuntimeStatus.READY:
+        reasons.append(executor.runtime_status.value)
+    if executor.provider not in routing_policy.allowed_providers:
+        reasons.append("provider not allowed")
+    if executor.provider in routing_policy.denied_providers:
+        reasons.append("provider denied")
+    if executor.permitted_repositories and project_id not in executor.permitted_repositories:
+        reasons.append("repository not permitted")
+    if ROUTE_TASK_CLASS not in executor.task_classes:
+        reasons.append(f"no {ROUTE_TASK_CLASS.value} task class")
+    missing_tools = sorted(ROUTE_TOOL_CAPABILITIES - set(executor.tool_capabilities))
+    if missing_tools:
+        reasons.append("missing tool capabilities: " + ", ".join(missing_tools))
+    if executor.context_window < ROUTED_MIN_CONTEXT_WINDOW:
+        reasons.append(f"context window < {ROUTED_MIN_CONTEXT_WINDOW}")
+    if executor.data_residency not in routing_policy.allowed_data_residency:
+        reasons.append("data residency not allowed")
+    if routing_policy.require_no_training_storage and executor.stores_training_data:
+        reasons.append("training-data storage not allowed")
+    if executor.quality_lower_bound <= 0 or executor.quality_lower_bound < (
+        routing_policy.floor_for(RiskLevel.LOW)
+    ):
+        reasons.append("below every quality floor")
+    return reasons
+
+
+def routable_executors(executors, routing_policy, project_id: str) -> list:
+    """Every executor the router may pick for an implementation run in this repository.
+
+    The ONE eligibility rule behind every routed doctor check (selectable executor, workflow
+    adapter, required secrets and variables), so READY cannot drift from what the router does.
+    """
+    return [e for e in executors if not _route_rejections(e, routing_policy, project_id)]
+
+
+def _executor_secret(executor) -> str | None:
+    """The repository secret the implement workflow hands this executor's adapter."""
+    if executor.provider == "anthropic":
+        return ANTHROPIC_AUTH_SECRETS.get(executor.auth_mode)
+    return ROUTED_PROVIDER_SECRETS.get(executor.provider)
+
+
 PUBLISHER_PERMISSIONS = {
     "contents": ("read", "write"),
     "issues": ("write",),
     "pull_requests": ("write",),
 }
+
+
+def _workflow_doc(path: Path) -> dict | None:
+    import yaml  # deferred: the CLI must import without site dependencies
+
+    try:
+        doc = yaml.safe_load(path.read_text())
+    except (OSError, yaml.YAMLError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def _workflow_jobs(path: Path) -> dict[str, dict]:
+    jobs = (_workflow_doc(path) or {}).get("jobs")
+    if not isinstance(jobs, dict):
+        return {}
+    return {str(k): v for k, v in jobs.items() if isinstance(v, dict)}
+
+
+_SECRET_REF = re.compile(r"^\$\{\{\s*(secrets|vars)\.([A-Za-z0-9_]+)\s*\}\}$")
+
+
+def _preflight_requirements(callers: Sequence[Path]) -> tuple[set[str], set[str]]:
+    """(secrets, variables) each installed caller's preflight fails without: an env entry bound to
+    `secrets.X`/`vars.X` that its script checks with `test -n "$NAME"`."""
+    secrets: set[str] = set()
+    variables: set[str] = set()
+    for caller in callers:
+        for step in (_workflow_jobs(caller).get("preflight") or {}).get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            script = str(step.get("run", ""))
+            for name, value in (step.get("env") or {}).items():
+                ref = _SECRET_REF.match(str(value).strip())
+                if ref and re.search(rf'test -n "?\${{?{re.escape(str(name))}\b', script):
+                    (secrets if ref.group(1) == "secrets" else variables).add(ref.group(2))
+    return secrets, variables
+
+
+def _forwarded_secrets(caller: Path) -> set[str] | None:
+    """Secret names a caller's reusable-workflow job passes on (None: `secrets: inherit`)."""
+    names: set[str] = set()
+    for job in _workflow_jobs(caller).values():
+        if "uses" not in job:
+            continue
+        passed = job.get("secrets")
+        if passed == "inherit":
+            return None
+        if isinstance(passed, dict):
+            names |= {str(k) for k in passed}
+    return names
+
+
+def _runs_on_labels(value) -> set[str] | None:
+    """Runner labels of a `runs-on` value (None when it is not a readable label list)."""
+    if isinstance(value, str):
+        return {value.strip()}
+    if isinstance(value, list):
+        return {str(x).strip() for x in value}
+    if isinstance(value, dict):
+        labels = value.get("labels") or []
+        return {str(x).strip() for x in (labels if isinstance(labels, list) else [labels])}
+    return None
+
+
+def _caller_runner_targets(callers: Sequence[Path]) -> dict[str, set[str]]:
+    """`file:job` -> runner labels for every job of the planning/implementation callers: each
+    `runs-on`, and the `runs_on` JSON a caller hands its reusable workflow (that workflow's own
+    jobs run there). An unreadable target is kept as its raw text, which no runner carries."""
+    targets: dict[str, set[str]] = {}
+    for caller in callers:
+        for name, job in _workflow_jobs(caller).items():
+            where = f"{caller.name}:{name}"
+            if "runs-on" in job:
+                labels = _runs_on_labels(job["runs-on"])
+                targets[where] = labels if labels is not None else {str(job["runs-on"])}
+            raw = (job.get("with") or {}).get("runs_on") if "uses" in job else None
+            if raw is not None:
+                try:
+                    labels = _runs_on_labels(json.loads(str(raw)))
+                except json.JSONDecodeError:
+                    labels = None
+                targets[f"{where} (runs_on)"] = labels if labels is not None else {str(raw)}
+    return targets
+
+
+def _github_hosted(labels: set[str]) -> bool:
+    return len(labels) == 1 and any(
+        p.fullmatch(label) for p in GITHUB_HOSTED_LABELS for label in labels
+    )
+
+
+def _runner_available(labels: set[str], runners: Sequence[dict]) -> bool:
+    """A standard GitHub-hosted label, or an online runner carrying every label. Anything else --
+    self-hosted, a typo, an unresolved expression, a runner group -- would queue forever."""
+    if _github_hosted(labels):
+        return True
+    return bool(labels) and any(
+        r.get("status") == "online"
+        and labels <= {str(lbl.get("name")) for lbl in r.get("labels") or []}
+        for r in runners
+    )
 
 
 def _ci_runs_on(base: Path) -> set[str] | None:
@@ -972,15 +1143,7 @@ def _ci_runs_on(base: Path) -> set[str] | None:
         job = (doc.get("jobs") or {}).get(REQUIRED_CHECK) or {}
     except (OSError, yaml.YAMLError, AttributeError):
         return None
-    runs_on = job.get("runs-on")
-    if isinstance(runs_on, str):
-        return {runs_on.strip()}
-    if isinstance(runs_on, list):
-        return {str(x).strip() for x in runs_on}
-    if isinstance(runs_on, dict):
-        labels = runs_on.get("labels") or []
-        return {str(x).strip() for x in (labels if isinstance(labels, list) else [labels])}
-    return None
+    return _runs_on_labels(job.get("runs-on"))
 
 
 def _ci_problems(base: Path) -> list[str]:
@@ -1004,11 +1167,22 @@ def _ci_problems(base: Path) -> list[str]:
     job = (doc.get("jobs") or {}).get(REQUIRED_CHECK)
     if not isinstance(job, dict):
         return [*problems, f"no '{REQUIRED_CHECK}' job"]
+    # A skipped or failure-tolerant job still reports a passing check to the ruleset.
+    problems += [
+        f"'{REQUIRED_CHECK}' job has {key}: its gates cannot fail the check"
+        for key in ("if", "continue-on-error")
+        if _job_key_set(job, key)
+    ]
+    # Only unconditional steps whose failure fails the job count; inside them, only commands
+    # whose exit status the shell enforces (see _shell_flow).
     executed = [
         argv
         for step in job.get("steps") or []
         if isinstance(step, dict)
-        for argv in _shell_commands(str(step.get("run", "")))
+        and not _job_key_set(step, "if")
+        and not _job_key_set(step, "continue-on-error")
+        for argv, enforced in _shell_flow(str(step.get("run", "")), step.get("shell"))
+        if enforced
     ]
     for gate in ("setup", "quality", "test"):
         command = str(commands.get(gate, "")).replace("\n", " ").strip()
@@ -1022,14 +1196,39 @@ def _ci_problems(base: Path) -> list[str]:
     return problems
 
 
-_SHELL_SEPARATORS = {";", "&&", "||", "|", "&", "(", ")"}
-_SHELL_KEYWORDS = {"if", "then", "elif", "else", "do", "while", "until", "!", "{", "time"}
+_SHELL_SEPARATORS = {";", "&&", "||", "|", "&", "(", ")", "|&", ";;"}
+_SHELL_KEYWORDS = {"then", "else", "do", "{", "time"}
+_SHELL_CONDITIONS = {"if", "elif", "while", "until", "!"}
+_SHELL_OPENERS = {"if", "while", "until", "for", "case", "select"}
+_SHELL_CLOSERS = {"fi", "done", "esac"}
+#: Shells whose run steps abort on a failing command: GitHub runs an unspecified or `bash` shell
+#: as `bash -eo pipefail`, and `sh` as `sh -e` (no pipefail).
+_ERREXIT_SHELLS = {None, "bash", "sh"}
 
 
-def _shell_commands(script: str) -> list[tuple[str, ...]]:
-    """The simple commands a `run:` script executes, as argv tuples. A gate counts only as a
-    command: `echo pytest`, `# pytest` and `"pytest"` are an argument, a comment and a string."""
-    found: list[tuple[str, ...]] = []
+def _job_key_set(node: dict, key: str) -> bool:
+    """`continue-on-error:` with anything but false, or `if:` with anything but true (an `if`
+    can skip the gate, and a skipped job or step passes)."""
+    if key not in node:
+        return False
+    neutral = "true" if key == "if" else "false"
+    return str(node[key]).strip().lower() != neutral
+
+
+def _shell_flow(script: str, shell: object = None) -> list[tuple[tuple[str, ...], bool]]:
+    """The simple commands a `run:` script executes, each with whether its failure fails the step.
+
+    With errexit (GitHub's default `bash -eo pipefail`, or `sh -e`) a command is enforced unless it
+    is a condition (`if`/`while`/`until`/`!`) or inside a conditional/loop body, backgrounded with
+    `&`, part of an `&&`/`||` list other than its last member (errexit ignores those), after `||`
+    (it may never run), piped onward without pipefail, or after `set +e`. Whatever the shell, the
+    script's LAST and-or list is the step's exit status: its `&&` members are enforced too.
+    """
+    shell_name = None if shell is None else str(shell).strip()
+    errexit = shell_name in _ERREXIT_SHELLS
+    records: list[dict] = []
+    depth = 0
+    previous = ";"
     for line in script.replace("\\\n", " ").splitlines():
         lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
         lexer.whitespace_split = True
@@ -1037,17 +1236,79 @@ def _shell_commands(script: str) -> list[tuple[str, ...]]:
             tokens = list(lexer)
         except ValueError:  # unbalanced quotes: no command we can vouch for
             continue
+        if not tokens:
+            continue
         argv: list[str] = []
-        for token in [*tokens, ";"]:
-            if token not in _SHELL_SEPARATORS:
+        for token in [*tokens, None]:
+            if token is not None and token not in _SHELL_SEPARATORS:
                 argv.append(token)
                 continue
-            while argv and (argv[0] in _SHELL_KEYWORDS or re.match(r"^[A-Za-z_]\w*=", argv[0])):
-                argv.pop(0)  # keywords and `VAR=value` prefixes are not the command
+            condition = False
+            while argv and (
+                argv[0] in _SHELL_KEYWORDS
+                or argv[0] in _SHELL_CONDITIONS
+                or argv[0] in _SHELL_CLOSERS
+                or re.match(r"^[A-Za-z_]\w*=", argv[0])
+            ):
+                head = argv.pop(0)  # keywords and `VAR=value` prefixes are not the command
+                condition = condition or head in _SHELL_CONDITIONS
+                if head in _SHELL_OPENERS:
+                    depth += 1
+                elif head in _SHELL_CLOSERS:
+                    depth = max(0, depth - 1)
+            nested = depth > 0
+            if argv and argv[0] in _SHELL_OPENERS:  # for/case/select open a body, run nothing
+                depth += 1
+                argv = []
+            following = ";" if token is None else token
             if argv:
-                found.append(tuple(argv))
+                if argv[0] == "set" and "+e" in argv[1:]:
+                    errexit = False
+                elif argv[0] == "set" and any(
+                    a.startswith("-") and "e" in a.lstrip("-") for a in argv[1:]
+                ):
+                    errexit = True
+                records.append(
+                    {
+                        "argv": tuple(argv),
+                        "reached": not condition and not nested and previous != "||",
+                        "previous": previous,
+                        "following": following,
+                        "errexit": errexit,
+                        "piped": following in {"|", "|&"}
+                        and shell_name != "bash"
+                        and shell_name is not None,
+                    }
+                )
             argv = []
+            if token is None:  # a line ending in an operator continues the list
+                previous = previous if tokens[-1] in {"&&", "||", "|"} else ";"
+            else:
+                previous = token
+    # The trailing and-or list: its status is the script's, so the step's.
+    last = len(records) - 1
+    while last > 0 and records[last]["previous"] in {"&&", "||", "|", "|&"}:
+        last -= 1
+    found = []
+    for index, r in enumerate(records):
+        base = r["reached"] and r["following"] != "&" and not r["piped"]
+        if index >= last and (index == len(records) - 1 or r["following"] in {"&&", "|", "|&"}):
+            enforced = base
+        else:
+            enforced = (
+                base
+                and r["errexit"]
+                and r["previous"] != "&&"
+                and r["following"] not in {"&&", "||"}
+            )
+        found.append((r["argv"], enforced))
     return found
+
+
+def _shell_commands(script: str) -> list[tuple[str, ...]]:
+    """The simple commands a `run:` script executes, as argv tuples. A gate counts only as a
+    command: `echo pytest`, `# pytest` and `"pytest"` are an argument, a comment and a string."""
+    return [argv for argv, _ in _shell_flow(script)]
 
 
 def doctor(
@@ -1166,36 +1427,33 @@ def doctor(
             routing_policy = load_routing_policy(
                 json.loads((base / ".forge/routing-policy.json").read_text())
             )
-            usable = [e for e in executors if project_id in e.permitted_repositories]
-            add(
-                Check(
-                    "routing files valid and permit this repo",
-                    bool(usable),
-                    f"{len(usable)} of {len(executors)} executors permit this repository"
-                    if usable
-                    else "no executor lists this repository",
-                )
-            )
-            # Every enabled fallback must be configured, or the router advances into a
-            # missing key after the first recoverable DeepSeek failure.
-            for e in usable:
-                if e.provider not in ROUTED_PROVIDER_SECRETS:
-                    continue  # the Anthropic executor runs on the OAuth token, no repo config
-                routed_secrets.add(ROUTED_PROVIDER_SECRETS[e.provider])
-                var = re.fullmatch(r"configured-by-([A-Z0-9_]+)", e.model or "")
-                if var:
-                    routed_vars.add(var.group(1))
-            # The router may pick any eligible executor; one the implement workflow cannot run
-            # fails at "adapter is not installed" after doctor said READY.
+            routable = routable_executors(executors, routing_policy, project_id)
+            # The router may pick any of these; one the implement workflow cannot run fails at
+            # "adapter is not installed" after doctor said READY.
             unsupported = [
                 f"{e.executor_id} ({reason})"
-                for e in usable
-                if e.available
-                and TaskClass.IMPLEMENTATION in e.task_classes
-                and e.provider in routing_policy.allowed_providers
+                for e in routable
                 for reason in [_adapter_gap(e)]
                 if reason
             ]
+            runnable = [e for e in routable if not _adapter_gap(e)]
+            rejected = "; ".join(
+                f"{e.executor_id}: {', '.join(_route_rejections(e, routing_policy, project_id))}"
+                for e in executors
+                if e not in routable
+            )
+            add(
+                Check(
+                    "routing files valid and permit this repo",
+                    bool(runnable),
+                    f"{len(routable)} of {len(executors)} executors are selectable for "
+                    f"{ROUTE_TASK_CLASS.value} in this repository"
+                    if runnable
+                    else "no executor the router can select for "
+                    f"{ROUTE_TASK_CLASS.value} here has a workflow adapter"
+                    + (f" ({rejected})" if rejected else ""),
+                )
+            )
             add(
                 Check(
                     "routed executors have a workflow adapter",
@@ -1205,8 +1463,35 @@ def doctor(
                     else "adapters: " + ", ".join(sorted(ROUTED_ADAPTER_PROVIDERS)),
                 )
             )
+            # Every executor the router may fall back to must be configured, or it advances into
+            # a missing key after the first recoverable failure.
+            for e in routable:
+                secret = _executor_secret(e)
+                if secret:
+                    routed_secrets.add(secret)
+                var = re.fullmatch(r"configured-by-([A-Z0-9_]+)", e.model or "")
+                if var:
+                    routed_vars.add(var.group(1))
         except (OSError, ExecutorError, json.JSONDecodeError, AttributeError) as exc:
             add(Check("routing files valid and permit this repo", False, str(exc)[:200]))
+        # A secret the repository holds is still empty inside the reusable workflow unless the
+        # caller passes it on.
+        unforwarded = [
+            f"{caller.name}: {', '.join(sorted(routed_secrets - forwarded))}"
+            for caller in implement_callers
+            if caller.exists()
+            for forwarded in [_forwarded_secrets(caller)]
+            if forwarded is not None and routed_secrets - forwarded
+        ]
+        add(
+            Check(
+                "implement callers forward every routed secret",
+                not unforwarded,
+                "not forwarded: " + "; ".join(unforwarded)
+                if unforwarded
+                else ", ".join(sorted(routed_secrets)),
+            )
+        )
 
     ref = None
     plan = base / ".github/workflows/agent-plan.yml"
@@ -1312,9 +1597,9 @@ def doctor(
         )
 
     # --- default branch in the policy is the repository's actual default branch
+    repo_info = _safe_json(gh, ["api", f"repos/{project_id}"])
+    actual_branch = repo_info.get("default_branch") if isinstance(repo_info, dict) else None
     if policy is not None:
-        repo_info = _safe_json(gh, ["api", f"repos/{project_id}"])
-        actual_branch = repo_info.get("default_branch") if isinstance(repo_info, dict) else None
         add(
             Check(
                 "policy default_branch matches the repository",
@@ -1322,6 +1607,43 @@ def doctor(
                 f"policy {policy.default_branch!r}, GitHub {actual_branch!r}",
             )
         )
+
+    # --- the managed files must be on the default branch: the workflows, CI and hooks GitHub
+    # runs are the pushed ones, not this checkout (`onboard --apply` writes them locally only).
+    remote_branch = actual_branch
+    managed = [
+        r
+        for r in [*required, *(routing_files if routed else ()), "docs/forge/cloud-implementer.md"]
+        if (base / r).is_file()
+    ]
+    unpushed = []
+    for relative in managed:
+        blob = _safe_json(
+            gh, ["api", f"repos/{project_id}/contents/{relative}?ref={remote_branch or 'HEAD'}"]
+        )
+        remote_bytes = None
+        if isinstance(blob, dict) and blob.get("encoding") == "base64":
+            try:
+                remote_bytes = base64.b64decode(str(blob.get("content") or ""))
+            except ValueError:
+                remote_bytes = None
+        if remote_bytes is None:
+            unpushed.append(f"{relative} (missing)")
+        elif remote_bytes != (base / relative).read_bytes():
+            unpushed.append(f"{relative} (differs)")
+    add(
+        Check(
+            "managed files are on the default branch",
+            bool(remote_branch) and not unpushed,
+            (
+                f"{remote_branch or 'default branch'}: "
+                + ", ".join(unpushed)
+                + " → commit and push these files first"
+            )
+            if unpushed or not remote_branch
+            else f"{len(managed)} files match {remote_branch}",
+        )
+    )
 
     # --- labels
     names = {x.get("name") for x in _paged_items(gh, f"repos/{project_id}/labels?per_page=100")}
@@ -1382,9 +1704,14 @@ def doctor(
     platform_private = _safe_json(gh, ["api", f"repos/{platform_repository}", "--jq", ".private"])
     if platform_private is True:  # GITHUB_TOKEN cannot check out another private repository
         need_secrets |= {"PLATFORM_READ_TOKEN"}
+    # Whatever an installed implement caller's preflight insists on must exist too, or every run
+    # stops there; and whatever the router may select must be configured.
+    pre_secrets, pre_vars = _preflight_requirements(implement_callers)
+    need_secrets |= pre_secrets
+    need_vars |= pre_vars
     if routed:
-        need_vars |= routed_vars or {"DEEPSEEK_MODEL_FLASH", "DEEPSEEK_MODEL_PRO"}
-        need_secrets |= routed_secrets or {"DEEPSEEK_API_KEY"}
+        need_vars |= routed_vars
+        need_secrets |= routed_secrets
     implement_wf = base / ".github/workflows/agent-implement.yml"
     if implement_wf.exists() and re.search(
         r"^\s*agent:\s*codex\s*$", implement_wf.read_text(), re.MULTILINE
@@ -1415,77 +1742,57 @@ def doctor(
         )
     )
 
-    # --- runner (only when workflows target self-hosted labels)
-    plan_text = plan.read_text() if plan.exists() else ""
-    self_hosted = "self-hosted" in plan_text if plan.exists() else True
-    wanted_labels: set[str] = set()
-    m = re.search(r"^\s*runs-on:\s*\[([^\]]*)\]", plan_text, re.MULTILINE)
-    if m:
-        wanted_labels = {x.strip().strip("'\"") for x in m.group(1).split(",") if x.strip()}
+    # --- runners: every job of every active caller, and ci.yml's `test` job, must run somewhere
+    # that exists, or the run (or every PR's required check) sits queued forever.
+    targets = _caller_runner_targets(callers)
+    ci_labels = _ci_runs_on(base)
+    need_runners = any(not _github_hosted(t) for t in [*targets.values(), ci_labels or set()])
     runners = (
-        _paged_items(gh, f"repos/{project_id}/actions/runners", "runners") if self_hosted else []
+        _paged_items(gh, f"repos/{project_id}/actions/runners", "runners") if need_runners else []
     )
-    online = [
-        r
-        for r in runners
-        if r.get("status") == "online"
-        and wanted_labels <= {str(lbl.get("name")) for lbl in r.get("labels") or []}
-    ]
-    if not self_hosted:
+    stranded = {
+        where: labels for where, labels in targets.items() if not _runner_available(labels, runners)
+    }
+    if targets and all(_github_hosted(t) for t in targets.values()):
         add(Check("runner", True, "GitHub-hosted runners (billed minutes on private repos)"))
-    else:
+    elif targets:
+        online = [r for r in runners if r.get("status") == "online"]
         add(
             Check(
                 "self-hosted runner online for this repo",
-                bool(online),
-                f"{len(online)} online with labels {sorted(wanted_labels)} / "
-                f"{len(runners)} registered"
-                if runners
-                else "none registered → gh api -X POST "
-                f"repos/{project_id}/actions/runners/registration-token, "
-                "then config.sh on a runner VM",
+                not stranded,
+                (
+                    "no online runner for "
+                    + "; ".join(f"{w} {sorted(lbls)}" for w, lbls in sorted(stranded.items()))
+                    + f" ({len(online)} online / {len(runners)} registered)"
+                    if runners
+                    else "none registered → gh api -X POST "
+                    f"repos/{project_id}/actions/runners/registration-token, "
+                    "then config.sh on a runner VM"
+                )
+                if stranded
+                else f"{len(online)} online, carrying "
+                + ", ".join(sorted({str(sorted(lbls)) for lbls in targets.values()})),
                 manual=True,
             )
         )
-
-    # --- ci.yml's `test` job must run somewhere that exists, or every PR blocks on a queued check
-    ci_labels = _ci_runs_on(base)
     if ci_labels is not None:
-        hosted = len(ci_labels) == 1 and any(
-            p.fullmatch(label) for p in GITHUB_HOSTED_LABELS for label in ci_labels
+        ci_ok = _runner_available(ci_labels, runners)
+        add(
+            Check(
+                "ci.yml test job runs on an available runner",
+                ci_ok,
+                ", ".join(sorted(ci_labels))
+                if _github_hosted(ci_labels)
+                else f"labels {sorted(ci_labels)}: "
+                + (
+                    "online runner found"
+                    if ci_ok
+                    else "not a GitHub-hosted label and no online runner carries all of them"
+                ),
+                manual=not ci_ok,
+            )
         )
-        if hosted:
-            add(
-                Check(
-                    "ci.yml test job runs on an available runner",
-                    True,
-                    ", ".join(sorted(ci_labels)),
-                )
-            )
-        else:
-            # self-hosted, a typo, an unresolved expression or a runner group: only an online
-            # runner carrying every label proves the check will ever be picked up.
-            all_runners = runners or _paged_items(
-                gh, f"repos/{project_id}/actions/runners", "runners"
-            )
-            ci_ok = bool(ci_labels) and any(
-                r.get("status") == "online"
-                and ci_labels <= {str(lbl.get("name")) for lbl in r.get("labels") or []}
-                for r in all_runners
-            )
-            add(
-                Check(
-                    "ci.yml test job runs on an available runner",
-                    ci_ok,
-                    f"labels {sorted(ci_labels)}: "
-                    + (
-                        "online runner found"
-                        if ci_ok
-                        else "not a GitHub-hosted label and no online runner carries all of them"
-                    ),
-                    manual=not ci_ok,
-                )
-            )
 
     # --- publisher app installed on this repo (Actions implementer publishes PRs through it)
     if cloud:

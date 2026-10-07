@@ -84,6 +84,8 @@ def main() -> int:
             "in-progress",
             "--state",
             "open",
+            "--limit",
+            "1000",  # gh defaults to 30; every lease must be in the do-not-touch inventory
             "--json",
             "number,title,assignees",
         ]

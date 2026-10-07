@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import re
 from pathlib import Path
@@ -42,14 +43,22 @@ def spec(**overrides) -> OnboardSpec:
     return OnboardSpec(**base)
 
 
+_CONSUMER: dict[str, Path] = {}  # the consumer checkout the current test created
+CONSUMER_CONTENTS = "api repos/owner/comic/contents/"
+
+
 def _repo(tmp_path: Path) -> Path:
     repo = tmp_path / "consumer"
     (repo / ".git").mkdir(parents=True)
+    _CONSUMER["path"] = repo
     return repo
 
 
 class FakeGh:
-    """Records gh invocations and answers from a canned table keyed by the first few args."""
+    """Records gh invocations and answers from a canned table keyed by the first few args.
+
+    Unless the table answers it, the consumer's contents API serves the files of the test's
+    checkout: by default everything doctor checks locally has also been pushed."""
 
     def __init__(self, answers: dict[str, str] | None = None, fail: set[str] | None = None):
         self.calls: list[tuple[tuple[str, ...], str | None]] = []
@@ -59,6 +68,15 @@ class FakeGh:
     def __call__(self, args, input=None):
         self.calls.append((tuple(args), input))
         key = " ".join(args)
+        if key.startswith(CONSUMER_CONTENTS):
+            for prefix, value in self.answers.items():
+                if prefix.startswith(CONSUMER_CONTENTS) and key.startswith(prefix):
+                    return value
+            path = _CONSUMER["path"] / key[len(CONSUMER_CONTENTS) :].split("?")[0]
+            if not path.is_file():
+                raise OnboardError("gh: Not Found (HTTP 404)")
+            content = base64.b64encode(path.read_bytes()).decode()
+            return json.dumps({"encoding": "base64", "content": content})
         for prefix, value in self.answers.items():
             if key.startswith(prefix):
                 return value
@@ -913,6 +931,61 @@ def test_commit_guard_sees_commit_after_value_taking_git_options(tmp_path):
         assert code(allowed) == 0, allowed
 
 
+def test_commit_guard_parses_path_qualified_and_wrapped_git(tmp_path):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+
+    def code(command):
+        payload = {"tool_name": "Bash", "session_id": "s1", "tool_input": {"command": command}}
+        return guard.decide(payload, "forge/issue-7", lambda n: None, lambda b: False)[0]
+
+    for blocked in (
+        "/usr/bin/git commit -m x",
+        "./git commit -m x",
+        "/usr/bin/git -C . -c a=b commit -m x",
+        "GIT_AUTHOR_NAME=x env -i /usr/local/bin/git commit -m x",
+        "make lint; /usr/bin/git commit -am 'a; b'",
+        "true && (cd sub && git commit -m x)",
+        "bash -c 'git -C . commit -m x'",
+        "git commit -m 'unbalanced",
+    ):
+        assert code(blocked) == 2, blocked
+    for allowed in (
+        "/usr/bin/git status",
+        "echo 'git commit'",
+        "grep -r 'git commit' docs",
+        "/usr/bin/git log --grep commit",
+        "legit commit",
+    ):
+        assert code(allowed) == 0, allowed
+
+
+def test_commit_guard_does_not_let_a_lapsed_session_regain_seniority(tmp_path, monkeypatch):
+    import subprocess
+    from datetime import UTC, datetime, timedelta
+
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    now = datetime.now(UTC)
+
+    def at(moment):
+        return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def marker(session, expires, posted):
+        body = f"<!-- forge-claim agent=a session={session} branch=b expires={at(expires)} -->"
+        return {"body": body, "author_association": "OWNER", "created_at": at(posted)}
+
+    comments = [
+        marker("old", now - timedelta(minutes=30), now - timedelta(hours=4)),
+        marker("new", now + timedelta(hours=1), now - timedelta(minutes=10)),
+        marker("old", now + timedelta(hours=2), now - timedelta(minutes=5)),  # late renewal
+    ]
+
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, stdout=json.dumps([comments]), stderr="")
+
+    monkeypatch.setattr(guard.subprocess, "run", fake_run)
+    assert guard.lease_for(7)["session"] == "new"
+
+
 def _guard_module(tmp_path, name):
     import importlib.util
 
@@ -1095,6 +1168,18 @@ def test_session_start_separates_expired_leases_from_live_ones(tmp_path):
     live, stale = start.classify_leased(issues, lambda n: {"session": "s"} if n == 1 else None)
     assert [line.split()[0] for line in live] == ["#1"]
     assert [line.split()[0] for line in stale] == ["#2"]
+
+
+def test_session_start_lists_every_in_progress_issue_not_the_default_30(tmp_path, monkeypatch):
+    import io
+
+    start = _guard_module(tmp_path, "forge_session_start")
+    calls = []
+    monkeypatch.setattr(start, "run", lambda cmd: calls.append(cmd) or "")
+    monkeypatch.setattr(start.sys, "stdin", io.StringIO("{}"))
+    assert start.main() == 0
+    listing = next(c for c in calls if c[:3] == ["gh", "issue", "list"])
+    assert "--limit" in listing and int(listing[listing.index("--limit") + 1]) >= 1000
 
 
 def test_cli_onboard_validates_var_before_writing_any_file(tmp_path, monkeypatch):
@@ -1386,3 +1471,175 @@ def test_routed_adapter_providers_match_the_implement_workflow():
     )
     direct = set(re.findall(r"selected_provider == '([\w-]+)'", text))
     assert compat and direct | set(json.loads(compat.group(1))) == ROUTED_ADAPTER_PROVIDERS
+
+
+# ------------------------------------------- doctor mirrors the router and workflows (PR 139)
+
+
+def _routed_repo(tmp_path, *extra_executors, allow=()):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    path = repo / ".forge/executors.json"
+    registry = json.loads(path.read_text())
+    registry["executors"] += list(extra_executors)
+    path.write_text(json.dumps(registry))
+    policy = repo / ".forge/routing-policy.json"
+    routing = json.loads(policy.read_text())
+    routing["allowedProviders"] += list(allow)
+    policy.write_text(json.dumps(routing))
+    return repo
+
+
+def _extra_executor(**overrides) -> dict:
+    claude = next(
+        e
+        for e in json.loads(render_onboarding(spec())[".forge/executors.json"])["executors"]
+        if e["provider"] == "anthropic"
+    )
+    return {**claude, **overrides}
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"available": False},
+        {"taskClasses": ["review"]},
+        {"permittedRepositories": ["owner/other"]},
+        {"runtimeStatus": "quota-exhausted"},
+        {"toolCapabilities": ["function-calling"]},
+    ],
+)
+def test_doctor_requires_an_executor_the_router_can_select(tmp_path, change):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    path = repo / ".forge/executors.json"
+    registry = json.loads(path.read_text())
+    registry["executors"] = [{**e, **change} for e in registry["executors"]]
+    path.write_text(json.dumps(registry))
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert "no executor the router can select" in (
+        failed["routing files valid and permit this repo"].detail
+    )
+
+
+def test_doctor_rejects_a_registry_whose_only_selectable_executor_is_policy_denied(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    policy = repo / ".forge/routing-policy.json"
+    routing = json.loads(policy.read_text())
+    routing["allowedProviders"] = ["openai"]
+    policy.write_text(json.dumps(routing))
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert "routing files valid and permit this repo" in failed
+
+
+def test_doctor_requires_the_openai_key_for_a_routed_codex_executor(tmp_path):
+    codex = _extra_executor(
+        executorId="codex",
+        provider="codex",
+        model="gpt-5-codex",
+        modelAlias="codex",
+        modelFamily="gpt",
+        adapter="codex",
+        authMode="api-key",
+        executionType="direct-api",
+    )
+    repo = _routed_repo(tmp_path, codex, allow=["codex"])
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh()))
+    assert set(failed) == {"repo secrets set (by name)"}
+    assert "OPENAI_API_KEY" in failed["repo secrets set (by name)"].detail
+
+
+def test_doctor_requires_and_forwards_the_anthropic_key_for_an_api_key_executor(tmp_path):
+    api = _extra_executor(executorId="claude-api", authMode="api-key", executionType="direct-api")
+    repo = _routed_repo(tmp_path, api)
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh()))
+    assert set(failed) == {"repo secrets set (by name)"}
+    assert "ANTHROPIC_API_KEY" in failed["repo secrets set (by name)"].detail
+    for name in ("agent-implement.yml", "agent-auto-implement.yml"):
+        doc = yaml.safe_load((repo / ".github/workflows" / name).read_text())
+        assert "ANTHROPIC_API_KEY" in doc["jobs"]["implement"]["secrets"]
+    caller = repo / ".github/workflows/agent-implement.yml"
+    caller.write_text(
+        caller.read_text().replace(
+            "      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}\n", ""
+        )
+    )
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert "agent-implement.yml: ANTHROPIC_API_KEY" in (
+        failed["implement callers forward every routed secret"].detail
+    )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda job, step: step.update({"continue-on-error": True}),
+        lambda job, step: step.update({"if": "github.event_name == 'push'"}),
+        lambda job, step: job.update({"continue-on-error": True}),
+        lambda job, step: job.update({"if": "false"}),
+        lambda job, step: step.update({"run": step["run"] + " || true"}),
+        lambda job, step: step.update({"run": "set +e\n" + step["run"] + "\necho done"}),
+        lambda job, step: step.update({"run": "if " + step["run"] + "; then echo ok; fi"}),
+    ],
+)
+def test_doctor_rejects_a_ci_gate_whose_failure_is_ignored(tmp_path, mutate):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    ci = repo / ".github/workflows/ci.yml"
+    doc = yaml.safe_load(ci.read_text())
+    job = doc["jobs"]["test"]
+    mutate(job, next(s for s in job["steps"] if s.get("name") == "Test"))
+    ci.write_text(yaml.safe_dump(doc, sort_keys=False))
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    assert "ci.yml runs the policy gates as 'test'" in _failed(report)
+
+
+def test_doctor_requires_the_managed_files_on_the_remote_default_branch(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _healthy_gh()
+    gh.answers[CONSUMER_CONTENTS] = ""  # nothing pushed yet
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))
+    assert set(failed) == {"managed files are on the default branch"}
+    detail = failed["managed files are on the default branch"].detail
+    assert ".github/workflows/ci.yml (missing)" in detail and "push these files first" in detail
+    gh = _healthy_gh()
+    plan = repo / ".github/workflows/agent-plan.yml"
+    gh.answers[CONSUMER_CONTENTS + ".github/workflows/agent-plan.yml"] = json.dumps(
+        {"encoding": "base64", "content": base64.b64encode(plan.read_bytes()).decode()}
+    )
+    plan.write_text(plan.read_text() + "# edited, not pushed\n")
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))
+    assert set(failed) == {"managed files are on the default branch"}
+    assert "agent-plan.yml (differs)" in failed["managed files are on the default branch"].detail
+    assert any(
+        c[1].endswith("contents/.github/workflows/agent-plan.yml?ref=main") for c, _ in gh.calls
+    )
+
+
+@pytest.mark.parametrize(
+    ("caller", "job"),
+    [("agent-plan.yml", "preflight"), ("agent-auto-implement.yml", "notify_failure")],
+)
+def test_doctor_validates_every_caller_runner_target(tmp_path, caller, job):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    path = repo / ".github/workflows" / caller
+    doc = yaml.safe_load(path.read_text())
+    doc["jobs"][job]["runs-on"] = "ubuntu-lates"
+    path.write_text(yaml.safe_dump(doc, sort_keys=False))
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh()))
+    assert set(failed) == {"self-hosted runner online for this repo"}
+    assert f"{caller}:{job}" in failed["self-hosted runner online for this repo"].detail
+
+
+def test_doctor_validates_the_runner_a_caller_hands_its_reusable_workflow(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    path = repo / ".github/workflows/agent-plan.yml"
+    path.write_text(path.read_text().replace('"x64"]', '"arm64"]'))
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh()))
+    assert "agent-plan.yml:plan (runs_on)" in (
+        failed["self-hosted runner online for this repo"].detail
+    )

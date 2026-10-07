@@ -9,7 +9,9 @@ examined; everything else passes.
 from __future__ import annotations
 
 import json
+import os
 import re
+import shlex
 import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
@@ -20,13 +22,72 @@ CLAIM = re.compile(r"<!--\s*forge-claim\s+([^>]*?)\s*-->")
 RELEASE = re.compile(r"<!--\s*forge-release\s+([^>]*?)\s*-->")
 # `git [global options] commit`: -C/-c/--git-dir/... take the NEXT word as their value, so
 # `git -C . commit` and `git -c k=v commit` are commits too. `commit.gpgsign=false` is not.
-_GIT_VALUE_OPTS = r"(?:-C|-c|--git-dir|--work-tree|--namespace|--super-prefix|--config-env)"
-_WORD = r"(?:'[^']*'|\"[^\"]*\"|\S+)"
-GIT_COMMIT = re.compile(
-    rf"(?:^|[\s;&|(])git(?:\s+(?:{_GIT_VALUE_OPTS}\s+{_WORD}|-\S+))*\s+commit(?=$|[\s;&|)])"
+GIT_VALUE_OPTS = frozenset(
+    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"}
+)
+# Words that run the rest of the command line as a new command (`env X=1 git commit`, ...).
+WRAPPERS = frozenset({"env", "command", "exec", "nohup", "time", "builtin", "sudo", "xargs"})
+SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
+OPERATORS = frozenset({";", "&", "&&", "|", "||", "(", ")", ";;", "|&"})
+_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# Fallback for text shlex cannot tokenize (unbalanced quotes): any `.../git ... commit` word pair.
+_GIT_COMMIT_LOOSE = re.compile(
+    r"(?:^|[\s;&|(])(?:\S*/)?git(?:\.exe)?\s(?:.*\s)?commit(?=$|[\s;&|)])"
 )
 MAX_TTL_MINUTES = 7 * 24 * 60  # leases.MAX_TTL_MINUTES
 TRUSTED = {"OWNER", "MEMBER", "COLLABORATOR"}  # plus GitHub Apps (user.type == "Bot")
+
+
+def _segments(command: str) -> list[list[str]]:
+    """Shell words of each simple command, split on `;`, `&&`, `||`, `|`, `&`, parentheses."""
+    lexer = shlex.shlex(command.replace("\n", ";"), posix=True, punctuation_chars=";&|()")
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    segments: list[list[str]] = [[]]
+    for token in lexer:
+        if token in OPERATORS:
+            segments.append([])
+        else:
+            segments[-1].append(token)
+    return [seg for seg in segments if seg]
+
+
+def _invokes_git_commit(argv: list[str], depth: int = 0) -> bool:
+    words = list(argv)
+    while words and (_ASSIGNMENT.match(words[0]) or os.path.basename(words[0]) in WRAPPERS):
+        words.pop(0)
+        while words and words[0].startswith("-"):  # wrapper flags: `env -i`, `sudo -u x`
+            words.pop(0)
+    if not words:
+        return False
+    program = os.path.basename(words[0])
+    if program in SHELLS and "-c" in words[1:-1] and depth < 3:
+        return is_git_commit(words[words.index("-c") + 1], depth + 1)
+    if program not in ("git", "git.exe"):
+        return False
+    rest = words[1:]
+    while rest:
+        word = rest.pop(0)
+        if word in GIT_VALUE_OPTS:
+            if rest:
+                rest.pop(0)  # the option's value, e.g. the path after -C
+            continue
+        if word.startswith("-"):
+            continue  # --no-pager, --exec-path=..., -C. forms with an attached value
+        return word == "commit"
+    return False
+
+
+def is_git_commit(command: str, depth: int = 0) -> bool:
+    """True when any simple command in `command` runs `git ... commit`, however git is spelled
+    (`git`, `/usr/bin/git`, `./git`) and whatever global options precede the subcommand."""
+    try:
+        segments = _segments(command)
+    except (
+        ValueError
+    ):  # unbalanced quotes: be conservative, block-check anything that looks like one
+        return bool(_GIT_COMMIT_LOOSE.search(command))
+    return any(_invokes_git_commit(seg, depth) for seg in segments)
 
 
 def current_branch(cwd: str | None) -> str:
@@ -91,6 +152,9 @@ def lease_for(issue: int) -> dict | None:
             posted = _parse_iso(c.get("created_at") or "")
             if posted is not None:  # expiry is capped at post time + MAX_TTL, as in leases.py
                 exp = min(exp, posted + timedelta(minutes=MAX_TTL_MINUTES))
+            previous = latest.get(fields["session"])
+            if previous is not None and posted is not None and previous["expires"] <= posted:
+                first_seen[fields["session"]] = position  # lapsed: a fresh claim, as in leases.py
             first_seen.setdefault(fields["session"], position)
             latest[fields["session"]] = {**fields, "expires": exp}
             continue
@@ -138,7 +202,7 @@ def decide(
     if payload.get("tool_name") != "Bash":
         return 0, ""
     command = str((payload.get("tool_input") or {}).get("command", ""))
-    if not GIT_COMMIT.search(command):
+    if not is_git_commit(command):
         return 0, ""
     m = ISSUE_BRANCH.search(branch or "")
     if not m:

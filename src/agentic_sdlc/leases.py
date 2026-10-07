@@ -164,8 +164,11 @@ def current_lease(
     Comments are chronological. A session's newest marker supersedes its older ones (renewals);
     a trusted release marker voids that session's claims; expiry is capped at post time +
     MAX_TTL_MINUTES. Ordering by *first* claim time is what makes acquisition safe: two agents
-    that both post a claim re-read the thread and only the earlier poster keeps it. When no
-    claim is live the most recent expired one is returned so callers can report a takeover.
+    that both post a claim re-read the thread and only the earlier poster keeps it. A marker
+    posted after the session's previous lease had already lapsed is a fresh claim, not a
+    renewal: it queues behind whoever claimed in the meantime, so a stale session cannot
+    reclaim seniority over a takeover. When no claim is live the most recent expired one is
+    returned so callers can report a takeover.
     """
     now = now or datetime.now(UTC)
     first_seen: dict[str, int] = {}
@@ -181,6 +184,9 @@ def current_lease(
                 continue
             cap = posted + timedelta(minutes=MAX_TTL_MINUTES)
             lease = parsed if parsed.expires <= cap else replace(parsed, expires=cap)
+            previous = latest.get(lease.session)
+            if previous is not None and not previous.live(posted):
+                first_seen[lease.session] = position  # lapsed: seniority is forfeited
             first_seen.setdefault(lease.session, position)
             latest[lease.session] = lease
             continue
@@ -268,6 +274,46 @@ def _check_ttl(ttl_minutes: int) -> None:
         raise LeaseError(f"ttl_minutes must be between 1 and {MAX_TTL_MINUTES}")
 
 
+def _post_and_arbitrate(
+    project: str, issue: int, session: str, body: str, gh: GhRunner, now: datetime
+) -> Lease | None:
+    """Post a claim/renewal marker, then re-read the thread and keep it only if it is authoritative.
+
+    GitHub has no compare-and-set, so every lease acquisition -- fresh claim, takeover or
+    renewal -- appends its marker and re-reads; only the session `current_lease()` names keeps
+    it, everyone else retracts. Returns the winner (``None`` when nothing is live).
+    """
+    _comment(project, issue, body, gh)
+    winner = current_lease(project, issue, gh, now)
+    if winner is not None and not winner.live(now):
+        winner = None
+    if winner is None or winner.session != session:
+        _comment(
+            project,
+            issue,
+            format_release_marker(session)
+            + f"\nLost the claim race to session `{getattr(winner, 'session', '?')}`; retracting.",
+            gh,
+        )
+    return winner
+
+
+def _sync_label(project: str, issue: int, gh: GhRunner, now: datetime | None = None) -> None:
+    """Make the `in-progress` label match the authoritative lease.
+
+    Removes it only when no lease is live, then re-reads and restores it if a claimant arrived
+    while we were removing it: label edits are not arbitrated, so the cleanup reconciles after.
+    """
+    now = now or datetime.now(UTC)
+    held = current_lease(project, issue, gh, now)
+    if held is None or not held.live(now):
+        _edit(project, issue, gh, "--remove-label", IN_PROGRESS_LABEL)
+        held = current_lease(project, issue, gh, now)
+    if held is not None and held.live(now):
+        _ensure_label(project, gh)
+        _edit(project, issue, gh, "--add-label", IN_PROGRESS_LABEL)
+
+
 def claim(
     project: str,
     issue: int,
@@ -305,7 +351,20 @@ def claim(
                     f"on {existing.branch} until {_iso(existing.expires)}"
                 ),
             )
-        _comment(project, issue, marker + f"\nLease renewed until {_iso(lease.expires)}.", gh)
+        winner = _post_and_arbitrate(
+            project,
+            issue,
+            session,
+            marker + f"\nLease renewed until {_iso(lease.expires)}.",
+            gh,
+            now,
+        )
+        if winner is None or winner.session != session:
+            return ClaimResult(
+                False,
+                winner,
+                reason=f"issue #{issue}: renewal lost to session={getattr(winner, 'session', '?')}",
+            )
         return ClaimResult(True, lease, renewed=True)
     if existing is not None:
         took_over = existing.session
@@ -321,19 +380,8 @@ def claim(
     )
     if took_over:
         note = f"Took over an expired lease from session `{took_over}`. " + note
-    # Post-then-verify: GitHub has no compare-and-set, so every contender appends its marker and
-    # re-reads the thread; only the session that claimed earliest keeps the lease, the others
-    # retract. Two concurrent claimers can therefore never both be told they own the issue.
-    _comment(project, issue, marker + "\n" + note, gh)
-    winner = current_lease(project, issue, gh, now)
+    winner = _post_and_arbitrate(project, issue, session, marker + "\n" + note, gh, now)
     if winner is None or winner.session != session:
-        _comment(
-            project,
-            issue,
-            format_release_marker(session)
-            + f"\nLost the claim race to session `{getattr(winner, 'session', '?')}`; retracting.",
-            gh,
-        )
         return ClaimResult(
             False,
             winner,
@@ -341,11 +389,27 @@ def claim(
                 f"issue #{issue}: lost the claim race to session={getattr(winner, 'session', '?')}"
             ),
         )
-    _ensure_label(project, gh)
     flags = ["--add-label", IN_PROGRESS_LABEL]
     if assignee:
         flags += ["--add-assignee", assignee]
-    _edit(project, issue, gh, *flags)
+    try:
+        _ensure_label(project, gh)
+        _edit(project, issue, gh, *flags)
+    except Exception:
+        # The marker already made the lease authoritative, but the caller is about to fail and
+        # nothing downstream will release it: retract so the issue is not blocked for the TTL.
+        try:
+            _comment(
+                project,
+                issue,
+                format_release_marker(session)
+                + "\nLabel/assignee bookkeeping failed; retracting the claim.",
+                gh,
+            )
+            _sync_label(project, issue, gh, now)
+        except Exception:  # noqa: BLE001 -- best effort; the original failure is what matters
+            pass
+        raise
     return ClaimResult(True, lease, took_over_from=took_over)
 
 
@@ -360,27 +424,37 @@ def renew(
 ) -> Lease:
     now = now or datetime.now(UTC)
     _check_ttl(ttl_minutes)
-    existing = current_lease(project, issue, gh)
+    existing = current_lease(project, issue, gh, now)
     if existing is None or existing.session != session:
         raise LeaseError(f"issue #{issue} is not leased by session {session}")
+    if not existing.live(now):
+        # An expired lease is up for takeover; renewing it could race a new claimant. Claim again.
+        raise LeaseError(f"issue #{issue}: the lease of session {session} has expired; claim again")
     lease = Lease(
         issue, existing.agent, session, existing.branch, now + timedelta(minutes=ttl_minutes)
     )
-    _comment(
-        project,
-        issue,
-        format_claim_marker(lease) + f"\nLease renewed until {_iso(lease.expires)}.",
-        gh,
-    )
+    body = format_claim_marker(lease) + f"\nLease renewed until {_iso(lease.expires)}."
+    winner = _post_and_arbitrate(project, issue, session, body, gh, now)
+    if winner is None or winner.session != session:
+        raise LeaseError(
+            f"issue #{issue}: renewal lost to session={getattr(winner, 'session', '?')}"
+        )
     return lease
 
 
 def release(
-    project: str, issue: int, *, session: str, gh: GhRunner, force: bool = False, note: str = ""
+    project: str,
+    issue: int,
+    *,
+    session: str,
+    gh: GhRunner,
+    force: bool = False,
+    note: str = "",
+    now: datetime | None = None,
 ) -> None:
-    existing = current_lease(project, issue, gh)
+    existing = current_lease(project, issue, gh, now)
     if existing is None:
-        _edit(project, issue, gh, "--remove-label", IN_PROGRESS_LABEL)
+        _sync_label(project, issue, gh, now)
         return
     if existing.session != session and not force:
         raise LeaseError(f"issue #{issue} is leased by session {existing.session}, not {session}")
@@ -397,7 +471,8 @@ def release(
         format_release_marker(existing.session) + f"\nLease released by `{who}`. {note}".rstrip(),
         gh,
     )
-    _edit(project, issue, gh, "--remove-label", IN_PROGRESS_LABEL)
+    # A new claimant may have taken the lease (and added the label) since we read it.
+    _sync_label(project, issue, gh, now)
 
 
 def list_claims(project: str, gh: GhRunner, now: datetime | None = None) -> list[ClaimRow]:
