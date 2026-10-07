@@ -12,8 +12,10 @@ concurrency:
 
 jobs:
   plan:
+    # Only the ready label triggers. An issue opened with both labels fires one `labeled` run per
+    # label, and both would see both labels and plan twice; the other is required, not a trigger.
     if: >-
-      (github.event.label.name == 'READY_LABEL' || github.event.label.name == 'human-review-required') &&
+      github.event.label.name == 'READY_LABEL' &&
       github.event.issue.pull_request == null &&
       contains(github.event.issue.labels.*.name, 'READY_LABEL') &&
       contains(github.event.issue.labels.*.name, 'human-review-required') &&

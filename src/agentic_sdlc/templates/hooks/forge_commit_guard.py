@@ -12,7 +12,7 @@ import json
 import re
 import subprocess
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 PROJECT = "PROJECT_ID"
 ISSUE_BRANCH = re.compile(r"(?:^|/)issue-(\d+)(?:$|[^0-9])")
@@ -25,6 +25,7 @@ _WORD = r"(?:'[^']*'|\"[^\"]*\"|\S+)"
 GIT_COMMIT = re.compile(
     rf"(?:^|[\s;&|(])git(?:\s+(?:{_GIT_VALUE_OPTS}\s+{_WORD}|-\S+))*\s+commit(?=$|[\s;&|)])"
 )
+MAX_TTL_MINUTES = 7 * 24 * 60  # leases.MAX_TTL_MINUTES
 TRUSTED = {"OWNER", "MEMBER", "COLLABORATOR"}  # plus GitHub Apps (user.type == "Bot")
 
 
@@ -41,8 +42,16 @@ def current_branch(cwd: str | None) -> str:
         return ""
 
 
+def _parse_iso(text: str) -> datetime | None:
+    try:
+        moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=UTC)  # naive means UTC
+
+
 def lease_for(issue: int) -> dict | None:
-    """Latest live claim marker on the issue (None if none/released/expired/unreachable)."""
+    """The live lease: the earliest-claiming live session (None if none/unreachable)."""
     try:
         out = subprocess.run(
             [
@@ -60,8 +69,12 @@ def lease_for(issue: int) -> dict | None:
     except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
         return None
     comments = [c for page in pages if isinstance(page, list) for c in page if isinstance(c, dict)]
-    lease = None
-    for c in comments:
+    # Same ordering as leases.current_lease(): a session's newest claim supersedes its older ones,
+    # a release voids that session, and the live session that claimed FIRST holds the lease, so a
+    # losing racer's retraction cannot clear the winner.
+    first_seen: dict[str, int] = {}
+    latest: dict[str, dict] = {}
+    for position, c in enumerate(comments):
         if (
             c.get("author_association") not in TRUSTED
             and (c.get("user") or {}).get("type") != "Bot"
@@ -72,24 +85,25 @@ def lease_for(issue: int) -> dict | None:
         m = found[-1] if found else None
         if m:
             fields = dict(re.findall(r"(\w+)=(\S+)", m.group(1)))
-            try:
-                exp = datetime.fromisoformat(fields.get("expires", "").replace("Z", "+00:00"))
-            except ValueError:
+            exp = _parse_iso(fields.get("expires", ""))
+            if exp is None or not all(k in fields for k in ("agent", "session", "branch")):
                 continue
-            if exp.tzinfo is None:  # same rule as leases._parse_iso: naive means UTC
-                exp = exp.replace(tzinfo=UTC)
-            lease = {**fields, "expires": exp}
+            posted = _parse_iso(c.get("created_at") or "")
+            if posted is not None:  # expiry is capped at post time + MAX_TTL, as in leases.py
+                exp = min(exp, posted + timedelta(minutes=MAX_TTL_MINUTES))
+            first_seen.setdefault(fields["session"], position)
+            latest[fields["session"]] = {**fields, "expires": exp}
             continue
         r = RELEASE.search(body)
-        if (
-            r
-            and lease
-            and dict(re.findall(r"(\w+)=(\S+)", r.group(1))).get("session") == lease.get("session")
-        ):
-            lease = None
-    if lease and lease["expires"] <= datetime.now(UTC):
-        return None
-    return lease
+        released = dict(re.findall(r"(\w+)=(\S+)", r.group(1))).get("session") if r else None
+        if released in latest:
+            del latest[released]
+            del first_seen[released]
+    now = datetime.now(UTC)
+    for session in sorted(latest, key=first_seen.__getitem__):
+        if latest[session]["expires"] > now:
+            return latest[session]
+    return None
 
 
 def open_pr_for(branch: str) -> bool:

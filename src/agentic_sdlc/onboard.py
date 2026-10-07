@@ -18,8 +18,9 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .executors import ExecutorError, load_executors, load_routing_policy
+from .executors import AuthMode, ExecutorError, TaskClass, load_executors, load_routing_policy
 from .leases import IN_PROGRESS_LABEL
+from .openai_compatible import PROVIDERS as OPENAI_COMPATIBLE_PROVIDERS
 from .policy import load_policy
 
 GhRunner = Callable[..., str]  # (args: Sequence[str], input: str | None = None) -> stdout
@@ -451,7 +452,10 @@ def default_executors(spec: OnboardSpec) -> dict:
                 "adapterVersion": "1.0.0",
                 "executionType": "subscription-runner",
                 "authMode": "oauth",
-                "model": "configured-by-CLAUDE_MODEL",
+                # A literal model: the Claude adapter in reusable-implement.yml passes the routed
+                # model straight to --model and, unlike openai_compatible, resolves no
+                # `configured-by-VAR` (same model as that workflow's legacy `agent: claude` route).
+                "model": "claude-opus-5",
                 "modelAlias": "claude",
                 "modelFamily": "claude",
                 "taskClasses": ["implementation", "repair", "review"],
@@ -816,6 +820,16 @@ def apply_repo_settings(
     return log
 
 
+def registry_model_vars(registry: dict) -> list[str]:
+    """Repo variables an executor registry names through `configured-by-VAR` models."""
+    names = []
+    for entry in registry.get("executors") or []:
+        found = re.fullmatch(r"configured-by-([A-Z0-9_]+)", str((entry or {}).get("model", "")))
+        if found and found.group(1) not in names:
+            names.append(found.group(1))
+    return names
+
+
 def copy_variables(
     source_project: str, names: Sequence[str], gh: GhRunner = run_gh
 ) -> dict[str, str]:
@@ -911,6 +925,37 @@ ROUTED_PROVIDER_SECRETS = {
     "kimi": "KIMI_API_KEY",
 }
 
+#: Standard GitHub-hosted runner labels (docs: "GitHub-hosted runners reference").
+GITHUB_HOSTED_LABELS = tuple(
+    re.compile(p)
+    for p in (
+        r"ubuntu-(?:latest|\d{2}\.04)(?:-arm)?",
+        r"ubuntu-slim",
+        r"windows-(?:latest|20\d{2})",
+        r"windows-11-arm",
+        r"macos-(?:latest|\d{2})(?:-(?:intel|large|xlarge))?",
+    )
+)
+
+#: Providers reusable-implement.yml can generate a patch with once routed: Codex, Claude Code and
+#: every provider the OpenAI-compatible adapter configures. Anything else stops at "needs an
+#: installed patch-generation adapter".
+ROUTED_ADAPTER_PROVIDERS = frozenset({"codex", "anthropic", *OPENAI_COMPATIBLE_PROVIDERS})
+ANTHROPIC_AUTH_MODES = frozenset({AuthMode.OAUTH, AuthMode.API_KEY})
+
+
+def _adapter_gap(executor) -> str:
+    """Why the implement workflow cannot run this executor ('' when it can)."""
+    if executor.provider not in ROUTED_ADAPTER_PROVIDERS:
+        return f"provider {executor.provider} has no workflow adapter"
+    if executor.provider == "anthropic":
+        if executor.auth_mode not in ANTHROPIC_AUTH_MODES:
+            return f"Claude adapter has no auth mode {executor.auth_mode.value}"
+        if executor.model.startswith("configured-by-"):
+            return "Claude adapter passes the model verbatim; configured-by- is not resolved"
+    return ""
+
+
 PUBLISHER_PERMISSIONS = {
     "contents": ("read", "write"),
     "issues": ("write",),
@@ -959,16 +1004,50 @@ def _ci_problems(base: Path) -> list[str]:
     job = (doc.get("jobs") or {}).get(REQUIRED_CHECK)
     if not isinstance(job, dict):
         return [*problems, f"no '{REQUIRED_CHECK}' job"]
-    runs = " \n".join(
-        str(step.get("run", "")) for step in job.get("steps") or [] if isinstance(step, dict)
-    )
+    executed = [
+        argv
+        for step in job.get("steps") or []
+        if isinstance(step, dict)
+        for argv in _shell_commands(str(step.get("run", "")))
+    ]
     for gate in ("setup", "quality", "test"):
         command = str(commands.get(gate, "")).replace("\n", " ").strip()
+        wanted = _shell_commands(command)
         if not command:
             problems.append(f"policy has no [commands] {gate}")
-        elif command not in runs:
+        elif not wanted or not all(
+            any(argv[: len(want)] == want for argv in executed) for want in wanted
+        ):
             problems.append(f"'{REQUIRED_CHECK}' job does not run the {gate} command {command!r}")
     return problems
+
+
+_SHELL_SEPARATORS = {";", "&&", "||", "|", "&", "(", ")"}
+_SHELL_KEYWORDS = {"if", "then", "elif", "else", "do", "while", "until", "!", "{", "time"}
+
+
+def _shell_commands(script: str) -> list[tuple[str, ...]]:
+    """The simple commands a `run:` script executes, as argv tuples. A gate counts only as a
+    command: `echo pytest`, `# pytest` and `"pytest"` are an argument, a comment and a string."""
+    found: list[tuple[str, ...]] = []
+    for line in script.replace("\\\n", " ").splitlines():
+        lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        try:
+            tokens = list(lexer)
+        except ValueError:  # unbalanced quotes: no command we can vouch for
+            continue
+        argv: list[str] = []
+        for token in [*tokens, ";"]:
+            if token not in _SHELL_SEPARATORS:
+                argv.append(token)
+                continue
+            while argv and (argv[0] in _SHELL_KEYWORDS or re.match(r"^[A-Za-z_]\w*=", argv[0])):
+                argv.pop(0)  # keywords and `VAR=value` prefixes are not the command
+            if argv:
+                found.append(tuple(argv))
+            argv = []
+    return found
 
 
 def doctor(
@@ -1084,7 +1163,9 @@ def doctor(
     elif routed:
         try:
             executors = load_executors(json.loads((base / ".forge/executors.json").read_text()))
-            load_routing_policy(json.loads((base / ".forge/routing-policy.json").read_text()))
+            routing_policy = load_routing_policy(
+                json.loads((base / ".forge/routing-policy.json").read_text())
+            )
             usable = [e for e in executors if project_id in e.permitted_repositories]
             add(
                 Check(
@@ -1104,6 +1185,26 @@ def doctor(
                 var = re.fullmatch(r"configured-by-([A-Z0-9_]+)", e.model or "")
                 if var:
                     routed_vars.add(var.group(1))
+            # The router may pick any eligible executor; one the implement workflow cannot run
+            # fails at "adapter is not installed" after doctor said READY.
+            unsupported = [
+                f"{e.executor_id} ({reason})"
+                for e in usable
+                if e.available
+                and TaskClass.IMPLEMENTATION in e.task_classes
+                and e.provider in routing_policy.allowed_providers
+                for reason in [_adapter_gap(e)]
+                if reason
+            ]
+            add(
+                Check(
+                    "routed executors have a workflow adapter",
+                    not unsupported,
+                    "; ".join(unsupported)
+                    if unsupported
+                    else "adapters: " + ", ".join(sorted(ROUTED_ADAPTER_PROVIDERS)),
+                )
+            )
         except (OSError, ExecutorError, json.JSONDecodeError, AttributeError) as exc:
             add(Check("routing files valid and permit this repo", False, str(exc)[:200]))
 
@@ -1223,11 +1324,7 @@ def doctor(
         )
 
     # --- labels
-    labels = (
-        _safe_json(gh, ["label", "list", "--repo", project_id, "--json", "name", "--limit", "200"])
-        or []
-    )
-    names = {x.get("name") for x in labels}
+    names = {x.get("name") for x in _paged_items(gh, f"repos/{project_id}/labels?per_page=100")}
     want = (
         {policy.ready_label, policy.human_review_label, policy.implementation_label}
         if policy
@@ -1354,11 +1451,24 @@ def doctor(
     # --- ci.yml's `test` job must run somewhere that exists, or every PR blocks on a queued check
     ci_labels = _ci_runs_on(base)
     if ci_labels is not None:
-        if "self-hosted" in ci_labels:
+        hosted = len(ci_labels) == 1 and any(
+            p.fullmatch(label) for p in GITHUB_HOSTED_LABELS for label in ci_labels
+        )
+        if hosted:
+            add(
+                Check(
+                    "ci.yml test job runs on an available runner",
+                    True,
+                    ", ".join(sorted(ci_labels)),
+                )
+            )
+        else:
+            # self-hosted, a typo, an unresolved expression or a runner group: only an online
+            # runner carrying every label proves the check will ever be picked up.
             all_runners = runners or _paged_items(
                 gh, f"repos/{project_id}/actions/runners", "runners"
             )
-            ci_ok = any(
+            ci_ok = bool(ci_labels) and any(
                 r.get("status") == "online"
                 and ci_labels <= {str(lbl.get("name")) for lbl in r.get("labels") or []}
                 for r in all_runners
@@ -1368,16 +1478,12 @@ def doctor(
                     "ci.yml test job runs on an available runner",
                     ci_ok,
                     f"labels {sorted(ci_labels)}: "
-                    + ("online runner found" if ci_ok else "no online runner carries all of them"),
+                    + (
+                        "online runner found"
+                        if ci_ok
+                        else "not a GitHub-hosted label and no online runner carries all of them"
+                    ),
                     manual=not ci_ok,
-                )
-            )
-        else:
-            add(
-                Check(
-                    "ci.yml test job runs on an available runner",
-                    True,
-                    ", ".join(sorted(ci_labels)),
                 )
             )
 
@@ -1391,7 +1497,32 @@ def doctor(
         return rep
     installs = _paged_items(gh, "/user/installations", "installations")
     apps = [i for i in installs if PUBLISHER_APP_SLUG_HINT in str(i.get("app_slug", "")).lower()]
-    if not apps:
+    # create-github-app-token pairs PUBLISHER_APP_CLIENT_ID with the private key: only the App
+    # that client ID belongs to counts, not any similarly named installation.
+    client_id = variable_values.get("PUBLISHER_APP_CLIENT_ID", "").strip()
+    meta = {
+        slug: _safe_json(gh, ["api", f"apps/{slug}"]) for slug in {str(a["app_slug"]) for a in apps}
+    }
+    named = apps
+    apps = [
+        a
+        for a in apps
+        if isinstance(meta[str(a["app_slug"])], dict)
+        and str(meta[str(a["app_slug"])].get("client_id") or "") == client_id
+        and client_id
+    ]
+    if named and not apps:
+        add(
+            Check(
+                "Publisher GitHub App installed on this repo",
+                False,
+                "PUBLISHER_APP_CLIENT_ID does not match the client ID of any installed "
+                + "/".join(sorted(meta))
+                + " app",
+                manual=True,
+            )
+        )
+    elif not apps:
         add(
             Check(
                 "Publisher GitHub App installed on this repo",

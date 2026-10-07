@@ -66,6 +66,7 @@ from .onboard import (
     apply_repo_settings,
     copy_variables,
     doctor,
+    registry_model_vars,
     repository_default_branch,
     resolve_platform_ref,
     run_gh,
@@ -777,8 +778,9 @@ def _onboard(args: argparse.Namespace) -> int:
         variables: dict[str, str] = {}
         if args.copy_vars_from:
             names = ["PUBLISHER_APP_CLIENT_ID"]
-            if spec.routed:
-                names += ["DEEPSEEK_MODEL_FLASH", "DEEPSEEK_MODEL_PRO"]
+            registry = destination / ".forge/executors.json"
+            if spec.routed and registry.exists():
+                names += registry_model_vars(json.loads(registry.read_text(encoding="utf-8")))
             variables.update(copy_variables(args.copy_vars_from, names))
         variables.update(assignments)
         result["applied"] = apply_repo_settings(spec, variables=variables)
