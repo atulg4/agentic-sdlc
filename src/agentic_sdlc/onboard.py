@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import importlib.resources
 import json
+import math
 import re
 import shlex
 import subprocess
@@ -151,6 +152,14 @@ class OnboardSpec:
             )
         if not self.test_command.strip():
             raise OnboardError("a test command is required; the gate fails closed without one")
+        if (
+            not self.ready_label.strip()
+            or len(self.ready_label) > 50
+            or any(ord(c) < 32 or c == "," for c in self.ready_label)
+        ):
+            # GitHub's 50-character limit; a comma would split the work-request front matter
+            # and a control character the generated `if:` blocks.
+            raise OnboardError("ready label must be 1-50 characters without commas or controls")
         if len({self.ready_label, HUMAN_REVIEW_LABEL, IMPLEMENTATION_LABEL}) != 3:
             raise OnboardError("ready label must differ from the review/approval labels")
         if not re.fullmatch(r"[A-Za-z0-9._/-]+", self.default_branch):
@@ -259,16 +268,63 @@ def _toml_list(items: Sequence[str], indent: str = "  ") -> str:
     return f"[\n{body}]"
 
 
+def _yaml_str(value: object) -> str:
+    """THE way a string reaches a generated YAML file: a double-quoted scalar (JSON strings are
+    valid YAML). `true`, `null`, `on`, `123` stay strings; `: `, `#`, `{`, `*` cannot change the
+    document's structure. Every string placeholder in the workflow templates goes through here."""
+    return json.dumps(str(value), ensure_ascii=False)
+
+
 def _yaml_labels(labels: Sequence[str]) -> str:
-    """A YAML flow sequence of quoted strings: `true`, `null`, `on` or `123` stay runner labels,
-    not a boolean, a null or an integer."""
-    return "[" + ", ".join(json.dumps(label) for label in labels) + "]"
+    """A YAML flow sequence of quoted strings (runner labels stay labels, never true/null/123)."""
+    return "[" + ", ".join(_yaml_str(label) for label in labels) + "]"
 
 
 def _yaml_run(command: str) -> str:
-    """A double-quoted YAML scalar (JSON strings are valid YAML), so `: `, `#`, `{`, `*` etc.
-    in a shell command cannot change the workflow's structure."""
-    return json.dumps(command.replace("\n", " ").strip())
+    """A shell command as one quoted scalar (`_yaml_str`), newlines folded to spaces."""
+    return _yaml_str(command.replace("\n", " ").strip())
+
+
+def _expr_str(value: str) -> str:
+    """A GitHub expression string literal: single-quoted, `'` doubled."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def auto_plan_condition(ready: str, human_review: str, implementation: str) -> str:
+    """The `if:` of agent-auto-plan.yml's `plan` job. Only the ready label triggers: an issue
+    opened with both labels fires one `labeled` run per label, and both would plan."""
+    return (
+        f"github.event.label.name == {_expr_str(ready)} &&\n"
+        "github.event.issue.pull_request == null &&\n"
+        f"contains(github.event.issue.labels.*.name, {_expr_str(ready)}) &&\n"
+        f"contains(github.event.issue.labels.*.name, {_expr_str(human_review)}) &&\n"
+        f"!contains(github.event.issue.labels.*.name, {_expr_str(implementation)})"
+    )
+
+
+def auto_implement_condition(ready: str, human_review: str, implementation: str) -> str:
+    """The `if:` of agent-auto-implement.yml's `preflight` job: any approval label triggers, and
+    every one of them must be on the issue, so a ready label alone never starts implementation."""
+    return (
+        f"(github.event.label.name == {_expr_str(implementation)} ||\n"
+        f" github.event.label.name == {_expr_str(ready)} ||\n"
+        f" github.event.label.name == {_expr_str(human_review)}) &&\n"
+        "github.event.issue.pull_request == null &&\n"
+        f"contains(github.event.issue.labels.*.name, {_expr_str(implementation)}) &&\n"
+        f"contains(github.event.issue.labels.*.name, {_expr_str(ready)}) &&\n"
+        f"contains(github.event.issue.labels.*.name, {_expr_str(human_review)})"
+    )
+
+
+def _yaml_folded(text: str, indent: str) -> str:
+    """`text` as a YAML folded block scalar (`>-`) at `indent`: readable conditions in the
+    generated files. Callers guarantee no line is blank or control-character laden."""
+    return ">-\n" + "\n".join(indent + line for line in text.splitlines())
+
+
+def _normalized_expr(text: object) -> str:
+    """An expression with its whitespace collapsed: how two `if:` conditions are compared."""
+    return " ".join(str(text).split())
 
 
 def render_policy(spec: OnboardSpec) -> str:
@@ -580,6 +636,28 @@ def default_routing_policy(spec: OnboardSpec) -> dict:
     }
 
 
+#: Every placeholder the workflow templates carry; each is a WHOLE YAML value.
+WORKFLOW_PLACEHOLDERS = (
+    "PLATFORM_REPOSITORY",
+    "PLATFORM_COMMIT_SHA",
+    "REUSABLE_PLAN_USES",
+    "REUSABLE_IMPLEMENT_USES",
+    "RUNS_ON_JSON",
+    "CI_RUNS_ON_YAML",
+    "RUNS_ON_YAML",
+    "ISSUE_NUMBER_EXPR",
+    "AGENT",
+    "EXECUTOR_REGISTRY_PATH",
+    "ROUTING_POLICY_PATH",
+    "DEFAULT_BRANCH",
+    "SETUP_COMMAND",
+    "QUALITY_COMMAND",
+    "TEST_COMMAND",
+    "AUTO_PLAN_IF",
+    "AUTO_IMPLEMENT_IF",
+)
+
+
 def _render_workflow(name: str, spec: OnboardSpec, issue_expr: str | None = None) -> str:
     text = _resource(f"github/forge/{name}")
     if "IMPLEMENT_JOBS" in text:
@@ -595,45 +673,41 @@ def _render_workflow(name: str, spec: OnboardSpec, issue_expr: str | None = None
         elif spec.implementer == "codex":
             extra = '          test -n "$OPENAI_API_KEY"\n'
         jobs = jobs.replace("PREFLIGHT_EXTRA\n", extra)
-        if issue_expr is None:
-            issue_expr = "${{ inputs.issue_number }}"
-        jobs = jobs.replace("ISSUE_NUMBER_EXPR", issue_expr)
         if name == "agent-auto-implement.yml":
-            jobs = jobs.replace(
-                "  preflight:\n",
-                (
-                    "  preflight:\n"
-                    "    if: >-\n"
-                    "      (github.event.label.name == 'IMPLEMENTATION_LABEL' ||\n"
-                    "       github.event.label.name == 'READY_LABEL' ||\n"
-                    "       github.event.label.name == 'human-review-required') &&\n"
-                    "      github.event.issue.pull_request == null &&\n"
-                    "      contains(github.event.issue.labels.*.name, 'IMPLEMENTATION_LABEL') &&\n"
-                    "      contains(github.event.issue.labels.*.name, 'READY_LABEL') &&\n"
-                    "      contains(github.event.issue.labels.*.name, 'human-review-required')\n"
-                ),
-                1,
-            )
+            jobs = jobs.replace("  preflight:\n", "  preflight:\n    if: AUTO_IMPLEMENT_IF\n", 1)
         text = text.replace("IMPLEMENT_JOBS\n", jobs)
+    labels = (spec.ready_label, HUMAN_REVIEW_LABEL, IMPLEMENTATION_LABEL)
+    platform = spec.platform_repository
+    # Every placeholder is a WHOLE YAML value: strings go through `_yaml_str`, label lists
+    # through `_yaml_labels`, conditions as folded blocks of quoted expression literals.
     replacements = {
-        "PLATFORM_REPOSITORY": spec.platform_repository,
-        "PLATFORM_COMMIT_SHA": spec.platform_ref,
-        "RUNS_ON_JSON": json.dumps(list(spec.runs_on), separators=(",", ":")),
+        "PLATFORM_REPOSITORY": _yaml_str(platform),
+        "PLATFORM_COMMIT_SHA": _yaml_str(spec.platform_ref),
+        "REUSABLE_PLAN_USES": _yaml_str(
+            f"{platform}/.github/workflows/reusable-plan.yml@{spec.platform_ref}"
+        ),
+        "REUSABLE_IMPLEMENT_USES": _yaml_str(
+            f"{platform}/.github/workflows/reusable-implement.yml@{spec.platform_ref}"
+        ),
+        "RUNS_ON_JSON": _yaml_str(json.dumps(list(spec.runs_on), separators=(",", ":"))),
         "CI_RUNS_ON_YAML": _yaml_labels(spec.ci_labels),
         "RUNS_ON_YAML": _yaml_labels(spec.runs_on),
-        "IMPLEMENTATION_LABEL": IMPLEMENTATION_LABEL,
-        "READY_LABEL": spec.ready_label,
-        "AGENT": spec.implementer,
-        "EXECUTOR_REGISTRY_PATH": ".forge/executors.json" if spec.routed else "",
-        "ROUTING_POLICY_PATH": ".forge/routing-policy.json" if spec.routed else "",
-        "DEFAULT_BRANCH": spec.default_branch,
+        "ISSUE_NUMBER_EXPR": _yaml_str(issue_expr or "${{ inputs.issue_number }}"),
+        "AGENT": _yaml_str(spec.implementer),
+        "EXECUTOR_REGISTRY_PATH": _yaml_str(".forge/executors.json" if spec.routed else ""),
+        "ROUTING_POLICY_PATH": _yaml_str(".forge/routing-policy.json" if spec.routed else ""),
+        "DEFAULT_BRANCH": _yaml_str(spec.default_branch),
         "SETUP_COMMAND": _yaml_run(spec.setup_command),
         "QUALITY_COMMAND": _yaml_run(spec.quality_command),
         "TEST_COMMAND": _yaml_run(spec.test_command),
+        "AUTO_PLAN_IF": _yaml_folded(auto_plan_condition(*labels), " " * 6),
+        "AUTO_IMPLEMENT_IF": _yaml_folded(auto_implement_condition(*labels), " " * 6),
     }
-    for key, value in replacements.items():
-        text = text.replace(key, value)
-    return text
+    if set(replacements) != set(WORKFLOW_PLACEHOLDERS):
+        raise OnboardError("workflow placeholders and their renderings disagree")
+    # One pass, whole words: a substituted value is never re-scanned for placeholder names.
+    pattern = re.compile(r"\b(" + "|".join(sorted(replacements, key=len, reverse=True)) + r")\b")
+    return pattern.sub(lambda m: replacements[m.group(1)], text)
 
 
 def render_work_request(spec: OnboardSpec) -> str:
@@ -678,11 +752,15 @@ def render_hooks(spec: OnboardSpec) -> dict[str, str]:
             ],
         }
     }
-    guard = _resource("hooks/forge_commit_guard.py").replace("PROJECT_ID", spec.project_id)
+    # The placeholders sit in Python string literals ("PROJECT_ID"): substitute the whole
+    # literal with a JSON string, which is a valid Python string literal.
+    guard = _resource("hooks/forge_commit_guard.py").replace(
+        '"PROJECT_ID"', json.dumps(spec.project_id)
+    )
     start = (
         _resource("hooks/forge_session_start.py")
-        .replace("PROJECT_ID", spec.project_id)
-        .replace("DEFAULT_BRANCH_NAME", spec.default_branch)
+        .replace('"PROJECT_ID"', json.dumps(spec.project_id))
+        .replace('"DEFAULT_BRANCH_NAME"', json.dumps(spec.default_branch))
     )
     return {
         ".claude/settings.json": json.dumps(settings, indent=2) + "\n",
@@ -718,11 +796,16 @@ def render_onboarding(spec: OnboardSpec) -> dict[str, str]:
         files[".forge/routing-policy.json"] = (
             json.dumps(default_routing_policy(spec), indent=2) + "\n"
         )
+    common = (
+        r"\b(PLATFORM_REPOSITORY|PLATFORM_COMMIT_SHA|(?:CI_)?RUNS_ON_(?:JSON|YAML)|"
+        r"(?:SETUP|QUALITY|TEST)_COMMAND|ISSUE_NUMBER_EXPR|IMPLEMENT_JOBS|PREFLIGHT_EXTRA)\b"
+    )
+    workflow = re.compile(
+        r"\b(" + "|".join((*WORKFLOW_PLACEHOLDERS, "IMPLEMENT_JOBS", "PREFLIGHT_EXTRA")) + r")\b"
+    )
     for name, content in files.items():
-        leftover = re.search(
-            r"\b(PLATFORM_REPOSITORY|PLATFORM_COMMIT_SHA|(?:CI_)?RUNS_ON_(?:JSON|YAML)|(?:SETUP|QUALITY|TEST)_COMMAND|ISSUE_NUMBER_EXPR|IMPLEMENT_JOBS|PREFLIGHT_EXTRA)\b",
-            content,
-        )
+        pattern = workflow if name.startswith(".github/workflows/") else re.compile(common)
+        leftover = pattern.search(content)
         if leftover:
             raise OnboardError(f"unrendered placeholder {leftover.group(0)} in {name}")
     return files
@@ -1174,20 +1257,61 @@ def implementation_route_request(
     )
 
 
-def _caller_route_budgets(callers: Sequence[Path]) -> set[float]:
-    """The `route_budget_usd` each installed implement caller hands reusable-implement.yml (the
-    workflow input's default when a caller passes none). Unreadable values are left out."""
+def _route_budget(value: object) -> float | None:
+    """A `route_budget_usd` as `route-executor --budget-usd` reads it: the string GitHub passes,
+    a finite non-negative number (None: the run would fail or route on a value doctor cannot
+    know -- an expression, a word, a boolean, NaN)."""
+    if isinstance(value, bool):
+        return None
+    text = _input_text(value)
+    if text is None or "${{" in text:
+        return None
+    try:
+        budget = float(text)
+    except ValueError:
+        return None
+    return budget if math.isfinite(budget) and budget >= 0 else None
+
+
+def _caller_route_budgets(callers: Sequence[Path]) -> tuple[set[float], list[str]]:
+    """(budgets, problems): the `route_budget_usd` each implement call hands
+    reusable-implement.yml (the input's default when it passes none), and every explicit value
+    doctor cannot read -- which fails the diagnosis instead of being replaced by the default."""
     budgets: set[float] = set()
+    problems: list[str] = []
     for caller in callers:
-        for job in _workflow_jobs(caller).values():
-            if not str(job.get("uses", "")).split("@")[0].endswith("/reusable-implement.yml"):
-                continue
-            raw = (job.get("with") or {}).get("route_budget_usd", ROUTE_DEFAULT_BUDGET_USD)
-            try:
-                budgets.add(float(raw))
-            except (TypeError, ValueError):
-                continue
-    return budgets or {ROUTE_DEFAULT_BUDGET_USD}
+        for name, job in _implement_calls(caller):
+            passed = job.get("with") if isinstance(job.get("with"), dict) else {}
+            raw = passed.get("route_budget_usd", ROUTE_DEFAULT_BUDGET_USD)
+            budget = _route_budget(raw)
+            if budget is None:
+                problems.append(f"{caller.name}:{name} route_budget_usd {raw!r}")
+            else:
+                budgets.add(budget)
+    return budgets, problems
+
+
+#: reusable-implement.yml's `agent` input default (test_onboard pins it to the workflow).
+REUSABLE_IMPLEMENT_DEFAULT_AGENT = "codex"
+REUSABLE_IMPLEMENT_AGENTS = frozenset({"codex", "claude", "route"})
+
+
+def _implement_agents(callers: Sequence[Path]) -> tuple[dict[str, str], list[str]]:
+    """(`file:job` -> agent, problems): the parsed `with.agent` of every reusable-implement.yml
+    call (its default when absent). An expression or an agent the workflow rejects is a
+    problem: doctor cannot say which adapter -- and which credentials -- the run needs."""
+    agents: dict[str, str] = {}
+    problems: list[str] = []
+    for caller in callers:
+        for name, job in _implement_calls(caller):
+            passed = job.get("with") if isinstance(job.get("with"), dict) else {}
+            raw = passed.get("agent", REUSABLE_IMPLEMENT_DEFAULT_AGENT)
+            text = _input_text(raw)
+            if text is None or text.strip() not in REUSABLE_IMPLEMENT_AGENTS:
+                problems.append(f"{caller.name}:{name} agent {raw!r}")
+            else:
+                agents[f"{caller.name}:{name}"] = text.strip()
+    return agents, problems
 
 
 def route_candidates(executors, routing_policy, request: RouteRequest) -> dict[str, list[str]]:
@@ -1259,17 +1383,27 @@ _SECRET_REF = re.compile(r"^\$\{\{\s*(secrets|vars)\.([A-Za-z0-9_]+)\s*\}\}$")
 
 def _preflight_requirements(callers: Sequence[Path]) -> tuple[set[str], set[str]]:
     """(secrets, variables) each installed caller's preflight fails without: an env entry bound to
-    `secrets.X`/`vars.X` that its script checks with `test -n "$NAME"`."""
+    `secrets.X`/`vars.X` that its script checks with `test -n "$NAME"` (a parsed command)."""
     secrets: set[str] = set()
     variables: set[str] = set()
     for caller in callers:
         for step in (_workflow_jobs(caller).get("preflight") or {}).get("steps") or []:
             if not isinstance(step, dict):
                 continue
-            script = str(step.get("run", ""))
-            for name, value in (step.get("env") or {}).items():
+            # The parsed commands, not the text: a comment or an echo checks nothing. Any
+            # `test -n "$NAME"` / `[ -n "$NAME" ]` counts, enforced or not (over-requiring a
+            # credential is the safe side).
+            checked = {
+                argv[2].removeprefix("$").strip("{}")
+                for argv, _ in _shell_flow(str(step.get("run", "")), step.get("shell"))
+                if len(argv) >= 3
+                and (argv[0] == "test" or (argv[0] == "[" and argv[-1] == "]"))
+                and argv[1] == "-n"
+            }
+            env = step.get("env")
+            for name, value in (env if isinstance(env, dict) else {}).items():
                 ref = _SECRET_REF.match(str(value).strip())
-                if ref and re.search(rf'test -n "?\${{?{re.escape(str(name))}\b', script):
+                if ref and str(name) in checked:
                     (secrets if ref.group(1) == "secrets" else variables).add(ref.group(2))
     return secrets, variables
 
@@ -1287,51 +1421,29 @@ def reusable_calls(caller: Path) -> list[tuple[str, str, str, str]]:
     return calls
 
 
-def _forwarded_secrets(caller: Path) -> set[str] | None:
-    """Secret names a caller's reusable-workflow job passes on (None: `secrets: inherit`)."""
-    names: set[str] = set()
-    for job in _workflow_jobs(caller).values():
-        if "uses" not in job:
-            continue
+def _implement_calls(caller: Path) -> list[tuple[str, dict]]:
+    """(job name, job) of every job whose parsed `uses` calls a remote reusable-implement.yml."""
+    return [
+        (name, job)
+        for name, job in _workflow_jobs(caller).items()
+        for found in [_REMOTE_REUSABLE.fullmatch(str(job.get("uses", "")).strip())]
+        if found and found.group(2) == "reusable-implement.yml"
+    ]
+
+
+def _unforwarded_secrets(caller: Path, needed: set[str]) -> list[str]:
+    """`job: names` for each reusable-implement.yml call of `caller` that does not pass every
+    secret in `needed`. Each call is judged on its OWN `secrets:` (another job's forwarding or
+    `secrets: inherit` reaches nothing here); `secrets: inherit` on the call passes them all."""
+    gaps = []
+    for name, job in _implement_calls(caller):
         passed = job.get("secrets")
         if passed == "inherit":
-            return None
-        if isinstance(passed, dict):
-            names |= {str(k) for k in passed}
-    return names
-
-
-def _runs_on_labels(value) -> set[str] | None:
-    """Runner labels of a `runs-on` value (None when it is not a readable label list)."""
-    if isinstance(value, str):
-        return {value.strip()}
-    if isinstance(value, list):
-        return {str(x).strip() for x in value}
-    if isinstance(value, dict):
-        labels = value.get("labels") or []
-        return {str(x).strip() for x in (labels if isinstance(labels, list) else [labels])}
-    return None
-
-
-def _caller_runner_targets(callers: Sequence[Path]) -> dict[str, set[str]]:
-    """`file:job` -> runner labels for every job of the planning/implementation callers: each
-    `runs-on`, and the `runs_on` JSON a caller hands its reusable workflow (that workflow's own
-    jobs run there). An unreadable target is kept as its raw text, which no runner carries."""
-    targets: dict[str, set[str]] = {}
-    for caller in callers:
-        for name, job in _workflow_jobs(caller).items():
-            where = f"{caller.name}:{name}"
-            if "runs-on" in job:
-                labels = _runs_on_labels(job["runs-on"])
-                targets[where] = labels if labels is not None else {str(job["runs-on"])}
-            raw = (job.get("with") or {}).get("runs_on") if "uses" in job else None
-            if raw is not None:
-                try:
-                    labels = _runs_on_labels(json.loads(str(raw)))
-                except json.JSONDecodeError:
-                    labels = None
-                targets[f"{where} (runs_on)"] = labels if labels is not None else {str(raw)}
-    return targets
+            continue
+        forwarded = {str(k) for k in passed} if isinstance(passed, dict) else set()
+        if needed - forwarded:
+            gaps.append(f"{caller.name}:{name}: {', '.join(sorted(needed - forwarded))}")
+    return gaps
 
 
 def _github_hosted(labels: set[str]) -> bool:
@@ -1356,19 +1468,49 @@ WINDOWS_UNSUPPORTED = (
 )
 
 
+def _runner_on_windows(runner: dict) -> bool:
+    """A registered runner whose OS is Windows (the runners API's `os`, or its `windows` default
+    label), whatever labels a workflow asked for."""
+    labels = {str(lbl.get("name", "")).lower() for lbl in runner.get("labels") or []}
+    return str(runner.get("os") or "").lower().startswith("windows") or "windows" in labels
+
+
 def _runner_available(labels: set[str], runners: Sequence[dict]) -> bool:
-    """A standard GitHub-hosted label, or an online runner carrying every label. Anything else --
-    self-hosted, a typo, an unresolved expression, a runner group -- would queue forever. A
-    Windows target is never available: the generated jobs cannot run there."""
+    """A standard GitHub-hosted label, or an online NON-Windows runner carrying every label.
+    Anything else -- self-hosted, a typo, an unresolved expression -- would queue forever. A
+    Windows target, or a match only on a Windows runner, is never available: the generated jobs
+    run bash with Unix paths."""
     if _windows_labels(labels):
         return False
     if _github_hosted(labels):
         return True
     return bool(labels) and any(
         r.get("status") == "online"
+        and not _runner_on_windows(r)
         and labels <= {str(lbl.get("name")) for lbl in r.get("labels") or []}
         for r in runners
     )
+
+
+def _fires_on_issue_labeled(doc: dict) -> bool:
+    """The workflow runs when a label is added to an issue: an `issues` trigger whose activity
+    types (all of them when unlisted) include `labeled`."""
+    triggers = doc.get("on", doc.get(True))
+    if isinstance(triggers, str):
+        return triggers == "issues"
+    if isinstance(triggers, list):
+        return "issues" in triggers
+    if not isinstance(triggers, dict) or "issues" not in triggers:
+        return False
+    spec = triggers["issues"]
+    if spec is None:
+        return True
+    if not isinstance(spec, dict):
+        return False
+    types = spec.get("types")
+    if types is None:
+        return True
+    return types == "labeled" or (isinstance(types, list) and "labeled" in types)
 
 
 def _triggers(doc: dict) -> set[str]:
@@ -1457,6 +1599,19 @@ def _resolved_labels(value: object, inputs: dict[str, str | None] | None) -> set
     return None
 
 
+def _unresolved_target(value: object, what: str) -> str:
+    """Why a runner target is not a provable label set. A runner GROUP is named as such: GitHub
+    also requires the runner to be in that group, and group membership is an organization
+    setting the repository runners API does not report -- so it fails closed rather than
+    passing on a same-labelled runner outside the group."""
+    if isinstance(value, dict) and "group" in value:
+        return (
+            f"runner group {value['group']!r}: membership cannot be verified through the "
+            "repository API; target runner labels instead"
+        )
+    return f"{what} {value!r} unresolvable"
+
+
 def _call_inputs(
     called: dict, passed: dict, inputs: dict[str, str | None] | None
 ) -> dict[str, str | None]:
@@ -1521,13 +1676,16 @@ def _reusable_call_targets(
         if "runs_on" not in passed:
             return {key: f"calls {found.group(2)} without an explicit runs_on"}
         raw, ok = _resolve_input(passed["runs_on"], inputs)
+        value: object = passed["runs_on"]
         labels = None
         if ok and isinstance(raw, str):
             try:
-                labels = _resolved_labels(json.loads(raw), None)
+                value = json.loads(raw)
             except json.JSONDecodeError:
-                labels = None
-        return {key: labels if labels is not None else f"runs_on {passed['runs_on']!r} unreadable"}
+                value = raw
+            else:
+                labels = _resolved_labels(value, None)
+        return {key: labels if labels is not None else _unresolved_target(value, "runs_on")}
     return {where: f"calls {uses}: its runners cannot be verified from this repository"}
 
 
@@ -1560,7 +1718,7 @@ def _job_runner_targets(
         elif "runs-on" in job:
             labels = _resolved_labels(job["runs-on"], inputs)
             targets[where] = (
-                labels if labels is not None else f"runs-on {job['runs-on']!r} unresolvable"
+                labels if labels is not None else _unresolved_target(job["runs-on"], "runs-on")
             )
         else:
             targets[where] = "no runs-on"
@@ -1587,20 +1745,23 @@ def _pull_request_off_hosted(base: Path, platform_repository: str) -> list[str]:
     return found
 
 
-def _ci_runs_on(base: Path) -> set[str] | None:
-    """Labels of ci.yml's `test` job runner (None when the file/job cannot be read)."""
-    import yaml  # deferred: the CLI must import without site dependencies
-
-    try:
-        doc = yaml.safe_load((base / ".github/workflows/ci.yml").read_text())
-        job = (doc.get("jobs") or {}).get(REQUIRED_CHECK) or {}
-    except (OSError, yaml.YAMLError, AttributeError):
+def _ci_runs_on(base: Path) -> RunnerTarget | None:
+    """Where ci.yml's `test` job runs: its labels, or why they cannot be proven (None when the
+    file or the job cannot be read -- the ci.yml gate check reports that)."""
+    doc = _workflow_doc(base / ".github/workflows/ci.yml")
+    jobs = doc.get("jobs") if doc is not None else None
+    job = jobs.get(REQUIRED_CHECK) if isinstance(jobs, dict) else None
+    if not isinstance(job, dict):
         return None
-    return _runs_on_labels(job.get("runs-on"))
+    if "runs-on" not in job:
+        return "no runs-on"
+    labels = _resolved_labels(job["runs-on"], None)
+    return labels if labels is not None else _unresolved_target(job["runs-on"], "runs-on")
 
 
 def _ci_problems(base: Path) -> list[str]:
-    """ci.yml must run on pull_request, as a job named `test`, the policy's three commands."""
+    """ci.yml must run on pull_request, as a job named `test`, the policy's three commands --
+    and nothing in the job may change what those commands do (`_gate_environment_problems`)."""
     import yaml  # deferred: the CLI must import without site dependencies
 
     try:
@@ -1613,7 +1774,8 @@ def _ci_problems(base: Path) -> list[str]:
     problems = []
     if "pull_request" not in _triggers(doc):
         problems.append("not triggered on pull_request")
-    job = (doc.get("jobs") or {}).get(REQUIRED_CHECK)
+    jobs = doc.get("jobs")
+    job = jobs.get(REQUIRED_CHECK) if isinstance(jobs, dict) else None
     if not isinstance(job, dict):
         return [*problems, f"no '{REQUIRED_CHECK}' job"]
     # A skipped or failure-tolerant job still reports a passing check to the ruleset.
@@ -1622,26 +1784,169 @@ def _ci_problems(base: Path) -> list[str]:
         for key in ("if", "continue-on-error")
         if _job_key_set(job, key)
     ]
+    steps = job.get("steps")
+    steps = [s for s in steps if isinstance(s, dict)] if isinstance(steps, list) else []
+    shell = _default_shell(doc, job)
+    scripts = [
+        (step, _shell_parse(str(step.get("run", "")), step.get("shell", shell)))
+        for step in steps
+        if "run" in step
+    ]
     # Only unconditional steps whose failure fails the job count; inside them, only commands
-    # whose exit status the shell enforces (see _shell_flow).
+    # whose exit status the shell enforces (see _shell_parse).
     executed = [
         argv
-        for step in job.get("steps") or []
-        if isinstance(step, dict)
-        and not _job_key_set(step, "if")
-        and not _job_key_set(step, "continue-on-error")
-        for argv, enforced in _shell_flow(str(step.get("run", "")), step.get("shell"))
+        for step, parsed in scripts
+        if not _job_key_set(step, "if") and not _job_key_set(step, "continue-on-error")
+        for argv, enforced in parsed.commands
         if enforced
     ]
+    wanted_by_gate = {}
     for gate in ("setup", "quality", "test"):
         command = str(commands.get(gate, "")).replace("\n", " ").strip()
         wanted = _shell_commands(command)
+        wanted_by_gate[gate] = wanted
         if not command:
             problems.append(f"policy has no [commands] {gate}")
         elif not wanted or not all(
             any(_gate_invocation(argv, want) for argv in executed) for want in wanted
         ):
             problems.append(f"'{REQUIRED_CHECK}' job does not run the {gate} command {command!r}")
+    tools = _gate_tools(argv for wanted in wanted_by_gate.values() for argv in wanted)
+    problems += _gate_environment_problems(doc, job, steps, scripts, tools)
+    return problems
+
+
+def _default_shell(doc: dict, job: dict) -> object:
+    """`defaults.run.shell` of the job, else of the workflow (None: GitHub's bash default)."""
+    for node in (job, doc):
+        defaults = node.get("defaults")
+        run = defaults.get("run") if isinstance(defaults, dict) else None
+        if isinstance(run, dict) and "shell" in run:
+            return run["shell"]
+    return None
+
+
+#: Environment variables that change what a Python gate runs or whether it can fail, whatever
+#: the tool: the interpreter's import path and startup, a shell's startup file (`BASH_ENV` is
+#: sourced by every non-interactive bash -- it can redefine `pytest`), preloaded libraries.
+GATE_ENV_ALWAYS = frozenset(
+    {
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
+        "PYTHONUSERBASE",
+        "PYTHONINSPECT",
+        "PYTHONWARNINGS",
+        "BASH_ENV",
+        "ENV",
+        "SHELLOPTS",
+        "BASHOPTS",
+        "LD_PRELOAD",
+    }
+)
+#: `<TOOL>_*` variables of a gate tool that only tune output or caching, never what runs.
+GATE_ENV_BENIGN = frozenset(
+    {
+        "PIP_DISABLE_PIP_VERSION_CHECK",
+        "PIP_NO_CACHE_DIR",
+        "PIP_CACHE_DIR",
+        "PIP_PROGRESS_BAR",
+        "PIP_ROOT_USER_ACTION",
+        "RUFF_CACHE_DIR",
+        "RUFF_NO_CACHE",
+        "RUFF_OUTPUT_FORMAT",
+    }
+)
+#: Actions a `test` job may use before its gates: they export only toolchain locations
+#: (`pythonLocation`, `LD_LIBRARY_PATH`, cache keys), never a gate tool's options. Any other
+#: action can export arbitrary variables through `$GITHUB_ENV`, which doctor cannot read.
+GATE_TRUSTED_ACTIONS = frozenset(
+    {"actions/checkout", "actions/setup-python", "actions/cache", "astral-sh/setup-uv"}
+)
+_PYTHON_PROGRAMS = re.compile(r"^python(?:3(?:\.\d+)?)?$")
+
+
+def _gate_tools(commands) -> set[str]:
+    """The tools the policy's gate commands run: each program, and the module of `python -m X`
+    (`python -m ruff check` -> ruff), as the prefix of their environment variables (RUFF)."""
+    tools: set[str] = set()
+    for argv in commands:
+        if not argv:
+            continue
+        program = Path(argv[0]).name
+        if _PYTHON_PROGRAMS.match(program):
+            if len(argv) > 2 and argv[1] == "-m":
+                tools.add(argv[2])
+        else:
+            tools.add(program)
+    return {re.sub(r"[^A-Za-z0-9]", "_", t).upper() for t in tools if t}
+
+
+def _gate_env_altering(name: str, tools: set[str]) -> bool:
+    """`name` changes what a gate tool does: any `*ADDOPTS*` (pytest's PYTEST_ADDOPTS, ...), a
+    gate tool's own `<TOOL>_*` configuration, or an interpreter/shell startup variable."""
+    name = str(name)
+    if name in GATE_ENV_BENIGN:
+        return False
+    return (
+        "ADDOPTS" in name.upper()
+        or name in GATE_ENV_ALWAYS
+        or any(name.upper().startswith(f"{tool}_") for tool in tools)
+    )
+
+
+def _gate_environment_problems(
+    doc: dict, job: dict, steps: list[dict], scripts: list, tools: set[str]
+) -> list[str]:
+    """What in the `test` job can change the environment or the meaning of its gate commands
+    without being a gate invocation doctor could see: a gate-altering variable set by the
+    workflow/job/step `env:` or by any script (prefix, assignment, export); a `$GITHUB_ENV`
+    write (it sets every later step's environment); a function or alias named like a gate
+    tool; a sourced file other than a virtualenv's `activate`, or `eval`; an untrusted action."""
+    problems: list[str] = []
+    gate_programs = {t.lower().replace("_", "-") for t in tools} | {t.lower() for t in tools}
+    for where, node in (("workflow", doc), (f"job '{REQUIRED_CHECK}'", job)):
+        env = node.get("env")
+        if env is not None and not isinstance(env, dict):
+            problems.append(f"{where} env is not a readable mapping (fails closed)")
+            continue
+        bad = sorted(str(k) for k in (env or {}) if _gate_env_altering(str(k), tools))
+        if bad:
+            problems.append(f"{where} env sets {', '.join(bad)}, which changes the gates")
+    for index, step in enumerate(steps):
+        label = f"step {step.get('name') or index + 1!s}"
+        env = step.get("env")
+        if env is not None and not isinstance(env, dict):
+            problems.append(f"{label} env is not a readable mapping (fails closed)")
+        else:
+            bad = sorted(str(k) for k in (env or {}) if _gate_env_altering(str(k), tools))
+            if bad:
+                problems.append(f"{label} env sets {', '.join(bad)}, which changes the gates")
+        uses = step.get("uses")
+        if uses is not None:
+            action = str(uses).split("@", 1)[0].strip()
+            if action not in GATE_TRUSTED_ACTIONS:
+                problems.append(
+                    f"{label} uses {action}, which may export variables the gates inherit "
+                    f"(trusted: {', '.join(sorted(GATE_TRUSTED_ACTIONS))})"
+                )
+    for step, parsed in scripts:
+        label = f"step {step.get('name') or steps.index(step) + 1!s}"
+        bad = sorted(n for n in parsed.assigned if _gate_env_altering(n, tools))
+        if bad:
+            problems.append(f"{label} sets {', '.join(bad)}, which changes the gates")
+        if parsed.github_env:
+            problems.append(f"{label} writes $GITHUB_ENV: later steps' gates inherit it")
+        shadow = sorted((parsed.functions | parsed.aliases) & gate_programs)
+        if shadow:
+            problems.append(f"{label} defines {', '.join(shadow)} as a function/alias")
+        foreign = [s for s in parsed.sourced if not s.endswith("/bin/activate")]
+        if foreign or parsed.evals:
+            problems.append(
+                f"{label} runs {'eval' if parsed.evals else 'source ' + foreign[0]!r}: "
+                "what it defines cannot be verified (fails closed)"
+            )
     return problems
 
 
@@ -1679,10 +1984,14 @@ def _gate_invocation(argv: Sequence[str], want: Sequence[str]) -> bool:
 
 
 _SHELL_SEPARATORS = {";", "&&", "||", "|", "&", "(", ")", "|&", ";;"}
-_SHELL_KEYWORDS = {"then", "else", "do", "{", "time"}
+_SHELL_KEYWORDS = {"then", "else", "do", "{", "}", "time"}
 _SHELL_CONDITIONS = {"if", "elif", "while", "until", "!"}
 _SHELL_OPENERS = {"if", "while", "until", "for", "case", "select"}
 _SHELL_CLOSERS = {"fi", "done", "esac"}
+#: Builtins whose `NAME=value` / `NAME` operands set (or export) a variable.
+_SHELL_DECLARERS = {"export", "declare", "typeset", "readonly", "local"}
+_ASSIGNMENT_WORD = re.compile(r"^([A-Za-z_]\w*)=")
+_NAME_WORD = re.compile(r"^[A-Za-z_]\w*$")
 #: Shells whose run steps abort on a failing command: GitHub runs an unspecified or `bash` shell
 #: as `bash -eo pipefail`, and `sh` as `sh -e` (no pipefail).
 _ERREXIT_SHELLS = {None, "bash", "sh"}
@@ -1697,19 +2006,48 @@ def _job_key_set(node: dict, key: str) -> bool:
     return str(node[key]).strip().lower() != neutral
 
 
-def _shell_flow(script: str, shell: object = None) -> list[tuple[tuple[str, ...], bool]]:
-    """The simple commands a `run:` script executes, each with whether its failure fails the step.
+@dataclass
+class ShellScript:
+    """What `_shell_parse` reads from a `run:` script.
+
+    `commands` holds each simple command with whether its failure fails the step. The rest is
+    what can change what a later command DOES without being that command: variables set
+    (`VAR=x cmd`, `VAR=x`, `export VAR=x`), functions and aliases defined (`pytest() {...}`
+    shadows the real pytest), files sourced or `eval`ed, and any mention of `$GITHUB_ENV`
+    (a write there sets the environment of every later step).
+    """
+
+    commands: list[tuple[tuple[str, ...], bool]]
+    assigned: set[str]
+    functions: set[str]
+    aliases: set[str]
+    sourced: list[str]
+    evals: bool
+    github_env: bool
+
+
+def _shell_parse(script: str, shell: object = None) -> ShellScript:
+    """The simple commands a `run:` script executes, each with whether its failure fails the
+    step, plus what the script sets up for later commands (`ShellScript`).
 
     With errexit (GitHub's default `bash -eo pipefail`, or `sh -e`) a command is enforced unless it
     is a condition (`if`/`while`/`until`/`!`) or inside a conditional/loop body, backgrounded with
     `&`, part of an `&&`/`||` list other than its last member (errexit ignores those), after `||`
     (it may never run), piped onward without pipefail, or after `set +e`. Whatever the shell, the
     script's LAST and-or list is the step's exit status: its `&&` members are enforced too.
+
+    Commands inside a shell function body (`name() { ... }`, `function name { ... }`) are NEVER
+    enforced: defining a function runs nothing, and whether a later call reaches the body (and
+    with which errexit state -- bash ignores `set -e` inside a function called as a condition) is
+    not modelled. A gate must be a top-level command.
     """
     shell_name = None if shell is None else str(shell).strip()
     errexit = shell_name in _ERREXIT_SHELLS
+    out = ShellScript([], set(), set(), set(), [], False, "GITHUB_ENV" in script)
     records: list[dict] = []
     depth = 0
+    braces: list[str] = []  # "function" / "group" per open `{`
+    pending_function = False
     previous = ";"
     for line in script.replace("\\\n", " ").splitlines():
         lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
@@ -1722,6 +2060,13 @@ def _shell_flow(script: str, shell: object = None) -> list[tuple[tuple[str, ...]
             continue
         argv: list[str] = []
         for token in [*tokens, None]:
+            if token == "()":  # `name()` / `function name()`: a function header, runs nothing
+                name = [w for w in argv if w != "function"]
+                if name:
+                    out.functions.add(name[-1])
+                pending_function = True
+                argv = []
+                continue
             if token is not None and token not in _SHELL_SEPARATORS:
                 argv.append(token)
                 continue
@@ -1730,20 +2075,44 @@ def _shell_flow(script: str, shell: object = None) -> list[tuple[tuple[str, ...]
                 argv[0] in _SHELL_KEYWORDS
                 or argv[0] in _SHELL_CONDITIONS
                 or argv[0] in _SHELL_CLOSERS
-                or re.match(r"^[A-Za-z_]\w*=", argv[0])
+                or argv[0] == "function"
+                or _ASSIGNMENT_WORD.match(argv[0])
             ):
                 head = argv.pop(0)  # keywords and `VAR=value` prefixes are not the command
+                assignment = _ASSIGNMENT_WORD.match(head)
+                if assignment:
+                    out.assigned.add(assignment.group(1))
+                elif head == "function" and argv:
+                    out.functions.add(argv.pop(0))
+                    pending_function = True
+                elif head == "{":
+                    braces.append("function" if pending_function else "group")
+                    pending_function = False
+                elif head == "}" and braces:
+                    braces.pop()
                 condition = condition or head in _SHELL_CONDITIONS
                 if head in _SHELL_OPENERS:
                     depth += 1
                 elif head in _SHELL_CLOSERS:
                     depth = max(0, depth - 1)
             nested = depth > 0
+            in_function = "function" in braces
             if argv and argv[0] in _SHELL_OPENERS:  # for/case/select open a body, run nothing
                 depth += 1
                 argv = []
             following = ";" if token is None else token
             if argv:
+                if argv[0] in _SHELL_DECLARERS:
+                    for word in argv[1:]:
+                        found = _ASSIGNMENT_WORD.match(word) or _NAME_WORD.match(word)
+                        if found:
+                            out.assigned.add(found.group(1) if found.groups() else word)
+                elif argv[0] == "alias":
+                    out.aliases |= {w.split("=", 1)[0] for w in argv[1:] if "=" in w}
+                elif argv[0] in {"source", "."}:
+                    out.sourced.append(argv[1] if len(argv) > 1 else "")
+                elif argv[0] == "eval":
+                    out.evals = True
                 if argv[0] == "set" and "+e" in argv[1:]:
                     errexit = False
                 elif argv[0] == "set" and any(
@@ -1753,7 +2122,10 @@ def _shell_flow(script: str, shell: object = None) -> list[tuple[tuple[str, ...]
                 records.append(
                     {
                         "argv": tuple(argv),
-                        "reached": not condition and not nested and previous != "||",
+                        "reached": not condition
+                        and not nested
+                        and not in_function
+                        and previous != "||",
                         "previous": previous,
                         "following": following,
                         "errexit": errexit,
@@ -1771,7 +2143,6 @@ def _shell_flow(script: str, shell: object = None) -> list[tuple[tuple[str, ...]
     last = len(records) - 1
     while last > 0 and records[last]["previous"] in {"&&", "||", "|", "|&"}:
         last -= 1
-    found = []
     for index, r in enumerate(records):
         base = r["reached"] and r["following"] != "&" and not r["piped"]
         if index >= last and (index == len(records) - 1 or r["following"] in {"&&", "|", "|&"}):
@@ -1783,8 +2154,14 @@ def _shell_flow(script: str, shell: object = None) -> list[tuple[tuple[str, ...]
                 and r["previous"] != "&&"
                 and r["following"] not in {"&&", "||"}
             )
-        found.append((r["argv"], enforced))
-    return found
+        out.commands.append((r["argv"], enforced))
+    return out
+
+
+def _shell_flow(script: str, shell: object = None) -> list[tuple[tuple[str, ...], bool]]:
+    """The simple commands a `run:` script executes, each with whether its failure fails the
+    step (see `_shell_parse`)."""
+    return _shell_parse(script, shell).commands
 
 
 def _shell_commands(script: str) -> list[tuple[str, ...]]:
@@ -1999,14 +2376,31 @@ def doctor(
     implement_callers = [
         base / ".github/workflows" / n for n in ("agent-implement.yml", "agent-auto-implement.yml")
     ]
-    # Route mode is what the installed callers/policy ask for, not whether the registry exists.
+    present_implement_callers = [c for c in implement_callers if c.exists()]
+    # The adapter each implement call asks for: its parsed `with.agent`, never the file text.
+    agents, agent_problems = _implement_agents(present_implement_callers)
+    if agent_problems:
+        add(
+            Check(
+                "implement callers name a known agent",
+                False,
+                "unreadable or unsupported (expected one of "
+                + ", ".join(sorted(REUSABLE_IMPLEMENT_AGENTS))
+                + "): "
+                + "; ".join(agent_problems),
+            )
+        )
+    try:
+        policy_doc = tomllib.loads(toml_path.read_text()) if toml_path.exists() else {}
+    except (OSError, tomllib.TOMLDecodeError):
+        policy_doc = {}  # "agentic-sdlc.toml loads" fails above
+    # Route mode is what the installed callers/policy ask for, not whether the registry exists;
+    # an agent doctor cannot read may be `route`, so it is checked as one (fails closed).
     routed = (
         any((base / f).exists() for f in routing_files)
-        or (toml_path.exists() and re.search(r"^\[routing\]", toml_path.read_text(), re.M))
-        or any(
-            c.exists() and re.search(r"^\s*agent:\s*route\s*$", c.read_text(), re.M)
-            for c in implement_callers
-        )
+        or "routing" in policy_doc
+        or "route" in agents.values()
+        or bool(agent_problems)
     )
     missing_routing = [f for f in routing_files if not (base / f).exists()]
     if routed and missing_routing:
@@ -2027,7 +2421,17 @@ def doctor(
                 raise ExecutorError("agentic-sdlc.toml must load to build the route request")
             # The exact request each installed implement caller makes (one per distinct
             # route_budget_usd), evaluated by the router itself.
-            budgets = sorted(_caller_route_budgets([c for c in implement_callers if c.exists()]))
+            readable_budgets, budget_problems = _caller_route_budgets(present_implement_callers)
+            if budget_problems:
+                add(
+                    Check(
+                        "implement callers pass a readable route_budget_usd",
+                        False,
+                        "route-executor --budget-usd needs a finite non-negative number; "
+                        "doctor cannot route on " + "; ".join(budget_problems),
+                    )
+                )
+            budgets = sorted(readable_budgets or {ROUTE_DEFAULT_BUDGET_USD})
             requests = [implementation_route_request(policy, project_id, b) for b in budgets]
             verdicts = [route_candidates(executors, routing_policy, r) for r in requests]
             routable = [e for e in executors if any(not v[e.executor_id] for v in verdicts)]
@@ -2094,11 +2498,9 @@ def doctor(
         # A secret the repository holds is still empty inside the reusable workflow unless the
         # caller passes it on.
         unforwarded = [
-            f"{caller.name}: {', '.join(sorted(routed_secrets - forwarded))}"
-            for caller in implement_callers
-            if caller.exists()
-            for forwarded in [_forwarded_secrets(caller)]
-            if forwarded is not None and routed_secrets - forwarded
+            gap
+            for caller in present_implement_callers
+            for gap in _unforwarded_secrets(caller, routed_secrets)
         ]
         add(
             Check(
@@ -2154,36 +2556,47 @@ def doctor(
             )
         )
         if policy is not None:
-            auto = base / ".github/workflows/agent-auto-implement.yml"
-            if auto.exists():
-                import yaml  # deferred: the CLI must import without site dependencies
-
-                try:
-                    preflight = (yaml.safe_load(auto.read_text()) or {})["jobs"]["preflight"]
-                    condition = str(preflight.get("if", ""))
-                except (yaml.YAMLError, KeyError, TypeError, AttributeError):
-                    condition = ""
-                # Every approval label must both trigger and be required on the issue, or a
-                # ready label alone could start credentialed implementation.
-                lacking = [
-                    label
-                    for label in (
-                        policy.ready_label,
-                        policy.human_review_label,
-                        policy.implementation_label,
+            labels = (policy.ready_label, policy.human_review_label, policy.implementation_label)
+            # The exact generated condition, compared after whitespace normalization: any other
+            # expression -- a dropped label, an `|| true`, a different label -- is not proven to
+            # require every approval label, so a ready label alone could start credentialed work.
+            mismatched = []
+            for file, job_name, expected in (
+                ("agent-auto-plan.yml", "plan", auto_plan_condition(*labels)),
+                ("agent-auto-implement.yml", "preflight", auto_implement_condition(*labels)),
+            ):
+                path = base / ".github/workflows" / file
+                if not path.exists():
+                    continue
+                job = _workflow_jobs(path).get(job_name)
+                actual = job.get("if") if isinstance(job, dict) else None
+                if actual is None or _normalized_expr(actual) != _normalized_expr(expected):
+                    mismatched.append(
+                        f"{file}:{job_name} if: must be exactly {_normalized_expr(expected)!r}"
                     )
-                    if f"github.event.label.name == '{label}'" not in condition
-                    or f"contains(github.event.issue.labels.*.name, '{label}')" not in condition
-                ]
-                add(
-                    Check(
-                        "workflow label conditions match the policy labels",
-                        not lacking,
-                        ""
-                        if not lacking
-                        else "auto-implement preflight does not require " + ", ".join(lacking),
-                    )
+            add(
+                Check(
+                    "workflow label conditions match the policy labels",
+                    not mismatched,
+                    "; ".join(mismatched),
                 )
+            )
+        # The automatic callers do nothing unless adding a label to an issue starts them.
+        inert = [
+            caller.name
+            for caller in callers
+            if caller.name in {"agent-auto-plan.yml", "agent-auto-implement.yml"}
+            and not _fires_on_issue_labeled(_workflow_doc(caller) or {})
+        ]
+        add(
+            Check(
+                "automatic callers trigger on issue labels",
+                not inert,
+                "not triggered by `on: issues: types: [labeled]`: " + ", ".join(inert)
+                if inert
+                else "",
+            )
+        )
     if not remote:
         return rep
 
@@ -2331,10 +2744,7 @@ def doctor(
     if routed:
         need_vars |= routed_vars
         need_secrets |= routed_secrets
-    implement_wf = base / ".github/workflows/agent-implement.yml"
-    if implement_wf.exists() and re.search(
-        r"^\s*agent:\s*codex\s*$", implement_wf.read_text(), re.MULTILINE
-    ):
+    if "codex" in agents.values():  # the parsed `with.agent` (or its codex default)
         need_secrets |= {"OPENAI_API_KEY"}
     mv, ms = sorted(need_vars - variables), sorted(need_secrets - secrets)
     empty_required = [name for name in mv if name in empty_vars]
@@ -2363,10 +2773,18 @@ def doctor(
 
     # --- runners: every job of every active caller, and ci.yml's `test` job, must run somewhere
     # that exists, or the run (or every PR's required check) sits queued forever.
-    all_targets = _caller_runner_targets(callers)
-    ci_labels = _ci_runs_on(base)
+    # The same resolver as the public-repository check: local reusable workflows are followed
+    # into their own jobs, platform calls through their `runs_on` input; anything it cannot
+    # prove (a runner group, an expression, a third-party workflow) is a str reason.
+    all_targets: dict[str, RunnerTarget] = {}
+    for caller in callers:
+        all_targets.update(_job_runner_targets(base, caller, platform_repository))
+    ci_target = _ci_runs_on(base)
+    ci_labels = ci_target if isinstance(ci_target, set) else None
+    unprovable = {w: why for w, why in all_targets.items() if isinstance(why, str)}
+    label_targets = {w: t for w, t in all_targets.items() if isinstance(t, set)}
     # (ci.yml's own runner check below reports a Windows CI target.)
-    on_windows = {where: lbls for where, lbls in all_targets.items() if _windows_labels(lbls)}
+    on_windows = {where: lbls for where, lbls in label_targets.items() if _windows_labels(lbls)}
     if on_windows:
         add(
             Check(
@@ -2377,8 +2795,16 @@ def doctor(
                 + "; ".join(f"{w} {sorted(lbls)}" for w, lbls in sorted(on_windows.items())),
             )
         )
+    if unprovable:
+        add(
+            Check(
+                "workflow runner targets are verifiable",
+                False,
+                "; ".join(f"{w}: {why}" for w, why in sorted(unprovable.items())),
+            )
+        )
     # Windows targets are reported above, not as a runner to register.
-    targets = {w: lbls for w, lbls in all_targets.items() if w not in on_windows}
+    targets = {w: lbls for w, lbls in label_targets.items() if w not in on_windows}
     need_runners = any(not _github_hosted(t) for t in [*targets.values(), ci_labels or set()])
     runners = (
         _paged_items(gh, f"repos/{project_id}/actions/runners", "runners") if need_runners else []
@@ -2395,7 +2821,7 @@ def doctor(
                 "self-hosted runner online for this repo",
                 not stranded,
                 (
-                    "no online runner for "
+                    "no online non-Windows runner for "
                     + "; ".join(f"{w} {sorted(lbls)}" for w, lbls in sorted(stranded.items()))
                     + f" ({len(online)} online / {len(runners)} registered)"
                     if runners
@@ -2409,7 +2835,9 @@ def doctor(
                 manual=True,
             )
         )
-    if ci_labels is not None:
+    if isinstance(ci_target, str):
+        add(Check("ci.yml test job runs on an available runner", False, ci_target))
+    elif ci_labels is not None:
         ci_ok = _runner_available(ci_labels, runners)
         ci_windows = bool(_windows_labels(ci_labels))
         add(
@@ -2424,7 +2852,8 @@ def doctor(
                 + (
                     "online runner found"
                     if ci_ok
-                    else "not a GitHub-hosted label and no online runner carries all of them"
+                    else "not a GitHub-hosted label and no online non-Windows runner carries "
+                    "all of them"
                 ),
                 manual=not ci_ok and not ci_windows,
             )

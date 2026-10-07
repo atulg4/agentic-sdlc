@@ -28,9 +28,9 @@ jobs:
       contents: read
       issues: write
       id-token: write
-    uses: PLATFORM_REPOSITORY/.github/workflows/reusable-plan.yml@PLATFORM_COMMIT_SHA
+    uses: REUSABLE_PLAN_USES
     with:
-      runs_on: 'RUNS_ON_JSON'
+      runs_on: RUNS_ON_JSON
       issue_number: ${{ inputs.issue_number }}
       trigger_actor: ${{ github.actor }}
       config_path: agentic-sdlc.toml

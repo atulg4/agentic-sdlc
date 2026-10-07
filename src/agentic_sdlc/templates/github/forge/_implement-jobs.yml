@@ -23,9 +23,9 @@ PREFLIGHT_EXTRA
       issues: read
       pull-requests: read
       id-token: write
-    uses: PLATFORM_REPOSITORY/.github/workflows/reusable-implement.yml@PLATFORM_COMMIT_SHA
+    uses: REUSABLE_IMPLEMENT_USES
     with:
-      runs_on: 'RUNS_ON_JSON'
+      runs_on: RUNS_ON_JSON
       issue_number: ISSUE_NUMBER_EXPR
       trigger_actor: ${{ github.actor }}
       config_path: agentic-sdlc.toml
@@ -34,8 +34,8 @@ PREFLIGHT_EXTRA
       publisher_app_client_id: ${{ vars.PUBLISHER_APP_CLIENT_ID }}
       agent: AGENT
       claude_auth_mode: subscription_oauth
-      executor_registry_path: 'EXECUTOR_REGISTRY_PATH'
-      routing_policy_path: 'ROUTING_POLICY_PATH'
+      executor_registry_path: EXECUTOR_REGISTRY_PATH
+      routing_policy_path: ROUTING_POLICY_PATH
     secrets:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
