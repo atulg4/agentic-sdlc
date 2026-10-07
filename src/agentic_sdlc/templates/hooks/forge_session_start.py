@@ -18,13 +18,21 @@ PROJECT = "PROJECT_ID"
 DEFAULT_BRANCH = "DEFAULT_BRANCH_NAME"
 
 
-def run(cmd: list[str]) -> str:
+UNAVAILABLE_WARNING = (
+    "[Forge] WARNING: lease inventory unavailable -- do not start issue work until it can be "
+    "checked. ({what} could not be read from GitHub: authentication, network or API failure; "
+    "fix `gh` and start a new session, or run `sdlcctl claims --project {project}`.)"
+)
+
+
+def run(cmd: list[str]) -> str | None:
+    """The command's stdout, or None when it failed -- a failure is never an empty answer."""
     try:
         return subprocess.run(
             cmd, capture_output=True, text=True, check=True, timeout=60
         ).stdout.strip()
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        return ""
+        return None
 
 
 def _lease_lookup():
@@ -49,7 +57,9 @@ def classify_leased(
         who = ",".join(a.get("login", "") for a in issue.get("assignees") or [])
         line = f"#{issue.get('number')} {issue.get('title', '')} (assignee: {who})"
         lease = lease_lookup(int(issue.get("number")))
-        if lease is None:
+        if isinstance(lease, dict) and lease.get("unavailable"):
+            live.append(f"{line} -- lease unreadable, treat as held")
+        elif lease is None:
             stale.append(line)
         elif session and isinstance(lease, dict) and str(lease.get("session") or "") == session:
             mine.append(line)
@@ -66,6 +76,7 @@ def main() -> int:
     session = str(payload.get("session_id") or "")
     run(["git", "fetch", "-q", "origin"])
     behind = run(["git", "rev-list", "--count", f"HEAD..origin/{DEFAULT_BRANCH}"]) or "?"
+    warnings: list[str] = []
     recent = run(["git", "log", "--oneline", "-8", f"origin/{DEFAULT_BRANCH}"])
     prs = run(
         [
@@ -101,26 +112,44 @@ def main() -> int:
             "number,title,assignees",
         ]
     )
-    try:
-        issues = json.loads(raw or "[]")
-    except json.JSONDecodeError:
-        issues = []
+    issues: list = []
+    listed = False  # the in-progress list itself was read; only then may "none" be printed
+    if raw is None:
+        warnings.append("the in-progress issue list")
+    else:
+        try:
+            parsed = json.loads(raw or "[]")
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, list):
+            issues = [i for i in parsed if isinstance(i, dict)]
+            listed = True
+        else:
+            warnings.append("the in-progress issue list (unparseable)")
     live, stale, mine = classify_leased(issues, _lease_lookup(), session)
+    if any(line.endswith("treat as held") for line in live):
+        warnings.append("at least one issue's lease")
+    for what in warnings:
+        print(UNAVAILABLE_WARNING.format(what=what, project=PROJECT))
     print(
         f"[Forge] {PROJECT}: HEAD is {behind} commit(s) behind origin/{DEFAULT_BRANCH}. "
         "Recent on main:"
     )
     print(recent or "  (unavailable)")
-    print("[Forge] Open PRs:\n" + (prs or "  none"))
+    if prs is None:
+        print("[Forge] Open PRs:\n  (unavailable -- the PR list could not be read from GitHub)")
+    else:
+        print("[Forge] Open PRs:\n" + (prs or "  none"))
     for line in mine:
         print(f"[Forge] Your current lease (this session, {session}): {line} -- keep working on it")
-    print(
-        "[Forge] Issues leased by other agents (do NOT work on these):\n"
-        + ("\n".join(live) or "  none")
-    )
+    if listed:
+        inventory = "\n".join(live) or "  none"
+    else:
+        inventory = "  UNAVAILABLE -- could not be read; do not assume none"
+    print("[Forge] Issues leased by other agents (do NOT work on these):\n" + inventory)
     if stale:
         print(
-            "[Forge] Labelled in-progress but no live lease (expired, released, or unreadable; "
+            "[Forge] Labelled in-progress but no live lease (expired or released; "
             "an expired lease may be taken over with sdlcctl claim):\n" + "\n".join(stale)
         )
     print(

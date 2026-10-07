@@ -42,6 +42,19 @@ PROJECT = "PROJECT_ID"
 ISSUE_BRANCH = re.compile(r"(?:^|/)issue-(\d+)(?:$|[^0-9])")
 CLAIM = re.compile(r"<!--\s*forge-claim\s+([^>]*?)\s*-->")
 RELEASE = re.compile(r"<!--\s*forge-release\s+([^>]*?)\s*-->")
+# What lease_for returns when GitHub could not be read. NEVER the same as "no lease" (None): a
+# failed read that looked like an empty inventory sent sessions into work owned elsewhere.
+UNAVAILABLE: dict = {"unavailable": True, "session": "", "agent": "unknown"}
+
+
+class LeaseUnavailable(Exception):
+    """A lease input (comments, a marker author's permission) could not be read from GitHub."""
+
+
+def lease_unavailable(lease: object) -> bool:
+    return isinstance(lease, dict) and bool(lease.get("unavailable"))
+
+
 # `git [global options] commit`: -C/-c/--git-dir/... take the NEXT word as their value, so
 # `git -C . commit` and `git -c k=v commit` are commits too. `commit.gpgsign=false` is not.
 GIT_VALUE_OPTS = frozenset(
@@ -771,20 +784,30 @@ _PERMISSIONS: dict[str, str | None] = {}  # one read per login (login_key) per h
 
 
 def repo_permission(login: str) -> str | None:
-    """The login's repository permission (role_name, else permission); None when unreadable."""
+    """The login's repository permission (role_name, else permission); None when GitHub says the
+    account has none (404). Any other failure raises LeaseUnavailable: an unreadable permission
+    must not silently drop that author's markers and read as "no lease"."""
     if login_key(login) in _PERMISSIONS:
         return _PERMISSIONS[login_key(login)]
     granted: str | None = None
     try:
-        out = subprocess.run(
+        proc = subprocess.run(
             ["gh", "api", f"repos/{PROJECT}/collaborators/{login}/permission"],
             capture_output=True,
             text=True,
-            check=True,
-        ).stdout
-        data = json.loads(out or "{}")
-    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
+            check=False,
+        )
+    except OSError as exc:
+        raise LeaseUnavailable(f"gh unavailable: {exc}") from exc
+    if proc.returncode != 0:
+        if "HTTP 404" not in (proc.stderr or ""):
+            raise LeaseUnavailable((proc.stderr or "").strip() or "permission read failed")
         data = None
+    else:
+        try:
+            data = json.loads(proc.stdout or "{}")
+        except json.JSONDecodeError as exc:
+            raise LeaseUnavailable("unparseable permission response") from exc
     if isinstance(data, dict):
         for key in ("role_name", "permission"):
             value = login_key(data.get(key))
@@ -808,9 +831,13 @@ def lease_from_comments(
     first_seen: dict[str, int] = {}
     latest: dict[str, dict] = {}
     for position, c in enumerate(comments):
-        if not isinstance(c, dict) or not trusted_marker_author(c, permission):
-            continue  # markers count only from writers and the trusted bots
+        if not isinstance(c, dict):
+            continue
         body = c.get("body") or ""
+        if not (CLAIM.search(body) or RELEASE.search(body)):
+            continue  # chatter: no permission read needed
+        if not trusted_marker_author(c, permission):
+            continue  # markers count only from writers and the trusted bots
         found = list(CLAIM.finditer(body))
         m = found[-1] if found else None
         if m:
@@ -840,7 +867,8 @@ def lease_from_comments(
 
 
 def lease_for(issue: int) -> dict | None:
-    """The live lease of `issue` (None if none/unreachable)."""
+    """The live lease of `issue`: None when there is none, UNAVAILABLE when GitHub could not be
+    read (callers must treat that as held, never as free)."""
     try:
         out = subprocess.run(
             [
@@ -856,13 +884,19 @@ def lease_for(issue: int) -> dict | None:
         ).stdout
         pages = json.loads(out or "[]")
     except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
-        return None
+        return UNAVAILABLE
+    if not isinstance(pages, list):
+        return UNAVAILABLE
     comments = [c for page in pages if isinstance(page, list) for c in page if isinstance(c, dict)]
-    return lease_from_comments(comments, repo_permission)
+    try:
+        return lease_from_comments(comments, repo_permission)
+    except LeaseUnavailable:
+        return UNAVAILABLE
 
 
-def open_pr_for(branch: str) -> bool:
-    """An open PR from this branch is the durable claim once the lease is released."""
+def open_pr_for(branch: str) -> bool | None:
+    """An open PR from this branch is the durable claim once the lease is released. None when
+    the PR list could not be read."""
     try:
         out = subprocess.run(
             [
@@ -884,7 +918,7 @@ def open_pr_for(branch: str) -> bool:
         ).stdout
         return bool(json.loads(out or "[]"))
     except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
-        return False
+        return None
 
 
 def decide(
@@ -911,8 +945,22 @@ def _decide_branch(payload: dict, branch: str, lease_lookup, pr_lookup) -> tuple
     issue = int(m.group(1))
     session = str(payload.get("session_id") or "")
     lease = lease_lookup(issue)
-    if lease is None and pr_lookup(branch):
+    if lease_unavailable(lease):
+        return 2, (
+            f"Forge guard: the lease of issue #{issue} could not be read from GitHub "
+            "(authentication, network or API failure). Lease inventory unavailable -- do not "
+            "commit issue work until it can be checked; retry once `gh` works."
+        )
+    has_pr = pr_lookup(branch) if lease is None else False
+    if lease is None and has_pr:
         return 0, ""  # follow-up commits to an open PR need no lease
+    if lease is None and has_pr is None:
+        return 2, (
+            f"Forge guard: branch '{branch}' targets issue #{issue}, it has no live lease and "
+            "its open PRs could not be read from GitHub (no PR could be confirmed). Claim it: "
+            f"sdlcctl claim --project {PROJECT} --issue {issue} --agent claude-code "
+            f"--session {session or '<session_id>'} --branch {branch}"
+        )
     if lease is None:
         return 2, (
             f"Forge guard: branch '{branch}' targets issue #{issue} but no live lease exists. "

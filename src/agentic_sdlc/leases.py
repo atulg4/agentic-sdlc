@@ -315,6 +315,15 @@ def current_lease(
     returned so callers can report a takeover.
     """
     now = now or datetime.now(UTC)
+    ordered = _open_leases(project, issue, gh)
+    live = [lease for lease in ordered if lease.live(now)]
+    if live:
+        return live[0]
+    return ordered[-1] if ordered else None
+
+
+def _open_leases(project: str, issue: int, gh: GhRunner) -> list[Lease]:
+    """Every session's unreleased lease (live or expired), in order of first claim."""
     first_seen: dict[str, int] = {}
     started: dict[str, datetime] = {}
     latest: dict[str, Lease] = {}
@@ -340,11 +349,7 @@ def current_lease(
             del latest[released]
             del first_seen[released]
             del started[released]
-    ordered = [latest[sess] for sess in sorted(latest, key=first_seen.__getitem__)]
-    live = [lease for lease in ordered if lease.live(now)]
-    if live:
-        return live[0]
-    return ordered[-1] if ordered else None
+    return [latest[sess] for sess in sorted(latest, key=first_seen.__getitem__)]
 
 
 @dataclass(frozen=True)
@@ -429,9 +434,42 @@ def reassigned_during(
     if claimed_at is None:
         return None
     try:
-        events = _paged(f"repos/{project}/issues/{issue}/events?per_page=100", gh)
+        events = _issue_events(project, issue, gh)
     except Exception:  # noqa: BLE001 -- unknown history: do not remove anyone
         return None
+    return _reassigned_in(events, login, claimed_at)
+
+
+def _issue_events(project: str, issue: int, gh: GhRunner) -> list[dict]:
+    return _paged(f"repos/{project}/issues/{issue}/events?per_page=100", gh)
+
+
+def _event_key(event: dict) -> str:
+    """An issue event's identity: its id, else its whole content (fakes and old payloads)."""
+    if event.get("id") is not None:
+        return f"id:{event['id']}"
+    return json.dumps(event, sort_keys=True, default=str)
+
+
+def _assigned_after(before: list[dict], after: list[dict], login: str) -> bool:
+    """Does `after` hold an `assigned` event for `login` that the `before` snapshot lacked?"""
+    seen: dict[str, int] = {}
+    for event in before:
+        seen[_event_key(event)] = seen.get(_event_key(event), 0) + 1
+    for event in after:
+        key = _event_key(event)
+        if seen.get(key):
+            seen[key] -= 1
+            continue
+        if event.get("event") == "assigned" and same_login(
+            (event.get("assignee") or {}).get("login"), login
+        ):
+            return True
+    return False
+
+
+def _reassigned_in(events: list[dict], login: str, claimed_at: datetime) -> bool | None:
+    """`reassigned_during` over an already-read event list."""
     assignments, removed = 0, False
     for event in events:
         kind = event.get("event")
@@ -568,20 +606,23 @@ def _sync_label(project: str, issue: int, gh: GhRunner, now: datetime | None = N
 
 def _sync_assignee(
     project: str, issue: int, login: str, gh: GhRunner, now: datetime | None = None
-) -> None:
+) -> bool:
     """Remove `login` -- an assignee a dead lease added -- unless the authoritative live lease
     wants it, then re-read and restore it if a claimant that wants it arrived meanwhile: the same
-    remove-then-reconcile as `_sync_label`, since assignee edits are not arbitrated either."""
+    remove-then-reconcile as `_sync_label`, since assignee edits are not arbitrated either. True
+    when the login was removed and stays removed."""
     now = now or datetime.now(UTC)
 
     def wanted(held: Lease | None) -> bool:
         return held is not None and held.live(now) and same_login(held.assignee, login)
 
     if wanted(current_lease(project, issue, gh, now)):
-        return
+        return False
     _edit(project, issue, gh, "--remove-assignee", login)
     if wanted(current_lease(project, issue, gh, now)):
         _edit(project, issue, gh, "--add-assignee", login)
+        return False
+    return True
 
 
 def _drop_owned_assignee(
@@ -600,13 +641,29 @@ def _drop_owned_assignee(
     the assignee and leaves the cleanup pending (False) for a later reconciliation."""
     if ended is None or not ended.owns_assignee or not ended.assignee:
         return False
+    try:
+        before: list[dict] | None = _issue_events(project, issue, gh)
+    except Exception:  # noqa: BLE001 -- unknown history
+        before = None
     if check_history:
-        superseded = reassigned_during(project, issue, ended.assignee, ended.claimed_at, gh)
+        if before is None or ended.claimed_at is None:
+            return False
+        superseded = _reassigned_in(before, ended.assignee, ended.claimed_at)
         if superseded is None:
             return False
         if superseded:
             return True
-    _sync_assignee(project, issue, ended.assignee, gh, now)
+    if not _sync_assignee(project, issue, ended.assignee, gh, now) or before is None:
+        return True
+    # The history check and the removal are not atomic: a maintainer may have assigned the
+    # login in between, and the removal just undid that. Re-read and give it back.
+    try:
+        after = _issue_events(project, issue, gh)
+    except Exception:  # noqa: BLE001 -- cannot tell: restore, keep the cleanup pending
+        _edit(project, issue, gh, "--add-assignee", ended.assignee)
+        return False
+    if _assigned_after(before, after, ended.assignee):
+        _edit(project, issue, gh, "--add-assignee", ended.assignee)  # the maintainer's now
     return True
 
 
@@ -833,7 +890,18 @@ def release(
     note: str = "",
     now: datetime | None = None,
 ) -> None:
+    now = now or datetime.now(UTC)
     existing = current_lease(project, issue, gh, now)
+    if (
+        existing is not None
+        and existing.session != session
+        and not existing.live(now)
+        and not force
+    ):
+        # Another session's EXPIRED lease is never a live conflicting holder: release this
+        # session's own unreleased lease if it has one, else just finish the cleanup (a retry
+        # after this session's release posted its marker and its assignee cleanup failed).
+        existing = next((x for x in _open_leases(project, issue, gh) if x.session == session), None)
     if existing is None:
         # Nothing to release -- possibly because an earlier release posted its marker and then
         # failed: finish that release's cleanup (idempotent, so a retry completes it).
