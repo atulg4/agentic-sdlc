@@ -217,7 +217,10 @@ something that runs differently.
 ## GitHub
 
 1. For a public platform repository, no platform credential is needed. For a
-   private platform, allow the consumer to call its reusable workflows and
+   private platform, allow the consumer to call its reusable workflows (on the
+   platform: Settings → Actions → General → Access, "Accessible from
+   repositories owned by" its user or organization; `sdlcctl doctor` reads this
+   setting and reports it as a manual TODO when it cannot) and
    create a fine-grained token that has Contents: Read for only the platform
    repository. Store it as `PLATFORM_READ_TOKEN`; never use a broad PAT.
 2. Copy the thin caller workflows from `examples/marketmaestro`.

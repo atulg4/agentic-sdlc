@@ -74,6 +74,12 @@ LABELS = {
     "in-progress": ("fbca04", "Leased: an agent/session is actively implementing this"),
 }
 
+#: Labels Forge fixes by name (all but the configurable ready label), case-folded as GitHub
+#: compares them. The ready label may collide with none of them, and they are distinct already.
+_FIXED_LABEL_KEYS = frozenset(name.casefold() for name in LABELS if name != "claude-ready")
+assert len(_FIXED_LABEL_KEYS) == len(LABELS) - 1, "Forge's fixed labels collide case-insensitively"
+assert IN_PROGRESS_LABEL.casefold() in _FIXED_LABEL_KEYS
+
 BASE_FORBIDDEN = (
     ".github/**",
     ".github/workflows/**",
@@ -157,10 +163,58 @@ def _project_id_problem(value: object) -> str:
     )
 
 
+def _ref_format_problem(name: str) -> str:
+    """Why `git check-ref-format --branch NAME` would refuse `name` ('' = it would not), by git's
+    own rules, so the answer does not depend on a git binary being installed."""
+    if name in ("@", "HEAD"):
+        return f"must not be {name!r}"
+    if name.startswith("-"):
+        return "must not start with '-'"
+    if name.startswith("/") or name.endswith("/") or "//" in name:
+        return "must not start or end with '/' or contain '//'"
+    if ".." in name or "@{" in name:
+        return "must not contain '..' or '@{'"
+    if name.endswith("."):
+        return "must not end with '.'"
+    if any(part.startswith(".") or part.endswith(".lock") for part in name.split("/")):
+        return "must not have a path component starting with '.' or ending with '.lock'"
+    if any(ord(c) < 0x20 or c == "\x7f" or c in " ~^:?*[\\" for c in name):
+        return "must not contain spaces, control characters or any of ~^:?*[\\"
+    return ""
+
+
+def _git_rejects_branch(name: str) -> bool:
+    """Does the installed git refuse `name` as a branch name? False when git cannot be run (the
+    rules above are then the whole check)."""
+    try:
+        proc = subprocess.run(
+            ["git", "check-ref-format", "--branch", name],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode != 0
+
+
 def _branch_problem(value: object) -> str:
-    return _str_problem(value) or (
-        "" if re.fullmatch(r"[A-Za-z0-9._/-]+", str(value)) else "contains unsupported characters"
-    )
+    """A branch name: renderable, a valid Git branch name by `git check-ref-format --branch`'s
+    rules (and by the installed git, when there is one: both must accept it), and within the
+    character set every generated workflow can carry unquoted."""
+    problem = _str_problem(value)
+    if problem:
+        return problem
+    name = str(value)
+    if not re.fullmatch(r"[A-Za-z0-9._/-]+", name):
+        return "contains unsupported characters"
+    problem = _ref_format_problem(name)
+    if problem:
+        return f"is not a valid Git branch name: {problem}"
+    if _git_rejects_branch(name):
+        return "is not a valid Git branch name (git check-ref-format --branch refuses it)"
+    return ""
 
 
 def _ready_label_problem(value: object) -> str:
@@ -174,8 +228,12 @@ def _ready_label_problem(value: object) -> str:
     if len(label) > 50 or "," in label:
         # GitHub's 50-character limit; a comma would split the work-request front matter.
         return "must be 1-50 characters without commas"
-    if label in {HUMAN_REVIEW_LABEL, IMPLEMENTATION_LABEL}:
-        return "must differ from the review/approval labels"
+    if label.casefold() in _FIXED_LABEL_KEYS:
+        # GitHub label names and Actions string comparisons ignore case: `Implementation-Approved`
+        # IS the approval label, and the issue template would apply it without the owner.
+        return "must differ (case-insensitively) from Forge's fixed labels: " + ", ".join(
+            sorted(_FIXED_LABEL_KEYS)
+        )
     return ""
 
 
@@ -1381,6 +1439,58 @@ def _remote_file_state(gh: GhRunner, args: Sequence[str]) -> str:
     except json.JSONDecodeError:
         return "unknown"
     return "present" if isinstance(data, (dict, list)) and data else "unknown"
+
+
+PLATFORM_ACCESS_CHECK = "private platform lets this repository call its workflows"
+
+
+def platform_access_check(gh: GhRunner, project_id: str, platform_repository: str) -> Check:
+    """A private (or internal) platform repository's reusable workflows can be called only from
+    the repositories its Actions access setting admits: `user` (repositories of the same user),
+    `organization` (of the same organization) or `enterprise` (of the same enterprise). Reading
+    the workflow file proves only that the reviewer can; `PLATFORM_READ_TOKEN` is used after a
+    called workflow starts and cannot resolve the caller's `uses:`. Unreadable (403/404: it needs
+    admin on the platform) or unverifiable is an unmet MANUAL requirement, never READY."""
+    consumer_owner = project_id.split("/")[0]
+    platform_owner = platform_repository.split("/")[0]
+    same_owner = consumer_owner.casefold() == platform_owner.casefold()
+    wanted = "user or organization" if same_owner else "enterprise"
+    fix = (
+        f"on {platform_repository}: Settings → Actions → General → Access → 'Accessible from "
+        f"repositories owned by / in {platform_owner}' (or: gh api -X PUT "
+        f"repos/{platform_repository}/actions/permissions/access -f access_level="
+        f"{'organization' if same_owner else 'enterprise'}; use access_level=user for a "
+        "user-owned platform)"
+    )
+    access = _safe_json(gh, ["api", f"repos/{platform_repository}/actions/permissions/access"])
+    level = access.get("access_level") if isinstance(access, dict) else None
+    if not isinstance(level, str):
+        return Check(
+            PLATFORM_ACCESS_CHECK,
+            False,
+            f"could not read the Actions access setting of {platform_repository} (403/404: "
+            f"needs admin on it); {project_id} can call its reusable workflows only when it "
+            f"is set to {wanted} → confirm {fix}",
+            manual=True,
+        )
+    if same_owner and level in {"user", "organization", "enterprise"}:
+        return Check(PLATFORM_ACCESS_CHECK, True, f"access_level {level}")
+    if not same_owner and level == "enterprise":
+        return Check(
+            PLATFORM_ACCESS_CHECK,
+            False,
+            f"access_level enterprise admits {consumer_owner} only inside the same enterprise "
+            f"as {platform_owner}, which doctor cannot verify → confirm it, or move "
+            f"{project_id} or {platform_repository} under one owner",
+            manual=True,
+        )
+    return Check(
+        PLATFORM_ACCESS_CHECK,
+        False,
+        f"access_level {level}: {project_id} cannot call the reusable workflows of "
+        f"{platform_repository} (every caller fails before any job starts) → set {fix}",
+        manual=True,
+    )
 
 
 def _paged_items(gh: GhRunner, path: str, key: str | None = None) -> list[dict]:
@@ -3541,6 +3651,11 @@ def doctor(
             )
         )
 
+    # --- a private platform must also admit this repository as a caller (Actions access)
+    platform_private = _safe_json(gh, ["api", f"repos/{platform_repository}", "--jq", ".private"])
+    if platform_private is True:
+        add(platform_access_check(gh, project_id, platform_repository))
+
     # --- default branch in the policy is the repository's actual default branch
     repo_info = _safe_json(gh, ["api", f"repos/{project_id}"])
     actual_branch = repo_info.get("default_branch") if isinstance(repo_info, dict) else None
@@ -3674,7 +3789,6 @@ def doctor(
     secrets = _paged_names(gh, f"repos/{project_id}/actions/secrets", "secrets")
     need_vars = set() if cloud else {"PUBLISHER_APP_CLIENT_ID"}
     need_secrets = {"CLAUDE_CODE_OAUTH_TOKEN"} | (set() if cloud else {"PUBLISHER_APP_PRIVATE_KEY"})
-    platform_private = _safe_json(gh, ["api", f"repos/{platform_repository}", "--jq", ".private"])
     if platform_private is True:  # GITHUB_TOKEN cannot check out another private repository
         need_secrets |= {"PLATFORM_READ_TOKEN"}
     # Whatever an installed implement caller's preflight insists on must exist too, or every run

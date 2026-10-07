@@ -2,8 +2,9 @@
 """Claude Code SessionStart hook: start every session from the real state of the repository.
 
 Installed by `sdlcctl onboard`. Fetches origin, reports how far the default branch moved, lists
-open PRs and issues currently leased by other agents, and reminds the session to claim before
-implementing. Output goes into the session's context.
+open PRs, this session's own live lease (a resume, clear or compaction after a claim) and the
+issues currently leased by other agents, and reminds the session to claim before implementing.
+Output goes into the session's context.
 """
 
 from __future__ import annotations
@@ -36,15 +37,25 @@ def _lease_lookup():
     return lease_for
 
 
-def classify_leased(issues: list, lease_lookup) -> tuple[list[str], list[str]]:
-    """Split `in-progress` issues into live leases and expired/released ones (label left over)."""
+def classify_leased(
+    issues: list, lease_lookup, session: str = ""
+) -> tuple[list[str], list[str], list[str]]:
+    """Split `in-progress` issues into live leases held by OTHER sessions, expired/released ones
+    (label left over), and this `session`'s own live leases (never "another agent's")."""
     live: list[str] = []
     stale: list[str] = []
+    mine: list[str] = []
     for issue in issues:
         who = ",".join(a.get("login", "") for a in issue.get("assignees") or [])
         line = f"#{issue.get('number')} {issue.get('title', '')} (assignee: {who})"
-        (live if lease_lookup(int(issue.get("number"))) is not None else stale).append(line)
-    return live, stale
+        lease = lease_lookup(int(issue.get("number")))
+        if lease is None:
+            stale.append(line)
+        elif session and isinstance(lease, dict) and str(lease.get("session") or "") == session:
+            mine.append(line)
+        else:
+            live.append(line)
+    return live, stale, mine
 
 
 def main() -> int:
@@ -52,7 +63,7 @@ def main() -> int:
         payload = json.loads(sys.stdin.read() or "{}")
     except json.JSONDecodeError:
         payload = {}
-    session = payload.get("session_id", "")
+    session = str(payload.get("session_id") or "")
     run(["git", "fetch", "-q", "origin"])
     behind = run(["git", "rev-list", "--count", f"HEAD..origin/{DEFAULT_BRANCH}"]) or "?"
     recent = run(["git", "log", "--oneline", "-8", f"origin/{DEFAULT_BRANCH}"])
@@ -94,13 +105,15 @@ def main() -> int:
         issues = json.loads(raw or "[]")
     except json.JSONDecodeError:
         issues = []
-    live, stale = classify_leased(issues, _lease_lookup())
+    live, stale, mine = classify_leased(issues, _lease_lookup(), session)
     print(
         f"[Forge] {PROJECT}: HEAD is {behind} commit(s) behind origin/{DEFAULT_BRANCH}. "
         "Recent on main:"
     )
     print(recent or "  (unavailable)")
     print("[Forge] Open PRs:\n" + (prs or "  none"))
+    for line in mine:
+        print(f"[Forge] Your current lease (this session, {session}): {line} -- keep working on it")
     print(
         "[Forge] Issues leased by other agents (do NOT work on these):\n"
         + ("\n".join(live) or "  none")

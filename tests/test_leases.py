@@ -1341,3 +1341,76 @@ def test_a_refused_claim_still_prints_only_json_on_stdout(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert json.loads(captured.out)["ok"] is False
     assert "REFUSED" in captured.err
+
+
+# ---------------------------------------------------------------- Codex 4205654923
+
+
+def _readd(gh, login, at, n=7):
+    """A maintainer removes and re-adds `login` at `at` (both events), leaving it assigned."""
+    gh.events.setdefault(n, []).extend(
+        [
+            {"event": "unassigned", "assignee": {"login": login}, "created_at": at.isoformat()},
+            {
+                "event": "assigned",
+                "assignee": {"login": login.upper()},
+                "created_at": (at + timedelta(seconds=5)).isoformat(),
+            },
+        ]
+    )
+
+
+def test_release_keeps_an_owned_assignee_a_maintainer_re_added_during_the_lease():
+    gh = FakeGh().issue(7)
+    assert claim(
+        PROJECT, 7, agent="a", session="s1", branch="b", gh=gh, now=NOW, assignee="alice"
+    ).ok
+    _readd(gh, "alice", NOW + timedelta(minutes=1))
+    release(PROJECT, 7, session="s1", gh=gh, now=NOW + timedelta(minutes=2))
+    assert _logins(gh) == ["alice"]
+    assert not any("--remove-assignee" in c for c in gh.calls)
+    # ownership ended: recorded, so no later retry removes it either
+    assert gh.issues[7]["comments"][-1]["body"] == (
+        "<!-- forge-cleanup session=s1 assignee=alice -->"
+    )
+
+
+def test_takeover_keeps_an_expired_leases_assignee_re_added_while_it_was_active():
+    stale = Lease(7, "a", "old", "b", NOW - timedelta(minutes=1), "alice", True)
+    gh = FakeGh().issue(7, assignees=["alice"], comments=[format_claim_marker(stale)])
+    gh.events[7] = [
+        {
+            "event": "assigned",
+            "assignee": {"login": "alice"},
+            "created_at": "2026-09-30T00:00:01Z",
+        }
+    ]
+    _readd(gh, "alice", datetime(2026, 9, 30, 1, 0, tzinfo=UTC))
+    assert claim(
+        PROJECT, 7, agent="a", session="new", branch="b", gh=gh, now=NOW, assignee="bob"
+    ).ok
+    assert sorted(_logins(gh)) == ["alice", "bob"]
+    assert not any("--remove-assignee" in c for c in gh.calls)
+
+
+def test_unreadable_events_keep_the_owned_assignee_and_leave_the_cleanup_pending():
+    gh = FakeGh().issue(7)
+    assert claim(
+        PROJECT, 7, agent="a", session="s1", branch="b", gh=gh, now=NOW, assignee="alice"
+    ).ok
+    real = gh.__call__
+
+    def no_events(args, input=None):
+        if args[0] == "api" and args[1].split("?")[0].endswith("/events"):
+            raise RuntimeError("gh: Forbidden (HTTP 403)")
+        return real(args, input=input)
+
+    release(PROJECT, 7, session="s1", gh=no_events, now=NOW)
+    assert _logins(gh) == ["alice"]
+    assert "forge-cleanup" not in gh.issues[7]["comments"][-1]["body"]
+    # Readable again and never re-added: a later release finishes the cleanup.
+    release(PROJECT, 7, session="s1", gh=gh, now=NOW + timedelta(minutes=1))
+    assert _logins(gh) == []
+    assert gh.issues[7]["comments"][-1]["body"] == (
+        "<!-- forge-cleanup session=s1 assignee=alice -->"
+    )
