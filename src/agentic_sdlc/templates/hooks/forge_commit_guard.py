@@ -1,31 +1,43 @@
 #!/usr/bin/env python3
-"""Claude Code PreToolUse hook: block `git commit` on an issue branch without this session's lease.
+"""Claude Code PreToolUse hook: guard git on an issue branch without this session's lease.
 
 Installed by `sdlcctl onboard`. Reads the hook payload on stdin; exit 2 blocks the tool call and
-shows the message to the agent. Only Bash commands that commit on `*/issue-N*` branches are
-examined; everything else passes.
+shows the message to the agent. Only an issue branch (`*/issue-N*`) this session does not lease
+is ever blocked; everything else passes.
 
-Posture: FAIL CLOSED. Two layers decide whether a command is a commit:
+Posture: DENY BY DEFAULT for git. On an issue branch, EVERY git invocation needs the lease except
+a short allowlist of read-only subcommands proven by plain literal tokens (`_read_only`):
+status, log, diff, show, blame, grep (no `-O` pager), ls-files, ls-tree, rev-parse, describe,
+shortlog, reflog (show/list), branch (only --list/-l/-a/-r/-v/--show-current/--contains, no
+positional arguments), remote (-v/show), config (--get*/--list/-l, no write mode), fetch (no
+--update-head-ok/-u, --upload-pack or refspec), stash list/show, tag (-l/--list, no create or
+delete flag), help, version, cat-file, for-each-ref, name-rev, merge-base, check-ignore,
+check-attr. Everything else -- commit, merge, cherry-pick, revert, rebase, am, apply, pull, reset,
+checkout, switch, stash push/pop/apply, notes, tag creation, update-ref, commit-tree,
+fast-import, filter-branch, replace, worktree, push, `git-<name>` programs, aliases and unknown
+subcommands -- goes to the lease check. So does an allowlisted subcommand whose meaning git or
+the shell can change out of sight: `-c`/`--config-env`/`--exec-path=` (pager, diff and fetch
+commands are configuration), an environment assignment other than GIT_DIR/GIT_WORK_TREE/locale
+on it (or a GIT_*/PAGER/EDITOR assignment anywhere in the command), `--output`, or an argument
+holding `$`, a backtick or a brace expansion.
 
-1. The precise parser (`_commit_targets`) PROVES a commit and finds the repository it lands in:
-   wrappers, `sh -c`, git global options, aliases, `cd`, and the bodies of `$(...)` and
-   backtick substitutions, which are parsed recursively with the same parser.
-2. A conservative pre-check over the RAW command: when the text holds a `git` word and a
-   `commit` word anywhere -- inside quotes, `$(...)`, backticks, `eval`, here-strings -- the
-   command is a commit UNLESS every simple command in it is positively proven not to be one
-   (`_segment_proven`): it holds no `$`/backtick expansion or here-string, and it either lacks
-   one of the two words, or is git itself running one of its own non-commit subcommands
-   (`git log --grep commit`), or is a `sh -c` whose string is proven the same way.
-3. A raw-text proof (`_raw_unproven`), whatever words the text holds: the shell can ASSEMBLE a
-   program or subcommand (`g$'it' com$'mit'`, `"g"it`, `\\git`, `co{m,}mit`, `$(echo git)`) that
-   neither check above can see. Every simple command's program and git subcommand must be a plain
-   literal word in the raw text (`[A-Za-z0-9_./+-]+`), `eval`/`source` may take only plain words,
-   and `$'...'`/`$"..."` quoting next to the letters of `git` then `commit` is unproven outright.
+Indirect execution is guarded the same way: any other program that receives `git` as a word
+(`xargs git`, `xargs -a f git`, `find -exec git`, `parallel git`, `eval git ...`,
+`python -c "...'git'..."`), `xargs`/`parallel`/`find` handing work to a shell, and a shell reading
+its program from stdin (`... | sh`, `bash <<< ...`, `bash -s`). `sh -c STRING` is parsed
+recursively, as are `$(...)`/backtick bodies; a shell running a script FILE is opaque like any
+other program and passes.
 
-Anything the parser cannot prove is treated as a commit and goes to the lease check. Only an
-unleased issue branch is ever blocked, so over-blocking (`echo "git commit"`) costs nothing on a
-leased branch or off issue branches; a missed commit costs the lease. Unparseable text (unbalanced
-quotes) holding both words is a commit too.
+A raw-text proof (`_raw_unproven`) backs the parser: the shell can ASSEMBLE a program or
+subcommand (`g$'it' com$'mit'`, `"g"it`, `\\git`, `co{m,}mit`, `$(echo git)`) the parser cannot
+see, so every program and git subcommand must be a plain literal word in the raw text
+(`[A-Za-z0-9_./+-]+`), `eval`/`source` may take only plain words, and `$'...'`/`$"..."` quoting
+next to the letters of `git` then `commit` is unproven outright. Unparseable text that mentions
+git is guarded too. Over-blocking (`echo "git merge"`) costs nothing on a leased branch or off
+issue branches; a missed history change costs the lease.
+
+Out of scope: programs that run git without naming it on the command line (a script file, a
+Makefile target) and direct writes into `.git/`.
 """
 
 from __future__ import annotations
@@ -97,21 +109,6 @@ WRAPPER_OPTS: dict[str, tuple[str, frozenset[str], int, frozenset[str]]] = {
     "ionice": ("cn", frozenset({"--class", "--classdata"}), 0, frozenset()),
     "timeout": ("sk", frozenset({"--signal", "--kill-after"}), 1, frozenset()),
     "stdbuf": ("ioe", frozenset({"--input", "--output", "--error"}), 0, frozenset()),
-    "xargs": (
-        "aEdILnPs",
-        frozenset(
-            {
-                "--arg-file",
-                "--delimiter",
-                "--max-args",
-                "--max-procs",
-                "--max-chars",
-                "--process-slot-var",
-            }
-        ),
-        0,
-        frozenset(),
-    ),
     "time": ("fo", frozenset({"--format", "--output"}), 0, frozenset()),
     "exec": ("a", frozenset(), 0, frozenset()),
     "command": ("", frozenset(), 0, frozenset()),
@@ -121,6 +118,11 @@ WRAPPER_OPTS: dict[str, tuple[str, frozenset[str], int, frozenset[str]]] = {
 }
 WRAPPERS = frozenset(WRAPPER_OPTS)
 SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
+GIT_PROGRAMS = frozenset({"git", "git.exe"})
+# Programs that run a command assembled from their input or arguments (`xargs sh`, `find -exec
+# bash`, `parallel sh`): handing work to a shell is unprovable (Codex 4206173667). `xargs` is NOT
+# a wrapper any more -- the arguments it appends from stdin or `-a FILE` are invisible here.
+FANOUT = frozenset({"xargs", "parallel", "find"})
 OPERATORS = frozenset({";", "&", "&&", "|", "||", "(", ")", ";;", "|&"})
 _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # Reserved words and grouping that may open a simple command without being its program:
@@ -130,9 +132,20 @@ SHELL_KEYWORDS = frozenset(
     {"if", "then", "elif", "else", "fi", "while", "until", "do", "done", "!", "{", "}", "esac"}
     | {"coproc", "function"}
 )
-# The fail-closed pre-check's words (see the module docstring), anywhere in the raw text.
-_GIT_WORD = re.compile(r"\bgit\b")
-_COMMIT_WORD = re.compile(r"\bcommit\b")
+# A `git` word anywhere in a program's (cooked) arguments: `git`, `/usr/bin/git`, `'git'` inside
+# a Python string -- but not `.git/HEAD`, `legit`, `github` or `git-lfs`.
+_GIT_WORD = re.compile(r"(?<![\w.-])git(?![\w-])")
+# An assignment anywhere in the command to a variable that changes what a read-only git command
+# runs (GIT_EXTERNAL_DIFF, GIT_PAGER, GIT_CONFIG_*, GIT_SSH, PAGER, EDITOR, ...), checked
+# with quotes and backslashes removed (`export GIT_EXTERNAL"_DIFF=x"`). GIT_DIR and GIT_WORK_TREE
+# only select the repository.
+_ENV_TAINT = re.compile(
+    r"(?<![A-Za-z0-9_])(?:GIT_(?!DIR=|WORK_TREE=)[A-Z0-9_]+|PAGER|EDITOR|VISUAL|LESS[A-Z]*)="
+)
+# Command-line assignments that leave a read-only git command read-only.
+SAFE_GIT_ENV = frozenset({"GIT_DIR", "GIT_WORK_TREE", "LANG", "TZ", "TERM", "NO_COLOR", "COLUMNS"})
+# A bash brace expansion (`{a,b}`, `{1..3}`): shlex keeps it one word, the shell does not.
+_BRACE_EXPANSION = re.compile(r"\{[^{}]*(?:,|\.\.)[^{}]*\}")
 # Text that expands into words the parser cannot see: `$x`, `${x}`, `$(...)`, backticks, and a
 # here-string / here-document feeding a command its input.
 _EXPANSION = re.compile(r"[$`]|^<<")
@@ -171,25 +184,108 @@ GIT_REPO_OPTS = frozenset({"-C", "--git-dir", "--work-tree"})
 GIT_REPO_ENV = frozenset({"GIT_DIR", "GIT_WORK_TREE"})
 # Command-line assignments git reads its configuration (and so its aliases) from.
 GIT_CONFIG_ENV = re.compile(r"^GIT_CONFIG(?:_[A-Z0-9_]+)?$")
-# Git's own subcommands: git never expands an alias that shadows one, so these are classified by
-# name alone. Anything else (`git ci`) may be an alias and is resolved before it is classified.
-GIT_BUILTINS = frozenset(
+# Deny by default (Codex 4206173667 / 4206173686): the read-only subcommands, each a plain
+# literal token. Those in READ_ONLY_ANY take any arguments; the rest are read-only only for the
+# argument shapes `_read_only` admits. Aliases are not followed: an alias is not a literal
+# allowlisted token, so `git st` needs the lease like any unknown subcommand.
+READ_ONLY_ANY = frozenset(
     {
-        "add", "am", "annotate", "apply", "archive", "bisect", "blame", "branch", "bundle",
-        "cat-file", "check-attr", "check-ignore", "check-ref-format", "checkout", "cherry",
-        "cherry-pick", "clean", "clone", "commit-graph", "commit-tree", "config",
-        "count-objects", "describe", "diff", "diff-files", "diff-index", "diff-tree",
-        "difftool", "fetch", "for-each-ref", "format-patch", "fsck", "gc", "grep",
-        "hash-object", "help", "init", "log", "ls-files", "ls-remote", "ls-tree",
-        "maintenance", "merge", "merge-base", "mergetool", "mv", "notes", "prune", "pull",
-        "push", "range-diff", "rebase", "reflog", "remote", "repack", "replace", "reset",
-        "restore", "rev-list", "rev-parse", "revert", "rm", "shortlog", "show", "show-ref",
-        "sparse-checkout", "stash", "status", "submodule", "switch", "symbolic-ref", "tag",
-        "update-index", "update-ref", "var", "verify-commit", "version", "whatchanged",
-        "worktree", "write-tree",
+        "status", "log", "diff", "show", "blame", "ls-files", "ls-tree", "rev-parse",
+        "describe", "shortlog", "help", "version", "cat-file", "for-each-ref", "name-rev",
+        "merge-base", "check-ignore", "check-attr",
     }
 )  # fmt: skip
-MAX_ALIAS_DEPTH = 8
+READ_ONLY_SHAPED = frozenset({"grep", "reflog", "branch", "remote", "config", "fetch"})
+READ_ONLY_SHAPED |= {"stash", "tag"}
+BRANCH_LIST_OPTS = frozenset({"--list", "-l", "-a", "--all", "-r", "--remotes", "-v"})
+BRANCH_LIST_OPTS |= {"-vv", "--verbose", "--show-current", "--contains"}
+CONFIG_READ = frozenset({"--get", "--get-all", "--get-regexp", "--get-urlmatch", "--list", "-l"})
+CONFIG_WRITE = frozenset(
+    {"--add", "--unset", "--unset-all", "--replace-all", "--rename-section", "--remove-section"}
+    | {"-e", "--edit", "set", "unset", "rename-section", "remove-section", "edit"}
+)
+TAG_WRITE = frozenset({"--delete", "--annotate", "--sign", "--local-user", "--force"})
+TAG_WRITE |= {"--message", "--file", "--create-reflog", "--no-sign", "--edit"}
+
+
+def _short_cluster(arg: str) -> str:
+    """The letters of a short-option cluster (`-av` -> `av`); empty for anything else."""
+    return arg[1:] if arg.startswith("-") and not arg.startswith("--") else ""
+
+
+def _read_only(sub: str, args: list[str]) -> bool:
+    """Is `git SUB ARGS` proven read-only for the branch's history? Deny by default: a
+    subcommand outside the allowlist, or an allowlisted one with an argument shape not admitted
+    here, is not. Expansions and brace expansions are unprovable everywhere (`git fetch -{u,}`)."""
+    if any(_EXPANSION.search(a) or _BRACE_EXPANSION.search(a) for a in args):
+        return False
+    if any(a == "--output" or a.startswith("--output=") for a in args):
+        return False  # log/diff/show write a file of git's choosing (a ref, a hook)
+    if sub in READ_ONLY_ANY:
+        return True
+    if sub not in READ_ONLY_SHAPED:
+        return False
+    options = args[: args.index("--")] if "--" in args else args
+    positionals = [a for a in options if not a.startswith("-")]
+    if sub == "grep":  # -O/--open-files-in-pager runs a program
+        return not any(
+            a.startswith("--open-files-in-pager") or "O" in _short_cluster(a) for a in options
+        )
+    if sub == "reflog":
+        if not args or args[0] in ("show", "list"):
+            return not any(a in ("expire", "delete", "drop", "exists") for a in args[1:])
+        return args[0].startswith("-") and not any(
+            a in ("expire", "delete", "drop", "exists") for a in args
+        )
+    if sub == "branch":
+        rest = list(args)
+        while rest:
+            arg = rest.pop(0)
+            if arg == "--contains":
+                if rest and not rest[0].startswith("-"):
+                    rest.pop(0)  # its commit
+                continue
+            if arg.startswith("--contains="):
+                continue
+            if arg in BRANCH_LIST_OPTS:
+                continue
+            letters = _short_cluster(arg)
+            if letters and set(letters) <= set("larv"):
+                continue
+            return False  # a positional (create/rename) or any other option
+        return True
+    if sub == "remote":
+        if positionals and positionals[0] != "show":
+            return False
+        before = options[: options.index("show")] if "show" in options else options
+        return all(a in ("-v", "--verbose") for a in before)
+    if sub == "config":
+        reads = any(a in CONFIG_READ for a in options) or (
+            bool(positionals) and positionals[0] in ("get", "list")
+        )
+        return reads and not any(a in CONFIG_WRITE for a in options)
+    if sub == "fetch":
+        for arg in options:
+            if arg.startswith(("--update-head-ok", "--upload-pack", "--exec")):
+                return False
+            if "u" in _short_cluster(arg):
+                return False
+        # `git fetch REMOTE SRC:DST` writes DST; an `ext::` remote runs a command
+        return not any(":" in a for a in positionals[1:]) and not any(
+            a.startswith("ext::") for a in positionals
+        )
+    if sub == "stash":
+        return bool(args) and args[0] in ("list", "show")
+    if sub == "tag":
+        if not args:
+            return True
+        listing = any(a in ("-l", "--list") or "l" in _short_cluster(a) for a in options)
+        writes = any(
+            a.partition("=")[0] in TAG_WRITE or set(_short_cluster(a)) & set("dasufmFe")
+            for a in options
+        )
+        return listing and not writes
+    return False
 
 
 def _strip_wrapper(name: str, words: list[str], chdirs: list[str]) -> list[str]:
@@ -229,16 +325,23 @@ def _strip_wrapper(name: str, words: list[str], chdirs: list[str]) -> list[str]:
     return words
 
 
-def _command_words(argv: list[str], chdirs: list[str], env: list[tuple[str, str]]) -> list[str]:
+def _command_words(
+    argv: list[str],
+    chdirs: list[str],
+    env: list[tuple[str, str]],
+    keys: list[str] | None = None,
+) -> list[str]:
     """`argv` without leading reserved words, `VAR=value` prefixes and wrappers (their directory
-    options go to `chdirs`, GIT_DIR/GIT_WORK_TREE assignments to `env`): the program and its
-    arguments."""
+    options go to `chdirs`, GIT_DIR/GIT_WORK_TREE assignments to `env`, every assigned name to
+    `keys`): the program and its arguments."""
     words = list(argv)
     while words:
         if words[0] in SHELL_KEYWORDS:
             words.pop(0)
         elif _ASSIGNMENT.match(words[0]):
             key, _, value = words.pop(0).partition("=")
+            if keys is not None:
+                keys.append(key)
             if key in GIT_REPO_ENV or GIT_CONFIG_ENV.match(key):
                 env.append((key, value))
         elif os.path.basename(words[0]) in WRAPPERS:
@@ -285,6 +388,20 @@ def _shell_command_string(words: list[str]) -> str | None:
     return rest[0] if has_c and rest else None
 
 
+def _shell_reads_stdin(words: list[str]) -> bool:
+    """A shell (without `-c`) taking its program from stdin -- `... | sh`, `bash -s`, `bash`,
+    `sh < file`, `bash <<< "..."` -- rather than from a script file operand."""
+    for word in words[1:]:
+        if word == "--":
+            continue
+        if word[:1] in ("-", "+") and len(word) > 1:
+            if word[0] == "-" and not word.startswith("--") and "s" in word[1:]:
+                return True
+            continue
+        return word.startswith(("<", ">"))  # a redirection, not a script operand
+    return True
+
+
 def _where(cwd: str | None, chdirs) -> str:
     """The directory `chdirs` lead to from `cwd`, in order (`cd -` is unknowable here: stay put)."""
     where = cwd or os.getcwd()
@@ -294,111 +411,81 @@ def _where(cwd: str | None, chdirs) -> str:
     return where
 
 
-def git_alias(
-    name: str, where: str, git_opts: tuple[str, ...] = (), env: dict[str, str] | None = None
-) -> str | None:
-    """`alias.<name>` as git itself resolves it in `where` (repository, global and system
-    configuration, plus GIT_CONFIG_* set on the command line); None when it has none."""
-    try:
-        proc = subprocess.run(
-            ["git", *git_opts, "config", "--get", f"alias.{name}"],
-            cwd=where if os.path.isdir(where) else None,
-            env={**os.environ, **env} if env else None,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError:
-        return None
-    return proc.stdout.rstrip("\n") if proc.returncode == 0 else None
+def _strip_substitutions(word: str) -> str:
+    """One word without its `$(...)`/backtick bodies (those are parsed as commands of their own)."""
+    for body in _substitutions(word):
+        word = word.replace(body, "", 1)
+    return word
 
 
 def _commit_targets(argv: list[str], depth: int = 0, cwd: str | None = None) -> list[Target]:
-    """The repository each `git ... commit` in one simple command commits to. A subcommand that
-    is not one of git's own is resolved as an alias first -- inline `-c alias.X=...`, then the
-    configuration git reads where the command runs -- and classified by its expansion; a shell
-    (`!`) alias, or one whose value cannot be read, counts as a commit (fails closed)."""
+    """The repository each guarded git invocation in one simple command acts on (see the module
+    docstring): empty only when the command is proven not to touch history through git."""
     chdirs: list[str] = []
     env: list[tuple[str, str]] = []
-    words = _command_words(argv, chdirs, env)
+    keys: list[str] = []
+    words = _command_words(argv, chdirs, env, keys)
     if not words:
         return []
+    unknown = [(tuple(chdirs), (), tuple(env))]
     program = os.path.basename(words[0])
     inner = _shell_command_string(words)
-    if inner is not None and depth < 3:
+    if inner is not None:
+        if depth >= MAX_SUBST_DEPTH:
+            return unknown
         return [
             ((*chdirs, *inner_dirs), opts, (*env, *inner_env))
             for inner_dirs, opts, inner_env in commit_targets(inner, depth + 1, _where(cwd, chdirs))
         ]
-    if program not in ("git", "git.exe"):
+    args = [_strip_substitutions(word) for word in words[1:]]
+    if program in SHELLS:  # `| sh`, `bash <<< ...`: the program arrives on stdin
+        reads_stdin = _shell_reads_stdin(words)
+        return unknown if reads_stdin or any(_mentions_git(a) for a in args) else []
+    if program.startswith("git-"):
+        return unknown  # `git-commit`, `git-merge`: a git subcommand run directly
+    if program not in GIT_PROGRAMS:
+        if any(_mentions_git(a) for a in args):
+            return unknown  # `xargs git`, `find -exec git`, `eval git ...`, `python -c '...git'`
+        if program in FANOUT and any(os.path.basename(a) in SHELLS for a in args):
+            return unknown  # `xargs sh`, `find -exec bash -c ...`
         return []
+    unsafe = any(
+        key not in SAFE_GIT_ENV and not key.startswith("LC_") for key in keys
+    )  # GIT_EXTERNAL_DIFF=..., GIT_CONFIG_*=..., PAGER=... git log
     rest = words[1:]
     repo_opts: list[str] = []
-    global_opts: list[str] = []  # every global option, re-applied to an alias's expansion
-    # Inline aliases, name -> value; one set from the environment (`--config-env`) cannot be read
-    # here and is recorded as a shell alias, which fails closed.
-    inline: dict[str, str] = {}
     while rest:
         word = rest.pop(0)
         if word in GIT_VALUE_OPTS:
-            if rest:
-                value = rest.pop(0)  # the option's value, e.g. the path after -C
-                global_opts += [word, value]
-                if word in GIT_REPO_OPTS:
-                    repo_opts += [word, value]
-                key, eq, setting = value.partition("=")
-                if key.lower().startswith("alias."):
-                    alias = key[len("alias.") :].lower()
-                    inline[alias] = "!" if word == "--config-env" else (setting if eq else "")
+            value = rest.pop(0) if rest else ""
+            if word in GIT_REPO_OPTS:
+                repo_opts += [word, value]
+            if word in ("-c", "--config-env"):
+                unsafe = True  # core.pager, diff.external, alias.*: configuration runs commands
             continue
-        if word.startswith("--config-env="):
-            global_opts.append(word)
-            key = word[len("--config-env=") :].partition("=")[0]
-            if key.lower().startswith("alias."):
-                inline[key[len("alias.") :].lower()] = "!"
+        if word.startswith(("--config-env=", "--exec-path=")) or (
+            word.startswith("-c") and len(word) > 2
+        ):
+            unsafe = True
             continue
         if word.startswith(("--git-dir=", "--work-tree=")):
             repo_opts.append(word)
-            global_opts.append(word)
             continue
         if word.startswith("-C") and len(word) > 2:
             repo_opts += ["-C", word[2:]]
-            global_opts += ["-C", word[2:]]
             continue
         if word.startswith("-"):
-            global_opts.append(word)
-            continue  # --no-pager, --exec-path=..., ...
+            continue  # --no-pager, --bare, ...
         target = [(tuple(chdirs), tuple(repo_opts), tuple(env))]
-        if word == "commit":
+        if unsafe or not _read_only(word, rest):
             return target
-        if word in GIT_BUILTINS:
-            return []
-        if _EXPANSION.search(word):
-            return target  # `git $sub`: the subcommand is unknowable here, fail closed
-        expansion: str | None
-        if word.lower() in inline:
-            expansion = inline[word.lower()]
-        else:
-            expansion = git_alias(word, _where(cwd, chdirs), tuple(repo_opts), dict(env))
-        if expansion is None:
-            return []  # not an alias: an external `git-<word>` command
-        try:
-            expanded = shlex.split(expansion)
-        except ValueError:
-            return target
-        if expansion.lstrip().startswith("!") or not expanded or depth >= MAX_ALIAS_DEPTH:
-            return target  # a shell alias (or one we cannot follow): fail closed
-        return _commit_targets(
-            [*argv[: len(argv) - len(words)], "git", *global_opts, *expanded, *rest],
-            depth + 1,
-            cwd,
-        )
-    return []
+        return []
+    return []  # `git`, `git --version`: no subcommand
 
 
-def _mentions_commit(text: str) -> bool:
-    """The pre-check: a `git` word and a `commit` word, in any order, anywhere in `text`."""
-    return bool(_GIT_WORD.search(text) and _COMMIT_WORD.search(text))
+def _mentions_git(text: str) -> bool:
+    """A `git` word anywhere in `text` (see `_GIT_WORD`)."""
+    return bool(_GIT_WORD.search(text))
 
 
 def _substitutions(word: str) -> list[str]:
@@ -438,44 +525,6 @@ def _git_subcommand(words: list[str]) -> str | None:
             continue
         return word
     return None
-
-
-def _segment_proven(seg: list[str], depth: int, cwd: str | None) -> bool:
-    """Is this simple command positively proven NOT to commit (the fail-closed pre-check)? No
-    expansion the parser cannot see, and: it lacks a `git` or a `commit` word, or it is git
-    itself running one of git's own non-commit subcommands, or a `sh -c` whose string is proven.
-    Anything else that mentions both words (`eval`, `echo "git commit"`, `bash <<< ...`, an
-    unknown wrapper, a git alias or external `git-foo`) is not proven."""
-    if any(_EXPANSION.search(word) for word in seg):
-        return False
-    if not _mentions_commit(" ".join(seg)):
-        return True
-    words = _command_words(seg, [], [])
-    if not words:
-        return True  # assignments only (`MSG="git commit"`): nothing runs
-    inner = _shell_command_string(words)
-    if inner is not None:
-        return depth < MAX_SUBST_DEPTH and not _unproven(inner, depth + 1, cwd)
-    if os.path.basename(words[0]) in ("git", "git.exe"):
-        sub = _git_subcommand(words)
-        return sub is not None and sub != "commit" and sub in GIT_BUILTINS
-    return False
-
-
-def _unproven(command: str, depth: int, cwd: str | None) -> bool:
-    """Does any simple command in `command` escape proof (see `_segment_proven`)?"""
-    if not _mentions_commit(command):
-        return False
-    try:
-        segments = _segments(command)
-    except ValueError:
-        return True
-    for seg in segments:
-        while seg and seg[0] in SHELL_KEYWORDS:
-            seg = seg[1:]
-        if seg and not _segment_proven(seg, depth, cwd):
-            return True
-    return False
 
 
 # ---- The raw-text proof (Codex 4205654928). shlex cooks quotes away and does not know ANSI-C
@@ -652,10 +701,10 @@ def _raw_unproven(command: str, depth: int = 0) -> bool:
 
 
 def commit_targets(command: str, depth: int = 0, cwd: str | None = None) -> list[Target]:
-    """Every `git ... commit` in `command` with the repository it commits to. `cd DIR` before it
-    (`cd ../wt && git commit`) counts too. Fails closed: a simple command that is not proven
-    to be a non-commit while the text mentions `git` and `commit` counts as one."""
-    suspicious = _mentions_commit(command)
+    """Every guarded git invocation in `command` (see the module docstring) with the repository
+    it acts on. `cd DIR` before it (`cd ../wt && git merge x`) counts too. Deny by default: any
+    git invocation not proven read-only, and anything that runs git or a shell indirectly, is
+    one; an assembled program or subcommand is one with an unknown repository."""
     found: list[Target] = []
     cds: list[str] = []
     for seg in _segments(command):
@@ -669,36 +718,40 @@ def commit_targets(command: str, depth: int = 0, cwd: str | None = None) -> list
             operands = [w for w in seg[1:] if not w.startswith("-") or w == "-"]
             cds.append(operands[-1] if operands else "~")
         targets = [] if is_cd else _commit_targets(seg, depth, where)
-        for body in (body for word in seg for body in _substitutions(word)):
+        # over the joined words: shlex splits an unquoted `cd \`git commit\`` across words
+        for body in _substitutions(" ".join(seg)):
             if depth >= MAX_SUBST_DEPTH:
-                targets += [((), (), ())] if _mentions_commit(body) else []
+                targets += [((), (), ())] if _mentions_git(body) else []
                 continue
             try:  # a substitution runs where the command runs: same `cd`s
                 targets += commit_targets(body, depth + 1, where)
             except ValueError:
-                targets += [((), (), ())] if _mentions_commit(body) else []
-        if not targets and suspicious and not _segment_proven(seg, depth, where):
-            targets = [((), (), ())]  # unknown repository: checked from cwd and the `cd`s
+                targets += [((), (), ())] if _mentions_git(body) else []
         prefix = cds[:-1] if is_cd else cds
         found += [((*prefix, *dirs), opts, env) for dirs, opts, env in targets]
-    if depth == 0 and _raw_unproven(command):
-        # An assembled program/subcommand somewhere: unknown repository, so every `cd` prefix.
+    if depth == 0 and (
+        _raw_unproven(command)
+        or (_mentions_git(command) and _ENV_TAINT.search(re.sub(r"[\"'\\]", "", command)))
+    ):
+        # An assembled program/subcommand, or git run under an exported GIT_*/PAGER/EDITOR
+        # setting: unknown repository, so every `cd` prefix.
         found += [(tuple(cds[:count]), (), ()) for count in range(len(cds) + 1)]
     return found
 
 
 def is_git_commit(command: str, depth: int = 0, cwd: str | None = None) -> bool:
-    """True when any simple command in `command` runs `git ... commit`, however git is spelled
-    (`git`, `/usr/bin/git`, `./git`), whatever wrapper (with its options) runs it, whatever
-    global options precede the subcommand, and whatever alias (`git ci`) stands for it."""
+    """True when `command` holds a guarded git invocation (the name predates deny-by-default:
+    any history-changing, unknown or unprovable git use counts, not only `git commit`), however
+    git is spelled (`git`, `/usr/bin/git`, `./git`), whatever wrapper (with its options) runs it,
+    and whatever runs it indirectly (`xargs git`, `... | sh`)."""
     try:
         return bool(commit_targets(command, depth, cwd))
-    except ValueError:  # unparseable to shlex: fail closed on the two words or the raw proof
-        return _mentions_commit(command) or _raw_unproven(command)
+    except ValueError:  # unparseable to shlex: fail closed on a git word or the raw proof
+        return _mentions_git(command) or _raw_unproven(command)
 
 
 def target_branch(target: Target, cwd: str | None) -> str:
-    """The branch `git <repo options> commit` would commit to, asked of git itself."""
+    """The branch `git <repo options> ...` acts on, asked of git itself."""
     chdirs, opts, env = target
     return current_branch(_where(cwd, chdirs), opts, dict(env))
 
@@ -924,8 +977,9 @@ def open_pr_for(branch: str) -> bool | None:
 def decide(
     payload: dict, branch: str | list[str], lease_lookup=lease_for, pr_lookup=open_pr_for
 ) -> tuple[int, str]:
-    """Block (2, why) a commit onto an issue branch this session does not lease. `branch` is the
-    branch the commit lands on, or every candidate (`commit_branches`); any unleased one blocks."""
+    """Block (2, why) a guarded git command (see the module docstring) on an issue branch this
+    session does not lease. `branch` is the branch it acts on, or every candidate
+    (`commit_branches`); any unleased one blocks."""
     if payload.get("tool_name") != "Bash":
         return 0, ""
     command = str((payload.get("tool_input") or {}).get("command", ""))

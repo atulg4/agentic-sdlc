@@ -149,7 +149,8 @@ rule. `reusable-implement.yml` claims as the last
 step of `prepare` (with an App-minted token: issues write, pull requests read) and releases after
 the draft PR exists or on failure. `sdlcctl onboard` installs two Claude Code hooks in the consumer repo: a SessionStart
 hook that fetches origin and lists PRs and leased issues, and a PreToolUse guard that blocks
-`git commit` on `*/issue-N` branches unless the session holds the lease.
+every git command except literal read-only ones (deny by default) on `*/issue-N` branches unless
+the session holds the lease.
 
 ### Generic profile: `sdlcctl scaffold`
 
