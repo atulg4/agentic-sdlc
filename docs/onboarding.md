@@ -62,6 +62,38 @@ macOS targets only: a GitHub-hosted `ubuntu-*`/`macos-*` label from GitHub's doc
 rejected), or a self-hosted runner's labels. Windows labels are refused by `onboard` and failed by
 `doctor`.
 
+Implementation is Linux-only, whatever the implementer: `reusable-implement.yml` installs
+bubblewrap for Claude Code with `apt-get`, which macOS has neither of, and a routed or Claude
+implementation reaches that step. With an Actions implementer, `--runs-on` must therefore be a
+GitHub-hosted `ubuntu-*` label or a self-hosted label set that includes `linux` (the OS label
+every self-hosted Linux runner carries); `doctor` fails an implement call whose `runs_on` is not.
+macOS remains fine for `ci.yml` (`--ci-runs-on macos-15`) and for a `cloud-routine` profile.
+
+### Managed workflows
+
+`agent-plan.yml`, `agent-auto-plan.yml`, `ci.yml` and, in Actions mode, `agent-implement.yml` and
+`agent-auto-implement.yml` are Forge-managed. `doctor` rebuilds each from the repository's own
+policy (`[agents] implementer` and `implementation_mode`, `[project] default_branch`, the platform
+repository and the caller's pinned SHA) exactly as `onboard` renders it, parses both, and
+requires them to be equal. Triggers and their filters, job `if:`, `needs`, every `with:` input
+(`issue_number`, `trigger_actor`, `config_path`, `agent`, the registry paths, ...), `secrets:`,
+permissions, concurrency, extra or missing jobs: any difference fails with
+`managed workflow X differs from the generated template at <path>; re-run sdlcctl onboard --force`.
+Comments and formatting do not count; only the parsed document does.
+
+The only tunable knobs, each validated by its own check instead:
+
+| Knob | Validated by |
+|---|---|
+| every job's `runs-on`, and a reusable call's `with.runs_on` | the runner checks (hosted label or an online runner; Linux for implementation) |
+| `with.route_budget_usd` on a reusable call (may be added) | "implement callers pass a readable route_budget_usd" |
+| `ci.yml`'s `test` job `steps` | the CI gate check below (exact policy commands, trusted actions, no gate-altering environment) |
+| the `if:` of `agent-auto-plan.yml:plan` and `agent-auto-implement.yml:preflight` | must be exactly the generated condition for the POLICY's labels |
+| the platform pin (`uses: ...@<sha>`, `with.platform_ref`) | the template is rendered at the caller's own pin; "workflows pin the platform to a commit SHA" requires one SHA on the platform repository |
+
+Everything else in those files is the template. To change it, change the policy and re-run
+`onboard --force`.
+
 ### What `doctor` verifies exactly
 
 - **Implementation mode** is `[agents] implementation_mode` in `agentic-sdlc.toml` (`actions` or
@@ -79,7 +111,10 @@ rejected), or a self-hosted runner's labels. Windows labels are refused by `onbo
   named like a gate tool; `eval` or a sourced file other than a virtualenv's `bin/activate`; an
   action other than `actions/checkout`, `actions/setup-python`, `actions/cache` or
   `astral-sh/setup-uv`. The setup command itself runs repository code by design; doctor proves
-  the workflow, not what that code does.
+  the workflow, not what that code does. The `pull_request` trigger must reach the `test` job
+  for every pull request into the protected branch: no `paths`, `paths-ignore` or
+  `branches-ignore` filter, a `branches` filter only when it lists the default branch by its
+  exact name, and `types` (if given) including `opened`, `synchronize` and `reopened`.
 - **Automatic callers** must trigger on `issues: types: [labeled]`, and their `if:` must be
   exactly the generated label condition (after whitespace normalization) for the policy's labels.
 - **Implement calls** are read from the parsed `with:`/`secrets:` of each job calling
@@ -98,6 +133,9 @@ rejected), or a self-hosted runner's labels. Windows labels are refused by `onbo
   (plus GitHub's mandatory Metadata read); any other grant fails.
 - **`onboard --apply`** merges Forge's rules into an existing `Protect main` ruleset: existing
   rules and stricter parameters (more approvals, extra status checks, signatures) are kept.
+  The one exception is Forge's own `test` check: a binding (`integration_id`) to an app other
+  than GitHub Actions (15368) could never be satisfied by `ci.yml`, so the merge drops it and
+  `doctor` fails a ruleset that has one.
 
 ## Required repository state
 

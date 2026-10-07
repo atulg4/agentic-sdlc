@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -99,9 +100,14 @@ class FakeGh:
                     lbl for lbl in self.issues[n]["labels"] if lbl["name"] != name
                 ]
             if "--add-assignee" in args:
-                self.issues[n]["assignees"].append(
-                    {"login": args[args.index("--add-assignee") + 1]}
-                )
+                login = args[args.index("--add-assignee") + 1]
+                if {"login": login} not in self.issues[n]["assignees"]:
+                    self.issues[n]["assignees"].append({"login": login})
+            if "--remove-assignee" in args:
+                login = args[args.index("--remove-assignee") + 1]
+                self.issues[n]["assignees"] = [
+                    a for a in self.issues[n]["assignees"] if a["login"] != login
+                ]
             return ""
         if (
             args[0] == "api"
@@ -111,7 +117,12 @@ class FakeGh:
             n = int(args[1].split("/")[4])
             issue = self.issues[n]
             return json.dumps(
-                {"number": n, "state": issue.get("state", "open"), **issue.get("extra", {})}
+                {
+                    "number": n,
+                    "state": issue.get("state", "open"),
+                    "assignees": issue["assignees"],
+                    **issue.get("extra", {}),
+                }
             )
         if args[:2] == ("pr", "list"):
             return json.dumps(self.prs)
@@ -630,3 +641,94 @@ def test_release_restores_the_label_when_a_claimant_lands_during_removal():
     release(PROJECT, 7, session="s1", gh=interleaved, now=NOW)
     assert current_lease(PROJECT, 7, gh, now=NOW).session == "r1"
     assert any(lbl["name"] == IN_PROGRESS_LABEL for lbl in gh.issues[7]["labels"])
+
+
+# ---------------------------------------------------------------- lease-owned assignees
+# Codex review 4204434971: release removed the label but left the assignee the claim added.
+
+
+def _logins(gh, n=7):
+    return [a["login"] for a in gh.issues[n]["assignees"]]
+
+
+def test_release_removes_the_assignee_the_lease_added():
+    gh = FakeGh().issue(7)
+    assert claim(
+        PROJECT, 7, agent="a", session="s1", branch="b", gh=gh, now=NOW, assignee="alice"
+    ).ok
+    assert "assignee=alice owns_assignee=1" in gh.issues[7]["comments"][-1]["body"]
+    assert _logins(gh) == ["alice"]
+    release(PROJECT, 7, session="s1", gh=gh, now=NOW)
+    assert _logins(gh) == []
+    assert not any(lbl["name"] == IN_PROGRESS_LABEL for lbl in gh.issues[7]["labels"])
+
+
+def test_release_keeps_a_pre_existing_assignee():
+    gh = FakeGh().issue(7, assignees=["alice", "bob"])
+    assert claim(
+        PROJECT, 7, agent="a", session="s1", branch="b", gh=gh, now=NOW, assignee="alice"
+    ).ok
+    assert "owns_assignee" not in gh.issues[7]["comments"][-1]["body"]
+    release(PROJECT, 7, session="s1", gh=gh, now=NOW)
+    assert _logins(gh) == ["alice", "bob"]
+    assert not any("--remove-assignee" in c for c in gh.calls)
+
+
+def test_renewal_keeps_assignee_ownership_until_release():
+    gh = FakeGh().issue(7)
+    claim(PROJECT, 7, agent="a", session="s1", branch="b", gh=gh, now=NOW, assignee="alice")
+    renew(PROJECT, 7, session="s1", ttl_minutes=60, gh=gh, now=NOW)
+    assert "assignee=alice owns_assignee=1" in gh.issues[7]["comments"][-1]["body"]
+    claim(PROJECT, 7, agent="a", session="s1", branch="b", gh=gh, now=NOW, assignee="alice")
+    assert current_lease(PROJECT, 7, gh, now=NOW).owns_assignee
+    release(PROJECT, 7, session="s1", gh=gh, now=NOW)
+    assert _logins(gh) == []
+
+
+def test_takeover_drops_the_expired_leases_assignee_and_inherits_a_shared_one():
+    stale = Lease(7, "a", "old", "b", NOW - timedelta(minutes=1), "alice", True)
+    gh = FakeGh().issue(7, assignees=["alice"], comments=[format_claim_marker(stale)])
+    assert claim(
+        PROJECT, 7, agent="a", session="new", branch="b", gh=gh, now=NOW, assignee="bob"
+    ).ok
+    assert _logins(gh) == ["bob"]  # no accumulation across takeovers
+
+    gh = FakeGh().issue(7, assignees=["alice"], comments=[format_claim_marker(stale)])
+    assert claim(
+        PROJECT, 7, agent="a", session="new", branch="b", gh=gh, now=NOW, assignee="alice"
+    ).ok
+    assert current_lease(PROJECT, 7, gh, now=NOW).owns_assignee  # inherited, not pre-existing
+    release(PROJECT, 7, session="new", gh=gh, now=NOW)
+    assert _logins(gh) == []
+
+
+def test_release_keeps_an_assignee_a_new_live_lease_wants():
+    mine = Lease(7, "me", "s1", "b", NOW + timedelta(minutes=5), "alice", True)
+    gh = FakeGh().issue(
+        7, labels=[IN_PROGRESS_LABEL], assignees=["alice"], comments=[format_claim_marker(mine)]
+    )
+    real = gh.__call__
+    fired = []
+
+    def interleaved(args, input=None):
+        if tuple(args[:2]) == ("issue", "edit") and "--remove-assignee" in args and not fired:
+            fired.append(True)
+            gh._next_comment += 1
+            rival = Lease(7, "x", "r1", "forge/x", NOW + timedelta(hours=1), "alice", False)
+            gh.issues[7]["comments"].append(
+                _comment_row(gh._next_comment, format_claim_marker(rival), NOW.isoformat())
+            )
+        return real(args, input=input)
+
+    release(PROJECT, 7, session="s1", gh=interleaved, now=NOW)
+    assert current_lease(PROJECT, 7, gh, now=NOW).session == "r1"
+    assert _logins(gh) == ["alice"]  # restored for the claimant that landed during removal
+
+
+def test_marker_round_trips_assignee_ownership():
+    lease = Lease(7, "a", "s", "b", NOW + timedelta(hours=1), "alice", True)
+    assert parse_marker(format_claim_marker(lease), issue=7) == lease
+    plain = Lease(7, "a", "s", "b", NOW + timedelta(hours=1))
+    assert "assignee" not in format_claim_marker(plain)
+    with pytest.raises(LeaseError):
+        format_claim_marker(replace(lease, assignee="bad login"))

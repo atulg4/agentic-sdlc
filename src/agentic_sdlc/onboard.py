@@ -55,6 +55,9 @@ HUMAN_REVIEW_LABEL = "human-review-required"
 IMPLEMENTATION_LABEL = "implementation-approved"
 RULESET_NAME = "Protect main"
 REQUIRED_CHECK = "test"
+#: The GitHub Actions app: the only integration that reports ci.yml's `test` job. A required
+#: status check pinned (`integration_id`) to any other app can never be satisfied by it.
+GITHUB_ACTIONS_INTEGRATION_ID = 15368
 PUBLISHER_APP_SLUG_HINT = "agentic-sdlc"
 
 LABELS = {
@@ -144,6 +147,10 @@ class OnboardSpec:
         windows = _windows_labels((*self.runs_on, *self.ci_runs_on))
         if windows:
             raise OnboardError(f"{WINDOWS_UNSUPPORTED} (got {', '.join(windows)})")
+        if self.actions_implement and not _linux_labels(self.runs_on):
+            raise OnboardError(
+                f"{LINUX_IMPLEMENTATION_REQUIRED} (got --runs-on {','.join(self.runs_on)})"
+            )
         if self.public and not _github_hosted(set(self.ci_labels)):
             raise OnboardError(
                 "a public repository's CI runs fork pull-request code: it must use a "
@@ -908,15 +915,36 @@ def ruleset_mismatches(actual: dict, spec: OnboardSpec) -> list[str]:
     ):
         problems.append("review-thread resolution not required")
     if "required_status_checks" in rules:
-        contexts = {
-            c.get("context")
+        checks = [
+            c
             for c in rules["required_status_checks"].get("required_status_checks") or []
-        }
+            if isinstance(c, dict)
+        ]
+        contexts = {c.get("context") for c in checks}
         if REQUIRED_CHECK not in contexts:
             problems.append(f"status check '{REQUIRED_CHECK}' not required")
+        foreign = sorted(
+            {
+                str(c.get("integration_id"))
+                for c in checks
+                if c.get("context") == REQUIRED_CHECK and _foreign_integration(c)
+            }
+        )
+        if foreign:
+            problems.append(
+                f"status check '{REQUIRED_CHECK}' only accepts integration "
+                f"{', '.join(foreign)}, not GitHub Actions ({GITHUB_ACTIONS_INTEGRATION_ID}): "
+                "ci.yml's job can never satisfy it"
+            )
         if not rules["required_status_checks"].get("strict_required_status_checks_policy"):
             problems.append("status checks are not strict (branch must be up to date)")
     return problems
+
+
+def _foreign_integration(check: dict) -> bool:
+    """A required status check bound to an app other than GitHub Actions."""
+    bound = check.get("integration_id")
+    return bound is not None and bound != GITHUB_ACTIONS_INTEGRATION_ID
 
 
 #: Ruleset fields a PUT accepts; everything else a GET returns (id, source, _links, ...) is
@@ -944,8 +972,18 @@ def _merge_rule_parameters(existing: dict, forge: dict) -> dict:
                 merged[key] = want
         elif key == "required_status_checks":
             checks = [c for c in have if isinstance(c, dict)] if isinstance(have, list) else []
-            contexts = {c.get("context") for c in checks}
-            merged[key] = checks + [
+            # Forge's own `test` context is reported by GitHub Actions: a binding to another
+            # app is dropped (never preserved -- it could not be satisfied), and duplicates fold.
+            kept: list[dict] = []
+            for check in checks:
+                if check.get("context") == REQUIRED_CHECK:
+                    if _foreign_integration(check):
+                        check = {k: v for k, v in check.items() if k != "integration_id"}
+                    if any(k.get("context") == check.get("context") for k in kept):
+                        continue
+                kept.append(check)
+            contexts = {c.get("context") for c in kept}
+            merged[key] = kept + [
                 c for c in want if isinstance(c, dict) and c.get("context") not in contexts
             ]
     return merged
@@ -1468,6 +1506,27 @@ WINDOWS_UNSUPPORTED = (
 )
 
 
+LINUX_IMPLEMENTATION_REQUIRED = (
+    "the implementation workflows run on Linux only: reusable-implement.yml installs bubblewrap "
+    "for Claude Code with apt-get, which macOS lacks; use a GitHub-hosted ubuntu-* label or "
+    "self-hosted labels that include `linux` (macOS is fine for ci.yml via --ci-runs-on)"
+)
+
+
+def _linux_labels(labels) -> bool:
+    """The labels select a Linux runner: one GitHub-hosted Linux label, or a self-hosted set that
+    names `linux` (the OS label every self-hosted Linux runner carries) and no other OS."""
+    names = {str(x) for x in labels}
+    lowered = {x.lower() for x in names}
+    if lowered & {"macos", "windows"} or any(
+        GITHUB_HOSTED_LABELS.get(x) in {"macos", "windows"} for x in names
+    ):
+        return False
+    if _github_hosted(names):
+        return GITHUB_HOSTED_LABELS[next(iter(names))] == "linux"
+    return "linux" in lowered
+
+
 def _runner_on_windows(runner: dict) -> bool:
     """A registered runner whose OS is Windows (the runners API's `os`, or its `windows` default
     label), whatever labels a workflow asked for."""
@@ -1774,6 +1833,13 @@ def _ci_problems(base: Path) -> list[str]:
     problems = []
     if "pull_request" not in _triggers(doc):
         problems.append("not triggered on pull_request")
+    else:
+        try:
+            project = tomllib.loads((base / "agentic-sdlc.toml").read_text()).get("project")
+        except (OSError, tomllib.TOMLDecodeError):
+            project = None
+        branch = project.get("default_branch") if isinstance(project, dict) else None
+        problems += _pull_request_coverage_problems(doc, str(branch or "main"))
     jobs = doc.get("jobs")
     job = jobs.get(REQUIRED_CHECK) if isinstance(jobs, dict) else None
     if not isinstance(job, dict):
@@ -1814,6 +1880,48 @@ def _ci_problems(base: Path) -> list[str]:
             problems.append(f"'{REQUIRED_CHECK}' job does not run the {gate} command {command!r}")
     tools = _gate_tools(argv for wanted in wanted_by_gate.values() for argv in wanted)
     problems += _gate_environment_problems(doc, job, steps, scripts, tools)
+    return problems
+
+
+#: `pull_request` activity types a required check must run on: a PR's head changing.
+PULL_REQUEST_REQUIRED_TYPES = ("opened", "synchronize", "reopened")
+
+
+def _pull_request_coverage_problems(doc: dict, default_branch: str) -> list[str]:
+    """ci.yml's `pull_request` trigger must start the `test` job for EVERY pull request into the
+    protected branch, or the ruleset waits forever on a check that is never reported: no
+    `paths`/`paths-ignore` filter, no `branches-ignore`, a `branches` filter only when it lists
+    the default branch by its exact name, and activity types covering every head update."""
+    triggers = doc.get("on", doc.get(True))
+    spec = triggers.get("pull_request") if isinstance(triggers, dict) else None
+    if spec is None:
+        return []  # `on: pull_request`, `on: [pull_request]` or `pull_request:` with no filters
+    if not isinstance(spec, dict):
+        return [f"pull_request trigger {spec!r} is not a readable mapping (fails closed)"]
+    problems = [
+        f"pull_request trigger has a {key} filter: pull requests outside it never report "
+        f"'{REQUIRED_CHECK}' and wait on the ruleset forever"
+        for key in ("paths", "paths-ignore", "branches-ignore")
+        if key in spec
+    ]
+    if "branches" in spec:
+        branches = spec["branches"]
+        listed = [branches] if isinstance(branches, str) else branches
+        if not isinstance(listed, list) or default_branch not in [str(b) for b in listed]:
+            problems.append(
+                f"pull_request branches filter {branches!r} does not name the default branch "
+                f"{default_branch!r} exactly"
+            )
+    if "types" in spec:
+        types = spec["types"]
+        listed = [types] if isinstance(types, str) else types
+        lacking = [
+            t
+            for t in PULL_REQUEST_REQUIRED_TYPES
+            if not isinstance(listed, list) or t not in [str(x) for x in listed]
+        ]
+        if lacking:
+            problems.append(f"pull_request types omit {', '.join(lacking)}")
     return problems
 
 
@@ -2240,6 +2348,160 @@ def hook_problems(settings_path: Path) -> list[str]:
     return problems
 
 
+# ---------------------------------------------------------------- managed workflow drift
+
+#: The Forge-managed workflows, each compared whole against what `onboard` renders for the
+#: repository's policy (`managed_workflow_drift`). The implement callers only in Actions mode.
+MANAGED_WORKFLOWS = ("agent-plan.yml", "agent-auto-plan.yml", "ci.yml")
+MANAGED_IMPLEMENT_WORKFLOWS = ("agent-implement.yml", "agent-auto-implement.yml")
+#: Policy `[agents] implementer` -> the `onboard --implementer` that wrote it (Actions mode).
+POLICY_IMPLEMENTERS = {"router": "route", "claude": "claude", "codex": "codex"}
+#: What a tunable knob is replaced with on both sides before the comparison.
+_TUNED = "<tunable>"
+#: The ONLY parts of a managed workflow that may differ from the generated template; each is
+#: validated by its own check instead. Documented in docs/onboarding.md ("Managed workflows").
+#:   - every job's `runs-on`, and a reusable call's `with.runs_on` (the runner checks);
+#:   - a reusable-implement call's `with.route_budget_usd` (absent or present; the budget check);
+#:   - ci.yml's `test` job `steps` (the gate check: exact policy commands, trusted actions only,
+#:     no environment that changes a gate);
+#:   - the automatic callers' label `if:` (the label-condition check: exactly the generated
+#:     condition for the POLICY's labels);
+#:   - the platform pin: the template is rendered at the caller's own pinned SHA (the pin check:
+#:     a SHA on the platform repository, one SHA across all callers).
+TUNABLE_KNOBS = (
+    "jobs.*.runs-on",
+    "jobs.*.with.runs_on",
+    "jobs.*.with.route_budget_usd",
+    "ci.yml: jobs.test.steps",
+    "agent-auto-plan.yml: jobs.plan.if",
+    "agent-auto-implement.yml: jobs.preflight.if",
+    "platform ref pin",
+)
+_LABEL_CONDITION_JOBS = {"agent-auto-plan.yml": "plan", "agent-auto-implement.yml": "preflight"}
+
+
+def _mask_tunables(name: str, doc: object) -> object:
+    """A deep copy of a parsed workflow with every TUNABLE_KNOBS value replaced by `_TUNED`
+    (route_budget_usd removed: the template omits it and the workflow defaults it)."""
+    doc = json.loads(json.dumps(doc, default=str))  # deep copy; YAML's `on: True` key -> "true"
+    jobs = doc.get("jobs") if isinstance(doc, dict) else None
+    if not isinstance(jobs, dict):
+        return doc
+    for job_name, job in jobs.items():
+        if not isinstance(job, dict):
+            continue
+        if "runs-on" in job:
+            job["runs-on"] = _TUNED
+        passed = job.get("with")
+        if isinstance(passed, dict):
+            if "runs_on" in passed:
+                passed["runs_on"] = _TUNED
+            passed.pop("route_budget_usd", None)
+        if name == "ci.yml" and job_name == REQUIRED_CHECK and "steps" in job:
+            job["steps"] = _TUNED
+        if _LABEL_CONDITION_JOBS.get(name) == job_name:
+            job["if"] = _TUNED
+    return doc
+
+
+def _first_difference(want: object, have: object, path: str = "") -> str | None:
+    """The first path (`jobs.implement.with.issue_number`) where two parsed documents differ."""
+    where = path or "<document>"
+    if isinstance(want, dict) and isinstance(have, dict):
+        for key in sorted(set(want) | set(have), key=str):
+            label = "on" if key == "true" and path == "" else str(key)
+            sub = f"{path}.{label}" if path else label
+            if key not in have:
+                return f"{sub} (missing)"
+            if key not in want:
+                return f"{sub} (not in the template)"
+            found = _first_difference(want[key], have[key], sub)
+            if found:
+                return found
+        return None
+    if isinstance(want, list) and isinstance(have, list):
+        for index, (a, b) in enumerate(zip(want, have, strict=False)):
+            found = _first_difference(a, b, f"{path}[{index}]")
+            if found:
+                return found
+        if len(want) != len(have):
+            return f"{where} ({len(have)} items, template has {len(want)})"
+        return None
+    if want != have:
+        return f"{where} ({have!r}, template {want!r})" if len(repr(have)) < 120 else where
+    return None
+
+
+def _caller_pin(doc: dict, platform_repository: str) -> str | None:
+    """The SHA the caller's first platform reusable-workflow call is pinned to."""
+    jobs = doc.get("jobs")
+    for job in jobs.values() if isinstance(jobs, dict) else ():
+        found = _REMOTE_REUSABLE.fullmatch(str((job or {}).get("uses", "")).strip())
+        if found and found.group(1) == platform_repository and _SHA.fullmatch(found.group(3)):
+            return found.group(3)
+    return None
+
+
+def managed_workflow_drift(
+    base: Path,
+    policy_doc: dict,
+    project_id: str,
+    platform_repository: str,
+    *,
+    cloud: bool,
+    default_branch: str,
+) -> list[str]:
+    """Every installed Forge-managed workflow must parse to exactly what `onboard` renders for
+    this repository's policy, apart from TUNABLE_KNOBS. One structural comparison instead of a
+    check per field: triggers and their filters, job conditions, `needs`, every `with:` input
+    (the issue number, actor, config path, agent, registry paths), `secrets:`, permissions,
+    concurrency and steps are all covered, including fields no specific check knows about."""
+    agents = policy_doc.get("agents") if isinstance(policy_doc.get("agents"), dict) else {}
+    implementer = (
+        "cloud-routine" if cloud else POLICY_IMPLEMENTERS.get(str(agents.get("implementer")))
+    )
+    if implementer is None:
+        return [
+            f"[agents] implementer {agents.get('implementer')!r} is not one onboard writes "
+            f"({', '.join(sorted(POLICY_IMPLEMENTERS))}); the managed workflows cannot be "
+            "rebuilt to compare against"
+        ]
+    names = MANAGED_WORKFLOWS + (() if cloud else MANAGED_IMPLEMENT_WORKFLOWS)
+    problems = []
+    for name in names:
+        path = base / ".github/workflows" / name
+        if not path.exists():
+            continue  # "required files present" reports it
+        installed = _workflow_doc(path)
+        if installed is None:
+            problems.append(f"{name} is not a readable workflow")
+            continue
+        pin = _caller_pin(installed, platform_repository) or "0" * 40
+        try:
+            spec = OnboardSpec(
+                project_id=project_id,
+                platform_repository=platform_repository,
+                platform_ref=pin,
+                test_command="-",  # ci.yml's steps are a tunable knob
+                implementer=implementer,
+                default_branch=default_branch,
+            )
+            rendered = render_onboarding(spec)[f".github/workflows/{name}"]
+        except (OnboardError, KeyError) as exc:
+            problems.append(f"{name}: the generated template cannot be rebuilt ({exc})")
+            continue
+        import yaml  # deferred: the CLI must import without site dependencies
+
+        want = _mask_tunables(name, yaml.safe_load(rendered))
+        found = _first_difference(want, _mask_tunables(name, installed))
+        if found:
+            problems.append(
+                f"managed workflow {name} differs from the generated template at {found}; "
+                "re-run `sdlcctl onboard --force`"
+            )
+    return problems
+
+
 def implementation_mode(toml_path: Path, actions_callers: Sequence[str]) -> tuple[str, str]:
     """(mode, problem) from the policy's `[agents] implementation_mode`; problem is '' when the
     mode is explicit and valid. A policy written before the field existed keeps working while its
@@ -2581,6 +2843,22 @@ def doctor(
                     "; ".join(mismatched),
                 )
             )
+        if policy is not None:
+            drift = managed_workflow_drift(
+                base,
+                policy_doc,
+                project_id,
+                platform_repository,
+                cloud=cloud,
+                default_branch=policy.default_branch,
+            )
+            add(
+                Check(
+                    "managed workflows match the generated templates",
+                    not drift,
+                    "; ".join(drift) if drift else "tunable only: " + ", ".join(TUNABLE_KNOBS),
+                )
+            )
         # The automatic callers do nothing unless adding a label to an issue starts them.
         inert = [
             caller.name
@@ -2793,6 +3071,26 @@ def doctor(
                 WINDOWS_UNSUPPORTED
                 + ": "
                 + "; ".join(f"{w} {sorted(lbls)}" for w, lbls in sorted(on_windows.items())),
+            )
+        )
+    # reusable-implement.yml is Linux-only (bubblewrap via apt-get): the runner each implement
+    # caller hands it.
+    off_linux = {
+        where: lbls
+        for where, lbls in label_targets.items()
+        if where.split(":", 1)[0] in MANAGED_IMPLEMENT_WORKFLOWS
+        and where.endswith(" (runs_on)")
+        and where not in on_windows
+        and not _linux_labels(lbls)
+    }
+    if not cloud and off_linux:
+        add(
+            Check(
+                "implementation runs on Linux runners",
+                False,
+                LINUX_IMPLEMENTATION_REQUIRED
+                + ": "
+                + "; ".join(f"{w} {sorted(lbls)}" for w, lbls in sorted(off_linux.items())),
             )
         )
     if unprovable:

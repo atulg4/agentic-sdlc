@@ -19,6 +19,7 @@ from agentic_sdlc.onboard import (
     apply_repo_settings,
     copy_variables,
     doctor,
+    merged_ruleset,
     render_onboarding,
     repository_default_branch,
     resolve_platform_ref,
@@ -1751,17 +1752,19 @@ def test_repository_is_public_reads_visibility():
 
 def test_runner_labels_render_as_yaml_strings():
     labels = ("true", "null", "on", "123")
-    files = render_onboarding(spec(runs_on=labels, ci_runs_on=labels))
+    agent_labels = ("linux", *labels)  # implementation is Linux-only
+    files = render_onboarding(spec(runs_on=agent_labels, ci_runs_on=labels))
     seen = 0
     for name, content in files.items():
         if not name.endswith(".yml"):
             continue
+        want = list(labels) if name.endswith("/ci.yml") else list(agent_labels)
         for job in (yaml.safe_load(content).get("jobs") or {}).values():
             if "runs-on" in job:
-                assert job["runs-on"] == list(labels), name
+                assert job["runs-on"] == want, name
                 seen += 1
             if "runs_on" in (job.get("with") or {}):
-                assert json.loads(job["with"]["runs_on"]) == list(labels), name
+                assert json.loads(job["with"]["runs_on"]) == want, name
                 seen += 1
     assert seen >= 8
 
@@ -2060,6 +2063,33 @@ def test_ruleset_update_merges_forge_rules_without_weakening_existing_ones():
     assert body["bypass_actors"] == []
     # a stricter Forge-free count on a fresh merge never drops below the existing one
     assert merged_ruleset(body, spec()) == body
+
+
+def test_ruleset_rejects_and_unbinds_a_foreign_integration_on_the_test_check():
+    """A `test` context pinned to another app's integration_id can never be satisfied by ci.yml
+    (Codex review 4204434963): doctor reports it, and the merge drops the binding."""
+    payload = ruleset_payload(spec())
+    foreign = json.loads(json.dumps(payload))
+    checks = foreign["rules"][3]["parameters"]["required_status_checks"]
+    checks[:] = [
+        {"context": "test", "integration_id": 99999},
+        {"context": "test"},
+        {"context": "lint", "integration_id": 4242},
+    ]
+    problems = ruleset_mismatches(foreign, spec())
+    assert any("integration 99999" in p for p in problems), problems
+    merged = merged_ruleset(foreign, spec())
+    kept = next(r for r in merged["rules"] if r["type"] == "required_status_checks")
+    assert kept["parameters"]["required_status_checks"] == [
+        {"context": "test"},
+        {"context": "lint", "integration_id": 4242},  # not Forge's context: untouched
+    ]
+    assert ruleset_mismatches(merged, spec()) == []
+    actions = json.loads(json.dumps(payload))
+    actions["rules"][3]["parameters"]["required_status_checks"] = [
+        {"context": "test", "integration_id": 15368}
+    ]
+    assert ruleset_mismatches(actions, spec()) == []
 
 
 def _wf(repo: Path, name: str, text: str) -> None:
@@ -2510,6 +2540,35 @@ def test_commit_guard_keeps_classified_non_commits(tmp_path, command):
     assert not guard.is_git_commit(command)
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bash -lc 'git commit -m x'",
+        "sh -ec 'git commit -m x'",
+        "zsh -ic 'git -C . commit'",
+        "dash -xec 'git commit'",
+        "bash -o pipefail -c 'git commit -m x'",
+        "bash -c -e 'git commit -m x'",
+        "bash --norc -lc 'git commit'",
+        "/bin/sh -euc 'cd sub && git commit -am x'",
+    ],
+)
+def test_commit_guard_reads_clustered_shell_c_options(tmp_path, command):
+    """`bash -lc CMD`: the shell's options cluster, and any cluster holding `c` makes the first
+    operand the command string (Codex review 4204434919)."""
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    assert guard.is_git_commit(command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["bash -lc 'git status'", "sh -e script.sh", "bash -x run-commit.sh", "bash -l"],
+)
+def test_commit_guard_clustered_shell_options_without_a_commit(tmp_path, command):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    assert not guard.is_git_commit(command)
+
+
 @pytest.mark.parametrize("name", ["agent-auto-plan.yml", "agent-auto-implement.yml"])
 def test_doctor_requires_the_automatic_callers_to_trigger_on_labeled_issues(tmp_path, name):
     repo = _repo(tmp_path)
@@ -2729,7 +2788,7 @@ def test_every_template_placeholder_round_trips_as_a_string(value):
     rendered = render_onboarding(
         spec(
             default_branch=value,
-            runs_on=("self-hosted", value),
+            runs_on=("self-hosted", "linux", value),
             ci_runs_on=(value,) if value != "true" else ("ubuntu-latest",),
             ready_label=f"{value}'s",
             setup_command=value,
@@ -2756,7 +2815,7 @@ def test_every_template_placeholder_round_trips_as_a_string(value):
                 if key in passed:
                     assert isinstance(passed[key], str), (name, key)
             if "runs_on" in passed:
-                assert json.loads(passed["runs_on"]) == ["self-hosted", value]
+                assert json.loads(passed["runs_on"]) == ["self-hosted", "linux", value]
             for step in job.get("steps") or []:
                 if "run" in step:
                     assert isinstance(step["run"], str)
@@ -2768,3 +2827,219 @@ def test_every_template_placeholder_round_trips_as_a_string(value):
     assert f"'{value}''s'" in auto["jobs"]["preflight"]["if"]
     hooks = rendered[".claude/hooks/forge_session_start.py"]
     assert f"DEFAULT_BRANCH = {json.dumps(value)}" in hooks
+
+
+# ---------------------------------------------------------------- managed workflow structure
+# One structural comparison against the rendered template replaces a check per field: Codex kept
+# finding one more field of the generated callers doctor did not read.
+
+DRIFT = "managed workflows match the generated templates"
+
+
+def _edit_workflow(repo: Path, name: str, change) -> None:
+    path = repo / ".github/workflows" / name
+    doc = yaml.safe_load(path.read_text())
+    change(doc)
+    path.write_text(yaml.safe_dump(doc, sort_keys=False))
+
+
+def _drift(repo: Path) -> str | None:
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    return failed[DRIFT].detail if DRIFT in failed else None
+
+
+def test_doctor_accepts_the_generated_workflows_unchanged(tmp_path):
+    for implementer in ("route", "claude", "codex", "cloud-routine"):
+        repo = _repo(tmp_path / implementer)
+        write_onboarding(repo, spec(implementer=implementer, runs_on=("ubuntu-latest",)))
+        assert _drift(repo) is None, implementer
+
+
+def test_doctor_tolerates_only_the_tunable_knobs(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+
+    def runners(doc):
+        for job in doc["jobs"].values():
+            if "runs-on" in job:
+                job["runs-on"] = "ubuntu-24.04"
+            if "runs_on" in (job.get("with") or {}):
+                job["with"]["runs_on"] = '["ubuntu-24.04"]'
+
+    for name in (
+        "agent-plan.yml",
+        "agent-auto-plan.yml",
+        "agent-implement.yml",
+        "agent-auto-implement.yml",
+        "ci.yml",
+    ):
+        _edit_workflow(repo, name, runners)
+    _edit_workflow(
+        repo,
+        "agent-auto-implement.yml",
+        lambda d: d["jobs"]["implement"]["with"].update(route_budget_usd="5"),
+    )
+    _edit_workflow(
+        repo,
+        "ci.yml",
+        lambda d: d["jobs"]["test"]["steps"].insert(
+            1, {"uses": "actions/setup-python@v5", "with": {"python-version": "3.12"}}
+        ),
+    )
+    assert _drift(repo) is None
+
+
+@pytest.mark.parametrize(
+    ("name", "change", "where"),
+    [
+        # Codex 4204434930: a disabled or detached automatic implementation call
+        (
+            "agent-auto-implement.yml",
+            lambda d: d["jobs"]["implement"].update({"if": False}),
+            "jobs.implement.if",
+        ),
+        (
+            "agent-auto-implement.yml",
+            lambda d: d["jobs"]["implement"].pop("needs"),
+            "jobs.implement.needs",
+        ),
+        # Codex 4204434942: the automatic callers must forward the event's issue
+        (
+            "agent-auto-implement.yml",
+            lambda d: d["jobs"]["implement"]["with"].update(issue_number="1"),
+            "jobs.implement.with.issue_number",
+        ),
+        (
+            "agent-auto-plan.yml",
+            lambda d: d["jobs"]["plan"]["with"].update(issue_number="${{ github.run_number }}"),
+            "jobs.plan.with.issue_number",
+        ),
+        (
+            "agent-auto-plan.yml",
+            lambda d: d["jobs"]["plan"]["with"].update(config_path="other.toml"),
+            "jobs.plan.with.config_path",
+        ),
+        (
+            "agent-implement.yml",
+            lambda d: d["jobs"]["implement"]["with"].update(trigger_actor="bot"),
+            "jobs.implement.with.trigger_actor",
+        ),
+        (
+            "agent-implement.yml",
+            lambda d: d["jobs"]["implement"].update(secrets="inherit"),
+            "jobs.implement.secrets",
+        ),
+        (
+            "agent-plan.yml",
+            lambda d: d["jobs"]["plan"]["secrets"].pop("PLATFORM_READ_TOKEN"),
+            "jobs.plan.secrets.PLATFORM_READ_TOKEN",
+        ),
+        (
+            "agent-auto-plan.yml",
+            lambda d: d[True]["issues"].update(types=["labeled", "opened"]),
+            "on.issues.types",
+        ),
+        (
+            "agent-plan.yml",
+            lambda d: d["jobs"]["notify_failure"].update(needs=["plan"]),
+            "jobs.notify_failure.needs",
+        ),
+        (
+            "ci.yml",
+            lambda d: d[True].update(pull_request={"paths": ["src/**"]}),
+            "on.pull_request",
+        ),
+        (
+            "ci.yml",
+            lambda d: d["jobs"]["test"].update({"continue-on-error": True}),
+            "jobs.test.continue-on-error",
+        ),
+        (
+            "agent-implement.yml",
+            lambda d: d["jobs"].update(extra={"runs-on": "ubuntu-latest", "steps": []}),
+            "jobs.extra",
+        ),
+    ],
+)
+def test_doctor_fails_any_drift_outside_the_tunable_knobs(tmp_path, name, change, where):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    _edit_workflow(repo, name, change)
+    detail = _drift(repo)
+    assert detail is not None and f"managed workflow {name} differs" in detail, detail
+    assert f"at {where}" in detail and "re-run" in detail, detail
+
+
+def test_doctor_rebuilds_the_template_from_the_policy_implementer(tmp_path):
+    """An agent other than the policy's is drift, not a tunable."""
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(implementer="codex", runs_on=("ubuntu-latest",)))
+    assert _drift(repo) is None
+    _edit_workflow(
+        repo,
+        "agent-implement.yml",
+        lambda d: d["jobs"]["implement"]["with"].update(agent="claude"),
+    )
+    assert "jobs.implement.with.agent" in (_drift(repo) or "")
+
+
+@pytest.mark.parametrize(
+    ("trigger", "problem"),
+    [
+        ({"paths": ["src/**"]}, "paths filter"),
+        ({"paths-ignore": ["docs/**"]}, "paths-ignore filter"),
+        ({"branches-ignore": ["main"]}, "branches-ignore filter"),
+        ({"branches": ["release/*"]}, "does not name the default branch"),
+        ({"branches": ["ma*"]}, "does not name the default branch"),
+        ({"types": ["opened"]}, "types omit synchronize, reopened"),
+    ],
+)
+def test_ci_check_requires_every_pull_request_to_reach_the_test_job(tmp_path, trigger, problem):
+    """Codex 4204434926: a filtered pull_request trigger leaves some PRs without the required
+    check; the gate check itself reports it (the structural check does too)."""
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    _edit_workflow(repo, "ci.yml", lambda d: d[True].update(pull_request=trigger))
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert problem in failed["ci.yml runs the policy gates as 'test'"].detail
+    assert DRIFT in failed
+
+
+def test_ci_check_accepts_an_exact_default_branch_filter(tmp_path):
+    from agentic_sdlc.onboard import _ci_problems
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    for trigger in (
+        {"branches": ["main"]},
+        {"branches": "main"},
+        {"types": ["opened", "synchronize", "reopened", "labeled"]},
+    ):
+        _edit_workflow(repo, "ci.yml", lambda d, t=trigger: d[True].update(pull_request=t))
+        assert _ci_problems(repo) == [], trigger
+
+
+@pytest.mark.parametrize("implementer", ["route", "claude", "codex"])
+@pytest.mark.parametrize("runs_on", [("macos-15",), ("self-hosted", "macOS"), ("self-hosted",)])
+def test_onboard_requires_linux_for_actions_implementation(implementer, runs_on):
+    """Codex 4204434954: reusable-implement.yml installs bubblewrap with apt-get."""
+    with pytest.raises(OnboardError, match="Linux only"):
+        spec(implementer=implementer, runs_on=runs_on)
+    # macOS stays fine for ci.yml, and for a cloud routine (no implement workflow runs)
+    spec(implementer=implementer, runs_on=("ubuntu-latest",), ci_runs_on=runs_on)
+    spec(implementer="cloud-routine", runs_on=runs_on)
+    spec(implementer=implementer, runs_on=("self-hosted", "Linux", "ARM64"))
+
+
+def test_doctor_fails_implementation_on_a_macos_runner(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(runs_on=("ubuntu-latest",)))
+    _edit_workflow(
+        repo,
+        "agent-auto-implement.yml",
+        lambda d: d["jobs"]["implement"]["with"].update(runs_on='["macos-15"]'),
+    )
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh()))
+    detail = failed["implementation runs on Linux runners"].detail
+    assert "agent-auto-implement.yml:implement (runs_on)" in detail and "macos-15" in detail
+    assert DRIFT not in failed  # the runner is a tunable knob, checked here instead
