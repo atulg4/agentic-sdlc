@@ -194,15 +194,27 @@ def _comments(project: str, issue: int, gh: GhRunner) -> list[dict]:
     return _paged(f"repos/{project}/issues/{issue}/comments?per_page=100", gh)
 
 
+def login_key(login: object) -> str:
+    """A GitHub login as compared. Logins are case-insensitive (`Alice` and `alice` are one
+    account), so EVERY login comparison and cache key -- assignees, marker authors, bot logins,
+    the permission cache -- goes through here; the original spelling is kept for display and
+    API calls. The commit-guard hook carries the same function."""
+    return str(login or "").strip().casefold()
+
+
+def same_login(a: object, b: object) -> bool:
+    return login_key(a) == login_key(b)
+
+
 def trusted_bot(login: str, configured: str | None = None) -> bool:
     """`github-actions[bot]`, or the Publisher App's bot: the logins in FORGE_LEASE_BOT_LOGINS
     when set, else a `<slug>[bot]` whose slug carries PUBLISHER_APP_SLUG_HINT. No other bot."""
-    login = login.lower()
-    if login == GITHUB_ACTIONS_BOT:
+    login = login_key(login)
+    if login == login_key(GITHUB_ACTIONS_BOT):
         return True
     if configured is None:
         configured = os.environ.get(LEASE_BOT_LOGINS_ENV, "")
-    named = {part.strip().lower() for part in configured.split(",") if part.strip()}
+    named = {login_key(part) for part in configured.split(",") if part.strip()}
     if named:
         return login in named
     return login.endswith("[bot]") and PUBLISHER_APP_SLUG_HINT in login[: -len("[bot]")]
@@ -219,17 +231,18 @@ def trusted_marker_author(
     login = str(user.get("login") or "")
     if not login:
         return False
-    if user.get("type") == "Bot" or login.endswith("[bot]"):
+    if user.get("type") == "Bot" or login_key(login).endswith("[bot]"):
         return user.get("type") == "Bot" and trusted_bot(login, configured)
     if not _LOGIN.fullmatch(login):
         return False
     granted = permission(login)
-    return granted is not None and granted in WRITE_PERMISSIONS
+    return granted is not None and login_key(granted) in WRITE_PERMISSIONS
 
 
 class PermissionCache:
     """Repository permission per login, read once per run (`GET .../collaborators/{u}/permission`).
-    A failed read is None (untrusted) and is not retried within the run."""
+    A failed read is None (untrusted) and is not retried within the run. Keyed by `login_key`:
+    `Alice` and `alice` are one read."""
 
     def __init__(self, project: str, gh: GhRunner):
         self.project = project
@@ -237,9 +250,10 @@ class PermissionCache:
         self._known: dict[str, str | None] = {}
 
     def __call__(self, login: str) -> str | None:
-        if login not in self._known:
-            self._known[login] = self._read(login)
-        return self._known[login]
+        key = login_key(login)
+        if key not in self._known:
+            self._known[key] = self._read(login)
+        return self._known[key]
 
     def _read(self, login: str) -> str | None:
         try:
@@ -252,7 +266,7 @@ class PermissionCache:
             return None
         # role_name distinguishes maintain (permission reads "write") and custom roles.
         for key in ("role_name", "permission"):
-            value = str(data.get(key) or "").lower()
+            value = login_key(data.get(key))
             if value in WRITE_PERMISSIONS:
                 return value
         return str(data.get("permission") or "") or None
@@ -344,9 +358,12 @@ def ended_leases(project: str, issue: int, gh: GhRunner) -> list[ReleasedLease]:
             if posted is not None:
                 cap = posted + timedelta(minutes=MAX_TTL_MINUTES)
                 parsed = parsed if parsed.expires <= cap else replace(parsed, expires=cap)
-                for other in [o for o in latest if o != parsed.session]:
-                    if not latest[other].live(posted):  # taken over after it expired
-                        ended.append(ReleasedLease(latest.pop(other), posted, cleaned=False))
+                # Every lease that had expired when this claim was posted has ended -- taken
+                # over by another session, or reclaimed by its OWN session (a lapsed marker is a
+                # fresh claim, `current_lease`): either way it can never release now, and
+                # replacing it below without recording it would lose its owned-assignee cleanup.
+                for other in [o for o in latest if not latest[o].live(posted)]:
+                    ended.append(ReleasedLease(latest.pop(other), posted, cleaned=False))
             latest[parsed.session] = parsed
             continue
         released = _release_session(body)
@@ -359,7 +376,7 @@ def ended_leases(project: str, issue: int, gh: GhRunner) -> list[ReleasedLease]:
             ended = [
                 replace(e, cleaned=True)
                 if e.lease.session == fields.get("session")
-                and e.lease.assignee == fields.get("assignee")
+                and same_login(e.lease.assignee, fields.get("assignee"))
                 else e
                 for e in ended
             ]
@@ -379,7 +396,7 @@ def assigned_since(project: str, issue: int, login: str, since: datetime, gh: Gh
             continue
         who = str((event.get("assignee") or {}).get("login") or "")
         at = _parse_iso(str(event.get("created_at") or ""))
-        if who.lower() == login.lower() and (at is None or at > since):
+        if same_login(who, login) and (at is None or at > since):
             return True
     return False
 
@@ -506,7 +523,7 @@ def _sync_assignee(
     now = now or datetime.now(UTC)
 
     def wanted(held: Lease | None) -> bool:
-        return held is not None and held.live(now) and held.assignee == login
+        return held is not None and held.live(now) and same_login(held.assignee, login)
 
     if wanted(current_lease(project, issue, gh, now)):
         return
@@ -543,11 +560,13 @@ def _reconcile_released_assignees(
     for ended in ended_leases(project, issue, gh):
         lease = ended.lease
         if not ended.cleaned and lease.owns_assignee and lease.assignee:
-            pending[(lease.session, lease.assignee)] = ended  # the latest end of that pair
+            pending[(lease.session, login_key(lease.assignee))] = ended  # latest end of the pair
     for ended in pending.values():
         lease = ended.lease
         target = json.loads(gh(["api", f"repos/{project}/issues/{issue}"]) or "{}")
-        if lease.assignee not in _assignee_logins(target if isinstance(target, dict) else {}):
+        if login_key(lease.assignee) not in _assignee_logins(
+            target if isinstance(target, dict) else {}
+        ):
             _record_cleanup(project, issue, lease, gh)
             continue
         if ended.released_at is None or assigned_since(
@@ -568,8 +587,9 @@ def _reconcile_best_effort(project: str, issue: int, gh: GhRunner, now: datetime
 
 
 def _assignee_logins(target: dict) -> set[str]:
+    """The issue's assignees, as `login_key`s."""
     return {
-        str(a.get("login"))
+        login_key(a.get("login"))
         for a in target.get("assignees") or []
         if isinstance(a, dict) and a.get("login")
     }
@@ -650,9 +670,12 @@ def claim(
         # The lease owns the assignment it makes: one not already on the issue, or one the
         # expired lease it takes over owned (that lease will never release it now).
         inherited = (
-            existing is not None and existing.owns_assignee and existing.assignee == assignee
+            existing is not None
+            and existing.owns_assignee
+            and same_login(existing.assignee, assignee)
         )
-        lease = replace(lease, owns_assignee=assignee not in _assignee_logins(target) or inherited)
+        assigned = login_key(assignee) in _assignee_logins(target)
+        lease = replace(lease, owns_assignee=not assigned or inherited)
     marker = format_claim_marker(lease)
     winner = _post_and_arbitrate(project, issue, session, marker + "\n" + note, gh, now)
     if winner is None or winner.session != session:
@@ -690,7 +713,7 @@ def claim(
     # would otherwise stay on the issue forever, accumulating one per takeover. The new claim is
     # already authoritative, so this cleanup is best effort: a failure is logged and left to the
     # reconciliation of ended leases, which every later claim and release retries.
-    if existing is not None and existing.assignee != lease.assignee:
+    if existing is not None and not same_login(existing.assignee, lease.assignee):
         try:
             if _drop_owned_assignee(project, issue, existing, gh, now):
                 _record_cleanup(project, issue, existing, gh)

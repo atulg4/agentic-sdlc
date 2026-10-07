@@ -81,9 +81,10 @@ class FakeGh:
             return self._pages(labelled, args)
         if args[0] == "api" and args[1].startswith(f"repos/{PROJECT}/collaborators/"):
             login = args[1].split("/")[4]
-            if login not in self.permissions:
+            known = {k.casefold(): v for k, v in self.permissions.items()}  # GitHub: any case
+            if login.casefold() not in known:
                 raise RuntimeError("gh: Not Found (HTTP 404)")
-            level = self.permissions[login]
+            level = known[login.casefold()]
             legacy = {"maintain": "write", "triage": "read"}.get(level, level)
             return json.dumps({"permission": legacy, "role_name": level})
         if args[0] == "api" and args[1].split("?")[0].endswith("/events"):
@@ -114,7 +115,8 @@ class FakeGh:
                 ]
             if "--add-assignee" in args:
                 login = args[args.index("--add-assignee") + 1]
-                if {"login": login} not in self.issues[n]["assignees"]:
+                held = {a["login"].casefold() for a in self.issues[n]["assignees"]}
+                if login.casefold() not in held:  # GitHub logins are case-insensitive
                     self.issues[n]["assignees"].append({"login": login})
                     self.events.setdefault(n, []).append(
                         {
@@ -126,7 +128,9 @@ class FakeGh:
             if "--remove-assignee" in args:
                 login = args[args.index("--remove-assignee") + 1]
                 self.issues[n]["assignees"] = [
-                    a for a in self.issues[n]["assignees"] if a["login"] != login
+                    a
+                    for a in self.issues[n]["assignees"]
+                    if a["login"].casefold() != login.casefold()
                 ]
             return ""
         if (
@@ -1143,3 +1147,197 @@ def test_a_successful_takeover_records_the_expired_leases_cleanup():
     assert _logins(gh) == ["bob"]
     bodies = [c["body"] for c in gh.issues[7]["comments"]]
     assert bodies.count("<!-- forge-cleanup session=old assignee=alice -->") == 1
+
+
+# ---------------------------------------------------------------- review regressions (PR 139, 12)
+
+
+def test_a_same_session_reclaim_records_the_expired_lease_as_ended():
+    """Codex 4205367682: a session reclaiming its OWN expired lease overwrote it before it was
+    recorded as ended, so a failed cleanup of its owned assignee was never retried."""
+    from agentic_sdlc.leases import ended_leases
+
+    stale = Lease(7, "a", "s1", "b", NOW - timedelta(minutes=1), "alice", True)
+    gh = FakeGh().issue(7, assignees=["alice"], comments=[format_claim_marker(stale)])
+    result = claim(
+        PROJECT,
+        7,
+        agent="a",
+        session="s1",
+        branch="b",
+        gh=_failing_removal(gh),
+        now=NOW,
+        assignee="bob",
+    )
+    assert result.ok and result.took_over_from == "s1"
+    assert sorted(_logins(gh)) == ["alice", "bob"]  # the cleanup failed
+    ended = ended_leases(PROJECT, 7, gh)
+    assert [(e.lease.session, e.lease.assignee, e.cleaned) for e in ended] == [
+        ("s1", "alice", False)
+    ]
+    release(PROJECT, 7, session="s1", gh=gh, now=NOW)  # the next operation finishes it
+    assert _logins(gh) == []
+    bodies = [c["body"] for c in gh.issues[7]["comments"]]
+    assert "<!-- forge-cleanup session=s1 assignee=alice -->" in bodies
+
+
+def test_a_live_same_session_marker_is_a_renewal_not_an_end():
+    from agentic_sdlc.leases import ended_leases
+
+    live = Lease(7, "a", "s1", "b", NOW + timedelta(hours=1), "alice", True)
+    gh = FakeGh().issue(7, comments=[format_claim_marker(live)])
+    assert claim(PROJECT, 7, agent="a", session="s1", branch="b", gh=gh, now=NOW).renewed
+    assert ended_leases(PROJECT, 7, gh) == []
+
+
+def test_a_differently_cased_pre_existing_assignee_is_never_lease_owned():
+    """Codex 4205367690: `--assignee alice` on an issue GitHub reports as assigned to `Alice`
+    is the same account; the lease must not own it, so release keeps it."""
+    gh = FakeGh().issue(7, assignees=["Alice"])
+    result = claim(
+        PROJECT, 7, agent="a", session="s1", branch="b", gh=gh, now=NOW, assignee="alice"
+    )
+    assert result.ok and not result.lease.owns_assignee
+    release(PROJECT, 7, session="s1", gh=gh, now=NOW)
+    assert _logins(gh) == ["Alice"]
+
+
+def test_a_takeover_inherits_an_owned_assignee_whatever_its_case():
+    stale = Lease(7, "a", "old", "b", NOW - timedelta(minutes=1), "Alice", True)
+    gh = FakeGh().issue(7, assignees=["Alice"], comments=[format_claim_marker(stale)])
+    result = claim(
+        PROJECT, 7, agent="a", session="new", branch="b", gh=gh, now=NOW, assignee="ALICE"
+    )
+    assert result.ok and result.lease.owns_assignee  # inherited, not dropped and re-added
+    assert _logins(gh) == ["Alice"]
+    release(PROJECT, 7, session="new", gh=gh, now=NOW)
+    assert _logins(gh) == []
+
+
+def test_cleanup_markers_and_live_leases_match_logins_case_insensitively():
+    from agentic_sdlc.leases import ended_leases, format_cleanup_marker, format_release_marker
+
+    ended = Lease(7, "a", "s1", "b", NOW + timedelta(hours=1), "alice", True)
+    gh = FakeGh().issue(
+        7,
+        comments=[
+            format_claim_marker(ended),
+            format_release_marker("s1"),
+            format_cleanup_marker("s1", "ALICE"),
+        ],
+    )
+    assert [e.cleaned for e in ended_leases(PROJECT, 7, gh)] == [True]
+    # a live lease that wants `Alice` keeps the login an ended lease owned as `alice`
+    gh = FakeGh().issue(7, assignees=["alice"])
+    gh.issues[7]["comments"] = [
+        _comment_row(1, format_claim_marker(ended), "2026-09-30T00:00:00Z"),
+        _comment_row(2, format_release_marker("s1"), "2026-09-30T00:01:00Z"),
+        _comment_row(
+            3,
+            format_claim_marker(Lease(7, "a", "s2", "b", NOW + timedelta(hours=1), "Alice", False)),
+            "2026-09-30T00:02:00Z",
+        ),
+    ]
+    release(PROJECT, 7, session="s2", gh=gh, now=NOW)  # s2 owns nothing; s1's cleanup retried
+    bodies = [c["body"] for c in gh.issues[7]["comments"]]
+    assert "<!-- forge-cleanup session=s1 assignee=alice -->" in bodies
+
+
+def test_marker_authors_bots_and_the_permission_cache_ignore_login_case(monkeypatch):
+    from agentic_sdlc.leases import LEASE_BOT_LOGINS_ENV, PermissionCache, trusted_marker_author
+
+    guard = _guard()
+    gh = FakeGh().issue(7)
+    marker = format_claim_marker(Lease(7, "me", "s1", "b", NOW + timedelta(hours=1)))
+    gh.issues[7]["comments"] += [
+        _comment_row(90, marker, "2026-09-30T01:00:00Z", "ATULG4"),
+        _comment_row(91, "<!-- forge-release session=s1 -->", "2026-09-30T01:01:00Z", "AtulG4"),
+    ]
+    assert current_lease(PROJECT, 7, gh, now=NOW) is None  # both spellings are the admin
+    reads = [c for c in gh.calls if "/collaborators/" in c[1]]
+    assert len(reads) == 1  # one cache entry per account, read with the spelling it was given
+    cache = PermissionCache(PROJECT, gh)
+    assert cache("Atulg4") == cache("atulg4") == "admin"
+    for configured, login in (
+        ("", "GitHub-Actions[bot]"),
+        ("", "Agentic-SDLC-Publisher[BOT]"),
+        ("My-Forge[bot]", "my-forge[BOT]"),
+    ):
+        monkeypatch.setenv(LEASE_BOT_LOGINS_ENV, configured)
+        row = _comment_row(1, "", NOW.isoformat(), login, "Bot", "NONE")
+        assert trusted_marker_author(row, lambda _: None), (configured, login)
+        assert guard.trusted_marker_author(row, lambda _: None), (configured, login)
+    row = _comment_row(1, "", NOW.isoformat(), "Writer", "User", "NONE")
+    assert trusted_marker_author(row, lambda _: "Write")  # a permission's case is not authority
+    assert guard.trusted_marker_author(row, lambda _: "Write")
+
+
+def test_the_commit_guard_caches_permissions_per_account(monkeypatch):
+    import subprocess
+
+    guard = _guard()
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout='{"role_name": "write"}', stderr="")
+
+    monkeypatch.setattr(guard.subprocess, "run", fake_run)
+    monkeypatch.setattr(guard, "_PERMISSIONS", {})
+    assert guard.repo_permission("Alice") == guard.repo_permission("alice") == "write"
+    assert len(calls) == 1 and calls[0][-1].endswith("/collaborators/Alice/permission")
+
+
+@pytest.mark.parametrize("subcommand", ["claim", "renew", "release", "claims"])
+@pytest.mark.parametrize("to_file", [False, True])
+def test_lease_subcommands_keep_stdout_pure_json(
+    subcommand, to_file, tmp_path, monkeypatch, capsys
+):
+    """Codex 4205367711: `claim` without --output wrote its JSON and then a status line to
+    stdout. Every lease subcommand: stdout is exactly one JSON document (or empty with --output),
+    status lines on stderr."""
+    from agentic_sdlc import cli
+
+    wall = datetime.now(UTC)
+    gh = FakeGh().issue(7)
+    gh.posted_at = wall
+    if subcommand != "claim":
+        mine = format_claim_marker(Lease(7, "me", "s1", "b", wall + timedelta(hours=1)))
+        gh.issues[7]["labels"].append({"name": IN_PROGRESS_LABEL})
+        gh.issues[7]["comments"].append(_comment_row(1, mine, wall.isoformat()))
+    monkeypatch.setattr(cli, "run_gh", gh)
+    argv = {
+        "claim": ["claim", "--agent", "me", "--branch", "b"],
+        "renew": ["renew"],
+        "release": ["release"],
+        "claims": ["claims"],
+    }[subcommand] + ["--project", PROJECT]
+    if subcommand != "claims":
+        argv += ["--issue", "7", "--session", "s1"]
+    out = tmp_path / "out.json"
+    if to_file:
+        argv += ["--output", str(out)]
+    assert cli.main(argv) == 0
+    captured = capsys.readouterr()
+    assert captured.err.strip()  # the human status line
+    if to_file:
+        assert captured.out == ""
+        document = json.loads(out.read_text())
+    else:
+        document = json.loads(captured.out)
+    assert document is not None
+
+
+def test_a_refused_claim_still_prints_only_json_on_stdout(monkeypatch, capsys):
+    from agentic_sdlc import cli
+
+    wall = datetime.now(UTC)
+    gh = FakeGh().issue(7)
+    theirs = format_claim_marker(Lease(7, "x", "other", "b", wall + timedelta(hours=1)))
+    gh.issues[7]["comments"].append(_comment_row(1, theirs, wall.isoformat()))
+    monkeypatch.setattr(cli, "run_gh", gh)
+    argv = ["claim", "--project", PROJECT, "--issue", "7", "--session", "s1"]
+    assert cli.main([*argv, "--agent", "me", "--branch", "b"]) == 2
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["ok"] is False
+    assert "REFUSED" in captured.err

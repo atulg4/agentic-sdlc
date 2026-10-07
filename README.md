@@ -131,6 +131,12 @@ sdlcctl release --project owner/repo --issue 12 --session "$SESSION"
 sdlcctl claims  --project owner/repo          # live + expired leases
 ```
 
+Each prints its result as one JSON document on stdout (or writes it to `--output`); the human
+status line (`claimed #12 …`, the `claims` table, a refusal) goes to stderr, so
+`sdlcctl claim … | jq .ok` always parses. GitHub logins compare case-insensitively everywhere
+(assignees, marker authors, bot logins): `--assignee alice` on an issue assigned to `Alice` is
+the pre-existing assignee, never one the lease owns.
+
 `claim` exits 2, changing nothing, when another live lease or an open PR for the issue exists;
 expired leases can be taken over (the takeover is commented). Markers count only when posted by
 a user whose repository permission (read per run from the collaborator permission API) is

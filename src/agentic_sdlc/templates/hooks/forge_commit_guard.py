@@ -552,15 +552,21 @@ def _parse_iso(text: str) -> datetime | None:
     return moment if moment.tzinfo else moment.replace(tzinfo=UTC)  # naive means UTC
 
 
+def login_key(login: object) -> str:
+    """A GitHub login as compared (leases.login_key): logins are case-insensitive, so every
+    comparison and cache key goes through here; the original spelling is kept for API calls."""
+    return str(login or "").strip().casefold()
+
+
 def trusted_bot(login: str, configured: str | None = None) -> bool:
     """`github-actions[bot]`, or the Publisher App's bot: the logins in FORGE_LEASE_BOT_LOGINS
     when set, else a `<slug>[bot]` whose slug carries PUBLISHER_APP_SLUG_HINT. No other bot."""
-    login = login.lower()
-    if login == GITHUB_ACTIONS_BOT:
+    login = login_key(login)
+    if login == login_key(GITHUB_ACTIONS_BOT):
         return True
     if configured is None:
         configured = os.environ.get(LEASE_BOT_LOGINS_ENV, "")
-    named = {part.strip().lower() for part in configured.split(",") if part.strip()}
+    named = {login_key(part) for part in configured.split(",") if part.strip()}
     if named:
         return login in named
     return login.endswith("[bot]") and PUBLISHER_APP_SLUG_HINT in login[: -len("[bot]")]
@@ -572,21 +578,21 @@ def trusted_marker_author(comment: dict, permission, configured: str | None = No
     login = str(user.get("login") or "")
     if not login:
         return False
-    if user.get("type") == "Bot" or login.endswith("[bot]"):
+    if user.get("type") == "Bot" or login_key(login).endswith("[bot]"):
         return user.get("type") == "Bot" and trusted_bot(login, configured)
     if not _LOGIN.fullmatch(login):
         return False
     granted = permission(login)
-    return granted is not None and granted in WRITE_PERMISSIONS
+    return granted is not None and login_key(granted) in WRITE_PERMISSIONS
 
 
-_PERMISSIONS: dict[str, str | None] = {}  # one read per login per hook run
+_PERMISSIONS: dict[str, str | None] = {}  # one read per login (login_key) per hook run
 
 
 def repo_permission(login: str) -> str | None:
     """The login's repository permission (role_name, else permission); None when unreadable."""
-    if login in _PERMISSIONS:
-        return _PERMISSIONS[login]
+    if login_key(login) in _PERMISSIONS:
+        return _PERMISSIONS[login_key(login)]
     granted: str | None = None
     try:
         out = subprocess.run(
@@ -600,13 +606,13 @@ def repo_permission(login: str) -> str | None:
         data = None
     if isinstance(data, dict):
         for key in ("role_name", "permission"):
-            value = str(data.get(key) or "").lower()
+            value = login_key(data.get(key))
             if value in WRITE_PERMISSIONS:
                 granted = value
                 break
         else:
             granted = str(data.get("permission") or "") or None
-    _PERMISSIONS[login] = granted
+    _PERMISSIONS[login_key(login)] = granted
     return granted
 
 

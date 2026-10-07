@@ -1683,8 +1683,10 @@ def test_doctor_validates_every_caller_runner_target(tmp_path, caller, job):
     doc["jobs"][job]["runs-on"] = "ubuntu-lates"
     path.write_text(yaml.safe_dump(doc, sort_keys=False))
     failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh()))
-    assert set(failed) == {"self-hosted runner online for this repo"}
+    # a lone custom label names no OS: not provably Linux either (Codex 4205367730)
+    assert set(failed) == {"self-hosted runner online for this repo", LINUX_CHECK}
     assert f"{caller}:{job}" in failed["self-hosted runner online for this repo"].detail
+    assert f"{caller}:{job}" in failed[LINUX_CHECK].detail
 
 
 def test_doctor_validates_the_runner_a_caller_hands_its_reusable_workflow(tmp_path):
@@ -3051,15 +3053,19 @@ def test_ci_check_accepts_an_exact_default_branch_filter(tmp_path):
         assert _ci_problems(repo) == [], trigger
 
 
-@pytest.mark.parametrize("implementer", ["route", "claude", "codex"])
+LINUX_CHECK = "Forge workflows run on Linux runners"
+
+
+@pytest.mark.parametrize("implementer", ["route", "claude", "codex", "cloud-routine"])
 @pytest.mark.parametrize("runs_on", [("macos-15",), ("self-hosted", "macOS"), ("self-hosted",)])
-def test_onboard_requires_linux_for_actions_implementation(implementer, runs_on):
-    """Codex 4204434954: reusable-implement.yml installs bubblewrap with apt-get."""
+def test_onboard_requires_linux_for_every_forge_runner(implementer, runs_on):
+    """Codex 4204434954: reusable-implement.yml installs bubblewrap with apt-get. Codex
+    4205367730: reusable-plan.yml runs GNU sha256sum, so a cloud routine's plan callers (and every
+    other non-CI Forge runner) need Linux too."""
     with pytest.raises(OnboardError, match="Linux only"):
         spec(implementer=implementer, runs_on=runs_on)
-    # macOS stays fine for ci.yml, and for a cloud routine (no implement workflow runs)
+    # macOS stays fine for ci.yml only
     spec(implementer=implementer, runs_on=("ubuntu-latest",), ci_runs_on=runs_on)
-    spec(implementer="cloud-routine", runs_on=runs_on)
     spec(implementer=implementer, runs_on=("self-hosted", "Linux", "ARM64"))
 
 
@@ -3072,7 +3078,7 @@ def test_doctor_fails_implementation_on_a_macos_runner(tmp_path):
         lambda d: d["jobs"]["implement"]["with"].update(runs_on='["macos-15"]'),
     )
     failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh()))
-    detail = failed["implementation runs on Linux runners"].detail
+    detail = failed[LINUX_CHECK].detail
     assert "agent-auto-implement.yml:implement (runs_on)" in detail and "macos-15" in detail
     assert DRIFT not in failed  # the runner is a tunable knob, checked here instead
 
@@ -3712,3 +3718,190 @@ def test_doctor_policy_fields_pass_for_every_generated_mode(tmp_path):
         report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
         assert POLICY_FIELDS_CHECK not in _failed(report), implementer
         assert any(c.name == POLICY_FIELDS_CHECK for c in report.checks)
+
+
+# ---------------------------------------------------------------- review regressions (PR 139, 12)
+
+ONBOARD_EDGE_CASES = {
+    "setup_command": ["", " ", "\t", "a\nb", "x\x7f", "x y", "x\ud800", "${{ x }}", "  pip  "],
+    "quality_command": ["", "  ", "ruff check . # c", "echo '`'", "a\tb", "x\x85y", "ünï"],
+    "test_command": ["", " ", "pytest\r", "pytest -k 'a and not b'", "x "],
+    "ready_label": [
+        "",
+        " ",
+        " x",
+        "x ",
+        "a,b",
+        "x" * 50,
+        "x" * 51,
+        "human-review-required",
+        "implementation-approved",
+        "in-progress",
+        "a'b",
+        'a"b',
+        "a #b: c",
+        "-x",
+        "x\x7f",
+        "x ",
+        "ünï",
+    ],
+    "default_branch": ["", "main", "feature/x", "a b", "release-1.2", "x\n"],
+    "python_version": ["", "3", "3.12", "3.12.4", "3.12 ", "3.12.4.1", 3.12],
+    "forbidden_paths": [(), ("",), ("a\nb",), ("ok/**", "*.png"), ("x\x7f",), ("ü/**",)],
+    "protected_paths": [(), ("",), ("src/app.py",), ("a ",)],
+    "max_changed_files": [0, 1, 10_000, 10_001, -1, True, "5"],
+    "max_diff_lines": [0, 1, 10_000_000, 10_000_001],
+    "project_id": ["a/b", "a/b/c", "a", "a b/c", "o.k/n_a-me"],
+    "runs_on": [
+        ("macos-15",),
+        ("self-hosted",),
+        ("ubuntu-latest",),
+        ("self-hosted", "linux"),
+        ("self-hosted", "macOS"),
+        ("windows-latest",),
+    ],
+    "ci_runs_on": [("macos-15",), ("windows-latest",), ("self-hosted", "macOS")],
+    "implementer": ["route", "claude", "codex", "cloud-routine", "gemini"],
+}
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [(f, v) for f, values in ONBOARD_EDGE_CASES.items() for v in values],
+    ids=lambda x: repr(x)[:40],
+)
+@pytest.mark.parametrize("implementer", ["route", "cloud-routine"])
+def test_onboard_rejects_or_doctor_is_green(tmp_path, field, value, implementer):
+    """Codex 4205367720 (`--setup ""` accepted by onboard, rejected by doctor), as a property:
+    for every edge case, onboard either refuses it or writes a repository `doctor --local` calls
+    READY. And the shared POLICY_FIELDS validator gives the same verdict on both sides."""
+    from agentic_sdlc.onboard import POLICY_FIELDS, policy_field_problem
+
+    overrides = {"implementer": implementer, "runs_on": ("ubuntu-latest",), field: value}
+    try:
+        built = spec(**overrides)
+    except OnboardError:
+        built = None
+    policy_field = {attr: name for name, (attr, *_) in POLICY_FIELDS.items()}.get(field)
+    if policy_field is not None:  # doctor's validator says the same about the written value
+        assert bool(policy_field_problem(policy_field, value)) == (built is None), value
+    if built is None:
+        return
+    repo = _repo(tmp_path)
+    write_onboarding(repo, built)
+    report = doctor(repo, built.project_id, "owner/agentic-sdlc", FakeGh(), remote=False)
+    assert report.ok, report.render()
+
+
+@pytest.mark.parametrize(
+    ("table", "key", "value"),
+    [
+        ("commands", "setup", ""),
+        ("commands", "quality", "   "),
+        ("automation", "ready_label", " padded"),
+        ("policy", "max_changed_files", 0),
+        ("ci", "python_version", "3"),
+    ],
+)
+def test_doctor_rejects_a_hand_edited_policy_value_onboard_would_refuse(
+    tmp_path, table, key, value
+):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    _set_policy_value(repo, table, key, value)
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert f"policy [{table}] {key} must" in failed[POLICY_VALUES_CHECK].detail
+
+
+POLICY_VALUES_CHECK = "policy values are ones onboard accepts"
+
+
+def _set_policy_value(repo: Path, table: str, key: str, value) -> None:
+    toml = repo / "agentic-sdlc.toml"
+    pattern = re.compile(rf"(?ms)^(\[{table}\]\n(?:(?!^\[).)*?^){key} = [^\n]*$")
+    text, count = pattern.subn(
+        lambda m: m.group(1) + f"{key} = {json.dumps(value)}", toml.read_text()
+    )
+    assert count == 1, (table, key)
+    toml.write_text(text)
+
+
+GUARD_HOOK = "forge_commit_guard.py"
+
+
+@pytest.mark.parametrize("event", ["PreToolUse", "SessionStart"])
+@pytest.mark.parametrize(
+    "extra",
+    [{"async": True}, {"async": False}, {"timeout": 1}, {"once": True}, {"statusMessage": "x"}],
+)
+def test_doctor_requires_each_forge_hook_to_be_exactly_the_generated_handler(
+    tmp_path, event, extra
+):
+    """Codex 4205367704: an `"async": true` commit guard runs in the background and cannot block,
+    yet doctor called it ready. Any field onboard does not write fails, on either Forge hook."""
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    path = repo / ".claude/settings.json"
+    settings = json.loads(path.read_text())
+    settings["hooks"][event][0]["hooks"][0].update(extra)
+    _settings(repo, settings)
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    detail = failed["required files present"].detail
+    assert f"{event} hook running python3" in detail and next(iter(extra)) in detail
+
+
+def test_doctor_rejects_an_async_guard_even_beside_a_synchronous_one(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    settings = json.loads((repo / ".claude/settings.json").read_text())
+    settings["hooks"]["PreToolUse"].append(
+        {"matcher": "Bash", "hooks": [{**_hook(GUARD_HOOK), "async": True}]}
+    )
+    _settings(repo, settings)
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert "async" in failed["required files present"].detail
+    # an extra field on the Forge hook's GROUP is a deviation too
+    settings["hooks"]["PreToolUse"] = [{"matcher": "Bash", "hooks": [_hook(GUARD_HOOK)], "x": 1}]
+    _settings(repo, settings)
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert "group x" in failed["required files present"].detail
+
+
+def test_doctor_allows_unrelated_hooks_with_any_fields(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    settings = json.loads((repo / ".claude/settings.json").read_text())
+    settings["hooks"]["PreToolUse"].append(
+        {"matcher": "Bash", "hooks": [{**_hook("lint.py"), "async": True, "timeout": 5}]}
+    )
+    settings["hooks"]["PostToolUse"] = [{"hooks": [{**_hook("fmt.py"), "async": True}]}]
+    _settings(repo, settings)
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    assert report.ok, report.render()
+
+
+def test_rendered_hooks_are_the_handlers_doctor_compares_against():
+    from agentic_sdlc.onboard import HOOK_SCRIPTS, forge_hook_entry
+
+    settings = json.loads(render_onboarding(spec())[".claude/settings.json"])
+    for event, script in HOOK_SCRIPTS.items():
+        assert settings["hooks"][event][0]["hooks"] == [forge_hook_entry(script)]
+
+
+def test_doctor_fails_a_cloud_routine_plan_caller_on_macos(tmp_path):
+    """Codex 4205367730: reusable-plan.yml runs GNU sha256sum; a cloud routine still plans."""
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(implementer="cloud-routine", runs_on=("ubuntu-latest",)))
+    _edit_workflow(
+        repo, "agent-plan.yml", lambda d: d["jobs"]["plan"]["with"].update(runs_on='["macos-15"]')
+    )
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh()))
+    assert "agent-plan.yml:plan (runs_on)" in failed[LINUX_CHECK].detail
+    # ci.yml alone may run on macOS
+    repo = _repo(tmp_path / "ci")
+    write_onboarding(
+        repo,
+        spec(implementer="cloud-routine", runs_on=("ubuntu-latest",), ci_runs_on=("macos-15",)),
+    )
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh()))
+    assert LINUX_CHECK not in failed
