@@ -1265,6 +1265,19 @@ def _safe_json(gh: GhRunner, args: Sequence[str]):
         return None
 
 
+def _remote_file_state(gh: GhRunner, args: Sequence[str]) -> str:
+    """The remote file's state: "absent" (the contents API answered 404), "present" (it served
+    the path) or "unknown"
+    (any other failure or answer: callers that need absence fail closed on it)."""
+    try:
+        data = json.loads(gh(args) or "null")
+    except OnboardError as exc:
+        return "absent" if re.search(r"\b404\b|Not Found", str(exc)) else "unknown"
+    except json.JSONDecodeError:
+        return "unknown"
+    return "present" if isinstance(data, (dict, list)) and data else "unknown"
+
+
 def _paged_items(gh: GhRunner, path: str, key: str | None = None) -> list[dict]:
     """Every item of a paginated list endpoint. --slurp wraps the pages in one array; each page
     is either a JSON array (key=None) or an object carrying the items under `key`."""
@@ -2896,6 +2909,60 @@ def managed_file_drift(
     return problems
 
 
+#: The `[routing]` table onboard writes; the implement callers pass these paths.
+ROUTING_TABLE = {"executors": ".forge/executors.json", "policy": ".forge/routing-policy.json"}
+
+
+def policy_field_problems(policy, policy_doc: dict, *, cloud: bool) -> list[str]:
+    """Every policy field onboard writes that the generated workflows or `prepare-request`
+    depend on, against the value they need (one problem per mismatch):
+
+    - `[project] provider` = "github": every plan/implement caller runs
+      `prepare-request --provider github`, which rejects any other provider.
+    - `[automation] human_review_label` / `implementation_label` = the fixed labels the
+      generated callers, routine doc and label conditions are rendered with.
+    - `[agents] implementer`: one onboard writes (it picks the adapter the implement callers are
+      rebuilt with); "claude" under cloud-routine, which is what onboard writes there.
+    - `[routing] executors` / `policy`: the registry paths the routed callers pass.
+
+    Checked separately: `[project] id` (= the repository, "policy project id matches the
+    repository"), `[project] default_branch` (= the remote default branch, which
+    prepare-request is handed as --expected-default-branch), `[agents] implementation_mode`
+    ("implementation mode is configured"), and the ready label (the label-condition check)."""
+    problems = []
+    if policy.provider != "github":
+        problems.append(
+            f"[project] provider is {policy.provider!r}; the generated workflows run "
+            "prepare-request --provider github, which rejects it"
+        )
+    for name, have, want in (
+        ("human_review_label", policy.human_review_label, HUMAN_REVIEW_LABEL),
+        ("implementation_label", policy.implementation_label, IMPLEMENTATION_LABEL),
+    ):
+        if have != want:
+            problems.append(
+                f"[automation] {name} is {have!r}; the generated workflows use {want!r}"
+            )
+    agents = policy_doc.get("agents") if isinstance(policy_doc.get("agents"), dict) else {}
+    implementer = agents.get("implementer")
+    if cloud and implementer != "claude":
+        problems.append(f"[agents] implementer is {implementer!r}; cloud-routine writes 'claude'")
+    elif not cloud and implementer not in POLICY_IMPLEMENTERS:
+        problems.append(
+            f"[agents] implementer is {implementer!r}; expected one of "
+            + ", ".join(sorted(POLICY_IMPLEMENTERS))
+        )
+    routing = policy_doc.get("routing")
+    if routing is not None:
+        table = routing if isinstance(routing, dict) else {}
+        for key, want in ROUTING_TABLE.items():
+            if table.get(key) != want:
+                problems.append(
+                    f"[routing] {key} is {table.get(key)!r}; the routed callers read {want!r}"
+                )
+    return problems
+
+
 def implementation_mode(toml_path: Path, actions_callers: Sequence[str]) -> tuple[str, str]:
     """(mode, problem) from the policy's `[agents] implementation_mode`; problem is '' when the
     mode is explicit and valid. A policy written before the field existed keeps working while its
@@ -3050,6 +3117,16 @@ def doctor(
         policy_doc = tomllib.loads(toml_path.read_text()) if toml_path.exists() else {}
     except (OSError, tomllib.TOMLDecodeError):
         policy_doc = {}  # "agentic-sdlc.toml loads" fails above
+    if policy is not None:
+        add(
+            Check(
+                "policy fields match what the generated automation requires",
+                not (fields := policy_field_problems(policy, policy_doc, cloud=cloud)),
+                "; ".join(fields)
+                if fields
+                else "provider github, approval labels, implementer and routing paths",
+            )
+        )
     # Route mode is what the installed callers/policy ask for, not whether the registry exists;
     # an agent doctor cannot read may be `route`, so it is checked as one (fails closed).
     routed = (
@@ -3359,6 +3436,23 @@ def doctor(
             unpushed.append(f"{relative} (differs)")
         elif managed_file_problem(relative, remote_bytes, remote_rendered):
             unpushed.append(f"{relative} (differs from the generated file; onboard --force)")
+    # A file another implementation mode (or routing) owns must be gone from the default branch
+    # too: `onboard --force` into cloud-routine deletes the Actions implementer workflows only
+    # locally, and until that deletion is pushed approval labels still launch them remotely.
+    owned = {*required, *(routing_files if routed else ())}
+    for relative in MODE_OWNED_FILES:
+        if relative in owned:
+            continue
+        state = _remote_file_state(
+            gh, ["api", f"repos/{project_id}/contents/{relative}?ref={remote_branch or 'HEAD'}"]
+        )
+        if state == "present":
+            unpushed.append(
+                f"{relative} (present, but the {mode} mode does not own it: push the "
+                "onboard --force changes first)"
+            )
+        elif state == "unknown":
+            unpushed.append(f"{relative} (unverifiable: must be absent in the {mode} mode)")
     add(
         Check(
             "managed files are on the default branch",

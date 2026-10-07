@@ -971,12 +971,14 @@ def test_commit_guard_parses_path_qualified_and_wrapped_git(tmp_path):
         "true && (cd sub && git commit -m x)",
         "bash -c 'git -C . commit -m x'",
         "git commit -m 'unbalanced",
+        # Fail-closed posture (Codex 4205123774): text that mentions both words and is not
+        # proven a non-commit is checked as one -- harmless on a leased branch.
+        "echo 'git commit'",
+        "grep -r 'git commit' docs",
     ):
         assert code(blocked) == 2, blocked
     for allowed in (
         "/usr/bin/git status",
-        "echo 'git commit'",
-        "grep -r 'git commit' docs",
         "/usr/bin/git log --grep commit",
         "legit commit",
     ):
@@ -3547,3 +3549,166 @@ def test_settings_json_stays_tunable_while_its_hooks_are_present(tmp_path):
     settings.write_text(json.dumps(doc))
     local = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
     assert FILES_CHECK not in local and "required files present" not in local
+
+
+# Codex 4205123774: commits inside substitutions, eval and here-strings. The guard fails closed:
+# text naming `git` and `commit` is a commit unless every simple command is proven otherwise.
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'output="$(git commit -m x)"',
+        'echo "`git commit -m x`"',
+        'echo "$(echo "$(git commit -m x)")"',
+        'eval "git commit"',
+        'bash <<< "git commit"',
+        "x=commit; git $x -m y",
+        'cd "$(git commit -m x)"',
+        "cd `git commit -m x` && ls",
+        "c=git; $c commit -m y",
+        "bash -c 'echo $(git commit -m x)'",
+        "echo '$(git commit)'",  # a literal, but quoting is gone after shlex: over-blocked
+        # Conservative: any expansion in a line naming both words is unproven, so blocked.
+        'out="$(git rev-parse HEAD)"; echo commit',
+    ],
+)
+def test_commit_guard_fails_closed_on_substitutions_and_eval(tmp_path, command):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    assert guard.is_git_commit(command, cwd=str(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git log --grep commit",
+        # Proven: `echo commit` has no git word, `git status` no commit word -> allowed.
+        "echo commit && git status",
+        "bash -c 'git log --grep commit'",
+        "git status",
+        "cd sub && git log --grep commit",
+    ],
+)
+def test_commit_guard_fail_closed_still_proves_non_commits(tmp_path, command):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    assert not guard.is_git_commit(command, cwd=str(tmp_path))
+
+
+def test_commit_guard_substitution_targets_its_own_repository(tmp_path):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    targets = guard.commit_targets('out="$(git -C ../wt commit -m x)"', cwd=str(tmp_path))
+    assert ((), ("-C", "../wt"), ()) in targets
+
+
+def test_commit_guard_blocks_substituted_commit_on_unleased_branch(tmp_path):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    payload = {
+        "tool_name": "Bash",
+        "session_id": "s1",
+        "tool_input": {"command": 'output="$(git commit -m x)"'},
+    }
+    assert guard.decide(payload, "forge/issue-7", lambda n: None, lambda b: False)[0] == 2
+    held = {"session": "s1", "agent": "a"}
+    assert guard.decide(payload, "forge/issue-7", lambda n: held, lambda b: False)[0] == 0
+
+
+# Codex 4205123787: files a mode does not own must be absent on the default branch too.
+
+POLICY_FIELDS_CHECK = "policy fields match what the generated automation requires"
+
+
+def test_doctor_flags_a_stale_remote_implement_workflow_after_switching_to_cloud(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    stale = (repo / ".github/workflows/agent-auto-implement.yml").read_bytes()
+    write_onboarding(repo, spec(implementer="cloud-routine"), force=True)
+    assert not (repo / ".github/workflows/agent-auto-implement.yml").exists()
+    gh = _healthy_gh()
+    # the deletion was never pushed: the default branch still launches the Actions implementer
+    gh.answers[CONSUMER_CONTENTS + ".github/workflows/agent-auto-implement.yml?ref=main"] = (
+        json.dumps({"encoding": "base64", "content": base64.b64encode(stale).decode()})
+    )
+    detail = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))[PUSHED_CHECK].detail
+    assert ".github/workflows/agent-auto-implement.yml (present" in detail
+    assert "push the onboard --force changes first" in detail
+    assert "agent-implement.yml (present" not in detail  # 404 remotely: absent, as required
+    # once the deletion is pushed (404 again) the check no longer fails on it
+    del gh.answers[CONSUMER_CONTENTS + ".github/workflows/agent-auto-implement.yml?ref=main"]
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))
+    assert "agent-auto-implement" not in getattr(failed.get(PUSHED_CHECK), "detail", "")
+
+
+def test_doctor_fails_closed_when_a_non_owned_files_absence_is_unverifiable(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _healthy_gh()
+    gh.answers[CONSUMER_CONTENTS + "docs/forge/cloud-implementer.md?ref=main"] = "not json"
+    detail = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))[PUSHED_CHECK].detail
+    assert "docs/forge/cloud-implementer.md (unverifiable" in detail
+
+
+def test_doctor_flags_a_stale_remote_routine_doc_after_switching_to_actions(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(implementer="cloud-routine"))
+    doc = (repo / "docs/forge/cloud-implementer.md").read_bytes()
+    write_onboarding(repo, spec(), force=True)
+    gh = _healthy_gh()
+    gh.answers[CONSUMER_CONTENTS + "docs/forge/cloud-implementer.md?ref=main"] = json.dumps(
+        {"encoding": "base64", "content": base64.b64encode(doc).decode()}
+    )
+    detail = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))[PUSHED_CHECK].detail
+    assert "docs/forge/cloud-implementer.md (present, but the actions mode" in detail
+
+
+# Codex 4205123815: the policy fields the generated automation depends on.
+
+
+def test_doctor_requires_the_github_provider(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    toml = repo / "agentic-sdlc.toml"
+    toml.write_text(toml.read_text().replace('provider = "github"', 'provider = "gitlab"'))
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert "prepare-request --provider github" in failed[POLICY_FIELDS_CHECK].detail
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh())
+    assert not report.ok and POLICY_FIELDS_CHECK in _failed(report)
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "needle"),
+    [
+        (
+            'human_review_label = "human-review-required"',
+            'human_review_label = "needs-human"',
+            "human_review_label",
+        ),
+        (
+            'implementation_label = "implementation-approved"',
+            'implementation_label = "go"',
+            "implementation_label",
+        ),
+        ('implementer = "router"', 'implementer = "gpt"', "implementer"),
+        (
+            'executors = ".forge/executors.json"',
+            'executors = "elsewhere.json"',
+            "[routing] executors",
+        ),
+    ],
+)
+def test_doctor_compares_each_policy_field_the_automation_depends_on(tmp_path, old, new, needle):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    toml = repo / "agentic-sdlc.toml"
+    assert old in toml.read_text()
+    toml.write_text(toml.read_text().replace(old, new))
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert needle in failed[POLICY_FIELDS_CHECK].detail
+
+
+def test_doctor_policy_fields_pass_for_every_generated_mode(tmp_path):
+    for index, implementer in enumerate(("route", "claude", "codex", "cloud-routine")):
+        repo = _repo(tmp_path / str(index))
+        write_onboarding(repo, spec(implementer=implementer))
+        report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+        assert POLICY_FIELDS_CHECK not in _failed(report), implementer
+        assert any(c.name == POLICY_FIELDS_CHECK for c in report.checks)

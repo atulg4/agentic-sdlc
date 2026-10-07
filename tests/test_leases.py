@@ -799,8 +799,9 @@ def test_retried_release_keeps_a_pre_existing_or_newly_wanted_assignee():
     later = Lease(7, "x", "s2", "b", NOW + timedelta(hours=1), "alice", False)
     gh.issues[7]["comments"].append(_comment_row(51, format_claim_marker(later), NOW.isoformat()))
     release(PROJECT, 7, session="s2", gh=gh, now=NOW)
-    # s2 never owned alice, and the reconciliation only runs when no lease exists at all
-    assert _logins(gh) == ["alice"]
+    # s2 never owned alice, but s1 did and never recorded its cleanup: once no live lease wants
+    # alice, the reconciliation of every ended lease (Codex 4205123792) finishes s1's.
+    assert _logins(gh) == []
 
 
 # ---------------------------------------------------------------- marker authority
@@ -1048,3 +1049,97 @@ def test_a_retry_records_the_cleanup_it_completes():
     release(PROJECT, 7, session="s1", gh=gh, now=NOW)  # nothing left to do
     assert not any("--remove-assignee" in c for c in gh.calls[before:])
     assert len(gh.issues[7]["comments"]) == comments
+
+
+# Codex 4205123792 / 4205123802: every ended lease is reconciled, and a takeover's cleanup of the
+# expired lease's assignee is best effort, never failing the authoritative claim.
+
+
+def _failing_removal(gh):
+    real = gh.__call__
+
+    def flaky(args, input=None):
+        if tuple(args[:2]) == ("issue", "edit") and "--remove-assignee" in args:
+            raise RuntimeError("transient GitHub failure")
+        return real(args, input=input)
+
+    return flaky
+
+
+def test_a_retry_cleans_an_earlier_release_after_another_session_claimed_and_released():
+    gh = FakeGh().issue(7)
+    assert claim(
+        PROJECT, 7, agent="a", session="A", branch="b", gh=gh, now=NOW, assignee="alice"
+    ).ok
+    with pytest.raises(RuntimeError):
+        release(PROJECT, 7, session="A", gh=_failing_removal(gh), now=NOW)
+    assert _logins(gh) == ["alice"]
+    flaky = _failing_removal(gh)  # B's whole run sees the outage too, so A's cleanup stays undone
+    assert claim(
+        PROJECT, 7, agent="b", session="B", branch="b", gh=flaky, now=NOW, assignee="bob"
+    ).ok
+    with pytest.raises(RuntimeError):
+        release(PROJECT, 7, session="B", gh=flaky, now=NOW)
+    assert sorted(_logins(gh)) == ["alice", "bob"]
+    release(PROJECT, 7, session="A", gh=gh, now=NOW)  # A's retry: the latest release is B's
+    assert _logins(gh) == []
+    cleaned = [c["body"] for c in gh.issues[7]["comments"] if "forge-cleanup" in c["body"]]
+    assert "<!-- forge-cleanup session=A assignee=alice -->" in cleaned
+    assert "<!-- forge-cleanup session=B assignee=bob -->" in cleaned
+
+
+def test_reconciling_every_release_still_skips_a_login_reassigned_after_its_release():
+    gh = FakeGh().issue(7)
+    claim(PROJECT, 7, agent="a", session="A", branch="b", gh=gh, now=NOW, assignee="alice")
+    with pytest.raises(RuntimeError):
+        release(PROJECT, 7, session="A", gh=_failing_removal(gh), now=NOW)
+    gh.events[7].append(
+        {
+            "event": "assigned",
+            "assignee": {"login": "alice"},
+            "created_at": (NOW + timedelta(minutes=3)).isoformat(),
+        }
+    )
+    gh.posted_at = NOW + timedelta(minutes=4)
+    claim(PROJECT, 7, agent="b", session="B", branch="b", gh=gh, now=gh.posted_at)
+    release(PROJECT, 7, session="B", gh=gh, now=gh.posted_at)
+    assert _logins(gh) == ["alice"]  # a maintainer's later assignment is never undone
+
+
+def test_a_takeover_succeeds_when_the_expired_assignee_cleanup_fails_and_a_later_op_finishes():
+    stale = Lease(7, "a", "old", "b", NOW - timedelta(minutes=1), "alice", True)
+    gh = FakeGh().issue(7, assignees=["alice"], comments=[format_claim_marker(stale)])
+    result = claim(
+        PROJECT,
+        7,
+        agent="a",
+        session="new",
+        branch="b",
+        gh=_failing_removal(gh),
+        now=NOW,
+        assignee="bob",
+    )
+    assert result.ok and result.took_over_from == "old"
+    assert current_lease(PROJECT, 7, gh, now=NOW).session == "new"  # never retracted
+    assert not any("forge-release session=new" in c["body"] for c in gh.issues[7]["comments"])
+    assert sorted(_logins(gh)) == ["alice", "bob"]
+    renewed = claim(  # any later claim/release retries the expired lease's cleanup
+        PROJECT, 7, agent="a", session="new", branch="b", gh=gh, now=NOW, assignee="bob"
+    )
+    assert renewed.ok and renewed.renewed
+    assert _logins(gh) == ["bob"]
+    release(PROJECT, 7, session="new", gh=gh, now=NOW)
+    assert _logins(gh) == []
+    bodies = [c["body"] for c in gh.issues[7]["comments"]]
+    assert "<!-- forge-cleanup session=old assignee=alice -->" in bodies
+
+
+def test_a_successful_takeover_records_the_expired_leases_cleanup():
+    stale = Lease(7, "a", "old", "b", NOW - timedelta(minutes=1), "alice", True)
+    gh = FakeGh().issue(7, assignees=["alice"], comments=[format_claim_marker(stale)])
+    assert claim(
+        PROJECT, 7, agent="a", session="new", branch="b", gh=gh, now=NOW, assignee="bob"
+    ).ok
+    assert _logins(gh) == ["bob"]
+    bodies = [c["body"] for c in gh.issues[7]["comments"]]
+    assert bodies.count("<!-- forge-cleanup session=old assignee=alice -->") == 1
