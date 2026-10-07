@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -325,15 +326,17 @@ def _healthy_gh() -> FakeGh:
         {
             "api repos/owner/agentic-sdlc/contents": '{"path": "reusable-implement.yml"}',
             "api repos/owner/comic/rulesets/11": json.dumps({"id": 11, **ruleset_payload(spec())}),
-            "label list": json.dumps(
+            "api repos/owner/comic/labels": json.dumps(
                 [
-                    {"name": n}
-                    for n in (
-                        "claude-ready",
-                        "human-review-required",
-                        IMPLEMENTATION_LABEL,
-                        "in-progress",
-                    )
+                    [
+                        {"name": n}
+                        for n in (
+                            "claude-ready",
+                            "human-review-required",
+                            IMPLEMENTATION_LABEL,
+                            "in-progress",
+                        )
+                    ]
                 ]
             ),
             "api repos/owner/comic/rulesets": json.dumps(
@@ -371,6 +374,9 @@ def _healthy_gh() -> FakeGh:
             ),
             "api repos/owner/comic": json.dumps({"default_branch": "main"}),
             "api /user/installations": _installs(7),
+            "api apps/agentic-sdlc-publisher": json.dumps(
+                {"slug": "agentic-sdlc-publisher", "client_id": "publisher_app_client_id-value"}
+            ),
         }
     )
 
@@ -859,8 +865,8 @@ def test_doctor_requires_the_in_progress_lease_label(tmp_path):
     repo = _repo(tmp_path)
     write_onboarding(repo, spec())
     gh = _healthy_gh()
-    gh.answers["label list"] = json.dumps(
-        [{"name": n} for n in ("claude-ready", "human-review-required", IMPLEMENTATION_LABEL)]
+    gh.answers["api repos/owner/comic/labels"] = json.dumps(
+        [[{"name": n} for n in ("claude-ready", "human-review-required", IMPLEMENTATION_LABEL)]]
     )
     report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
     failed = {c.name: c for c in report.checks if not c.ok}
@@ -1188,3 +1194,192 @@ def test_doctor_checks_the_ci_test_job_runner_target(tmp_path):
         c for c in report.checks if c.name == "ci.yml test job runs on an available runner"
     )
     assert not check.ok and "arm64" in check.detail
+
+
+# ---------------------------------------------------------------- review regressions (PR 139)
+
+
+def _failed(report) -> dict:
+    return {c.name: c for c in report.checks if not c.ok}
+
+
+def test_commit_guard_keeps_the_earliest_live_claim_after_a_racer_retracts(tmp_path, monkeypatch):
+    import subprocess
+    from datetime import UTC, datetime, timedelta
+
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    exp = (datetime.now(UTC) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    posted = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def marker(body):
+        return {"body": body, "author_association": "OWNER", "created_at": posted}
+
+    winner = marker(f"<!-- forge-claim agent=a session=s1 branch=b expires={exp} -->")
+    racer = marker(f"<!-- forge-claim agent=a session=s2 branch=b expires={exp} -->")
+    retract = marker("<!-- forge-release session=s2 -->")
+    for comments in ([winner, racer], [winner, racer, retract]):
+
+        def fake_run(args, comments=comments, **kwargs):
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps([comments]), stderr="")
+
+        monkeypatch.setattr(guard.subprocess, "run", fake_run)
+        lease = guard.lease_for(7)
+        assert lease is not None and lease["session"] == "s1"
+
+
+def _ci_test_step(repo: Path, run: str) -> None:
+    ci = repo / ".github/workflows/ci.yml"
+    doc = yaml.safe_load(ci.read_text())
+    step = next(s for s in doc["jobs"]["test"]["steps"] if s.get("name") == "Test")
+    step["run"] = run
+    ci.write_text(yaml.safe_dump(doc, sort_keys=False))
+
+
+@pytest.mark.parametrize(
+    "run",
+    [
+        "echo pytest tests -q -m 'not e2e'",
+        "# pytest tests -q -m 'not e2e'",
+        "true \"pytest tests -q -m 'not e2e'\"",
+    ],
+)
+def test_doctor_rejects_a_ci_gate_that_only_mentions_the_command(tmp_path, run):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    _ci_test_step(repo, run)
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    assert "ci.yml runs the policy gates as 'test'" in _failed(report)
+
+
+def test_doctor_accepts_a_ci_gate_run_as_a_command_among_others(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    _ci_test_step(repo, "set -e  # run the tests\nCI=1 pytest tests -q -m 'not e2e' --maxfail=1")
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    assert "ci.yml runs the policy gates as 'test'" not in _failed(report)
+
+
+def test_doctor_rejects_a_client_id_of_another_publisher_app(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _healthy_gh()
+    gh.answers["api apps/agentic-sdlc-publisher"] = json.dumps({"client_id": "Iv1.other"})
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))
+    assert set(failed) == {"Publisher GitHub App installed on this repo"}
+    assert "PUBLISHER_APP_CLIENT_ID" in failed["Publisher GitHub App installed on this repo"].detail
+
+
+def test_cli_copy_vars_from_copies_every_registry_model_variable(tmp_path, monkeypatch):
+    from agentic_sdlc import cli
+    from agentic_sdlc.onboard import DoctorReport
+
+    copied: list[str] = []
+    monkeypatch.setattr(cli, "copy_variables", lambda src, names: copied.extend(names) or {})
+    monkeypatch.setattr(cli, "apply_repo_settings", lambda *a, **k: {})
+    monkeypatch.setattr(cli, "doctor", lambda *a, **k: DoctorReport())
+    repo = _repo(tmp_path)
+    args = ["onboard", "--destination", str(repo), "--project-id", "owner/comic"]
+    args += ["--platform-repository", "owner/agentic-sdlc", "--platform-ref", SHA]
+    args += ["--test", "pytest -q", "--default-branch", "main", "--apply"]
+    assert cli.main([*args, "--copy-vars-from", "owner/music", "--output", "-"]) == 0
+    registry = json.loads((repo / ".forge/executors.json").read_text())
+    wanted = {
+        e["model"].removeprefix("configured-by-")
+        for e in registry["executors"]
+        if e["model"].startswith("configured-by-")
+    }
+    assert wanted == {
+        "DEEPSEEK_MODEL_FLASH",
+        "DEEPSEEK_MODEL_PRO",
+        "ZAI_MODEL_GLM",
+        "KIMI_MODEL_K3",
+    }
+    assert set(copied) == {"PUBLISHER_APP_CLIENT_ID", *wanted}
+
+
+@pytest.mark.parametrize("runs_on", ["ubuntu-lates", "${{ matrix.os }}", "big-runner-group"])
+def test_doctor_rejects_unknown_hosted_runner_labels(tmp_path, runs_on):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    ci = repo / ".github/workflows/ci.yml"
+    doc = yaml.safe_load(ci.read_text())
+    doc["jobs"]["test"]["runs-on"] = runs_on
+    ci.write_text(yaml.safe_dump(doc, sort_keys=False))
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh()))
+    assert set(failed) == {"ci.yml test job runs on an available runner"}
+
+
+@pytest.mark.parametrize(
+    "runs_on", ["ubuntu-latest", "ubuntu-24.04-arm", "macos-15", "windows-2025"]
+)
+def test_doctor_accepts_github_hosted_runner_labels(tmp_path, runs_on):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    ci = repo / ".github/workflows/ci.yml"
+    doc = yaml.safe_load(ci.read_text())
+    doc["jobs"]["test"]["runs-on"] = runs_on
+    ci.write_text(yaml.safe_dump(doc, sort_keys=False))
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh())
+    assert report.ok, report.render()
+
+
+def test_auto_plan_triggers_on_the_ready_label_only():
+    doc = yaml.safe_load(render_onboarding(spec())[".github/workflows/agent-auto-plan.yml"])
+    cond = doc["jobs"]["plan"]["if"]
+    assert "github.event.label.name == 'claude-ready'" in cond
+    assert "github.event.label.name == 'human-review-required'" not in cond
+    assert "contains(github.event.issue.labels.*.name, 'human-review-required')" in cond
+
+
+def test_default_claude_executor_routes_a_literal_model(tmp_path):
+    registry = json.loads(render_onboarding(spec())[".forge/executors.json"])
+    claude = next(e for e in registry["executors"] if e["provider"] == "anthropic")
+    assert not claude["model"].startswith("configured-by-")
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    claude["model"] = "configured-by-CLAUDE_MODEL"
+    (repo / ".forge/executors.json").write_text(json.dumps(registry))
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert "configured-by-" in failed["routed executors have a workflow adapter"].detail
+
+
+def test_doctor_reads_every_page_of_labels(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _healthy_gh()
+    filler = [{"name": f"area-{i}"} for i in range(250)]
+    forge = [{"name": n} for n in ("claude-ready", "human-review-required", IMPLEMENTATION_LABEL)]
+    rows = [*filler, *forge, {"name": "in-progress"}]
+    gh.answers["api repos/owner/comic/labels"] = json.dumps(
+        [rows[i : i + 100] for i in range(0, len(rows), 100)]
+    )
+    assert doctor(repo, "owner/comic", "owner/agentic-sdlc", gh).ok
+    call = next(c for c, _ in gh.calls if c[:2] == ("api", "repos/owner/comic/labels?per_page=100"))
+    assert "--paginate" in call
+
+
+@pytest.mark.parametrize("provider", ["openai", "aws-bedrock", "azure-foundry"])
+def test_doctor_rejects_a_routed_provider_without_a_workflow_adapter(tmp_path, provider):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    path = repo / ".forge/executors.json"
+    registry = json.loads(path.read_text())
+    registry["executors"][0]["provider"] = provider
+    path.write_text(json.dumps(registry))
+    policy = repo / ".forge/routing-policy.json"
+    routing = json.loads(policy.read_text())
+    routing["allowedProviders"].append(provider)
+    policy.write_text(json.dumps(routing))
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert provider in failed["routed executors have a workflow adapter"].detail
+
+
+def test_routed_adapter_providers_match_the_implement_workflow():
+    from agentic_sdlc.onboard import ROUTED_ADAPTER_PROVIDERS
+
+    text = (Path(__file__).parents[1] / ".github/workflows/reusable-implement.yml").read_text()
+    compat = re.search(
+        r"contains\(fromJSON\('(\[[^']*\])'\), needs\.prepare\.outputs\.selected_provider\)", text
+    )
+    direct = set(re.findall(r"selected_provider == '([\w-]+)'", text))
+    assert compat and direct | set(json.loads(compat.group(1))) == ROUTED_ADAPTER_PROVIDERS
