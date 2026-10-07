@@ -352,8 +352,25 @@ jobs:
       - name: Install bubblewrap (Claude Code subprocess isolation)
         if: needs.prepare.outputs.selected_provider == 'anthropic'
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q bubblewrap
+          set -euo pipefail
+          # bubblewrap is baked into the self-hosted runner images; skip apt (and its
+          # lock contention with sibling runners / unattended-upgrades) when present,
+          # and wait for the lock when an install is genuinely needed.
+          if command -v bwrap >/dev/null; then
+            echo "bubblewrap already installed; skipping apt"
+          else
+            # DPkg::Lock::Timeout covers the dpkg locks only; `update` takes the
+            # apt lists lock once and exits 100 if another process holds it.
+            # Retry it for the same ~5 minutes the dpkg timeout allows.
+            for attempt in 1 2 3 4 5 6 7 8 9 10; do
+              sudo apt-get -o DPkg::Lock::Timeout=300 update -q && break
+              if [ "$attempt" = 10 ]; then exit 1; fi
+              echo "apt-get update failed (attempt $attempt); retrying in 30s"
+              sleep 30
+            done
+            sudo apt-get -o DPkg::Lock::Timeout=300 install -y -q bubblewrap
+          fi
+          command -v bwrap >/dev/null
       - name: Draft missing sections with Claude Code using Max/Pro OAuth
         if: needs.prepare.outputs.selected_provider == 'anthropic' && needs.prepare.outputs.selected_auth_mode == 'oauth'
         uses: anthropics/claude-code-action@8cf3482550831fb35a4fc3fbf7ca139cf8028b4c # v1
