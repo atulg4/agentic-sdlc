@@ -100,7 +100,15 @@ _GIT_COMMIT_LOOSE = re.compile(
     r"(?:^|[\s;&|(])(?:\S*/)?git(?:\.exe)?\s(?:.*\s)?commit(?=$|[\s;&|)])"
 )
 MAX_TTL_MINUTES = 7 * 24 * 60  # leases.MAX_TTL_MINUTES
-TRUSTED = {"OWNER", "MEMBER", "COLLABORATOR"}  # plus GitHub Apps (user.type == "Bot")
+# Who may post lease markers -- the SAME rule as leases.trusted_marker_author (a test holds the
+# two to identical decisions): a user with write/maintain/admin on the repository, read from the
+# collaborator permission API (author_association is no authority: a read-only member is MEMBER),
+# `github-actions[bot]`, or the Forge Publisher App's bot. Unreadable permission = untrusted.
+WRITE_PERMISSIONS = frozenset({"admin", "maintain", "write"})  # leases.WRITE_PERMISSIONS
+GITHUB_ACTIONS_BOT = "github-actions[bot]"  # leases.GITHUB_ACTIONS_BOT
+PUBLISHER_APP_SLUG_HINT = "agentic-sdlc"  # leases.PUBLISHER_APP_SLUG_HINT
+LEASE_BOT_LOGINS_ENV = "FORGE_LEASE_BOT_LOGINS"  # leases.LEASE_BOT_LOGINS_ENV
+_LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
 
 
 def _segments(command: str) -> list[list[str]]:
@@ -442,36 +450,77 @@ def _parse_iso(text: str) -> datetime | None:
     return moment if moment.tzinfo else moment.replace(tzinfo=UTC)  # naive means UTC
 
 
-def lease_for(issue: int) -> dict | None:
-    """The live lease: the earliest-claiming live session (None if none/unreachable)."""
+def trusted_bot(login: str, configured: str | None = None) -> bool:
+    """`github-actions[bot]`, or the Publisher App's bot: the logins in FORGE_LEASE_BOT_LOGINS
+    when set, else a `<slug>[bot]` whose slug carries PUBLISHER_APP_SLUG_HINT. No other bot."""
+    login = login.lower()
+    if login == GITHUB_ACTIONS_BOT:
+        return True
+    if configured is None:
+        configured = os.environ.get(LEASE_BOT_LOGINS_ENV, "")
+    named = {part.strip().lower() for part in configured.split(",") if part.strip()}
+    if named:
+        return login in named
+    return login.endswith("[bot]") and PUBLISHER_APP_SLUG_HINT in login[: -len("[bot]")]
+
+
+def trusted_marker_author(comment: dict, permission, configured: str | None = None) -> bool:
+    """May this comment's author post lease markers (leases.trusted_marker_author)?"""
+    user = comment.get("user") or {}
+    login = str(user.get("login") or "")
+    if not login:
+        return False
+    if user.get("type") == "Bot" or login.endswith("[bot]"):
+        return user.get("type") == "Bot" and trusted_bot(login, configured)
+    if not _LOGIN.fullmatch(login):
+        return False
+    granted = permission(login)
+    return granted is not None and granted in WRITE_PERMISSIONS
+
+
+_PERMISSIONS: dict[str, str | None] = {}  # one read per login per hook run
+
+
+def repo_permission(login: str) -> str | None:
+    """The login's repository permission (role_name, else permission); None when unreadable."""
+    if login in _PERMISSIONS:
+        return _PERMISSIONS[login]
+    granted: str | None = None
     try:
         out = subprocess.run(
-            [
-                "gh",
-                "api",
-                f"repos/{PROJECT}/issues/{issue}/comments?per_page=100",
-                "--paginate",
-                "--slurp",
-            ],
+            ["gh", "api", f"repos/{PROJECT}/collaborators/{login}/permission"],
             capture_output=True,
             text=True,
             check=True,
         ).stdout
-        pages = json.loads(out or "[]")
+        data = json.loads(out or "{}")
     except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
-        return None
-    comments = [c for page in pages if isinstance(page, list) for c in page if isinstance(c, dict)]
-    # Same ordering as leases.current_lease(): a session's newest claim supersedes its older ones,
-    # a release voids that session, and the live session that claimed FIRST holds the lease, so a
-    # losing racer's retraction cannot clear the winner.
+        data = None
+    if isinstance(data, dict):
+        for key in ("role_name", "permission"):
+            value = str(data.get(key) or "").lower()
+            if value in WRITE_PERMISSIONS:
+                granted = value
+                break
+        else:
+            granted = str(data.get("permission") or "") or None
+    _PERMISSIONS[login] = granted
+    return granted
+
+
+def lease_from_comments(
+    comments: list, permission=None, now: datetime | None = None
+) -> dict | None:
+    """The live lease in an issue's comments: the earliest-claiming live session (None if none).
+    Same ordering as leases.current_lease(): a session's newest claim supersedes its older ones,
+    a release voids that session, and the live session that claimed FIRST holds the lease, so a
+    losing racer's retraction cannot clear the winner."""
+    permission = permission or repo_permission
     first_seen: dict[str, int] = {}
     latest: dict[str, dict] = {}
     for position, c in enumerate(comments):
-        if (
-            c.get("author_association") not in TRUSTED
-            and (c.get("user") or {}).get("type") != "Bot"
-        ):
-            continue  # markers only count from members/collaborators and GitHub Apps
+        if not isinstance(c, dict) or not trusted_marker_author(c, permission):
+            continue  # markers count only from writers and the trusted bots
         body = c.get("body") or ""
         found = list(CLAIM.finditer(body))
         m = found[-1] if found else None
@@ -494,11 +543,33 @@ def lease_for(issue: int) -> dict | None:
         if released in latest:
             del latest[released]
             del first_seen[released]
-    now = datetime.now(UTC)
+    now = now or datetime.now(UTC)
     for session in sorted(latest, key=first_seen.__getitem__):
         if latest[session]["expires"] > now:
             return latest[session]
     return None
+
+
+def lease_for(issue: int) -> dict | None:
+    """The live lease of `issue` (None if none/unreachable)."""
+    try:
+        out = subprocess.run(
+            [
+                "gh",
+                "api",
+                f"repos/{PROJECT}/issues/{issue}/comments?per_page=100",
+                "--paginate",
+                "--slurp",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        pages = json.loads(out or "[]")
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
+        return None
+    comments = [c for page in pages if isinstance(page, list) for c in page if isinstance(c, dict)]
+    return lease_from_comments(comments, repo_permission)
 
 
 def open_pr_for(branch: str) -> bool:

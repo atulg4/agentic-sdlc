@@ -48,7 +48,8 @@ offline) and, for a public repository, renders `ci.yml` on `ubuntu-latest` while
 issue-triggered agent workflows keep `--runs-on`. `--ci-runs-on` overrides the CI runner, but only
 with GitHub-hosted labels on a public repository: there is no opt-in for self-hosted pull-request
 CI. `doctor` fails a public repository in which any `pull_request*`-triggered job (in any workflow
-file) targets anything but a single GitHub-hosted label, following the jobs of every local
+file on the default branch, read through the contents API -- the set GitHub runs, not this
+checkout's, which is checked in addition; an unreadable remote set fails closed) targets anything but a single GitHub-hosted label, following the jobs of every local
 reusable workflow it calls (`./.github/workflows/x.yml`, with `with:` inputs substituted). A call
 to a third-party reusable workflow, a runner expression that is not a resolvable input, or a
 Forge platform reusable workflow called without an explicit `runs_on` cannot be proven hosted and
@@ -92,6 +93,24 @@ The only tunable knobs, each validated by its own check instead:
 
 Everything else in those files is the template. To change it, change the policy and re-run
 `onboard --force`.
+
+### Other managed files
+
+Every other file `onboard` writes is compared with what it renders for the repository's policy,
+both in the checkout and on the default branch:
+
+| File | Compared |
+|---|---|
+| `.claude/hooks/forge_commit_guard.py`, `.claude/hooks/forge_session_start.py` | byte for byte |
+| `.github/ISSUE_TEMPLATE/agent-work-request.md` | byte for byte |
+| `docs/forge/cloud-implementer.md` (cloud-routine mode) | byte for byte apart from the CI runner it names |
+| `AGENTS.md`, `CLAUDE.md` | must contain the generated text verbatim (notes may be added around it) |
+| `.claude/settings.json` | structurally: the Forge hooks must be configured (other settings are yours) |
+| `.forge/executors.json`, `.forge/routing-policy.json` | semantically: loaded and routed on |
+| `agentic-sdlc.toml` | the policy itself: loaded and checked against the repository |
+
+A difference fails "managed files match the generated files" (or, on the default branch,
+"managed files are on the default branch"); re-run `sdlcctl onboard --force`.
 
 ### The CI test job is fully managed
 

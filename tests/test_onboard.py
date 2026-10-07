@@ -78,6 +78,17 @@ class FakeGh:
                 if prefix.startswith(CONSUMER_CONTENTS) and key.startswith(prefix):
                     return value
             path = _CONSUMER["path"] / key[len(CONSUMER_CONTENTS) :].split("?")[0]
+            if path.is_dir():  # a directory listing, as the contents API returns it
+                return json.dumps(
+                    [
+                        {
+                            "name": child.name,
+                            "path": str(child.relative_to(_CONSUMER["path"])),
+                            "type": "dir" if child.is_dir() else "file",
+                        }
+                        for child in sorted(path.iterdir())
+                    ]
+                )
             if not path.is_file():
                 raise OnboardError("gh: Not Found (HTTP 404)")
             content = base64.b64encode(path.read_bytes()).decode()
@@ -821,11 +832,11 @@ def test_commit_guard_reads_paginated_comments_and_ignores_untrusted_markers(tmp
     module_spec.loader.exec_module(guard)
     expires = (datetime.now(UTC) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    def row(body, association="OWNER"):
-        return {"body": body, "author_association": association, "user": {"type": "User"}}
+    def row(body, login="owner"):
+        return {"body": body, "user": {"login": login, "type": "User"}}
 
     mine = row(f"<!-- forge-claim agent=a session=s1 branch=b expires={expires} -->")
-    forged = row("<!-- forge-release session=s1 -->", association="NONE")
+    forged = row("<!-- forge-release session=s1 -->", login="rando")  # no write access
     pages = [[row("chatter")] * 30, [mine, forged]]
 
     def fake_run(args, **kwargs):
@@ -833,6 +844,7 @@ def test_commit_guard_reads_paginated_comments_and_ignores_untrusted_markers(tmp
         return subprocess.CompletedProcess(args, 0, stdout=out, stderr="")
 
     monkeypatch.setattr(guard.subprocess, "run", fake_run)
+    monkeypatch.setattr(guard, "repo_permission", {"owner": "admin", "rando": "read"}.get)
     lease = guard.lease_for(7)
     assert lease is not None and lease["session"] == "s1"
 
@@ -983,7 +995,7 @@ def test_commit_guard_does_not_let_a_lapsed_session_regain_seniority(tmp_path, m
 
     def marker(session, expires, posted):
         body = f"<!-- forge-claim agent=a session={session} branch=b expires={at(expires)} -->"
-        return {"body": body, "author_association": "OWNER", "created_at": at(posted)}
+        return {"body": body, "user": {"login": "owner", "type": "User"}, "created_at": at(posted)}
 
     comments = [
         marker("old", now - timedelta(minutes=30), now - timedelta(hours=4)),
@@ -995,6 +1007,7 @@ def test_commit_guard_does_not_let_a_lapsed_session_regain_seniority(tmp_path, m
         return subprocess.CompletedProcess(args, 0, stdout=json.dumps([comments]), stderr="")
 
     monkeypatch.setattr(guard.subprocess, "run", fake_run)
+    monkeypatch.setattr(guard, "repo_permission", lambda login: "write")
     assert guard.lease_for(7)["session"] == "new"
 
 
@@ -1161,12 +1174,13 @@ def test_commit_guard_treats_a_timezone_less_expiry_as_utc(tmp_path, monkeypatch
     guard = _guard_module(tmp_path, "forge_commit_guard")
     naive = (datetime.now(UTC) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S")
     body = f"<!-- forge-claim agent=a session=s1 branch=b expires={naive} -->"
-    pages = [[{"body": body, "author_association": "OWNER", "user": {"type": "User"}}]]
+    pages = [[{"body": body, "user": {"login": "owner", "type": "User"}}]]
 
     def fake_run(args, **kwargs):
         return subprocess.CompletedProcess(args, 0, stdout=json.dumps(pages), stderr="")
 
     monkeypatch.setattr(guard.subprocess, "run", fake_run)
+    monkeypatch.setattr(guard, "repo_permission", lambda login: "admin")
     lease = guard.lease_for(7)
     assert lease is not None and lease["expires"].tzinfo is not None
 
@@ -1311,7 +1325,7 @@ def test_commit_guard_keeps_the_earliest_live_claim_after_a_racer_retracts(tmp_p
     posted = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     def marker(body):
-        return {"body": body, "author_association": "OWNER", "created_at": posted}
+        return {"body": body, "user": {"login": "owner", "type": "User"}, "created_at": posted}
 
     winner = marker(f"<!-- forge-claim agent=a session=s1 branch=b expires={exp} -->")
     racer = marker(f"<!-- forge-claim agent=a session=s2 branch=b expires={exp} -->")
@@ -1322,6 +1336,7 @@ def test_commit_guard_keeps_the_earliest_live_claim_after_a_racer_retracts(tmp_p
             return subprocess.CompletedProcess(args, 0, stdout=json.dumps([comments]), stderr="")
 
         monkeypatch.setattr(guard.subprocess, "run", fake_run)
+        monkeypatch.setattr(guard, "repo_permission", lambda login: "maintain")
         lease = guard.lease_for(7)
         assert lease is not None and lease["session"] == "s1"
 
@@ -3360,3 +3375,175 @@ def test_cli_onboard_passes_the_python_version_into_policy_and_ci(tmp_path):
     assert ci["jobs"]["test"]["steps"][1]["with"]["python-version"] == "3.11"
     failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
     assert GATE_CHECK not in failed and DRIFT not in failed
+
+
+# ---------------------------------------------------------------- remote workflows / managed files
+
+PUBLIC_CHECK = "public repository runs pull requests on GitHub-hosted runners"
+FILES_CHECK = "managed files match the generated files"
+PUSHED_CHECK = "managed files are on the default branch"
+SELF_HOSTED_PR = (
+    "on: pull_request\njobs:\n  lint:\n    runs-on: [self-hosted]\n"
+    "    steps:\n      - run: make lint\n"
+)
+
+
+def _public_gh() -> FakeGh:
+    gh = _healthy_gh()
+    gh.answers["api repos/owner/comic"] = json.dumps(
+        {"default_branch": "main", "visibility": "public"}
+    )
+    return gh
+
+
+def _remote_workflows(gh: FakeGh, files: dict[str, str]) -> None:
+    """Serve `files` as the default branch's .github/workflows (instead of the checkout's)."""
+    listing = [{"name": n, "path": f".github/workflows/{n}", "type": "file"} for n in sorted(files)]
+    gh.answers[CONSUMER_CONTENTS + ".github/workflows?ref=main"] = json.dumps(listing)
+    for name, text in files.items():
+        gh.answers[CONSUMER_CONTENTS + f".github/workflows/{name}?ref=main"] = json.dumps(
+            {"encoding": "base64", "content": base64.b64encode(text.encode()).decode()}
+        )
+
+
+def test_public_runner_safety_reads_the_default_branchs_workflows(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(public=True))
+    local = {p.name: p.read_text() for p in (repo / ".github/workflows").glob("*.yml")}
+    gh = _public_gh()
+    # The checkout is stale: the default branch also runs a self-hosted pull_request workflow.
+    _remote_workflows(gh, {**local, "lint.yml": SELF_HOSTED_PR})
+    check = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))[PUBLIC_CHECK]
+    assert "lint.yml:lint" in check.detail and "local checkout" not in check.detail
+    # ... and a reusable workflow present only remotely is followed from the remote set.
+    gh = _public_gh()
+    _remote_workflows(
+        gh,
+        {
+            **local,
+            "reuse.yml": REUSE_SELF_HOSTED,
+            "pr.yml": _pr_caller("./.github/workflows/reuse.yml"),
+        },
+    )
+    check = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))[PUBLIC_CHECK]
+    assert "pr.yml:call > reuse.yml:build" in check.detail
+
+
+def test_public_runner_safety_fails_closed_without_the_remote_workflow_set(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(public=True))
+    gh = _public_gh()
+    gh.answers[CONSUMER_CONTENTS + ".github/workflows?ref=main"] = "not json"
+    check = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))[PUBLIC_CHECK]
+    assert "unverifiable" in check.detail and "fails closed" in check.detail
+    # One unreadable file is an unreadable set, not a smaller one.
+    gh = _public_gh()
+    gh.answers[CONSUMER_CONTENTS + ".github/workflows/ci.yml?ref=main"] = json.dumps(
+        {"encoding": "none", "content": ""}
+    )
+    check = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))[PUBLIC_CHECK]
+    assert "could not read .github/workflows/ci.yml" in check.detail
+
+
+def test_public_runner_safety_still_checks_local_workflows_as_an_addition(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(public=True))
+    remote = {p.name: p.read_text() for p in (repo / ".github/workflows").glob("*.yml")}
+    _wf(repo, "lint.yml", SELF_HOSTED_PR)  # not pushed yet
+    gh = _public_gh()
+    _remote_workflows(gh, remote)
+    check = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))[PUBLIC_CHECK]
+    assert "local checkout: lint.yml:lint" in check.detail
+
+
+def test_doctor_compares_hook_scripts_with_the_rendered_hooks(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    guard = repo / ".claude/hooks/forge_commit_guard.py"
+    guard.write_text("import sys\nsys.exit(0)\n")
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh()))
+    assert ".claude/hooks/forge_commit_guard.py differs" in failed[FILES_CHECK].detail
+    # the pushed copy is the same disabled script: compared with the template, not only local
+    assert "forge_commit_guard.py (differs from the generated file" in failed[PUSHED_CHECK].detail
+    local = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert FILES_CHECK in local
+
+
+def test_doctor_flags_a_remote_only_disabled_session_start_hook(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _healthy_gh()
+    gh.answers[CONSUMER_CONTENTS + ".claude/hooks/forge_session_start.py"] = json.dumps(
+        {"encoding": "base64", "content": base64.b64encode(b"pass\n").decode()}
+    )
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))
+    assert FILES_CHECK not in failed
+    assert "forge_session_start.py (differs)" in failed[PUSHED_CHECK].detail
+
+
+@pytest.mark.parametrize(
+    ("relative", "edit", "fails"),
+    [
+        (".github/ISSUE_TEMPLATE/agent-work-request.md", lambda t: t + "\nextra\n", True),
+        ("AGENTS.md", lambda t: t + "\n## Repository notes\n\nlocal detail\n", False),
+        ("AGENTS.md", lambda t: t.replace("Never merge", "Feel free to merge"), True),
+        ("CLAUDE.md", lambda t: t.replace("Tests first", "Tests later"), True),
+    ],
+)
+def test_doctor_compares_every_managed_file_with_its_rendered_form(tmp_path, relative, edit, fails):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    path = repo / relative
+    path.write_text(edit(path.read_text()))
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh()))
+    assert (FILES_CHECK in failed) is fails, failed.get(FILES_CHECK)
+    if fails:
+        assert f"{relative} differs" in failed[FILES_CHECK].detail
+
+
+def test_doctor_compares_the_cloud_routine_doc_apart_from_its_ci_runner(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(implementer="cloud-routine"))
+    doc = repo / "docs/forge/cloud-implementer.md"
+    text = doc.read_text()
+    doc.write_text(re.sub(r"runs on\s+`[^`]*`", "runs on\n`ubuntu-latest`", text))
+    local = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert FILES_CHECK not in local
+    doc.write_text(text.replace("Never merge", "Merge when green"))
+    local = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert "docs/forge/cloud-implementer.md differs" in local[FILES_CHECK].detail
+
+
+def test_every_rendered_file_is_compared_by_some_doctor_check():
+    """No Forge-managed file may be checked for existence only."""
+    from agentic_sdlc.onboard import (
+        CONTAINED_MANAGED_FILES,
+        EXACT_MANAGED_FILES,
+        MANAGED_IMPLEMENT_WORKFLOWS,
+        MANAGED_WORKFLOWS,
+        ROUTINE_DOC,
+    )
+
+    compared = {
+        *EXACT_MANAGED_FILES,
+        *CONTAINED_MANAGED_FILES,
+        ROUTINE_DOC,
+        *(f".github/workflows/{n}" for n in (*MANAGED_WORKFLOWS, *MANAGED_IMPLEMENT_WORKFLOWS)),
+        ".claude/settings.json",  # hook_problems: the parsed hooks structure
+        "agentic-sdlc.toml",  # the policy itself: load_policy + the policy checks
+        ".forge/executors.json",  # the routing check validates and routes on both registries
+        ".forge/routing-policy.json",
+    }
+    for implementer in ("route", "claude", "cloud-routine"):
+        assert set(render_onboarding(spec(implementer=implementer))) <= compared
+
+
+def test_settings_json_stays_tunable_while_its_hooks_are_present(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    settings = repo / ".claude/settings.json"
+    doc = json.loads(settings.read_text())
+    doc["permissions"] = {"allow": ["Bash(pytest:*)"]}
+    settings.write_text(json.dumps(doc))
+    local = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert FILES_CHECK not in local and "required files present" not in local
