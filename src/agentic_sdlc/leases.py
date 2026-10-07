@@ -5,6 +5,12 @@ the issue carries the `in-progress` label, an assignee when one is known, and a 
 comment ``<!-- forge-claim agent=… session=… branch=… expires=… -->``. A later
 ``<!-- forge-release session=… -->`` comment ends it. Leases expire, so a crashed agent cannot
 block a ticket forever; an expired lease may be taken over (and the takeover is commented).
+
+A claim with an assignee records it in the marker (``assignee=<login>``), and
+``owns_assignee=1`` when the lease itself put that assignee on the issue (it was not assigned
+already, or it was inherited from the expired lease this one took over). Release -- and a
+takeover -- remove only an assignee a lease owned, and only when the authoritative live lease
+does not want the same login; a pre-existing assignee is never touched.
 """
 
 from __future__ import annotations
@@ -46,6 +52,10 @@ class Lease:
     session: str
     branch: str
     expires: datetime
+    #: The login this lease asked to be assigned ('' = none).
+    assignee: str = ""
+    #: The lease added `assignee` to the issue (it was not already assigned), so release removes it.
+    owns_assignee: bool = False
 
     def live(self, now: datetime) -> bool:
         return self.expires > now
@@ -93,12 +103,16 @@ def _parse_iso(text: str) -> datetime | None:
 
 
 def format_claim_marker(lease: Lease) -> str:
-    for value in (lease.agent, lease.session, lease.branch):
+    optional = (lease.assignee,) if lease.assignee else ()
+    for value in (lease.agent, lease.session, lease.branch, *optional):
         if not _TOKEN.fullmatch(value):
             raise LeaseError(f"lease field contains unsupported characters: {value!r}")
+    owner = ""
+    if lease.assignee:
+        owner = f" assignee={lease.assignee}" + (" owns_assignee=1" if lease.owns_assignee else "")
     return (
         f"<!-- {CLAIM_MARKER} agent={lease.agent} session={lease.session} "
-        f"branch={lease.branch} expires={_iso(lease.expires)} -->"
+        f"branch={lease.branch} expires={_iso(lease.expires)}{owner} -->"
     )
 
 
@@ -122,6 +136,8 @@ def parse_marker(body: str, issue: int) -> Lease | None:
         session=fields["session"],
         branch=fields["branch"],
         expires=expires,
+        assignee=fields.get("assignee", ""),
+        owns_assignee=bool(fields.get("assignee")) and fields.get("owns_assignee") == "1",
     )
 
 
@@ -314,6 +330,40 @@ def _sync_label(project: str, issue: int, gh: GhRunner, now: datetime | None = N
         _edit(project, issue, gh, "--add-label", IN_PROGRESS_LABEL)
 
 
+def _sync_assignee(
+    project: str, issue: int, login: str, gh: GhRunner, now: datetime | None = None
+) -> None:
+    """Remove `login` -- an assignee a dead lease added -- unless the authoritative live lease
+    wants it, then re-read and restore it if a claimant that wants it arrived meanwhile: the same
+    remove-then-reconcile as `_sync_label`, since assignee edits are not arbitrated either."""
+    now = now or datetime.now(UTC)
+
+    def wanted(held: Lease | None) -> bool:
+        return held is not None and held.live(now) and held.assignee == login
+
+    if wanted(current_lease(project, issue, gh, now)):
+        return
+    _edit(project, issue, gh, "--remove-assignee", login)
+    if wanted(current_lease(project, issue, gh, now)):
+        _edit(project, issue, gh, "--add-assignee", login)
+
+
+def _drop_owned_assignee(
+    project: str, issue: int, ended: Lease | None, gh: GhRunner, now: datetime | None
+) -> None:
+    """Undo the assignment an ended lease made (nothing when it did not make one)."""
+    if ended is not None and ended.owns_assignee and ended.assignee:
+        _sync_assignee(project, issue, ended.assignee, gh, now)
+
+
+def _assignee_logins(target: dict) -> set[str]:
+    return {
+        str(a.get("login"))
+        for a in target.get("assignees") or []
+        if isinstance(a, dict) and a.get("login")
+    }
+
+
 def claim(
     project: str,
     issue: int,
@@ -329,8 +379,10 @@ def claim(
     """Take the lease if free (or expired, or already ours). Never mutates on refusal."""
     now = now or datetime.now(UTC)
     _check_ttl(ttl_minutes)
-    lease = Lease(issue, agent, session, branch, now + timedelta(minutes=ttl_minutes))
-    marker = format_claim_marker(lease)  # validate before reading or writing anything
+    lease = Lease(
+        issue, agent, session, branch, now + timedelta(minutes=ttl_minutes), assignee or ""
+    )
+    format_claim_marker(lease)  # validate before reading or writing anything
     target = json.loads(gh(["api", f"repos/{project}/issues/{issue}"]) or "{}")
     if target.get("pull_request"):
         return ClaimResult(False, None, reason=f"#{issue} is a pull request, not an issue")
@@ -351,11 +403,13 @@ def claim(
                     f"on {existing.branch} until {_iso(existing.expires)}"
                 ),
             )
+        # A renewal keeps the assignment bookkeeping of the lease it extends.
+        lease = replace(lease, assignee=existing.assignee, owns_assignee=existing.owns_assignee)
         winner = _post_and_arbitrate(
             project,
             issue,
             session,
-            marker + f"\nLease renewed until {_iso(lease.expires)}.",
+            format_claim_marker(lease) + f"\nLease renewed until {_iso(lease.expires)}.",
             gh,
             now,
         )
@@ -380,6 +434,14 @@ def claim(
     )
     if took_over:
         note = f"Took over an expired lease from session `{took_over}`. " + note
+    if assignee:
+        # The lease owns the assignment it makes: one not already on the issue, or one the
+        # expired lease it takes over owned (that lease will never release it now).
+        inherited = (
+            existing is not None and existing.owns_assignee and existing.assignee == assignee
+        )
+        lease = replace(lease, owns_assignee=assignee not in _assignee_logins(target) or inherited)
+    marker = format_claim_marker(lease)
     winner = _post_and_arbitrate(project, issue, session, marker + "\n" + note, gh, now)
     if winner is None or winner.session != session:
         return ClaimResult(
@@ -407,9 +469,14 @@ def claim(
                 gh,
             )
             _sync_label(project, issue, gh, now)
+            _drop_owned_assignee(project, issue, lease, gh, now)
         except Exception:  # noqa: BLE001 -- best effort; the original failure is what matters
             pass
         raise
+    # A takeover ends the expired lease: an assignee it added (and this lease does not want)
+    # would otherwise stay on the issue forever, accumulating one per takeover.
+    if existing is not None and existing.assignee != lease.assignee:
+        _drop_owned_assignee(project, issue, existing, gh, now)
     return ClaimResult(True, lease, took_over_from=took_over)
 
 
@@ -430,9 +497,7 @@ def renew(
     if not existing.live(now):
         # An expired lease is up for takeover; renewing it could race a new claimant. Claim again.
         raise LeaseError(f"issue #{issue}: the lease of session {session} has expired; claim again")
-    lease = Lease(
-        issue, existing.agent, session, existing.branch, now + timedelta(minutes=ttl_minutes)
-    )
+    lease = replace(existing, expires=now + timedelta(minutes=ttl_minutes))
     body = format_claim_marker(lease) + f"\nLease renewed until {_iso(lease.expires)}."
     winner = _post_and_arbitrate(project, issue, session, body, gh, now)
     if winner is None or winner.session != session:
@@ -473,6 +538,8 @@ def release(
     )
     # A new claimant may have taken the lease (and added the label) since we read it.
     _sync_label(project, issue, gh, now)
+    # The assignee this lease added goes too, reconciled the same way.
+    _drop_owned_assignee(project, issue, existing, gh, now)
 
 
 def list_claims(project: str, gh: GhRunner, now: datetime | None = None) -> list[ClaimRow]:

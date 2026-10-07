@@ -118,6 +118,9 @@ Criteria`, `## Required Tests`, `## Non-Goals`, `## Dependencies`, the last two 
 Actions jobs, cloud routines and interactive Claude Code sessions all coordinate through a
 GitHub-native lease on the issue (`in-progress` label + assignee + a machine-readable
 `<!-- forge-claim … expires=… -->` comment; default TTL 4 h via `[automation] lease_ttl_minutes`).
+The marker records an `--assignee` and whether the lease added it (`owns_assignee=1`); release,
+and a takeover of an expired lease, remove only an assignee the lease added, never one that was
+already on the issue, and only when the live lease does not want the same login.
 
 ```bash
 sdlcctl claim   --project owner/repo --issue 12 --agent claude-code --session "$SESSION" --branch forge/issue-12

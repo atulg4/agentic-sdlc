@@ -181,6 +181,43 @@ def _command_words(argv: list[str], chdirs: list[str], env: list[tuple[str, str]
     return words
 
 
+# Shell options that take the NEXT word as their value (`bash -o pipefail -c ...`).
+SHELL_VALUE_OPTS = frozenset("oO")
+SHELL_LONG_VALUE_OPTS = frozenset({"--rcfile", "--init-file"})
+
+
+def _shell_command_string(words: list[str]) -> str | None:
+    """The command string a shell runs with `-c`, however its options are spelled: `sh -c CMD`,
+    `bash -lc CMD`, `sh -ec CMD`, `bash -o pipefail -c CMD`, `bash -c -e CMD`. A shell reads its
+    options up to the first operand (or `--`); when any short-option cluster among them holds
+    `c`, that first operand is the command. None when `words` is not a shell running `-c`."""
+    if not words or os.path.basename(words[0]) not in SHELLS:
+        return None
+    rest = list(words[1:])
+    has_c = False
+    while rest:
+        word = rest[0]
+        if word == "--":
+            rest.pop(0)
+            break
+        if word.startswith("--") and len(word) > 2:
+            rest.pop(0)
+            if word.partition("=")[0] in SHELL_LONG_VALUE_OPTS and "=" not in word and rest:
+                rest.pop(0)
+            continue
+        if word[:1] in ("-", "+") and len(word) > 1:
+            rest.pop(0)
+            letters = word[1:]
+            if "c" in letters and word[0] == "-":
+                has_c = True
+            for _ in range(sum(letter in SHELL_VALUE_OPTS for letter in letters)):
+                if rest:
+                    rest.pop(0)
+            continue
+        break
+    return rest[0] if has_c and rest else None
+
+
 def _commit_targets(argv: list[str], depth: int = 0) -> list[Target]:
     """The repository each `git ... commit` in one simple command commits to."""
     chdirs: list[str] = []
@@ -189,12 +226,11 @@ def _commit_targets(argv: list[str], depth: int = 0) -> list[Target]:
     if not words:
         return []
     program = os.path.basename(words[0])
-    if program in SHELLS and "-c" in words[1:-1] and depth < 3:
+    inner = _shell_command_string(words)
+    if inner is not None and depth < 3:
         return [
             ((*chdirs, *inner_dirs), opts, (*env, *inner_env))
-            for inner_dirs, opts, inner_env in commit_targets(
-                words[words.index("-c") + 1], depth + 1
-            )
+            for inner_dirs, opts, inner_env in commit_targets(inner, depth + 1)
         ]
     if program not in ("git", "git.exe"):
         return []
@@ -226,7 +262,7 @@ def _unclassified_commit(argv: list[str]) -> bool:
     commit. `git log --grep commit` was classified (git, not committing) and is not one."""
     words = _command_words(argv, [], [])
     program = os.path.basename(words[0]) if words else ""
-    if not words or program in ("git", "git.exe") or (program in SHELLS and "-c" in words):
+    if not words or program in ("git", "git.exe") or _shell_command_string(words) is not None:
         return False
     for index, word in enumerate(words):
         if os.path.basename(word) in ("git", "git.exe") and "commit" in words[index + 1 :]:
