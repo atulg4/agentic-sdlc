@@ -1,0 +1,10 @@
+version = 1
+
+[project]
+id = "example/project"
+provider = "github"
+default_branch = "main"
+
+[policy]
+human_merge_required = true
+protected_paths = ["src/auth/**"]

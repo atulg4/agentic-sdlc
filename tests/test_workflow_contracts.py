@@ -287,3 +287,52 @@ def test_implementation_leases_the_issue_before_generating_and_releases_after() 
     assert "needs.prepare.result == 'success'" in failure
     assert "permission-issues: write" in failure and "contents: write" not in failure
     assert "GH_TOKEN: ${{ github.token }}" not in failure
+
+
+# Sandbox binaries are baked into the self-hosted runner images, so every apt
+# invocation in the platform workflows is normally a no-op that still contends
+# for the apt/dpkg locks with sibling runners on the same VM and with
+# unattended-upgrades. Both pins below keep a lock collision from being reported
+# as a sandbox failure.
+SANDBOX_INSTALL_WORKFLOWS = (
+    "reusable-review.yml",
+    "reusable-repair.yml",
+    "reusable-ci-repair.yml",
+    "reusable-implement.yml",
+    "reusable-spec.yml",
+)
+
+
+def test_platform_workflows_give_apt_a_lock_timeout() -> None:
+    pattern = re.compile(r"^[ \t]*sudo apt-get .*$", re.MULTILINE)
+    invocations = 0
+    for workflow in WORKFLOWS.glob("*.yml"):
+        for invocation in pattern.findall(workflow.read_text(encoding="utf-8")):
+            invocations += 1
+            assert "-o DPkg::Lock::Timeout=300" in invocation, f"{workflow.name}: {invocation}"
+    assert invocations, "no apt invocations found to pin"
+
+
+def test_sandbox_install_is_skipped_when_the_binaries_are_already_present() -> None:
+    for name in SANDBOX_INSTALL_WORKFLOWS:
+        document = (WORKFLOWS / name).read_text(encoding="utf-8")
+        install = document.index("sudo apt-get -o DPkg::Lock::Timeout=300 install")
+        guard = document.rindex("if command -v bwrap >/dev/null", 0, install)
+
+        assert guard < install, name
+        assert "skipping apt" in document[guard:install], name
+
+
+def test_apt_update_retries_the_lists_lock() -> None:
+    # DPkg::Lock::Timeout is honoured for the dpkg locks only; apt-get update
+    # acquires /var/lib/apt/lists/lock once and fails at once if it is held,
+    # so every update must sit inside a bounded retry loop.
+    for name in SANDBOX_INSTALL_WORKFLOWS:
+        document = (WORKFLOWS / name).read_text(encoding="utf-8")
+        update = document.index("sudo apt-get -o DPkg::Lock::Timeout=300 update -q && break")
+        loop = document.rindex("for attempt in ", 0, update)
+        assert update - loop < 200, name
+        done = document.index("done", update)
+        assert "sleep" in document[update:done], name
+        assert "exit 1" in document[update:done], name
+        assert document.count("update -q") == 1, name

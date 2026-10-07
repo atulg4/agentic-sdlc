@@ -18,8 +18,6 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import yaml
-
 from .executors import ExecutorError, load_executors, load_routing_policy
 from .leases import IN_PROGRESS_LABEL
 from .policy import load_policy
@@ -922,6 +920,8 @@ PUBLISHER_PERMISSIONS = {
 
 def _ci_runs_on(base: Path) -> set[str] | None:
     """Labels of ci.yml's `test` job runner (None when the file/job cannot be read)."""
+    import yaml  # deferred: the CLI must import without site dependencies
+
     try:
         doc = yaml.safe_load((base / ".github/workflows/ci.yml").read_text())
         job = (doc.get("jobs") or {}).get(REQUIRED_CHECK) or {}
@@ -940,6 +940,8 @@ def _ci_runs_on(base: Path) -> set[str] | None:
 
 def _ci_problems(base: Path) -> list[str]:
     """ci.yml must run on pull_request, as a job named `test`, the policy's three commands."""
+    import yaml  # deferred: the CLI must import without site dependencies
+
     try:
         doc = yaml.safe_load((base / ".github/workflows/ci.yml").read_text())
         commands = tomllib.loads((base / "agentic-sdlc.toml").read_text()).get("commands") or {}
@@ -1151,6 +1153,8 @@ def doctor(
         if policy is not None:
             auto = base / ".github/workflows/agent-auto-implement.yml"
             if auto.exists():
+                import yaml  # deferred: the CLI must import without site dependencies
+
                 try:
                     preflight = (yaml.safe_load(auto.read_text()) or {})["jobs"]["preflight"]
                     condition = str(preflight.get("if", ""))

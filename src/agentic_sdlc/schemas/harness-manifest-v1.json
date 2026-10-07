@@ -1,0 +1,651 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Forge Harness Manifest v1 (foundation; not dispatch authorization)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "harness",
+    "work",
+    "lineage",
+    "policy",
+    "classification",
+    "risk",
+    "mission",
+    "skills",
+    "context",
+    "permissions",
+    "executor",
+    "budget",
+    "verification",
+    "escalation"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "harness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "version",
+        "recipeDigest"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "version": {
+          "$ref": "#/$defs/version"
+        },
+        "recipeDigest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "work": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "projectId",
+        "workRef",
+        "unitId",
+        "taskSpecDigest",
+        "baseCommit",
+        "candidateTree",
+        "publishedHeadCommit",
+        "patchDigest"
+      ],
+      "properties": {
+        "projectId": {
+          "$ref": "#/$defs/project"
+        },
+        "workRef": {
+          "$ref": "#/$defs/text"
+        },
+        "unitId": {
+          "$ref": "#/$defs/controlPlaneId"
+        },
+        "taskSpecDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "baseCommit": {
+          "$ref": "#/$defs/commit"
+        },
+        "candidateTree": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/commit"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "publishedHeadCommit": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/commit"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "patchDigest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "lineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attemptId",
+        "parentManifestDigest",
+        "budgetLedgerId"
+      ],
+      "properties": {
+        "attemptId": {
+          "$ref": "#/$defs/controlPlaneId"
+        },
+        "parentManifestDigest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "budgetLedgerId": {
+          "$ref": "#/$defs/controlPlaneId"
+        }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "platformCommit",
+        "projectPolicyCommit",
+        "projectPolicyDigest",
+        "missionRegistryDigest",
+        "skillRegistryDigest",
+        "executorRegistryDigest",
+        "routingPolicyDigest",
+        "riskPolicyDigest"
+      ],
+      "properties": {
+        "platformCommit": {
+          "$ref": "#/$defs/commit"
+        },
+        "projectPolicyCommit": {
+          "$ref": "#/$defs/commit"
+        },
+        "projectPolicyDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "missionRegistryDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "skillRegistryDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "executorRegistryDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "routingPolicyDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "riskPolicyDigest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "classification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "taskType",
+        "domains",
+        "complexity",
+        "evidenceRefs"
+      ],
+      "properties": {
+        "taskType": {
+          "type": "string",
+          "enum": [
+            "bug",
+            "feature",
+            "migration",
+            "security",
+            "performance",
+            "refactor",
+            "documentation",
+            "infrastructure",
+            "dependency-update",
+            "unknown"
+          ]
+        },
+        "domains": {
+          "$ref": "#/$defs/strings"
+        },
+        "complexity": {
+          "type": "string",
+          "enum": [
+            "bounded",
+            "complex",
+            "unknown"
+          ]
+        },
+        "evidenceRefs": {
+          "$ref": "#/$defs/strings"
+        }
+      }
+    },
+    "risk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "effective",
+        "ruleMatches",
+        "decisionDigest"
+      ],
+      "properties": {
+        "effective": {
+          "$ref": "#/$defs/risk"
+        },
+        "ruleMatches": {
+          "$ref": "#/$defs/ids"
+        },
+        "decisionDigest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "mission": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "version",
+        "contractDigest",
+        "requiredCapabilities",
+        "independentOf"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "version": {
+          "$ref": "#/$defs/version"
+        },
+        "contractDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "requiredCapabilities": {
+          "$ref": "#/$defs/capabilities"
+        },
+        "independentOf": {
+          "$ref": "#/$defs/ids"
+        }
+      }
+    },
+    "skills": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/skill"
+      },
+      "minItems": 0,
+      "maxItems": 256,
+      "uniqueItems": true,
+      "x-order": "ordered"
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "packDigest",
+        "renderedInputDigest",
+        "indexSnapshotDigest",
+        "sourceRevisionDigest",
+        "tokenizerId",
+        "inputTokenLimit",
+        "outputTokenReserve",
+        "requiredEvidenceRefs",
+        "exclusions"
+      ],
+      "properties": {
+        "packDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "renderedInputDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "indexSnapshotDigest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sourceRevisionDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "tokenizerId": {
+          "$ref": "#/$defs/id"
+        },
+        "inputTokenLimit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000000
+        },
+        "outputTokenReserve": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000000
+        },
+        "requiredEvidenceRefs": {
+          "$ref": "#/$defs/strings"
+        },
+        "exclusions": {
+          "$ref": "#/$defs/strings"
+        }
+      }
+    },
+    "permissions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "readPaths",
+        "writePaths",
+        "toolProfileId",
+        "networkProfileId",
+        "commandProfileIds",
+        "denyCapabilities"
+      ],
+      "properties": {
+        "readPaths": {
+          "$ref": "#/$defs/strings"
+        },
+        "writePaths": {
+          "$ref": "#/$defs/strings"
+        },
+        "toolProfileId": {
+          "$ref": "#/$defs/id"
+        },
+        "networkProfileId": {
+          "$ref": "#/$defs/id"
+        },
+        "commandProfileIds": {
+          "$ref": "#/$defs/ids"
+        },
+        "denyCapabilities": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "merge",
+              "deploy",
+              "production-secrets",
+              "edit-governance"
+            ]
+          },
+          "minItems": 4,
+          "maxItems": 256,
+          "uniqueItems": true,
+          "x-order": "set"
+        }
+      }
+    },
+    "executor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "executorId",
+        "profileDigest",
+        "adapter",
+        "adapterVersion",
+        "executionType",
+        "authMode",
+        "provider",
+        "model",
+        "modelAlias",
+        "routeDecisionDigest"
+      ],
+      "properties": {
+        "executorId": {
+          "$ref": "#/$defs/id"
+        },
+        "profileDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "adapter": {
+          "$ref": "#/$defs/text"
+        },
+        "adapterVersion": {
+          "$ref": "#/$defs/text"
+        },
+        "executionType": {
+          "type": "string",
+          "enum": [
+            "subscription-cloud",
+            "subscription-runner",
+            "direct-api",
+            "cloud-platform",
+            "self-hosted"
+          ]
+        },
+        "authMode": {
+          "type": "string",
+          "enum": [
+            "oauth",
+            "api-key",
+            "oidc",
+            "workload-identity",
+            "local-trusted-runner"
+          ]
+        },
+        "provider": {
+          "type": "string",
+          "enum": [
+            "anthropic",
+            "aws-bedrock",
+            "azure-foundry",
+            "codex",
+            "deepseek",
+            "google-vertex",
+            "kimi",
+            "moonshot",
+            "openai",
+            "self-hosted",
+            "zai"
+          ]
+        },
+        "model": {
+          "$ref": "#/$defs/text"
+        },
+        "modelAlias": {
+          "$ref": "#/$defs/text"
+        },
+        "routeDecisionDigest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maxCostUsd",
+        "maxTotalTokens",
+        "maxRuntimeSeconds",
+        "maxModelCalls",
+        "maxRepairCycles",
+        "maxConcurrentMissions"
+      ],
+      "properties": {
+        "maxCostUsd": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1000000
+        },
+        "maxTotalTokens": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000000
+        },
+        "maxRuntimeSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400
+        },
+        "maxModelCalls": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "maxRepairCycles": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10
+        },
+        "maxConcurrentMissions": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64
+        }
+      }
+    },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requiredGateIds",
+        "additionalGateIds",
+        "requiredArtifactTypes"
+      ],
+      "properties": {
+        "requiredGateIds": {
+          "$ref": "#/$defs/ids"
+        },
+        "additionalGateIds": {
+          "$ref": "#/$defs/ids"
+        },
+        "requiredArtifactTypes": {
+          "$ref": "#/$defs/ids"
+        }
+      }
+    },
+    "escalation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "failurePolicyId",
+        "maxContextExpansions",
+        "terminalAction"
+      ],
+      "properties": {
+        "failurePolicyId": {
+          "$ref": "#/$defs/id"
+        },
+        "maxContextExpansions": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10
+        },
+        "terminalAction": {
+          "type": "string",
+          "enum": [
+            "block-and-escalate"
+          ]
+        }
+      }
+    }
+  },
+  "$defs": {
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[^\\x00-\\x1f\\x7f]+$"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "controlPlaneId": {
+      "description": "Opaque control-plane identity, never a filesystem path or registry slug.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[^\\x00-\\x20\\x7f]+$"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]{1,4}\\.[0-9]{1,4}\\.[0-9]{1,4}$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "risk": {
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "critical"
+      ]
+    },
+    "project": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+$",
+      "maxLength": 256
+    },
+    "strings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/text"
+      },
+      "minItems": 0,
+      "maxItems": 256,
+      "uniqueItems": true,
+      "x-order": "set"
+    },
+    "ids": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/id"
+      },
+      "minItems": 0,
+      "maxItems": 256,
+      "uniqueItems": true,
+      "x-order": "set"
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "specify",
+          "plan",
+          "run-commands",
+          "validate-release",
+          "build-context",
+          "review-code",
+          "review-security",
+          "review-architecture",
+          "review-data-quality",
+          "review-quantitative",
+          "edit-code",
+          "author-tests",
+          "edit-docs",
+          "repair"
+        ]
+      },
+      "minItems": 1,
+      "maxItems": 256,
+      "uniqueItems": true,
+      "x-order": "set"
+    },
+    "skill": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "version",
+        "contentDigest"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "version": {
+          "$ref": "#/$defs/version"
+        },
+        "contentDigest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    }
+  }
+}

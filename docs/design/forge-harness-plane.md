@@ -1,6 +1,10 @@
 # Forge Harness Plane
 
-**Status: Draft / Proposal — not approved, implemented, or enabled.**
+**Status: Draft / Proposal — full Harness Plane not approved or enabled.**
+
+Implementation has started with the [read-only manifest foundation](../harness-manifests.md)
+(phase 1a). The full Harness Plane remains proposed and is not enabled; the
+inspector is not a dispatch authorization. This is not completion of phase 1.
 
 - Date: 2026-09-19.
 - Review follow-up: 2026-09-25; addresses the four post-merge findings on
@@ -13,8 +17,8 @@
   recording call sites, effective-risk propagation and executor profile fields.
 - Origin: the owner's “Harness engineering for Forge” conversation and request
   for a reviewable architecture proposal for a generic software factory.
-- Scope of this change: documentation only. All new modules, fields, formats,
-  policies, limits, and commands below are proposed contracts, not current APIs.
+- Scope: proposed architecture. Only the phase 1a subset linked above is
+  implemented; other modules, policies, formats and commands remain proposed.
 
 ## 1. Decision requested
 
@@ -140,7 +144,9 @@ preparation/dispatch path. Unknown classifications can request a bounded,
 read-only triage mission; its suggestions remain untrusted input to policy.
 No new always-on service is required. Proposed implementation seams are
 `harness.py`, `skills.py`, `context_builder.py`, and `repo_index.py` within
-`src/agentic_sdlc/`; these files are not introduced by this documentation PR.
+`src/agentic_sdlc/`. Only `harness.py` has an initial read-only manifest
+foundation; the assembler, registries, context builder and index remain future
+work as tracked in [the implementation status](../harness-manifests.md).
 
 ## 4. Harness Manifest contract
 
