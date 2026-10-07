@@ -92,7 +92,35 @@ def lease_for(issue: int) -> dict | None:
     return lease
 
 
-def decide(payload: dict, branch: str, lease_lookup=lease_for) -> tuple[int, str]:
+def open_pr_for(branch: str) -> bool:
+    """An open PR from this branch is the durable claim once the lease is released."""
+    try:
+        out = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "list",
+                "--repo",
+                PROJECT,
+                "--head",
+                branch,
+                "--state",
+                "open",
+                "--json",
+                "number",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        return bool(json.loads(out or "[]"))
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
+        return False
+
+
+def decide(
+    payload: dict, branch: str, lease_lookup=lease_for, pr_lookup=open_pr_for
+) -> tuple[int, str]:
     if payload.get("tool_name") != "Bash":
         return 0, ""
     command = str((payload.get("tool_input") or {}).get("command", ""))
@@ -104,6 +132,8 @@ def decide(payload: dict, branch: str, lease_lookup=lease_for) -> tuple[int, str
     issue = int(m.group(1))
     session = str(payload.get("session_id") or "")
     lease = lease_lookup(issue)
+    if lease is None and pr_lookup(branch):
+        return 0, ""  # follow-up commits to an open PR need no lease
     if lease is None:
         return 2, (
             f"Forge guard: branch '{branch}' targets issue #{issue} but no live lease exists. "

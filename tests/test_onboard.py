@@ -275,9 +275,11 @@ def test_copy_variables_skips_missing_ones():
         {"variable get DEEPSEEK_MODEL_FLASH": "deepseek-v4-flash\n"},
         fail={"variable get DEEPSEEK_MODEL_PRO"},
     )
-    assert copy_variables("owner/music", ["DEEPSEEK_MODEL_FLASH", "DEEPSEEK_MODEL_PRO"], gh) == {
-        "DEEPSEEK_MODEL_FLASH": "deepseek-v4-flash"
-    }
+    assert copy_variables(
+        "owner/music",
+        ["DEEPSEEK_MODEL_FLASH", "DEEPSEEK_MODEL_PRO", "ZAI_MODEL_GLM", "KIMI_MODEL_K3"],
+        gh,
+    ) == {"DEEPSEEK_MODEL_FLASH": "deepseek-v4-flash"}
 
 
 # ---------------------------------------------------------------- doctor
@@ -313,7 +315,7 @@ def _installs(*ids: int, permissions: dict | None = None) -> str:
 
 def _var_pages(*names: str, per_page: int = 30) -> str:
     """`gh api .../actions/variables --paginate --slurp`: an array of {"variables": [...]}."""
-    rows = [{"name": n} for n in names]
+    rows = [{"name": n, "value": f"{n.lower()}-value"} for n in names]
     pages = [rows[i : i + per_page] for i in range(0, len(rows), per_page)] or [[]]
     return json.dumps([{"total_count": len(rows), "variables": page} for page in pages])
 
@@ -337,11 +339,20 @@ def _healthy_gh() -> FakeGh:
             "api repos/owner/comic/rulesets": json.dumps(
                 [{"id": 11, "name": RULESET_NAME, "enforcement": "active"}]
             ),
+            # the generated registry routes to deepseek, zai and kimi: every fallback configured
             "api repos/owner/comic/actions/variables": _var_pages(
-                "PUBLISHER_APP_CLIENT_ID", "DEEPSEEK_MODEL_FLASH", "DEEPSEEK_MODEL_PRO"
+                "PUBLISHER_APP_CLIENT_ID",
+                "DEEPSEEK_MODEL_FLASH",
+                "DEEPSEEK_MODEL_PRO",
+                "ZAI_MODEL_GLM",
+                "KIMI_MODEL_K3",
             ),
             "api repos/owner/comic/actions/secrets": _secret_pages(
-                "PUBLISHER_APP_PRIVATE_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "DEEPSEEK_API_KEY"
+                "PUBLISHER_APP_PRIVATE_KEY",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+                "DEEPSEEK_API_KEY",
+                "ZAI_API_KEY",
+                "KIMI_API_KEY",
             ),
             "api repos/owner/comic/actions/runners": _pages(
                 "runners",
@@ -385,6 +396,7 @@ def test_doctor_flags_missing_secrets_runner_and_app_as_manual_todos(tmp_path):
     assert not report.ok
     failed = {c.name: c for c in report.checks if not c.ok}
     assert set(failed) == {
+        "ci.yml test job runs on an available runner",
         "repo secrets set (by name)",
         "self-hosted runner online for this repo",
         "Publisher GitHub App installed on this repo",
@@ -688,7 +700,10 @@ def test_doctor_requires_a_runner_carrying_every_workflow_label(tmp_path):
     )
     report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
     failed = {c.name for c in report.checks if not c.ok}
-    assert failed == {"self-hosted runner online for this repo"}
+    assert failed == {
+        "self-hosted runner online for this repo",
+        "ci.yml test job runs on an available runner",  # ci.yml targets the same labels
+    }
 
 
 def test_doctor_requires_every_caller_to_pin_the_same_platform_sha(tmp_path):
@@ -745,7 +760,12 @@ def test_doctor_reads_every_page_of_repository_secrets(tmp_path):
     gh = _healthy_gh()
     filler = [f"SECRET_{i:02d}" for i in range(30)]
     gh.answers["api repos/owner/comic/actions/secrets"] = _secret_pages(
-        *filler, "PUBLISHER_APP_PRIVATE_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "DEEPSEEK_API_KEY"
+        *filler,
+        "PUBLISHER_APP_PRIVATE_KEY",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "DEEPSEEK_API_KEY",
+        "ZAI_API_KEY",
+        "KIMI_API_KEY",
     )
     report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
     assert report.ok, report.render()
@@ -793,7 +813,12 @@ def test_doctor_reads_every_page_of_repository_variables(tmp_path):
     gh = _healthy_gh()
     filler = [f"VAR_{i:02d}" for i in range(30)]
     gh.answers["api repos/owner/comic/actions/variables"] = _var_pages(
-        *filler, "PUBLISHER_APP_CLIENT_ID", "DEEPSEEK_MODEL_FLASH", "DEEPSEEK_MODEL_PRO"
+        *filler,
+        "PUBLISHER_APP_CLIENT_ID",
+        "DEEPSEEK_MODEL_FLASH",
+        "DEEPSEEK_MODEL_PRO",
+        "ZAI_MODEL_GLM",
+        "KIMI_MODEL_K3",
     )
     report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
     assert report.ok, report.render()
@@ -1031,6 +1056,8 @@ def test_doctor_requires_platform_read_token_for_a_private_platform(tmp_path):
         "PUBLISHER_APP_PRIVATE_KEY",
         "CLAUDE_CODE_OAUTH_TOKEN",
         "DEEPSEEK_API_KEY",
+        "ZAI_API_KEY",
+        "KIMI_API_KEY",
         "PLATFORM_READ_TOKEN",
     )
     assert doctor(repo, "owner/comic", "owner/agentic-sdlc", gh).ok
@@ -1091,3 +1118,73 @@ def test_cli_onboard_validates_var_before_writing_any_file(tmp_path, monkeypatch
     )
     assert code != 0
     assert not (repo / "agentic-sdlc.toml").exists()
+
+
+def test_doctor_rejects_a_mixed_cloud_and_actions_profile(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())  # Actions implementer
+    (repo / "docs/forge").mkdir(parents=True)
+    (repo / "docs/forge/cloud-implementer.md").write_text("# cloud\n")
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    bad = {c.name: c for c in report.checks if not c.ok}
+    assert "implementation profile is unambiguous" in bad
+    assert "agent-auto-implement.yml" in bad["implementation profile is unambiguous"].detail
+
+
+def test_doctor_requires_every_routed_fallback_to_be_configured(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())  # route mode: deepseek + zai + kimi + claude executors
+    gh = _healthy_gh()
+    gh.answers["api repos/owner/comic/actions/variables"] = _var_pages(
+        "PUBLISHER_APP_CLIENT_ID", "DEEPSEEK_MODEL_FLASH", "DEEPSEEK_MODEL_PRO"
+    )
+    gh.answers["api repos/owner/comic/actions/secrets"] = _secret_pages(
+        "PUBLISHER_APP_PRIVATE_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "DEEPSEEK_API_KEY"
+    )
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    bad = {c.name: c.detail for c in report.checks if not c.ok}
+    assert "ZAI_API_KEY" in bad["repo secrets set (by name)"]
+    assert "KIMI_API_KEY" in bad["repo secrets set (by name)"]
+    assert "ZAI_MODEL_GLM" in bad["repo variables set (non-empty)"]
+    assert "KIMI_MODEL_K3" in bad["repo variables set (non-empty)"]
+
+
+def test_doctor_rejects_empty_required_variables(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(implementer="claude"))
+    gh = _healthy_gh()
+    gh.answers["api repos/owner/comic/actions/variables"] = json.dumps(
+        [{"total_count": 1, "variables": [{"name": "PUBLISHER_APP_CLIENT_ID", "value": ""}]}]
+    )
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    bad = {c.name: c.detail for c in report.checks if not c.ok}
+    assert "PUBLISHER_APP_CLIENT_ID" in bad["repo variables set (non-empty)"]
+    assert "empty value" in bad["repo variables set (non-empty)"]
+
+
+def test_doctor_accepts_a_registry_with_one_usable_executor(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    reg = json.loads((repo / ".forge/executors.json").read_text())
+    reg["executors"][1]["permittedRepositories"] = ["owner/other"]  # shared registry entry
+    (repo / ".forge/executors.json").write_text(json.dumps(reg))
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    routing = next(c for c in report.checks if c.name == "routing files valid and permit this repo")
+    assert routing.ok and "4 of 5" in routing.detail
+
+
+def test_doctor_checks_the_ci_test_job_runner_target(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(implementer="claude"))
+    ci = repo / ".github/workflows/ci.yml"
+    ci.write_text(
+        ci.read_text().replace(
+            "runs-on: [self-hosted, linux, x64]", "runs-on: [self-hosted, linux, arm64]"
+        )
+    )
+    gh = _healthy_gh()  # runner carries self-hosted/linux/x64 only
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    check = next(
+        c for c in report.checks if c.name == "ci.yml test job runs on an available runner"
+    )
+    assert not check.ok and "arm64" in check.detail
