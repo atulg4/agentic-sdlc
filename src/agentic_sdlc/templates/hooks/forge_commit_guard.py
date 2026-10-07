@@ -123,6 +123,27 @@ def _segments(command: str) -> list[list[str]]:
 Target = tuple[tuple[str, ...], tuple[str, ...], tuple[tuple[str, str], ...]]
 GIT_REPO_OPTS = frozenset({"-C", "--git-dir", "--work-tree"})
 GIT_REPO_ENV = frozenset({"GIT_DIR", "GIT_WORK_TREE"})
+# Command-line assignments git reads its configuration (and so its aliases) from.
+GIT_CONFIG_ENV = re.compile(r"^GIT_CONFIG(?:_[A-Z0-9_]+)?$")
+# Git's own subcommands: git never expands an alias that shadows one, so these are classified by
+# name alone. Anything else (`git ci`) may be an alias and is resolved before it is classified.
+GIT_BUILTINS = frozenset(
+    {
+        "add", "am", "annotate", "apply", "archive", "bisect", "blame", "branch", "bundle",
+        "cat-file", "check-attr", "check-ignore", "check-ref-format", "checkout", "cherry",
+        "cherry-pick", "clean", "clone", "commit-graph", "commit-tree", "config",
+        "count-objects", "describe", "diff", "diff-files", "diff-index", "diff-tree",
+        "difftool", "fetch", "for-each-ref", "format-patch", "fsck", "gc", "grep",
+        "hash-object", "help", "init", "log", "ls-files", "ls-remote", "ls-tree",
+        "maintenance", "merge", "merge-base", "mergetool", "mv", "notes", "prune", "pull",
+        "push", "range-diff", "rebase", "reflog", "remote", "repack", "replace", "reset",
+        "restore", "rev-list", "rev-parse", "revert", "rm", "shortlog", "show", "show-ref",
+        "sparse-checkout", "stash", "status", "submodule", "switch", "symbolic-ref", "tag",
+        "update-index", "update-ref", "var", "verify-commit", "version", "whatchanged",
+        "worktree", "write-tree",
+    }
+)  # fmt: skip
+MAX_ALIAS_DEPTH = 8
 
 
 def _strip_wrapper(name: str, words: list[str], chdirs: list[str]) -> list[str]:
@@ -172,7 +193,7 @@ def _command_words(argv: list[str], chdirs: list[str], env: list[tuple[str, str]
             words.pop(0)
         elif _ASSIGNMENT.match(words[0]):
             key, _, value = words.pop(0).partition("=")
-            if key in GIT_REPO_ENV:
+            if key in GIT_REPO_ENV or GIT_CONFIG_ENV.match(key):
                 env.append((key, value))
         elif os.path.basename(words[0]) in WRAPPERS:
             words = _strip_wrapper(os.path.basename(words.pop(0)), words, chdirs)
@@ -218,8 +239,39 @@ def _shell_command_string(words: list[str]) -> str | None:
     return rest[0] if has_c and rest else None
 
 
-def _commit_targets(argv: list[str], depth: int = 0) -> list[Target]:
-    """The repository each `git ... commit` in one simple command commits to."""
+def _where(cwd: str | None, chdirs) -> str:
+    """The directory `chdirs` lead to from `cwd`, in order (`cd -` is unknowable here: stay put)."""
+    where = cwd or os.getcwd()
+    for directory in chdirs:
+        if directory != "-":
+            where = os.path.join(where, os.path.expanduser(directory))
+    return where
+
+
+def git_alias(
+    name: str, where: str, git_opts: tuple[str, ...] = (), env: dict[str, str] | None = None
+) -> str | None:
+    """`alias.<name>` as git itself resolves it in `where` (repository, global and system
+    configuration, plus GIT_CONFIG_* set on the command line); None when it has none."""
+    try:
+        proc = subprocess.run(
+            ["git", *git_opts, "config", "--get", f"alias.{name}"],
+            cwd=where if os.path.isdir(where) else None,
+            env={**os.environ, **env} if env else None,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    return proc.stdout.rstrip("\n") if proc.returncode == 0 else None
+
+
+def _commit_targets(argv: list[str], depth: int = 0, cwd: str | None = None) -> list[Target]:
+    """The repository each `git ... commit` in one simple command commits to. A subcommand that
+    is not one of git's own is resolved as an alias first -- inline `-c alias.X=...`, then the
+    configuration git reads where the command runs -- and classified by its expansion; a shell
+    (`!`) alias, or one whose value cannot be read, counts as a commit (fails closed)."""
     chdirs: list[str] = []
     env: list[tuple[str, str]] = []
     words = _command_words(argv, chdirs, env)
@@ -230,29 +282,69 @@ def _commit_targets(argv: list[str], depth: int = 0) -> list[Target]:
     if inner is not None and depth < 3:
         return [
             ((*chdirs, *inner_dirs), opts, (*env, *inner_env))
-            for inner_dirs, opts, inner_env in commit_targets(inner, depth + 1)
+            for inner_dirs, opts, inner_env in commit_targets(inner, depth + 1, _where(cwd, chdirs))
         ]
     if program not in ("git", "git.exe"):
         return []
     rest = words[1:]
     repo_opts: list[str] = []
+    global_opts: list[str] = []  # every global option, re-applied to an alias's expansion
+    # Inline aliases, name -> value; one set from the environment (`--config-env`) cannot be read
+    # here and is recorded as a shell alias, which fails closed.
+    inline: dict[str, str] = {}
     while rest:
         word = rest.pop(0)
         if word in GIT_VALUE_OPTS:
             if rest:
                 value = rest.pop(0)  # the option's value, e.g. the path after -C
+                global_opts += [word, value]
                 if word in GIT_REPO_OPTS:
                     repo_opts += [word, value]
+                key, eq, setting = value.partition("=")
+                if key.lower().startswith("alias."):
+                    alias = key[len("alias.") :].lower()
+                    inline[alias] = "!" if word == "--config-env" else (setting if eq else "")
+            continue
+        if word.startswith("--config-env="):
+            global_opts.append(word)
+            key = word[len("--config-env=") :].partition("=")[0]
+            if key.lower().startswith("alias."):
+                inline[key[len("alias.") :].lower()] = "!"
             continue
         if word.startswith(("--git-dir=", "--work-tree=")):
             repo_opts.append(word)
+            global_opts.append(word)
             continue
         if word.startswith("-C") and len(word) > 2:
             repo_opts += ["-C", word[2:]]
+            global_opts += ["-C", word[2:]]
             continue
         if word.startswith("-"):
+            global_opts.append(word)
             continue  # --no-pager, --exec-path=..., ...
-        return [(tuple(chdirs), tuple(repo_opts), tuple(env))] if word == "commit" else []
+        target = [(tuple(chdirs), tuple(repo_opts), tuple(env))]
+        if word == "commit":
+            return target
+        if word in GIT_BUILTINS:
+            return []
+        expansion: str | None
+        if word.lower() in inline:
+            expansion = inline[word.lower()]
+        else:
+            expansion = git_alias(word, _where(cwd, chdirs), tuple(repo_opts), dict(env))
+        if expansion is None:
+            return []  # not an alias: an external `git-<word>` command
+        try:
+            expanded = shlex.split(expansion)
+        except ValueError:
+            return target
+        if expansion.lstrip().startswith("!") or not expanded or depth >= MAX_ALIAS_DEPTH:
+            return target  # a shell alias (or one we cannot follow): fail closed
+        return _commit_targets(
+            [*argv[: len(argv) - len(words)], "git", *global_opts, *expanded, *rest],
+            depth + 1,
+            cwd,
+        )
     return []
 
 
@@ -270,7 +362,7 @@ def _unclassified_commit(argv: list[str]) -> bool:
     return False
 
 
-def commit_targets(command: str, depth: int = 0) -> list[Target]:
+def commit_targets(command: str, depth: int = 0, cwd: str | None = None) -> list[Target]:
     """Every `git ... commit` in `command` with the repository it commits to. `cd DIR` before it
     (`cd ../wt && git commit`) counts too."""
     found: list[Target] = []
@@ -284,19 +376,19 @@ def commit_targets(command: str, depth: int = 0) -> list[Target]:
             operands = [w for w in seg[1:] if not w.startswith("-") or w == "-"]
             cds.append(operands[-1] if operands else "~")
             continue
-        targets = _commit_targets(seg, depth)
+        targets = _commit_targets(seg, depth, _where(cwd, cds))
         if not targets and _unclassified_commit(seg):
             targets = [((), (), ())]  # unknown repository: checked from cwd and the `cd`s
         found += [((*cds, *dirs), opts, env) for dirs, opts, env in targets]
     return found
 
 
-def is_git_commit(command: str, depth: int = 0) -> bool:
+def is_git_commit(command: str, depth: int = 0, cwd: str | None = None) -> bool:
     """True when any simple command in `command` runs `git ... commit`, however git is spelled
-    (`git`, `/usr/bin/git`, `./git`), whatever wrapper (with its options) runs it, and whatever
-    global options precede the subcommand."""
+    (`git`, `/usr/bin/git`, `./git`), whatever wrapper (with its options) runs it, whatever
+    global options precede the subcommand, and whatever alias (`git ci`) stands for it."""
     try:
-        return bool(commit_targets(command, depth))
+        return bool(commit_targets(command, depth, cwd))
     except ValueError:  # unbalanced quotes: be conservative, block-check anything like one
         return bool(_GIT_COMMIT_LOOSE.search(command))
 
@@ -304,12 +396,7 @@ def is_git_commit(command: str, depth: int = 0) -> bool:
 def target_branch(target: Target, cwd: str | None) -> str:
     """The branch `git <repo options> commit` would commit to, asked of git itself."""
     chdirs, opts, env = target
-    where = cwd or os.getcwd()
-    for directory in chdirs:
-        if directory == "-":
-            continue  # `cd -`: unknowable here; stay put
-        where = os.path.join(where, os.path.expanduser(directory))
-    return current_branch(where, opts, dict(env))
+    return current_branch(_where(cwd, chdirs), opts, dict(env))
 
 
 def commit_branches(command: str, cwd: str | None) -> list[str]:
@@ -317,7 +404,7 @@ def commit_branches(command: str, cwd: str | None) -> list[str]:
     `cd`s lead and from the hook's cwd (a `cd` inside a subshell does not persist), so the guard
     errs towards checking more, never fewer."""
     try:
-        targets = commit_targets(command)
+        targets = commit_targets(command, cwd=cwd)
     except ValueError:
         targets = []
     if not targets:
@@ -448,7 +535,7 @@ def decide(
     if payload.get("tool_name") != "Bash":
         return 0, ""
     command = str((payload.get("tool_input") or {}).get("command", ""))
-    if not is_git_commit(command):
+    if not is_git_commit(command, cwd=payload.get("cwd")):
         return 0, ""
     for candidate in [branch] if isinstance(branch, str) else branch:
         verdict = _decide_branch(payload, candidate, lease_lookup, pr_lookup)
@@ -487,7 +574,11 @@ def main() -> int:
     except json.JSONDecodeError:
         return 0
     command = str((payload.get("tool_input") or {}).get("command", ""))
-    branches = commit_branches(command, payload.get("cwd")) if is_git_commit(command) else []
+    branches = (
+        commit_branches(command, payload.get("cwd"))
+        if is_git_commit(command, cwd=payload.get("cwd"))
+        else []
+    )
     code, message = decide(payload, branches)
     if message:
         print(message, file=sys.stderr)

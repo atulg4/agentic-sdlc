@@ -732,3 +732,48 @@ def test_marker_round_trips_assignee_ownership():
     assert "assignee" not in format_claim_marker(plain)
     with pytest.raises(LeaseError):
         format_claim_marker(replace(lease, assignee="bad login"))
+
+
+# Codex review 4204654794: the assignee cleanup must be retryable after the release marker.
+
+
+def test_retried_release_drops_the_owned_assignee_after_a_failed_cleanup():
+    gh = FakeGh().issue(7)
+    assert claim(
+        PROJECT, 7, agent="a", session="s1", branch="b", gh=gh, now=NOW, assignee="alice"
+    ).ok
+    real = gh.__call__
+
+    def flaky(args, input=None):
+        if tuple(args[:2]) == ("issue", "edit") and "--remove-assignee" in args:
+            raise RuntimeError("transient GitHub failure")
+        return real(args, input=input)
+
+    with pytest.raises(RuntimeError):
+        release(PROJECT, 7, session="s1", gh=flaky, now=NOW)
+    assert current_lease(PROJECT, 7, gh, now=NOW) is None  # the marker landed
+    assert _logins(gh) == ["alice"]
+    release(PROJECT, 7, session="s1", gh=gh, now=NOW)  # the retry finishes the cleanup
+    assert _logins(gh) == []
+    removals = sum("--remove-assignee" in c for c in gh.calls)
+    release(PROJECT, 7, session="s1", gh=gh, now=NOW)  # idempotent: nothing left to remove
+    assert sum("--remove-assignee" in c for c in gh.calls) == removals
+
+
+def test_retried_release_keeps_a_pre_existing_or_newly_wanted_assignee():
+    gh = FakeGh().issue(7, assignees=["alice"])
+    claim(PROJECT, 7, agent="a", session="s1", branch="b", gh=gh, now=NOW, assignee="alice")
+    release(PROJECT, 7, session="s1", gh=gh, now=NOW)
+    release(PROJECT, 7, session="s1", gh=gh, now=NOW)
+    assert _logins(gh) == ["alice"]  # never owned: untouched however often release runs
+
+    gh = FakeGh().issue(7)
+    claim(PROJECT, 7, agent="a", session="s1", branch="b", gh=gh, now=NOW, assignee="alice")
+    gh.issues[7]["comments"].append(
+        _comment_row(50, "<!-- forge-release session=s1 -->", NOW.isoformat())
+    )
+    later = Lease(7, "x", "s2", "b", NOW + timedelta(hours=1), "alice", False)
+    gh.issues[7]["comments"].append(_comment_row(51, format_claim_marker(later), NOW.isoformat()))
+    release(PROJECT, 7, session="s2", gh=gh, now=NOW)
+    # s2 never owned alice, and the reconciliation only runs when no lease exists at all
+    assert _logins(gh) == ["alice"]

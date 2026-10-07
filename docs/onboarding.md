@@ -87,12 +87,31 @@ The only tunable knobs, each validated by its own check instead:
 |---|---|
 | every job's `runs-on`, and a reusable call's `with.runs_on` | the runner checks (hosted label or an online runner; Linux for implementation) |
 | `with.route_budget_usd` on a reusable call (may be added) | "implement callers pass a readable route_budget_usd" |
-| `ci.yml`'s `test` job `steps` | the CI gate check below (exact policy commands, trusted actions, no gate-altering environment) |
 | the `if:` of `agent-auto-plan.yml:plan` and `agent-auto-implement.yml:preflight` | must be exactly the generated condition for the POLICY's labels |
 | the platform pin (`uses: ...@<sha>`, `with.platform_ref`) | the template is rendered at the caller's own pin; "workflows pin the platform to a commit SHA" requires one SHA on the platform repository |
 
 Everything else in those files is the template. To change it, change the policy and re-run
 `onboard --force`.
+
+### The CI test job is fully managed
+
+`ci.yml`'s `test` job is NOT a tunable knob. Its steps are exactly what `onboard` renders from
+the policy, and `doctor` requires the installed steps to equal them (parsed, not textually):
+
+1. `actions/checkout` at a pinned SHA with `persist-credentials: false` and no `ref` or
+   `repository` input, so the pull request's own revision is what is tested;
+2. `actions/setup-python` at a pinned SHA, `python-version` from `[ci] python_version` in
+   `agentic-sdlc.toml` (default `3.12`; `onboard --python-version`);
+3. `Setup`, `Quality` and `Test`, each running the policy's `[commands]` `setup`, `quality` and
+   `test` verbatim as one quoted YAML scalar.
+
+Customize CI only through the policy: edit `[commands]` (or `[ci] python_version`) and re-run
+`sdlcctl onboard --force`. Any hand edit to the steps -- an extra action, an extra flag on a
+gate, a cache step -- fails "ci.yml runs the policy gates as 'test'" and "managed workflows match
+the generated templates". Each gate command must be a single line (join several with `&&`) and
+must not contain `${{` (GitHub would evaluate it before the shell runs the command); `onboard`
+refuses such a command and `doctor` fails a policy holding one, rather than normalizing it into
+something that runs differently.
 
 ### What `doctor` verifies exactly
 
@@ -100,14 +119,19 @@ Everything else in those files is the template. To change it, change the policy 
   `cloud-routine`), never inferred from which files exist. A policy written before the field
   existed still passes while its Actions implement callers are installed; without them, add
   `implementation_mode = "cloud-routine"` (or re-run `onboard --force`).
-- **CI gates** must be invoked exactly as `[commands]` states. Only output and fail-fast extras
+- **CI gates**: the `test` job's steps must equal the template rendered from `[commands]`
+  (above); that equality is the guarantee. The checks that follow are defense in depth behind
+  it. Each gate must be invoked exactly as `[commands]` states. Only output and fail-fast extras
   may be appended (`-q`, `-v`, `-x`, `--maxfail=N`, `--tb=…`, `--durations=N`, `-r…`, `--color=…`);
   anything else (`--help`, `--collect-only`, `-k`, `--ignore`, ...) fails the check.
   A gate counts only as a top-level command: commands inside a shell function body never count,
   whether or not the function is called. Nothing in the `test` job may change what a gate does
   without being a visible argument: a `*ADDOPTS*`, `<TOOL>_*` (for the gate tools: `PYTEST_*`,
   `RUFF_*`, `PIP_*`, ...) or interpreter/shell startup variable (`PYTHONPATH`, `BASH_ENV`, ...)
-  set by workflow/job/step `env:` or by a script; any `$GITHUB_ENV` write; a function or alias
+  set by workflow/job/step `env:` or by a script; any mention of `$GITHUB_ENV` or `$GITHUB_PATH`
+  (a directory added to the path can shadow a gate tool); an `exit`, `exec` or `return` anywhere
+  before a gate (it is then not proven to run); an `actions/checkout` with a `ref` or
+  `repository` input; a function or alias
   named like a gate tool; `eval` or a sourced file other than a virtualenv's `bin/activate`; an
   action other than `actions/checkout`, `actions/setup-python`, `actions/cache` or
   `astral-sh/setup-uv`. The setup command itself runs repository code by design; doctor proves
@@ -128,9 +152,17 @@ Everything else in those files is the template. To change it, change the policy 
   through the repository API.
 - **Claude Code hooks** are read from the parsed `.claude/settings.json`: a `SessionStart` group
   firing on startup that runs `python3 .claude/hooks/forge_session_start.py`, and a `PreToolUse`
-  group whose matcher covers `Bash` running `python3 .claude/hooks/forge_commit_guard.py`.
+  group whose matcher covers `Bash` running `python3 .claude/hooks/forge_commit_guard.py`. The
+  commit guard resolves git aliases before classifying a subcommand: inline `-c alias.X=...`,
+  then `git config --get alias.X` where the command runs (repository and global configuration,
+  plus `GIT_CONFIG_*` set on the command line). A `!` shell alias or an alias set through
+  `--config-env` cannot be classified and counts as a commit.
 - **Publisher App** permissions must be exactly Contents read, Issues write, Pull requests write
   (plus GitHub's mandatory Metadata read); any other grant fails.
+- **Rulesets**: every parameter Forge's ruleset sets is compared (iterated from the payload, not
+  hand-listed): a boolean Forge sets true -- `dismiss_stale_reviews_on_push`,
+  `required_review_thread_resolution`, `strict_required_status_checks_policy` -- must be true, a
+  count at least Forge's, a list a superset of Forge's.
 - **`onboard --apply`** merges Forge's rules into an existing `Protect main` ruleset: existing
   rules and stricter parameters (more approvals, extra status checks, signatures) are kept.
   The one exception is Forge's own `test` check: a binding (`integration_id`) to an app other
