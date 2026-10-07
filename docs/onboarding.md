@@ -186,16 +186,25 @@ something that runs differently.
   only the command's spelling may vary: `python`, a `$CLAUDE_PROJECT_DIR` prefix); a handler
   with any other field -- `"async": true` above all, which runs it in the background where its
   exit 2 can no longer block the commit, or a `timeout` -- fails, wherever it sits. Unrelated
-  hooks may sit beside them. The commit guard resolves git aliases before classifying a subcommand: inline `-c alias.X=...`,
-  then `git config --get alias.X` where the command runs (repository and global configuration,
-  plus `GIT_CONFIG_*` set on the command line). A `!` shell alias or an alias set through
-  `--config-env` cannot be classified and counts as a commit.
+  hooks may sit beside them. The commit guard is deny-by-default for git: on an issue branch without the
+  session's lease, every git invocation is blocked except literal read-only subcommands (status,
+  log, diff, show, blame, grep, ls-files, ls-tree, rev-parse, describe, shortlog, `reflog show`,
+  listing forms of `branch`/`tag`/`remote`/`config`/`stash`, `fetch` without a refspec or
+  `--update-head-ok`, help, version, cat-file, for-each-ref, name-rev, merge-base, check-ignore,
+  check-attr). Aliases, `git-<name>` programs, `-c`/`--config-env`, and anything that runs git or
+  a shell indirectly (`xargs git`, `find -exec git`, `... | sh`) need the lease too.
 - **Publisher App** permissions must be exactly Contents read, Issues write, Pull requests write
   (plus GitHub's mandatory Metadata read); any other grant fails.
 - **Rulesets**: every parameter Forge's ruleset sets is compared (iterated from the payload, not
   hand-listed): a boolean Forge sets true -- `dismiss_stale_reviews_on_push`,
   `required_review_thread_resolution`, `strict_required_status_checks_policy` -- must be true, a
   count at least Forge's, a list a superset of Forge's.
+- **Effective rules**: `doctor` also reads the rules that actually apply to the default branch
+  (`GET repos/{owner}/{repo}/rules/branches/{branch}`), so organization and enterprise rulesets
+  count. A required status context no installed workflow job reports, required deployments,
+  required workflows, a merge queue no workflow runs on `merge_group` for, required signatures,
+  update restrictions and code-scanning gates are reported as a manual TODO, as is an
+  unreadable answer. `onboard --apply` still changes only the repository's own ruleset.
 - **`onboard --apply`** merges Forge's rules into an existing `Protect main` ruleset: existing
   rules and stricter parameters (more approvals, extra status checks, signatures) are kept.
   The one exception is Forge's own `test` check: a binding (`integration_id`) to an app other

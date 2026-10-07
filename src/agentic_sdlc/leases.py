@@ -8,7 +8,10 @@ block a ticket forever; an expired lease may be taken over (and the takeover is 
 
 A claim with an assignee records it in the marker (``assignee=<login>``), and
 ``owns_assignee=1`` when the lease itself put that assignee on the issue (it was not assigned
-already, or it was inherited from the expired lease this one took over). Release -- and a
+already, or it was inherited from the expired lease this one took over). A fresh assignment is
+owned only when PROVEN: a fresh read right before the add finds the login unassigned and the
+issue events then show a new `assigned` event for it by this process's own actor; the claim
+marker carries no ownership until a follow-up marker records that proof. Release -- and a
 takeover -- remove only an assignee a lease owned, and only when the authoritative live lease
 does not want the same login; a pre-existing assignee is never touched. Every claim and release
 reconciles the owned assignees of ALL ended leases (released, or expired and taken over) whose
@@ -710,6 +713,75 @@ def _reconcile_best_effort(project: str, issue: int, gh: GhRunner, now: datetime
         _log.warning("issue #%s: assignee cleanup of ended leases deferred: %s", issue, exc)
 
 
+#: How far GitHub's event clock may lag the local one when an assignment is tied to the add.
+ASSIGN_CLOCK_SKEW = timedelta(minutes=2)
+
+
+def _assignment_snapshot(
+    project: str, issue: int, login: str, gh: GhRunner
+) -> tuple[bool, list[dict]] | None:
+    """Immediately before a claim adds `login`: is it on the issue already (a FRESH read, not
+    the claim's first one), and the issue's events so far. None when either cannot be read."""
+    try:
+        target = json.loads(gh(["api", f"repos/{project}/issues/{issue}"]) or "{}")
+        events = _issue_events(project, issue, gh)
+    except Exception:  # noqa: BLE001 -- unknown: the lease will not own the assignee
+        return None
+    assigned = login_key(login) in _assignee_logins(target if isinstance(target, dict) else {})
+    return assigned, events
+
+
+def _own_actor(project: str, issue: int, session: str, gh: GhRunner) -> str:
+    """The account this process acts as: the author of this session's newest claim marker (the
+    same token posted it and makes the add; `/user` is unreadable for App tokens)."""
+    for comment in reversed(_comments(project, issue, gh)):
+        parsed = parse_marker(comment.get("body") or "", issue)
+        if parsed is not None and parsed.session == session:
+            return str((comment.get("user") or {}).get("login") or "")
+    return ""
+
+
+def _confirm_own_assignment(
+    project: str,
+    issue: int,
+    session: str,
+    login: str,
+    snapshot: tuple[bool, list[dict]] | None,
+    since: datetime,
+    gh: GhRunner,
+) -> bool:
+    """Did THIS claim's add put `login` on the issue? Only when the fresh read right before the
+    add did not have it AND the events now hold an `assigned` event for it that the pre-add
+    snapshot lacked, made by our own actor, at or after the claim began (less clock skew).
+    Anything unreadable or ambiguous is False: the lease then never removes the login."""
+    if snapshot is None or snapshot[0]:
+        return False
+    try:
+        actor = _own_actor(project, issue, session, gh)
+        after = _issue_events(project, issue, gh)
+    except Exception:  # noqa: BLE001 -- unknown: not ours
+        return False
+    if not actor:
+        return False
+    seen: dict[str, int] = {}
+    for event in snapshot[1]:
+        seen[_event_key(event)] = seen.get(_event_key(event), 0) + 1
+    for event in after:
+        key = _event_key(event)
+        if seen.get(key):
+            seen[key] -= 1
+            continue
+        if event.get("event") != "assigned":
+            continue
+        if not same_login((event.get("assignee") or {}).get("login"), login):
+            continue
+        at = _parse_iso(str(event.get("created_at") or ""))
+        by = (event.get("actor") or {}).get("login")
+        if at is not None and at >= since - ASSIGN_CLOCK_SKEW and same_login(by, actor):
+            return True
+    return False
+
+
 def _assignee_logins(target: dict) -> set[str]:
     """The issue's assignees, as `login_key`s."""
     return {
@@ -790,16 +862,19 @@ def claim(
     )
     if took_over:
         note = f"Took over an expired lease from session `{took_over}`. " + note
+    inherited = False
     if assignee:
-        # The lease owns the assignment it makes: one not already on the issue, or one the
-        # expired lease it takes over owned (that lease will never release it now).
+        # The lease owns an assignment the expired lease it takes over owned (that lease will
+        # never release it now). One it makes itself is owned only once PROVEN around the add
+        # (`_confirm_own_assignment`): the issue read above is stale by then, and a maintainer
+        # who assigns the login in between makes the add a no-op (Codex 4206173677). Until
+        # proven, the marker claims no ownership -- a crash leaves an assignee, never removes one.
         inherited = (
             existing is not None
             and existing.owns_assignee
             and same_login(existing.assignee, assignee)
         )
-        assigned = login_key(assignee) in _assignee_logins(target)
-        lease = replace(lease, owns_assignee=not assigned or inherited)
+        lease = replace(lease, owns_assignee=inherited)
     marker = format_claim_marker(lease)
     winner = _post_and_arbitrate(project, issue, session, marker + "\n" + note, gh, now)
     if winner is None or winner.session != session:
@@ -813,10 +888,20 @@ def claim(
     flags = ["--add-label", IN_PROGRESS_LABEL]
     if assignee:
         flags += ["--add-assignee", assignee]
+    snapshot: tuple[bool, list[dict]] | None = None
     try:
         _ensure_label(project, gh)
+        if assignee and not inherited:
+            snapshot = _assignment_snapshot(project, issue, assignee, gh)
         _edit(project, issue, gh, *flags)
     except Exception:
+        if assignee and not inherited:
+            lease = replace(
+                lease,
+                owns_assignee=_confirm_own_assignment(
+                    project, issue, session, assignee, snapshot, now, gh
+                ),
+            )
         # The marker already made the lease authoritative, but the caller is about to fail and
         # nothing downstream will release it: retract so the issue is not blocked for the TTL.
         try:
@@ -834,6 +919,23 @@ def claim(
         except Exception:  # noqa: BLE001 -- best effort; the original failure is what matters
             pass
         raise
+    if (
+        assignee
+        and not inherited
+        and _confirm_own_assignment(project, issue, session, assignee, snapshot, now, gh)
+    ):
+        owned = replace(lease, owns_assignee=True)
+        try:
+            _comment(
+                project,
+                issue,
+                format_claim_marker(owned)
+                + f"\nAssigned `{assignee}` for this lease; it is removed on release.",
+                gh,
+            )
+            lease = owned
+        except Exception as exc:  # noqa: BLE001 -- unrecorded ownership only leaves the login
+            _log.warning("issue #%s: assignee ownership not recorded: %s", issue, exc)
     # A takeover ends the expired lease: an assignee it added (and this lease does not want)
     # would otherwise stay on the issue forever, accumulating one per takeover. The new claim is
     # already authoritative, so this cleanup is best effort: a failure is logged and left to the

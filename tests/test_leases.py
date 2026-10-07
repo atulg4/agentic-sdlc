@@ -122,6 +122,7 @@ class FakeGh:
                         {
                             "event": "assigned",
                             "assignee": {"login": login},
+                            "actor": {"login": self.poster.get("login", "atulg4")},
                             "created_at": self.posted_at.isoformat(),
                         }
                     )
@@ -639,8 +640,10 @@ def test_claim_retracts_its_marker_when_label_bookkeeping_fails():
             assignee="nobody",
         )
     bodies = [c["body"] for c in gh.issues[7]["comments"]]
-    assert "forge-release session=s1" in bodies[-2]
-    assert bodies[-1] == "<!-- forge-cleanup session=s1 assignee=nobody -->"
+    # the add never happened (no `assigned` event by us): nothing is owned, nothing to clean up
+    assert "forge-release session=s1" in bodies[-1]
+    assert not any("forge-cleanup" in body for body in bodies)
+    assert _logins(gh) == []
     assert current_lease(PROJECT, 7, gh, now=NOW) is None  # not blocked for the TTL
 
 
@@ -1492,3 +1495,85 @@ def test_release_retry_reconciles_despite_another_sessions_expired_marker():
     gh2 = FakeGh().issue(7, comments=[format_claim_marker(replace(stale, expires=later))])
     with pytest.raises(LeaseError):
         release(PROJECT, 7, session="sA", gh=gh2, now=NOW)
+
+
+# Codex 4206173677: ownership of the assignee is proven around the add, not taken from the
+# claim's first (stale) read of the issue.
+
+
+def _maintainer_assigns(gh, login, n=7):
+    gh.issues[n]["assignees"].append({"login": login})
+    gh.events.setdefault(n, []).append(
+        {
+            "event": "assigned",
+            "assignee": {"login": login},
+            "actor": {"login": "maintainer"},
+            "created_at": NOW.isoformat(),
+        }
+    )
+
+
+@pytest.mark.parametrize("moment", ["before_fresh_read", "between_fresh_read_and_add"])
+def test_claim_does_not_own_an_assignee_a_maintainer_added_during_the_claim(moment):
+    gh = FakeGh().issue(7)
+    real = gh.__call__
+    fired = []
+
+    def racing(args, input=None):
+        args = tuple(args)
+        issue_read = args[0] == "api" and args[1] == f"repos/{PROJECT}/issues/7"
+        add = args[:2] == ("issue", "edit") and "--add-assignee" in args
+        reads = sum(1 for c in gh.calls if c[0] == "api" and c[1] == f"repos/{PROJECT}/issues/7")
+        if not fired and (
+            (moment == "before_fresh_read" and issue_read and reads >= 1)
+            or (moment == "between_fresh_read_and_add" and add)
+        ):
+            fired.append(True)
+            _maintainer_assigns(gh, "alice")  # after the claim's first read of the issue
+        return real(args, input=input)
+
+    result = claim(
+        PROJECT, 7, agent="a", session="s1", branch="b", gh=racing, now=NOW, assignee="alice"
+    )
+    assert fired and result.ok and not result.lease.owns_assignee
+    assert not any("owns_assignee=1" in c["body"] for c in gh.issues[7]["comments"])
+    release(PROJECT, 7, session="s1", gh=gh, now=NOW)
+    assert _logins(gh) == ["alice"]  # the maintainer's assignment survives the release
+
+
+def test_claim_owns_only_an_assignment_its_own_actor_made():
+    gh = FakeGh().issue(7)
+    result = claim(
+        PROJECT, 7, agent="a", session="s1", branch="b", gh=gh, now=NOW, assignee="alice"
+    )
+    assert result.ok and result.lease.owns_assignee
+    assert current_lease(PROJECT, 7, gh, now=NOW).owns_assignee
+    # the same add, but the event GitHub reports names someone else as the actor
+    gh2 = FakeGh().issue(7)
+    real = gh2.__call__
+
+    def other_actor(args, input=None):
+        out = real(args, input=input)
+        for event in gh2.events.get(7, []):
+            event["actor"] = {"login": "maintainer"}
+        return out
+
+    result = claim(
+        PROJECT, 7, agent="a", session="s1", branch="b", gh=other_actor, now=NOW, assignee="alice"
+    )
+    assert result.ok and not result.lease.owns_assignee
+
+
+def test_claim_does_not_own_an_assignee_when_events_cannot_be_read():
+    gh = FakeGh().issue(7)
+    real = gh.__call__
+
+    def no_events(args, input=None):
+        if args[0] == "api" and args[1].split("?")[0].endswith("/events"):
+            raise RuntimeError("HTTP 502")
+        return real(args, input=input)
+
+    result = claim(
+        PROJECT, 7, agent="a", session="s1", branch="b", gh=no_events, now=NOW, assignee="alice"
+    )
+    assert result.ok and not result.lease.owns_assignee and _logins(gh) == ["alice"]

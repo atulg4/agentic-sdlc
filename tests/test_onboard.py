@@ -379,9 +379,21 @@ def _var_pages(*names: str, per_page: int = 30) -> str:
     return json.dumps([{"total_count": len(rows), "variables": page} for page in pages])
 
 
+def _effective_rules(*extra: dict) -> str:
+    """`gh api repos/.../rules/branches/main --paginate --slurp`: Forge's own rules, as the
+    repository's ruleset applies them, plus `extra` (inherited) rules."""
+    own = [
+        {**rule, "ruleset_source_type": "Repository", "ruleset_source": "owner/comic"}
+        for rule in ruleset_payload(spec())["rules"]
+    ]
+    return json.dumps([[*own, *extra]])
+
+
 def _healthy_gh() -> FakeGh:
     return FakeGh(
         {
+            # before "api repos/owner/comic": answers match by prefix, in this order
+            "api repos/owner/comic/rules/branches/main": _effective_rules(),
             "api repos/owner/comic/rulesets/11": json.dumps({"id": 11, **ruleset_payload(spec())}),
             "api repos/owner/comic/labels": json.dumps(
                 [
@@ -971,9 +983,11 @@ def test_commit_guard_sees_commit_after_value_taking_git_options(tmp_path):
         "git --git-dir .git --work-tree . commit -m x",
         "git --namespace ns --exec-path=/usr/lib/git-core commit",
         "cd sub && git --no-pager -C .. commit -am x",
+        # deny by default: `-c` can set core.pager / diff.external, so even `log` needs the lease
+        "git -c commit.gpgsign=false log",
     ):
         assert code(blocked) == 2, blocked
-    for allowed in ("git -C . status", "git -c commit.gpgsign=false log", "git log --grep commit"):
+    for allowed in ("git -C . status", "git --no-pager log", "git log --grep commit"):
         assert code(allowed) == 0, allowed
 
 
@@ -2666,7 +2680,7 @@ def test_commit_guard_reads_clustered_shell_c_options(tmp_path, command):
 
 @pytest.mark.parametrize(
     "command",
-    ["bash -lc 'git status'", "sh -e script.sh", "bash -x run-commit.sh", "bash -l"],
+    ["bash -lc 'git status'", "sh -e script.sh", "bash -x run-commit.sh"],
 )
 def test_commit_guard_clustered_shell_options_without_a_commit(tmp_path, command):
     guard = _guard_module(tmp_path, "forge_commit_guard")
@@ -3388,9 +3402,11 @@ def test_commit_guard_resolves_inline_git_aliases(tmp_path, command):
     "command",
     ["git -c alias.st=status st", "git -c alias.ci=commit status", "git lfs push origin main"],
 )
-def test_commit_guard_keeps_non_committing_aliases(tmp_path, command):
+def test_commit_guard_denies_aliases_and_external_subcommands_by_default(tmp_path, command):
+    """Deny by default (Codex 4206173686): an alias or `git-<name>` program is not a literal
+    allowlisted subcommand, and `-c` makes even `status` unprovable."""
     guard = _guard_module(tmp_path, "forge_commit_guard")
-    assert not guard.is_git_commit(command, cwd=str(tmp_path))
+    assert guard.is_git_commit(command, cwd=str(tmp_path))
 
 
 def test_commit_guard_resolves_repository_and_global_aliases(tmp_path, monkeypatch):
@@ -3422,8 +3438,9 @@ def test_commit_guard_resolves_repository_and_global_aliases(tmp_path, monkeypat
     for blocked in ("git ci -m x", "git sh", "git gci -m x", "cd wt && git ci -m x"):
         cwd = tmp_path if blocked.startswith("cd ") else repo
         assert code(blocked, cwd) == 2, blocked
-    assert code("git st") == 0
-    assert not guard.is_git_commit("git ci -m x", cwd=str(tmp_path))  # no such alias there
+    assert code("git st") == 2  # aliases are not followed: not a literal read-only subcommand
+    assert code("git status") == 0
+    assert guard.is_git_commit("git ci -m x", cwd=str(tmp_path))  # unknown subcommand
     # GIT_CONFIG_* on the command line is read the way git reads it
     assert guard.is_git_commit(
         "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.yy GIT_CONFIG_VALUE_0=commit git yy",
@@ -3641,8 +3658,6 @@ def test_settings_json_stays_tunable_while_its_hooks_are_present(tmp_path):
         "c=git; $c commit -m y",
         "bash -c 'echo $(git commit -m x)'",
         "echo '$(git commit)'",  # a literal, but quoting is gone after shlex: over-blocked
-        # Conservative: any expansion in a line naming both words is unproven, so blocked.
-        'out="$(git rev-parse HEAD)"; echo commit',
     ],
 )
 def test_commit_guard_fails_closed_on_substitutions_and_eval(tmp_path, command):
@@ -3659,6 +3674,8 @@ def test_commit_guard_fails_closed_on_substitutions_and_eval(tmp_path, command):
         "bash -c 'git log --grep commit'",
         "git status",
         "cd sub && git log --grep commit",
+        # the substitution is proven read-only; `echo commit` names no git
+        'out="$(git rev-parse HEAD)"; echo commit',
     ],
 )
 def test_commit_guard_fail_closed_still_proves_non_commits(tmp_path, command):
@@ -4482,3 +4499,198 @@ def test_reusable_call_contract_rules():
         "c:j: does not pass secret 'S', which x.yml requires",
     ]
     assert "no on.workflow_call" in reusable_call_mismatches("c:j", {}, "x.yml", {"on": "push"})[0]
+
+
+# Codex 4206173667 / 4206173686: the guard is deny-by-default for git. On an issue branch every
+# git invocation needs the lease except literal read-only subcommands; anything that runs git or
+# a shell indirectly (xargs, find -exec, parallel, `| sh`) needs it too.
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "printf '%s\\n' commit -m x | xargs git",
+        "xargs -a args.txt git",
+        "xargs -n 1 -a f git",
+        "find . -exec git commit -m x {} +",
+        "find . -name '*.sh' -exec sh -c 'x' {} +",
+        "ls | xargs bash",
+        "parallel git ::: commit",
+        "printf 'git commit -m x' | sh",
+        "cat cmds.txt | bash",
+        "bash -s",
+        "sh < cmds.txt",
+        'bash <<< "echo hi"',
+        "git cherry-pick abc123",
+        "git revert abc123",
+        "git merge feature",
+        "git rebase main",
+        "git pull",
+        "git am < patch",
+        "git reset --hard HEAD~1",
+        "git checkout other",
+        "git switch other",
+        "git stash",
+        "git stash pop",
+        "git notes add -m x",
+        "git tag v1",
+        "git tag -a v1 -m x",
+        "git update-ref refs/heads/forge/issue-7 HEAD~1",
+        "git worktree add ../x",
+        "git push",
+        "git-merge feature",
+        "git branch newbranch",
+        "git branch -D old",
+        "git branch -f forge/issue-7 HEAD~1",
+        "git config user.name x",
+        "git stash drop",
+        "git reflog expire --all",
+        "git fetch -u origin main:main",
+        "git fetch origin main:forge/issue-7",
+        "git fetch --upload-pack='sh -c x' origin",
+        "git fetch -{u,}",
+        "git grep -O'sh -c x' foo",
+        "git -c core.pager=x log",
+        "GIT_EXTERNAL_DIFF=x git diff",
+        "export GIT_EXTERNAL_DIFF=x; git diff",
+        "git log --output=.git/refs/heads/forge/issue-7",
+        "git diff $REV",
+        "python3 -c \"import subprocess; subprocess.run(['git', 'merge', 'x'])\"",
+        "some-new-subcommand-wrapper git status",
+    ],
+)
+def test_commit_guard_denies_git_by_default(tmp_path, command):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    assert guard.is_git_commit(command, cwd=str(tmp_path))
+    payload = {"tool_name": "Bash", "session_id": "s1", "tool_input": {"command": command}}
+    assert guard.decide(payload, "forge/issue-7", lambda n: None, lambda b: False)[0] == 2
+    held = {"session": "s1", "agent": "a"}
+    assert guard.decide(payload, "forge/issue-7", lambda n: held, lambda b: False)[0] == 0
+    assert guard.decide(payload, "main", lambda n: None, lambda b: False)[0] == 0
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git status",
+        "git log --grep commit",
+        "git log --grep merge --oneline",
+        "git diff",
+        "git diff HEAD~1 -- src",
+        "git show HEAD:README.md",
+        "git branch --show-current",
+        "git branch",
+        "git branch -a -vv",
+        "git branch --contains abc123",
+        "git remote -v",
+        "git remote show origin",
+        "git config --get user.name",
+        "git config --list",
+        "git fetch origin",
+        "git stash list",
+        "git stash show -p",
+        "git tag -l 'v*'",
+        "git reflog",
+        "git reflog show",
+        "git help commit",
+        "git --version",
+        "git grep -n foo",
+        "git cat-file -p HEAD",
+        "git for-each-ref refs/heads",
+        "git merge-base main HEAD",
+        "git rev-parse --show-toplevel",
+        'cd "$(git rev-parse --show-toplevel)" && git status',
+        "LC_ALL=C git log",
+        "git status | head",
+        "git log --oneline | xargs echo",
+        "ls | xargs grep foo",
+        "ls .git && cat .git/HEAD",
+        "bash scripts/test.sh",
+        "pytest -q",
+    ],
+)
+def test_commit_guard_allows_literal_read_only_git(tmp_path, command):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    assert not guard.is_git_commit(command, cwd=str(tmp_path))
+    payload = {"tool_name": "Bash", "session_id": "s1", "tool_input": {"command": command}}
+    assert guard.decide(payload, "forge/issue-7", lambda n: None, lambda b: False)[0] == 0
+
+
+# Codex 4206173701: doctor diagnoses the EFFECTIVE rules of the default branch, inherited
+# organization/enterprise rulesets included; `--apply` still manages only the repository's own.
+
+
+def _org_rule(kind: str, **parameters) -> dict:
+    return {
+        "type": kind,
+        "parameters": parameters,
+        "ruleset_source_type": "Organization",
+        "ruleset_source": "owner",
+        "ruleset_id": 99,
+    }
+
+
+def _effective_check(gh, tmp_path):
+    from agentic_sdlc.onboard import EFFECTIVE_RULES_CHECK
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    return report, next(c for c in report.checks if c.name == EFFECTIVE_RULES_CHECK)
+
+
+def test_doctor_flags_an_inherited_required_check_no_workflow_reports(tmp_path):
+    gh = _healthy_gh()
+    gh.answers["api repos/owner/comic/rules/branches/main"] = _effective_rules(
+        _org_rule("required_status_checks", required_status_checks=[{"context": "sec/scan"}])
+    )
+    report, check = _effective_check(gh, tmp_path)
+    assert not report.ok and "NOT READY" in report.render()
+    assert not check.ok and check.manual
+    assert "Organization owner" in check.detail and "'sec/scan'" in check.detail
+
+
+def test_doctor_accepts_an_inherited_required_check_an_installed_job_reports(tmp_path):
+    gh = _healthy_gh()
+    gh.answers["api repos/owner/comic/rules/branches/main"] = _effective_rules(
+        _org_rule("required_status_checks", required_status_checks=[{"context": "test"}]),
+        _org_rule("pull_request", required_approving_review_count=2),
+    )
+    report, check = _effective_check(gh, tmp_path)
+    assert report.ok, report.render()
+    assert check.ok and "inherited from Organization owner" in check.detail
+
+
+@pytest.mark.parametrize(
+    ("rule", "words"),
+    [
+        (_org_rule("required_deployments", required_deployment_environments=["prod"]), "prod"),
+        (_org_rule("workflows", workflows=[{"path": ".github/workflows/sec.yml"}]), "sec.yml"),
+        (_org_rule("merge_queue", merge_method="SQUASH"), "merge_group"),
+        (_org_rule("required_signatures"), "signed commits"),
+        (_org_rule("update"), "restricts updates"),
+        (_org_rule("code_scanning", code_scanning_tools=[{"tool": "CodeQL"}]), "CodeQL"),
+    ],
+)
+def test_doctor_surfaces_inherited_requirements_forge_cannot_meet(tmp_path, rule, words):
+    gh = _healthy_gh()
+    gh.answers["api repos/owner/comic/rules/branches/main"] = _effective_rules(rule)
+    report, check = _effective_check(gh, tmp_path)
+    assert not report.ok and not check.ok and check.manual
+    assert words in check.detail and "Organization owner" in check.detail
+
+
+def test_doctor_reports_unreadable_effective_rules_as_a_manual_todo(tmp_path):
+    gh = _healthy_gh()
+    gh.answers["api repos/owner/comic/rules/branches/main"] = "not json"
+    report, check = _effective_check(gh, tmp_path)
+    assert not report.ok and not check.ok and check.manual
+    assert "by hand" in check.detail and "[TODO]" in report.render()
+
+
+def test_apply_still_manages_only_the_repository_rulesets():
+    gh = FakeGh({"api repos/owner/comic/rulesets": json.dumps([])})
+    apply_repo_settings(spec(), gh)
+    called = [" ".join(c) for c, _ in gh.calls]
+    assert any("rulesets?includes_parents=false" in c for c in called)
+    assert not any("includes_parents=true" in c or "/rules/branches/" in c for c in called)

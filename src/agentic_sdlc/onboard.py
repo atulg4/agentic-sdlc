@@ -20,6 +20,7 @@ import unicodedata
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import quote
 
 from .executors import (
     AuthMode,
@@ -677,7 +678,7 @@ Read `AGENTS.md` first; it is the authoritative agent guide. Highlights:
 
 - **Claim first.** Work only on an issue you lease (`sdlcctl claim … --session <your session id>`);
   the SessionStart hook prints the id and which issues other agents hold. The commit guard blocks
-  commits on `*/issue-N` branches without your lease.
+  every git command but read-only ones on `*/issue-N` branches without your lease.
 - **Tests first.** Every change ships with tests. Run {_md_code(spec.test_command)} before
   proposing a change.
 - **Merge authority is the repository owner.** Agents open draft PRs only; never merge,
@@ -1742,6 +1743,101 @@ def _repo_rulesets(project_id: str, gh: GhRunner) -> list[dict]:
     (a repository admin cannot update those through the repository endpoint)."""
     rows = _paged_items(gh, f"repos/{project_id}/rulesets?includes_parents=false")
     return [r for r in rows if r.get("source_type", "Repository") == "Repository"]
+
+
+EFFECTIVE_RULES_CHECK = "effective default-branch rules (org/enterprise rulesets too) fit Forge"
+
+
+def workflow_check_contexts(base: Path) -> tuple[set[str], tuple[str, ...], bool]:
+    """What the installed workflows can report as status-check contexts: exact job names (`name:`
+    else the job id), prefixes for the contexts GitHub derives (`caller / callee` for a reusable
+    call, `name (...)` for a matrix, the literal part of a name holding an expression), and
+    whether any workflow runs on `merge_group` (a merge queue's checks)."""
+    exact: set[str] = set()
+    prefixes: list[str] = []
+    merge_group = False
+    workflows = base / ".github/workflows"
+    paths = sorted([*workflows.glob("*.yml"), *workflows.glob("*.yaml")])
+    for path in paths:
+        doc = _workflow_doc(path) or {}
+        triggers = doc.get("on", doc.get(True))  # YAML 1.1 reads a bare `on:` key as True
+        if triggers == "merge_group" or (
+            isinstance(triggers, (list, dict)) and "merge_group" in triggers
+        ):
+            merge_group = True
+        for job_id, job in _workflow_jobs(path).items():
+            name = str(job.get("name") or job_id)
+            if "${{" in name:
+                prefixes.append(name.split("${{")[0])
+                continue
+            exact.add(name)
+            if job.get("uses"):
+                prefixes.append(f"{name} / ")
+            strategy = job.get("strategy")
+            if isinstance(strategy, dict) and strategy.get("matrix"):
+                prefixes.append(f"{name} (")
+    return exact, tuple(prefixes), merge_group
+
+
+def effective_rule_problems(
+    rules: Sequence[dict], produced: tuple[set[str], tuple[str, ...], bool]
+) -> list[str]:
+    """The requirements in the default branch's EFFECTIVE rules (`rules/branches/{branch}`:
+    repository, organization and enterprise rulesets alike) that a Forge PR cannot meet, or that
+    doctor cannot verify: required status contexts no installed workflow job reports, required
+    deployments, required workflows, a merge queue no workflow serves, required signatures,
+    update restrictions and code-scanning gates."""
+    exact, prefixes, merge_group = produced
+    problems: list[str] = []
+    for rule in rules:
+        kind = str(rule.get("type") or "")
+        params = rule.get("parameters") if isinstance(rule.get("parameters"), dict) else {}
+        source = (
+            f"{rule.get('ruleset_source_type') or 'ruleset'} "
+            f"{rule.get('ruleset_source') or ''} (ruleset {rule.get('ruleset_id', '?')})"
+        ).replace("  ", " ")
+        if kind == "required_status_checks":
+            for check in params.get("required_status_checks") or []:
+                context = str((check or {}).get("context") or "")
+                if context and context not in exact and not context.startswith(prefixes):
+                    problems.append(
+                        f"{source}: requires status check '{context}', which no installed "
+                        "workflow job reports"
+                    )
+        elif kind == "required_deployments":
+            envs = ", ".join(params.get("required_deployment_environments") or []) or "?"
+            problems.append(
+                f"{source}: requires deployments ({envs}) before merge; Forge deploys nothing"
+            )
+        elif kind == "workflows":
+            paths = ", ".join(
+                str((w or {}).get("path") or "?") for w in params.get("workflows") or []
+            )
+            problems.append(
+                f"{source}: requires workflows ({paths or '?'}) to pass; verify they run on "
+                "Forge PRs"
+            )
+        elif kind == "merge_queue" and not merge_group:
+            problems.append(
+                f"{source}: requires a merge queue, but no installed workflow runs on "
+                "merge_group, so its required checks never report"
+            )
+        elif kind == "required_signatures":
+            problems.append(
+                f"{source}: requires signed commits; verify the Forge publisher's commits are "
+                "verified (manual)"
+            )
+        elif kind == "update":
+            problems.append(f"{source}: restricts updates; merging a Forge PR needs a bypass")
+        elif kind == "code_scanning":
+            tools = ", ".join(
+                str((t or {}).get("tool") or "?") for t in params.get("code_scanning_tools") or []
+            )
+            problems.append(
+                f"{source}: requires code scanning results ({tools or '?'}); verify a scanner "
+                "reports on Forge PRs"
+            )
+    return problems
 
 
 # What each generated caller must call.
@@ -4140,6 +4236,52 @@ def doctor(
                 f"ruleset '{RULESET_NAME}' active on default branch",
                 not problems,
                 "; ".join(problems),
+            )
+        )
+
+    # --- the EFFECTIVE rules of the default branch: rulesets inherited from the organization or
+    # enterprise apply too, and a requirement no Forge PR can meet leaves every PR unmergeable
+    # however correct `Protect main` is. Diagnosis only: `--apply` manages the repository's own.
+    effective_branch = policy.default_branch if policy else "main"
+    pages = _safe_json(
+        gh,
+        [
+            "api",
+            f"repos/{project_id}/rules/branches/{quote(effective_branch, safe='')}",
+            "--paginate",
+            "--slurp",
+        ],
+    )
+    if not isinstance(pages, list) or not all(isinstance(page, list) for page in pages):
+        add(
+            Check(
+                EFFECTIVE_RULES_CHECK,
+                False,
+                f"could not read the rules that apply to {effective_branch} "
+                f"(GET repos/{project_id}/rules/branches/{effective_branch}) → check org and "
+                "enterprise rulesets by hand",
+                manual=True,
+            )
+        )
+    else:
+        rules = [rule for page in pages for rule in page if isinstance(rule, dict)]
+        problems = effective_rule_problems(rules, workflow_check_contexts(base))
+        inherited = sorted(
+            {
+                f"{r.get('ruleset_source_type')} {r.get('ruleset_source')}"
+                for r in rules
+                if r.get("ruleset_source_type") not in (None, "Repository")
+            }
+        )
+        add(
+            Check(
+                EFFECTIVE_RULES_CHECK,
+                not problems,
+                "; ".join(problems)
+                if problems
+                else f"{len(rules)} rules on {effective_branch}"
+                + (f", inherited from {', '.join(inherited)}" if inherited else ""),
+                manual=True,
             )
         )
 
