@@ -1392,7 +1392,10 @@ def test_cli_copy_vars_from_copies_every_registry_model_variable(tmp_path, monke
     assert set(copied) == {"PUBLISHER_APP_CLIENT_ID", *wanted}
 
 
-@pytest.mark.parametrize("runs_on", ["ubuntu-lates", "${{ matrix.os }}", "big-runner-group"])
+@pytest.mark.parametrize(
+    "runs_on",
+    ["ubuntu-lates", "${{ matrix.os }}", "big-runner-group", "ubuntu-99.04", "macos-99"],
+)
 def test_doctor_rejects_unknown_hosted_runner_labels(tmp_path, runs_on):
     repo = _repo(tmp_path)
     write_onboarding(repo, spec())
@@ -1405,7 +1408,7 @@ def test_doctor_rejects_unknown_hosted_runner_labels(tmp_path, runs_on):
 
 
 @pytest.mark.parametrize(
-    "runs_on", ["ubuntu-latest", "ubuntu-24.04-arm", "macos-15", "windows-2025"]
+    "runs_on", ["ubuntu-latest", "ubuntu-24.04-arm", "macos-15", "macos-15-xlarge"]
 )
 def test_doctor_accepts_github_hosted_runner_labels(tmp_path, runs_on):
     repo = _repo(tmp_path)
@@ -1973,3 +1976,493 @@ def test_commit_guard_checks_the_repository_git_c_selects(tmp_path):
     assert code("git -C ../main commit -m x", cwd=issue_repo) == 0
     assert code("git commit -m x", cwd=issue_repo) == 2
     assert code("git -C ../wt status") == 0
+
+
+# ---------------------------------------------------------------- review regressions (PR 139, 5)
+
+
+def test_ruleset_update_merges_forge_rules_without_weakening_existing_ones():
+    from agentic_sdlc.onboard import merged_ruleset
+
+    strong = {
+        "id": 5,
+        "name": RULESET_NAME,
+        "source_type": "Repository",
+        "target": "branch",
+        "enforcement": "active",
+        "bypass_actors": [{"actor_id": 1, "actor_type": "RepositoryRole"}],
+        "conditions": {"ref_name": {"include": ["refs/heads/release"], "exclude": []}},
+        "rules": [
+            {"type": "deletion"},
+            {"type": "required_signatures"},
+            {"type": "required_linear_history"},
+            {
+                "type": "pull_request",
+                "parameters": {
+                    "required_approving_review_count": 2,
+                    "dismiss_stale_reviews_on_push": False,
+                    "require_code_owner_review": True,
+                    "require_last_push_approval": True,
+                    "required_review_thread_resolution": False,
+                    "allowed_merge_methods": ["squash"],
+                },
+            },
+            {
+                "type": "required_status_checks",
+                "parameters": {
+                    "strict_required_status_checks_policy": False,
+                    "required_status_checks": [
+                        {"context": "lint"},
+                        {"context": "test", "integration_id": 15368},
+                        {"context": "e2e"},
+                    ],
+                },
+            },
+        ],
+    }
+    assert ruleset_mismatches(strong, spec())  # it lacks Forge's requirements
+    gh = FakeGh(
+        {
+            "api repos/owner/comic/rulesets/5": json.dumps(strong),
+            "api repos/owner/comic/rulesets": json.dumps([strong]),
+        }
+    )
+    apply_repo_settings(spec(), gh)
+    body = json.loads(next(i for c, i in gh.calls if c[:3] == ("api", "-X", "PUT")))
+    assert body == merged_ruleset(strong, spec())
+    assert "id" not in body and "source_type" not in body
+    assert ruleset_mismatches(body, spec()) == []
+    rules = {r["type"]: r.get("parameters") for r in body["rules"]}
+    # every existing rule survives, and Forge's missing one is added
+    assert {"required_signatures", "required_linear_history", "non_fast_forward"} <= set(rules)
+    pr = rules["pull_request"]
+    assert pr["required_approving_review_count"] == 2  # never lowered to Forge's 0
+    assert pr["require_code_owner_review"] is True and pr["require_last_push_approval"] is True
+    assert pr["required_review_thread_resolution"] is True
+    assert pr["dismiss_stale_reviews_on_push"] is True
+    assert pr["allowed_merge_methods"] == ["squash"]
+    checks = rules["required_status_checks"]
+    assert checks["strict_required_status_checks_policy"] is True
+    assert checks["required_status_checks"] == [
+        {"context": "lint"},
+        {"context": "test", "integration_id": 15368},
+        {"context": "e2e"},
+    ]
+    include = body["conditions"]["ref_name"]["include"]
+    assert include == ["refs/heads/release", "~DEFAULT_BRANCH"]
+    assert body["bypass_actors"] == []
+    # a stricter Forge-free count on a fresh merge never drops below the existing one
+    assert merged_ruleset(body, spec()) == body
+
+
+def _wf(repo: Path, name: str, text: str) -> None:
+    (repo / ".github/workflows" / name).write_text(text)
+
+
+REUSE_SELF_HOSTED = (
+    "on:\n  workflow_call:\njobs:\n  build:\n    runs-on: [self-hosted, linux]\n"
+    "    steps:\n      - run: make test\n"
+)
+REUSE_INPUT = (
+    "on:\n  workflow_call:\n    inputs:\n      runner:\n        type: string\n"
+    "        default: RUNNER_DEFAULT\njobs:\n  build:\n    runs-on: ${{ inputs.runner }}\n"
+    "    steps:\n      - run: make test\n"
+)
+
+
+CALL_ONLY = "on:\n  workflow_call:\njobs:\n  go:\n    uses: ./.github/workflows/{}.yml\n"
+
+
+def _pr_caller(uses: str, with_: str = "") -> str:
+    return f"on: pull_request\njobs:\n  call:\n    uses: {uses}\n{with_}"
+
+
+@pytest.mark.parametrize(
+    ("files", "exposed"),
+    [
+        # the Codex case: no with.runs_on, the called file's job is self-hosted
+        (
+            {"reuse.yml": REUSE_SELF_HOSTED, "pr.yml": _pr_caller("./.github/workflows/reuse.yml")},
+            True,
+        ),
+        # inputs substituted from `with:`
+        (
+            {
+                "reuse.yml": REUSE_INPUT.replace("RUNNER_DEFAULT", "self-hosted"),
+                "pr.yml": _pr_caller(
+                    "./.github/workflows/reuse.yml", "    with:\n      runner: ubuntu-latest\n"
+                ),
+            },
+            False,
+        ),
+        (
+            {
+                "reuse.yml": REUSE_INPUT.replace("RUNNER_DEFAULT", "ubuntu-latest"),
+                "pr.yml": _pr_caller(
+                    "./.github/workflows/reuse.yml", "    with:\n      runner: self-hosted\n"
+                ),
+            },
+            True,
+        ),
+        # the input's default applies when the caller passes none
+        (
+            {
+                "reuse.yml": REUSE_INPUT.replace("RUNNER_DEFAULT", "self-hosted"),
+                "pr.yml": _pr_caller("./.github/workflows/reuse.yml"),
+            },
+            True,
+        ),
+        (
+            {
+                "reuse.yml": REUSE_INPUT.replace("RUNNER_DEFAULT", "ubuntu-latest"),
+                "pr.yml": _pr_caller("./.github/workflows/reuse.yml"),
+            },
+            False,
+        ),
+        # an expression that is not a resolvable input fails closed
+        (
+            {
+                "reuse.yml": REUSE_INPUT.replace("RUNNER_DEFAULT", "ubuntu-latest"),
+                "pr.yml": _pr_caller(
+                    "./.github/workflows/reuse.yml", "    with:\n      runner: ${{ vars.RUNNER }}\n"
+                ),
+            },
+            True,
+        ),
+        # nested local calls are followed
+        (
+            {
+                "inner.yml": REUSE_SELF_HOSTED,
+                "outer.yml": "on:\n  workflow_call:\njobs:\n  go:\n"
+                "    uses: ./.github/workflows/inner.yml\n",
+                "pr.yml": _pr_caller("./.github/workflows/outer.yml"),
+            },
+            True,
+        ),
+        # a cycle cannot be proven and must not recurse forever
+        (
+            {
+                "a.yml": CALL_ONLY.format("b"),
+                "b.yml": CALL_ONLY.format("a"),
+                "pr.yml": _pr_caller("./.github/workflows/a.yml"),
+            },
+            True,
+        ),
+        ({"pr.yml": _pr_caller("./.github/workflows/missing.yml")}, True),
+        # a third-party reusable workflow's runners are unknowable from here
+        ({"pr.yml": _pr_caller(f"someone/else/.github/workflows/ci.yml@{SHA}")}, True),
+        # the Forge platform's reusable workflows run where with.runs_on says
+        (
+            {
+                "pr.yml": _pr_caller(
+                    f"owner/agentic-sdlc/.github/workflows/reusable-review.yml@{SHA}",
+                    "    with:\n      runs_on: '[\"ubuntu-latest\"]'\n",
+                )
+            },
+            False,
+        ),
+        (
+            {
+                "pr.yml": _pr_caller(
+                    f"owner/agentic-sdlc/.github/workflows/reusable-review.yml@{SHA}",
+                    "    with:\n      runs_on: '[\"self-hosted\"]'\n",
+                )
+            },
+            True,
+        ),
+        (
+            {
+                "pr.yml": _pr_caller(
+                    f"owner/agentic-sdlc/.github/workflows/reusable-review.yml@{SHA}"
+                )
+            },
+            True,
+        ),
+        (
+            {
+                "pr.yml": _pr_caller(
+                    "owner/agentic-sdlc/.github/workflows/reusable-review.yml@main",
+                    "    with:\n      runs_on: '[\"ubuntu-latest\"]'\n",
+                )
+            },
+            True,
+        ),
+    ],
+)
+def test_public_runner_safety_follows_reusable_workflows(tmp_path, files, exposed):
+    from agentic_sdlc.onboard import _pull_request_off_hosted
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(public=True))
+    for name, text in files.items():
+        _wf(repo, name, text)
+    found = _pull_request_off_hosted(repo, "owner/agentic-sdlc")
+    assert bool(found) is exposed, found
+    assert not any(f.startswith("ci.yml:") for f in found)  # the hosted CI stays clean
+
+
+def test_doctor_fails_a_public_repo_whose_pr_workflow_calls_a_self_hosted_reusable(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(public=True))
+    _wf(repo, "reuse.yml", REUSE_SELF_HOSTED)
+    _wf(repo, "pr.yml", _pr_caller("./.github/workflows/reuse.yml"))
+    gh = _healthy_gh()
+    gh.answers["api repos/owner/comic"] = json.dumps(
+        {"default_branch": "main", "visibility": "public"}
+    )
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))
+    check = failed["public repository runs pull requests on GitHub-hosted runners"]
+    assert "pr.yml:call > reuse.yml:build" in check.detail
+
+
+def test_platform_runs_on_workflows_run_every_job_on_the_runs_on_input():
+    from agentic_sdlc.onboard import PLATFORM_RUNS_ON_WORKFLOWS
+
+    workflows = Path(__file__).resolve().parents[1] / ".github/workflows"
+    pinned = set()
+    for path in workflows.glob("reusable-*.yml"):
+        jobs = yaml.safe_load(path.read_text())["jobs"].values()
+        if all(job.get("runs-on") == "${{ fromJSON(inputs.runs_on) }}" for job in jobs):
+            pinned.add(path.name)
+    assert pinned >= PLATFORM_RUNS_ON_WORKFLOWS
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "--help",
+        "-h",
+        "--version",
+        "--collect-only",
+        "--co",
+        "--setup-plan",
+        "-k nothing",
+        "--ignore tests",
+        "--exit-zero",
+    ],
+)
+def test_doctor_rejects_a_ci_gate_whose_extra_arguments_change_what_runs(tmp_path, suffix):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    _ci_test_step(repo, f"pytest tests -q -m 'not e2e' {suffix}")
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    assert "ci.yml runs the policy gates as 'test'" in _failed(report)
+
+
+@pytest.mark.parametrize("suffix", ["", "-x", "--maxfail=3 -vv", "--tb=short -rA --durations=5"])
+def test_doctor_accepts_a_ci_gate_with_only_output_or_fail_fast_extras(tmp_path, suffix):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    _ci_test_step(repo, f"pytest tests -q -m 'not e2e' {suffix}".strip())
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    assert "ci.yml runs the policy gates as 'test'" not in _failed(report)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"runs_on": ("windows-2025",)},
+        {"runs_on": ("windows-latest",)},
+        {"runs_on": ("self-hosted", "windows", "x64")},
+        {"ci_runs_on": ("windows-11-arm",)},
+        {"public": True, "ci_runs_on": ("windows-latest",)},
+    ],
+)
+def test_onboard_rejects_windows_runner_targets(overrides):
+    with pytest.raises(OnboardError, match="Windows runners are not supported"):
+        spec(**overrides)
+
+
+def test_doctor_rejects_windows_runner_targets(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    ci = repo / ".github/workflows/ci.yml"
+    doc = yaml.safe_load(ci.read_text())
+    doc["jobs"]["test"]["runs-on"] = "windows-2025"
+    ci.write_text(yaml.safe_dump(doc, sort_keys=False))
+    plan = repo / ".github/workflows/agent-plan.yml"
+    doc = yaml.safe_load(plan.read_text())
+    doc["jobs"]["preflight"]["runs-on"] = "windows-latest"
+    plan.write_text(yaml.safe_dump(doc, sort_keys=False))
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh()))
+    assert set(failed) == {
+        "ci.yml test job runs on an available runner",
+        "workflows target Unix runners",
+    }
+    assert all("Windows" in c.detail and not c.manual for c in failed.values())
+    assert "agent-plan.yml:preflight" in failed["workflows target Unix runners"].detail
+
+
+def test_hosted_labels_are_the_documented_finite_set():
+    from agentic_sdlc.onboard import GITHUB_HOSTED_LABELS, _github_hosted
+
+    for label in ("ubuntu-latest", "ubuntu-22.04-arm", "macos-15-intel", "macos-14-large"):
+        assert _github_hosted({label}), label
+    for label in ("ubuntu-99.04", "windows-2099", "macos-99", "macos-15-huge", "ubuntu-20.10"):
+        assert not _github_hosted({label}), label
+    assert {f for f in GITHUB_HOSTED_LABELS.values()} == {"linux", "macos", "windows"}
+
+
+HOOK_START = ".claude/hooks/forge_session_start.py"
+
+
+def _settings(repo: Path, data) -> None:
+    (repo / ".claude/settings.json").write_text(data if isinstance(data, str) else json.dumps(data))
+
+
+def _hook(script: str, command: str | None = None) -> dict:
+    return {"type": "command", "command": command or f"python3 .claude/hooks/{script}"}
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        # both names merely mentioned
+        {"note": "forge_session_start.py and forge_commit_guard.py run as hooks"},
+        "not json at all forge_session_start.py forge_commit_guard.py",
+        # hooks disabled outright
+        {
+            "disableAllHooks": True,
+            "hooks": {
+                "SessionStart": [{"hooks": [_hook("forge_session_start.py")]}],
+                "PreToolUse": [{"matcher": "Bash", "hooks": [_hook("forge_commit_guard.py")]}],
+            },
+        },
+        # guard under a matcher that never sees Bash
+        {
+            "hooks": {
+                "SessionStart": [{"hooks": [_hook("forge_session_start.py")]}],
+                "PreToolUse": [{"matcher": "Edit", "hooks": [_hook("forge_commit_guard.py")]}],
+            }
+        },
+        # scripts swapped between events
+        {
+            "hooks": {
+                "SessionStart": [{"hooks": [_hook("forge_commit_guard.py")]}],
+                "PreToolUse": [{"matcher": "Bash", "hooks": [_hook("forge_session_start.py")]}],
+            }
+        },
+        # a command that only echoes the path
+        {
+            "hooks": {
+                "SessionStart": [
+                    {"hooks": [_hook("x", "echo .claude/hooks/forge_session_start.py")]}
+                ],
+                "PreToolUse": [{"matcher": "Bash", "hooks": [_hook("forge_commit_guard.py")]}],
+            }
+        },
+        # SessionStart only on resume
+        {
+            "hooks": {
+                "SessionStart": [{"matcher": "resume", "hooks": [_hook("forge_session_start.py")]}],
+                "PreToolUse": [{"matcher": "Bash", "hooks": [_hook("forge_commit_guard.py")]}],
+            }
+        },
+    ],
+)
+def test_doctor_rejects_hooks_claude_code_would_not_run(tmp_path, settings):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    _settings(repo, settings)
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    assert "required files present" in _failed(report)
+
+
+def test_doctor_accepts_equivalent_hook_configurations(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    _settings(
+        repo,
+        {
+            "hooks": {
+                "SessionStart": [
+                    {
+                        "matcher": "startup|resume",
+                        "hooks": [_hook("x", 'python3 "$CLAUDE_PROJECT_DIR"/' + HOOK_START)],
+                    }
+                ],
+                "PreToolUse": [
+                    {"matcher": "Edit", "hooks": [_hook("other.py")]},
+                    {"matcher": "Bash|Edit", "hooks": [_hook("forge_commit_guard.py")]},
+                ],
+            }
+        },
+    )
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    assert "required files present" not in _failed(report)
+
+
+def test_onboarding_records_the_implementation_mode_in_the_policy():
+    import tomllib
+
+    for implementer, mode in (("route", "actions"), ("cloud-routine", "cloud-routine")):
+        files = render_onboarding(spec(implementer=implementer, runs_on=("ubuntu-latest",)))
+        agents = tomllib.loads(files["agentic-sdlc.toml"])["agents"]
+        assert agents["implementation_mode"] == mode
+
+
+def test_doctor_does_not_infer_cloud_mode_from_a_stale_routine_doc(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    for name in ("agent-implement.yml", "agent-auto-implement.yml"):
+        (repo / ".github/workflows" / name).unlink()
+    (repo / "docs/forge").mkdir(parents=True)
+    (repo / "docs/forge/cloud-implementer.md").write_text("# stale\n")
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert "agent-implement.yml" in failed["required files present"].detail
+    assert "implementation profile is unambiguous" in failed
+
+
+def test_doctor_fails_a_legacy_policy_without_mode_or_callers(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(implementer="cloud-routine", runs_on=("ubuntu-latest",)))
+    toml = repo / "agentic-sdlc.toml"
+    legacy = re.sub(r"(?m)^implementation_mode = .*\n", "", toml.read_text())
+    toml.write_text(legacy)
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert "implementation_mode" in failed["implementation mode is configured"].detail
+    # a legacy Actions repo keeps working: its callers are the mode
+    repo2 = _repo(tmp_path / "two")
+    write_onboarding(repo2, spec())
+    toml2 = repo2 / "agentic-sdlc.toml"
+    toml2.write_text(re.sub(r"(?m)^implementation_mode = .*\n", "", toml2.read_text()))
+    report = doctor(repo2, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    assert "implementation mode is configured" not in _failed(report)
+    # an unknown value is not guessed at
+    toml2.write_text(
+        toml2.read_text().replace(
+            'reviewer = "codex"', 'reviewer = "codex"\nimplementation_mode = "cloud"'
+        )
+    )
+    failed = _failed(doctor(repo2, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert "'cloud'" in failed["implementation mode is configured"].detail
+
+
+@pytest.mark.parametrize(
+    "permissions",
+    [
+        {"contents": "write", "issues": "write", "pull_requests": "write"},
+        {**PUBLISHER_PERMS, "workflows": "write"},
+        {**PUBLISHER_PERMS, "administration": "read"},
+        {**PUBLISHER_PERMS, "metadata": "write"},
+        {"issues": "write", "pull_requests": "write"},
+    ],
+)
+def test_doctor_rejects_a_publisher_app_outside_the_exact_permission_set(tmp_path, permissions):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _healthy_gh()
+    gh.answers["api /user/installations"] = _installs(7, permissions=permissions)
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))
+    assert set(failed) == {"Publisher GitHub App installed on this repo"}
+
+
+def test_doctor_accepts_the_publisher_app_with_its_mandatory_metadata_permission(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _healthy_gh()
+    gh.answers["api /user/installations"] = _installs(
+        7, permissions={**PUBLISHER_PERMS, "metadata": "read"}
+    )
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    assert report.ok, report.render()

@@ -48,7 +48,36 @@ offline) and, for a public repository, renders `ci.yml` on `ubuntu-latest` while
 issue-triggered agent workflows keep `--runs-on`. `--ci-runs-on` overrides the CI runner, but only
 with GitHub-hosted labels on a public repository: there is no opt-in for self-hosted pull-request
 CI. `doctor` fails a public repository in which any `pull_request*`-triggered job (in any workflow
-file) targets anything but a single GitHub-hosted label.
+file) targets anything but a single GitHub-hosted label, following the jobs of every local
+reusable workflow it calls (`./.github/workflows/x.yml`, with `with:` inputs substituted). A call
+to a third-party reusable workflow, a runner expression that is not a resolvable input, or a
+Forge platform reusable workflow called without an explicit `runs_on` cannot be proven hosted and
+fails.
+
+### Runner labels
+
+The generated workflows are bash with Unix paths, so `--runs-on`/`--ci-runs-on` accept Linux and
+macOS targets only: a GitHub-hosted `ubuntu-*`/`macos-*` label from GitHub's documented list
+(`GITHUB_HOSTED_LABELS` in `onboard.py`; a version-shaped label GitHub does not provide is
+rejected), or a self-hosted runner's labels. Windows labels are refused by `onboard` and failed by
+`doctor`.
+
+### What `doctor` verifies exactly
+
+- **Implementation mode** is `[agents] implementation_mode` in `agentic-sdlc.toml` (`actions` or
+  `cloud-routine`), never inferred from which files exist. A policy written before the field
+  existed still passes while its Actions implement callers are installed; without them, add
+  `implementation_mode = "cloud-routine"` (or re-run `onboard --force`).
+- **CI gates** must be invoked exactly as `[commands]` states. Only output and fail-fast extras
+  may be appended (`-q`, `-v`, `-x`, `--maxfail=N`, `--tb=…`, `--durations=N`, `-r…`, `--color=…`);
+  anything else (`--help`, `--collect-only`, `-k`, `--ignore`, ...) fails the check.
+- **Claude Code hooks** are read from the parsed `.claude/settings.json`: a `SessionStart` group
+  firing on startup that runs `python3 .claude/hooks/forge_session_start.py`, and a `PreToolUse`
+  group whose matcher covers `Bash` running `python3 .claude/hooks/forge_commit_guard.py`.
+- **Publisher App** permissions must be exactly Contents read, Issues write, Pull requests write
+  (plus GitHub's mandatory Metadata read); any other grant fails.
+- **`onboard --apply`** merges Forge's rules into an existing `Protect main` ruleset: existing
+  rules and stricter parameters (more approvals, extra status checks, signatures) are kept.
 
 ## Required repository state
 
