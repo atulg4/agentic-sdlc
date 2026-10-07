@@ -10,7 +10,9 @@ A claim with an assignee records it in the marker (``assignee=<login>``), and
 ``owns_assignee=1`` when the lease itself put that assignee on the issue (it was not assigned
 already, or it was inherited from the expired lease this one took over). Release -- and a
 takeover -- remove only an assignee a lease owned, and only when the authoritative live lease
-does not want the same login; a pre-existing assignee is never touched.
+does not want the same login; a pre-existing assignee is never touched. A release that finds
+no lease reconciles the owned assignee of the last released one, so retrying a release whose
+cleanup failed after its marker was posted completes that cleanup.
 """
 
 from __future__ import annotations
@@ -217,6 +219,26 @@ def current_lease(
     return ordered[-1] if ordered else None
 
 
+def last_released_lease(project: str, issue: int, gh: GhRunner) -> Lease | None:
+    """The lease the most recent trusted release (or retraction) marker ended: the claim it
+    voided, with the assignee bookkeeping that claim recorded. None when no release has ended
+    a claim. Lets a retried release finish the cleanup a failed one began after its marker."""
+    latest: dict[str, Lease] = {}
+    ended: Lease | None = None
+    for comment in _comments(project, issue, gh):
+        if not _trusted(comment):
+            continue
+        body = comment.get("body") or ""
+        parsed = parse_marker(body, issue)
+        if parsed is not None:
+            latest[parsed.session] = parsed
+            continue
+        released = _release_session(body)
+        if released in latest:
+            ended = latest.pop(released)
+    return ended
+
+
 def open_prs_for_issue(project: str, issue: int, gh: GhRunner) -> list[dict]:
     raw = (
         gh(
@@ -353,6 +375,19 @@ def _drop_owned_assignee(
 ) -> None:
     """Undo the assignment an ended lease made (nothing when it did not make one)."""
     if ended is not None and ended.owns_assignee and ended.assignee:
+        _sync_assignee(project, issue, ended.assignee, gh, now)
+
+
+def _reconcile_released_assignee(
+    project: str, issue: int, gh: GhRunner, now: datetime | None
+) -> None:
+    """Drop the assignee the last released lease owned if it is still on the issue and no live
+    lease wants it (`_sync_assignee` re-checks that)."""
+    ended = last_released_lease(project, issue, gh)
+    if ended is None or not ended.owns_assignee or not ended.assignee:
+        return
+    target = json.loads(gh(["api", f"repos/{project}/issues/{issue}"]) or "{}")
+    if ended.assignee in _assignee_logins(target if isinstance(target, dict) else {}):
         _sync_assignee(project, issue, ended.assignee, gh, now)
 
 
@@ -519,7 +554,10 @@ def release(
 ) -> None:
     existing = current_lease(project, issue, gh, now)
     if existing is None:
+        # Nothing to release -- possibly because an earlier release posted its marker and then
+        # failed: finish that release's cleanup (idempotent, so a retry completes it).
         _sync_label(project, issue, gh, now)
+        _reconcile_released_assignee(project, issue, gh, now)
         return
     if existing.session != session and not force:
         raise LeaseError(f"issue #{issue} is leased by session {existing.session}, not {session}")

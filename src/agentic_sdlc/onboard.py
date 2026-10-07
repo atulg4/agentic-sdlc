@@ -51,6 +51,11 @@ DEFAULT_RUNS_ON = ("self-hosted", "linux", "x64")
 #: in that job, so it must be a fresh GitHub-hosted VM, never a persistent self-hosted runner.
 PUBLIC_CI_RUNS_ON = ("ubuntu-latest",)
 DEFAULT_QUALITY = "python -m ruff check --select E9,F63,F7,F82 ."
+#: The interpreter ci.yml's pinned actions/setup-python installs (`[ci] python_version`).
+DEFAULT_PYTHON_VERSION = "3.12"
+_PYTHON_VERSION = re.compile(r"^\d+\.\d+(?:\.\d+)?$")
+#: The policy's gate commands, in the order ci.yml runs them.
+GATE_COMMANDS = ("setup", "quality", "test")
 HUMAN_REVIEW_LABEL = "human-review-required"
 IMPLEMENTATION_LABEL = "implementation-approved"
 RULESET_NAME = "Protect main"
@@ -107,6 +112,22 @@ class OnboardError(ValueError):
     """Raised when a repository cannot be onboarded safely."""
 
 
+def gate_command_problem(command: object) -> str:
+    """Why a policy gate command cannot be rendered into ci.yml unchanged ('' = it can). A gate
+    is ONE line: a newline is a shell command separator, so folding it into a space would change
+    what runs (`true\npytest` -> `true pytest`), and a YAML block would make the rendered step
+    something doctor has to re-prove. `${{` is a GitHub expression, evaluated before the shell
+    sees the command, so CI would not run the command the policy states."""
+    text = str(command)
+    if "\n" in text or "\r" in text:
+        return "must be a single line (join commands with `&&` instead of newlines)"
+    if any(ord(c) < 32 and c != "\t" for c in text):
+        return "must not contain control characters"
+    if "${{" in text:
+        return "must not contain a GitHub expression (`${{`)"
+    return ""
+
+
 @dataclass(frozen=True)
 class OnboardSpec:
     project_id: str
@@ -128,6 +149,7 @@ class OnboardSpec:
     protected_paths: tuple[str, ...] = ()
     max_changed_files: int = 20
     max_diff_lines: int = 2500
+    python_version: str = DEFAULT_PYTHON_VERSION
 
     def __post_init__(self) -> None:
         if not _PROJECT.fullmatch(self.project_id) or not _PROJECT.fullmatch(
@@ -159,6 +181,16 @@ class OnboardSpec:
             )
         if not self.test_command.strip():
             raise OnboardError("a test command is required; the gate fails closed without one")
+        for gate, command in zip(
+            GATE_COMMANDS,
+            (self.setup_command, self.quality_command, self.test_command),
+            strict=True,
+        ):
+            problem = gate_command_problem(command)
+            if problem:
+                raise OnboardError(f"--{gate}: {problem}")
+        if not _PYTHON_VERSION.fullmatch(self.python_version):
+            raise OnboardError("python version must look like 3.12 or 3.12.4")
         if (
             not self.ready_label.strip()
             or len(self.ready_label) > 50
@@ -288,8 +320,30 @@ def _yaml_labels(labels: Sequence[str]) -> str:
 
 
 def _yaml_run(command: str) -> str:
-    """A shell command as one quoted scalar (`_yaml_str`), newlines folded to spaces."""
-    return _yaml_str(command.replace("\n", " ").strip())
+    """A gate command as one quoted scalar (`_yaml_str`), byte for byte. Never normalized:
+    `gate_command_problem` refuses the multiline commands a normalization would change."""
+    problem = gate_command_problem(command)
+    if problem:
+        raise OnboardError(f"gate command {command!r} {problem}")
+    return _yaml_str(command)
+
+
+def _md_code(value: object) -> str:
+    """`value` as a Markdown inline code span that no backtick inside it can close: fenced by a
+    backtick run longer than any it contains, padded when it starts or ends with one."""
+    text = str(value).replace("\n", " ")
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    fence = "`" * (longest + 1)
+    pad = " " if text.startswith("`") or text.endswith("`") or not text.strip() else ""
+    return f"{fence}{pad}{text}{pad}{fence}"
+
+
+def _md_block(lines: Sequence[str], info: str = "") -> str:
+    """`lines` as a fenced Markdown code block whose fence no line can close (longer than any
+    backtick run inside)."""
+    longest = max((len(run) for line in lines for run in re.findall(r"`+", line)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}{info}\n" + "".join(f"{line}\n" for line in lines) + fence
 
 
 def _expr_str(value: str) -> str:
@@ -347,28 +401,28 @@ def render_policy(spec: OnboardSpec) -> str:
     implementer = {"route": "router", "cloud-routine": "claude"}.get(
         spec.implementer, spec.implementer
     )
-    patterns = "".join(f"  '{p}',\n" for p in BASE_FORBIDDEN_TASKS)
-    return f'''\
+    patterns = "".join(f"  {_toml_str(p)},\n" for p in BASE_FORBIDDEN_TASKS)
+    return f"""\
 version = 1
 
 [project]
-id = "{spec.project_id}"
+id = {_toml_str(spec.project_id)}
 provider = "github"
-default_branch = "{spec.default_branch}"
+default_branch = {_toml_str(spec.default_branch)}
 
 [agents]
 planner = "codex"
-implementer = "{implementer}"
+implementer = {_toml_str(implementer)}
 reviewer = "codex"
 # Where implementation runs: "actions" (agent-implement.yml / agent-auto-implement.yml) or
 # "cloud-routine" (docs/forge/cloud-implementer.md). `sdlcctl doctor` reads this, never infers it.
-implementation_mode = "{spec.implementation_mode}"
+implementation_mode = {_toml_str(spec.implementation_mode)}
 
 [automation]
 default_mode = "plan"
-ready_label = "{spec.ready_label}"
-human_review_label = "{HUMAN_REVIEW_LABEL}"
-implementation_label = "{IMPLEMENTATION_LABEL}"
+ready_label = {_toml_str(spec.ready_label)}
+human_review_label = {_toml_str(HUMAN_REVIEW_LABEL)}
+implementation_label = {_toml_str(IMPLEMENTATION_LABEL)}
 lease_ttl_minutes = 240
 {routing}
 [policy]
@@ -383,14 +437,20 @@ forbidden_task_patterns = [
 {patterns}]
 
 [commands]
+# Rendered verbatim into ci.yml's `test` job, which doctor requires to match exactly: change a
+# command here and re-run `sdlcctl onboard --force`. One line each.
 setup = {_toml_str(spec.setup_command)}
 quality = {_toml_str(spec.quality_command)}
 test = {_toml_str(spec.test_command)}
 
+[ci]
+# The interpreter ci.yml's pinned actions/setup-python installs.
+python_version = {_toml_str(spec.python_version)}
+
 [verification]
 gates = ["setup", "quality", "test"]
 timeout_seconds = {{ setup = 900, quality = 300, test = 900 }}
-'''
+"""
 
 
 def render_agents_md(spec: OnboardSpec) -> str:
@@ -425,11 +485,7 @@ Codex is the primary architect, planner, and independent reviewer. The routed im
 
 ## Verification
 
-```bash
-{spec.setup_command}
-{spec.quality_command}
-{spec.test_command}
-```
+{_md_block((spec.setup_command, spec.quality_command, spec.test_command), "bash")}
 
 The controlling machine-readable policy is `agentic-sdlc.toml`.
 """
@@ -443,7 +499,7 @@ Read `AGENTS.md` first; it is the authoritative agent guide. Highlights:
 - **Claim first.** Work only on an issue you lease (`sdlcctl claim … --session <your session id>`);
   the SessionStart hook prints the id and which issues other agents hold. The commit guard blocks
   commits on `*/issue-N` branches without your lease.
-- **Tests first.** Every change ships with tests. Run `{spec.test_command}` before
+- **Tests first.** Every change ships with tests. Run {_md_code(spec.test_command)} before
   proposing a change.
 - **Merge authority is the repository owner.** Agents open draft PRs only; never merge,
   approve, or deploy.
@@ -456,18 +512,9 @@ Read `AGENTS.md` first; it is the authoritative agent guide. Highlights:
 
 
 def render_cloud_routine_md(spec: OnboardSpec) -> str:
-    return f"""# Cloud implementer routine — {spec.project_id}
-
-Implementation for this repository is done by a **Claude Code cloud routine** (a scheduled cloud
-agent on claude.ai), not by a GitHub Actions job, so no self-hosted runner is required for it.
-The routine must obey `AGENTS.md`, `CLAUDE.md` and `agentic-sdlc.toml` exactly as an Actions
-implementer would. Suggested routine prompt (create it with the `schedule` skill or the
-claude.ai routines UI):
-
-```
-Repository: {spec.project_id}. Every run:
-1. List open issues that carry ALL of: `{spec.ready_label}`, `{HUMAN_REVIEW_LABEL}`,
-   `{IMPLEMENTATION_LABEL}`
+    prompt = f"""Repository: {spec.project_id}. Every run:
+1. List open issues that carry ALL of: {_md_code(spec.ready_label)}, {_md_code(HUMAN_REVIEW_LABEL)},
+   {_md_code(IMPLEMENTATION_LABEL)}
    and have no open PR referencing them. Take the oldest one; if none, stop.
 1b. Claim it before touching code:
    `sdlcctl claim --project {spec.project_id} --issue <n> --agent cloud-routine
@@ -478,12 +525,24 @@ Repository: {spec.project_id}. Every run:
 3. On a new branch `forge/issue-<n>`, implement the smallest change that satisfies the acceptance
    criteria, tests first. Never touch `forbidden_paths` from agentic-sdlc.toml; stay within
    max_changed_files={spec.max_changed_files} and max_diff_lines={spec.max_diff_lines}.
-4. Run: {spec.setup_command} && {spec.quality_command} && {spec.test_command}. All must pass.
+4. Run each, in order; all must pass:
+   {spec.setup_command}
+   {spec.quality_command}
+   {spec.test_command}
 5. Open a DRAFT pull request titled "<issue title> (#<n>)" with a summary and test plan;
    link the issue. Then `sdlcctl release` the lease (the open PR now marks the work); on any
    failure, release it too so another run can retry.
    Never merge, approve, deploy, or edit workflows/policy files.
-```
+"""
+    return f"""# Cloud implementer routine — {spec.project_id}
+
+Implementation for this repository is done by a **Claude Code cloud routine** (a scheduled cloud
+agent on claude.ai), not by a GitHub Actions job, so no self-hosted runner is required for it.
+The routine must obey `AGENTS.md`, `CLAUDE.md` and `agentic-sdlc.toml` exactly as an Actions
+implementer would. Suggested routine prompt (create it with the `schedule` skill or the
+claude.ai routines UI):
+
+{_md_block(prompt.splitlines())}
 
 Required GitHub state (created by `sdlcctl onboard --apply`): the three labels, the
 `{RULESET_NAME}` ruleset requiring the `{REQUIRED_CHECK}` check and review-thread resolution.
@@ -660,6 +719,7 @@ WORKFLOW_PLACEHOLDERS = (
     "SETUP_COMMAND",
     "QUALITY_COMMAND",
     "TEST_COMMAND",
+    "PYTHON_VERSION",
     "AUTO_PLAN_IF",
     "AUTO_IMPLEMENT_IF",
 )
@@ -707,6 +767,7 @@ def _render_workflow(name: str, spec: OnboardSpec, issue_expr: str | None = None
         "SETUP_COMMAND": _yaml_run(spec.setup_command),
         "QUALITY_COMMAND": _yaml_run(spec.quality_command),
         "TEST_COMMAND": _yaml_run(spec.test_command),
+        "PYTHON_VERSION": _yaml_str(spec.python_version),
         "AUTO_PLAN_IF": _yaml_folded(auto_plan_condition(*labels), " " * 6),
         "AUTO_IMPLEMENT_IF": _yaml_folded(auto_implement_condition(*labels), " " * 6),
     }
@@ -722,7 +783,8 @@ def render_work_request(spec: OnboardSpec) -> str:
     text = _resource("work-request.md")
     rendered, count = re.subn(
         r"^labels: .*$",
-        f"labels: {spec.ready_label}, {HUMAN_REVIEW_LABEL}",
+        # A flow sequence of quoted scalars: a label's `:`, `#`, quotes or leading `-` stay text.
+        lambda _: f"labels: {_yaml_labels((spec.ready_label, HUMAN_REVIEW_LABEL))}",
         text,
         count=1,
         flags=re.MULTILINE,
@@ -906,39 +968,79 @@ def ruleset_mismatches(actual: dict, spec: OnboardSpec) -> list[str]:
     exclude = ((actual.get("conditions") or {}).get("ref_name") or {}).get("exclude") or []
     if exclude:  # an exclusion match makes the condition fail; the payload excludes nothing
         problems.append("excludes " + ", ".join(map(str, exclude)))
-    rules = {r.get("type"): r.get("parameters") or {} for r in actual.get("rules") or []}
+    rules = {
+        r.get("type"): r.get("parameters") or {}
+        for r in actual.get("rules") or []
+        if isinstance(r, dict)
+    }
+    # Every parameter Forge's payload sets, iterated rather than hand-listed, so no field can
+    # drift unchecked: a boolean Forge sets true must be true, a count at least Forge's, a list
+    # a superset of Forge's (required status checks by context, bound to GitHub Actions).
     for rule in want["rules"]:
-        if rule["type"] not in rules:
-            problems.append(f"missing rule {rule['type']}")
-    if "pull_request" in rules and not rules["pull_request"].get(
-        "required_review_thread_resolution"
-    ):
-        problems.append("review-thread resolution not required")
-    if "required_status_checks" in rules:
-        checks = [
-            c
-            for c in rules["required_status_checks"].get("required_status_checks") or []
-            if isinstance(c, dict)
-        ]
-        contexts = {c.get("context") for c in checks}
-        if REQUIRED_CHECK not in contexts:
-            problems.append(f"status check '{REQUIRED_CHECK}' not required")
-        foreign = sorted(
-            {
-                str(c.get("integration_id"))
-                for c in checks
-                if c.get("context") == REQUIRED_CHECK and _foreign_integration(c)
-            }
-        )
-        if foreign:
-            problems.append(
-                f"status check '{REQUIRED_CHECK}' only accepts integration "
-                f"{', '.join(foreign)}, not GitHub Actions ({GITHUB_ACTIONS_INTEGRATION_ID}): "
-                "ci.yml's job can never satisfy it"
-            )
-        if not rules["required_status_checks"].get("strict_required_status_checks_policy"):
-            problems.append("status checks are not strict (branch must be up to date)")
+        kind = rule["type"]
+        if kind not in rules:
+            problems.append(f"missing rule {kind}")
+            continue
+        have = rules[kind] if isinstance(rules[kind], dict) else {}
+        for key, wanted in (rule.get("parameters") or {}).items():
+            problems += _parameter_shortfall(kind, key, wanted, have.get(key))
     return problems
+
+
+#: The messages doctor has always printed for the best-known parameters.
+_PARAMETER_MESSAGES = {
+    "required_review_thread_resolution": "review-thread resolution not required",
+    "strict_required_status_checks_policy": (
+        "status checks are not strict (branch must be up to date)"
+    ),
+    "dismiss_stale_reviews_on_push": (
+        "stale approvals are not dismissed on push (an approval survives new commits)"
+    ),
+}
+
+
+def _parameter_shortfall(kind: str, key: str, wanted: object, have: object) -> list[str]:
+    """Why the existing value `have` of rule `kind`'s parameter `key` is weaker than Forge's
+    `wanted` (empty = it is at least as strict)."""
+    if isinstance(wanted, bool):
+        if wanted and have is not True:
+            return [_PARAMETER_MESSAGES.get(key, f"{kind} {key} is {have!r}, must be true")]
+        return []
+    if isinstance(wanted, int):
+        if isinstance(have, bool) or not isinstance(have, int) or have < wanted:
+            return [f"{kind} {key} is {have!r}, must be at least {wanted}"]
+        return []
+    if key == "required_status_checks":
+        checks = [c for c in have if isinstance(c, dict)] if isinstance(have, list) else []
+        problems = []
+        for want_check in wanted if isinstance(wanted, list) else []:
+            context = want_check.get("context")
+            matching = [c for c in checks if c.get("context") == context]
+            if not matching:
+                problems.append(f"status check '{context}' not required")
+                continue
+            foreign = sorted(
+                {str(c.get("integration_id")) for c in matching if _foreign_integration(c)}
+            )
+            if foreign:
+                problems.append(
+                    f"status check '{context}' only accepts integration "
+                    f"{', '.join(foreign)}, not GitHub Actions ({GITHUB_ACTIONS_INTEGRATION_ID}): "
+                    "ci.yml's job can never satisfy it"
+                )
+        return problems
+    if isinstance(wanted, list):
+        listed = have if isinstance(have, list) else []
+        lacking = [item for item in wanted if item not in listed]
+        return [f"{kind} {key} lacks {lacking!r}"] if lacking else []
+    if isinstance(wanted, dict):
+        nested = have if isinstance(have, dict) else {}
+        return [
+            problem
+            for sub, value in wanted.items()
+            for problem in _parameter_shortfall(kind, f"{key}.{sub}", value, nested.get(sub))
+        ]
+    return [] if have == wanted else [f"{kind} {key} is {have!r}, must be {wanted!r}"]
 
 
 def _foreign_integration(check: dict) -> bool:
@@ -1818,16 +1920,77 @@ def _ci_runs_on(base: Path) -> RunnerTarget | None:
     return labels if labels is not None else _unresolved_target(job["runs-on"], "runs-on")
 
 
+def policy_gate_commands(policy_doc: dict) -> tuple[dict[str, str], list[str]]:
+    """The policy's `[commands]` setup/quality/test, and why any cannot be rendered into ci.yml
+    (missing, or not a single line -- `gate_command_problem`). Never normalized."""
+    table = policy_doc.get("commands") if isinstance(policy_doc, dict) else None
+    table = table if isinstance(table, dict) else {}
+    commands: dict[str, str] = {}
+    problems: list[str] = []
+    for gate in GATE_COMMANDS:
+        value = table.get(gate)
+        if not isinstance(value, str) or not value.strip():
+            problems.append(f"policy has no [commands] {gate}")
+            continue
+        problem = gate_command_problem(value)
+        if problem:
+            problems.append(f"policy [commands] {gate} {problem}")
+            continue
+        commands[gate] = value
+    return commands, problems
+
+
+def policy_python_version(policy_doc: dict) -> str:
+    """`[ci] python_version` (DEFAULT_PYTHON_VERSION when the policy predates it)."""
+    table = policy_doc.get("ci") if isinstance(policy_doc, dict) else None
+    value = table.get("python_version") if isinstance(table, dict) else None
+    return str(value) if value is not None else DEFAULT_PYTHON_VERSION
+
+
+def _template_spec(policy_doc: dict, **fields) -> OnboardSpec:
+    """An OnboardSpec carrying the policy's gate commands and Python version (raises
+    OnboardError when the policy's commands cannot be rendered)."""
+    commands, problems = policy_gate_commands(policy_doc)
+    if problems:
+        raise OnboardError("; ".join(problems))
+    return OnboardSpec(
+        setup_command=commands["setup"],
+        quality_command=commands["quality"],
+        test_command=commands["test"],
+        python_version=policy_python_version(policy_doc),
+        **fields,
+    )
+
+
+def expected_ci_steps(policy_doc: dict) -> list:
+    """The parsed `steps` of the `test` job `onboard` renders for this policy: the ONLY steps
+    ci.yml's test job may have (raises OnboardError when they cannot be rendered)."""
+    import yaml  # deferred: the CLI must import without site dependencies
+
+    spec = _template_spec(
+        policy_doc,
+        project_id="forge/consumer",
+        platform_repository="forge/platform",
+        platform_ref="0" * 40,
+    )
+    doc = yaml.safe_load(_render_workflow("ci.yml", spec))
+    return json.loads(json.dumps(doc["jobs"][REQUIRED_CHECK]["steps"]))
+
+
 def _ci_problems(base: Path) -> list[str]:
-    """ci.yml must run on pull_request, as a job named `test`, the policy's three commands --
-    and nothing in the job may change what those commands do (`_gate_environment_problems`)."""
+    """ci.yml must run on pull_request, as a job named `test`, whose steps are EXACTLY the steps
+    `onboard` renders from the policy's commands (`expected_ci_steps`): the test job is fully
+    managed, so no hand edit can change what the gates run. The structural analysis that
+    follows (the policy's three commands are enforced invocations; nothing in the job changes
+    what they do, `_gate_environment_problems`) is defense in depth behind that equality."""
     import yaml  # deferred: the CLI must import without site dependencies
 
     try:
         doc = yaml.safe_load((base / ".github/workflows/ci.yml").read_text())
-        commands = tomllib.loads((base / "agentic-sdlc.toml").read_text()).get("commands") or {}
+        policy_doc = tomllib.loads((base / "agentic-sdlc.toml").read_text())
     except (OSError, yaml.YAMLError, tomllib.TOMLDecodeError) as exc:
         return [str(exc)[:200]]
+    commands, command_problems = policy_gate_commands(policy_doc)
     if not isinstance(doc, dict):
         return ["not a workflow mapping"]
     problems = []
@@ -1850,6 +2013,22 @@ def _ci_problems(base: Path) -> list[str]:
         for key in ("if", "continue-on-error")
         if _job_key_set(job, key)
     ]
+    if command_problems:
+        problems += command_problems
+    else:
+        try:
+            want_steps = expected_ci_steps(policy_doc)
+        except OnboardError as exc:
+            problems.append(f"the template's steps cannot be rendered ({exc})")
+        else:
+            have_steps = json.loads(json.dumps(job.get("steps"), default=str))
+            found = _first_difference(want_steps, have_steps, f"jobs.{REQUIRED_CHECK}.steps")
+            if found:
+                problems.append(
+                    f"'{REQUIRED_CHECK}' job steps differ from the ones onboard renders from the "
+                    f"policy commands, at {found}: the CI test job is fully managed -- change "
+                    "[commands] in agentic-sdlc.toml and re-run `sdlcctl onboard --force`"
+                )
     steps = job.get("steps")
     steps = [s for s in steps if isinstance(s, dict)] if isinstance(steps, list) else []
     shell = _default_shell(doc, job)
@@ -1868,13 +2047,13 @@ def _ci_problems(base: Path) -> list[str]:
         if enforced
     ]
     wanted_by_gate = {}
-    for gate in ("setup", "quality", "test"):
-        command = str(commands.get(gate, "")).replace("\n", " ").strip()
+    for gate in GATE_COMMANDS:
+        command = commands.get(gate)
+        if command is None:
+            continue  # reported by policy_gate_commands
         wanted = _shell_commands(command)
         wanted_by_gate[gate] = wanted
-        if not command:
-            problems.append(f"policy has no [commands] {gate}")
-        elif not wanted or not all(
+        if not wanted or not all(
             any(_gate_invocation(argv, want) for argv in executed) for want in wanted
         ):
             problems.append(f"'{REQUIRED_CHECK}' job does not run the {gate} command {command!r}")
@@ -1972,6 +2151,8 @@ GATE_ENV_BENIGN = frozenset(
 GATE_TRUSTED_ACTIONS = frozenset(
     {"actions/checkout", "actions/setup-python", "actions/cache", "astral-sh/setup-uv"}
 )
+#: actions/checkout inputs that change WHICH code is checked out (and so tested).
+CHECKOUT_FORBIDDEN_INPUTS = frozenset({"ref", "repository"})
 _PYTHON_PROGRAMS = re.compile(r"^python(?:3(?:\.\d+)?)?$")
 
 
@@ -2034,6 +2215,20 @@ def _gate_environment_problems(
         uses = step.get("uses")
         if uses is not None:
             action = str(uses).split("@", 1)[0].strip()
+            inputs = step.get("with")
+            if action == "actions/checkout":
+                # The pull request's merge revision is what the check vouches for: any other
+                # ref or repository tests code that is not the change.
+                moved = (
+                    sorted(k for k in inputs if str(k) in CHECKOUT_FORBIDDEN_INPUTS)
+                    if isinstance(inputs, dict)
+                    else ([] if inputs is None else ["<unreadable with:>"])
+                )
+                if moved:
+                    problems.append(
+                        f"{label} checks out with {', '.join(map(str, moved))}: the gates must "
+                        "run on the pull request's own revision"
+                    )
             if action not in GATE_TRUSTED_ACTIONS:
                 problems.append(
                     f"{label} uses {action}, which may export variables the gates inherit "
@@ -2046,6 +2241,11 @@ def _gate_environment_problems(
             problems.append(f"{label} sets {', '.join(bad)}, which changes the gates")
         if parsed.github_env:
             problems.append(f"{label} writes $GITHUB_ENV: later steps' gates inherit it")
+        if parsed.github_path:
+            problems.append(
+                f"{label} mentions $GITHUB_PATH: a directory added there can put another "
+                "program in place of a gate tool for every later step"
+            )
         shadow = sorted((parsed.functions | parsed.aliases) & gate_programs)
         if shadow:
             problems.append(f"{label} defines {', '.join(shadow)} as a function/alias")
@@ -2096,6 +2296,8 @@ _SHELL_KEYWORDS = {"then", "else", "do", "{", "}", "time"}
 _SHELL_CONDITIONS = {"if", "elif", "while", "until", "!"}
 _SHELL_OPENERS = {"if", "while", "until", "for", "case", "select"}
 _SHELL_CLOSERS = {"fi", "done", "esac"}
+#: Builtins after which the script (or the function) may not continue: `exit 0; pytest`.
+_SHELL_TERMINATORS = {"exit", "exec", "return"}
 #: Builtins whose `NAME=value` / `NAME` operands set (or export) a variable.
 _SHELL_DECLARERS = {"export", "declare", "typeset", "readonly", "local"}
 _ASSIGNMENT_WORD = re.compile(r"^([A-Za-z_]\w*)=")
@@ -2132,6 +2334,8 @@ class ShellScript:
     sourced: list[str]
     evals: bool
     github_env: bool
+    #: Any mention of `$GITHUB_PATH` (a write there prepends to every later step's PATH).
+    github_path: bool = False
 
 
 def _shell_parse(script: str, shell: object = None) -> ShellScript:
@@ -2151,7 +2355,10 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
     """
     shell_name = None if shell is None else str(shell).strip()
     errexit = shell_name in _ERREXIT_SHELLS
-    out = ShellScript([], set(), set(), set(), [], False, "GITHUB_ENV" in script)
+    out = ShellScript(
+        [], set(), set(), set(), [], False, "GITHUB_ENV" in script, "GITHUB_PATH" in script
+    )
+    terminated = False  # an `exit`/`exec`/`return` was seen: nothing after it is proven reached
     records: list[dict] = []
     depth = 0
     braces: list[str] = []  # "function" / "group" per open `{`
@@ -2230,7 +2437,8 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                 records.append(
                     {
                         "argv": tuple(argv),
-                        "reached": not condition
+                        "reached": not terminated
+                        and not condition
                         and not nested
                         and not in_function
                         and previous != "||",
@@ -2242,6 +2450,13 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                         and shell_name is not None,
                     }
                 )
+                program = (
+                    argv[1] if argv[0] in {"builtin", "command"} and len(argv) > 1 else argv[0]
+                )
+                if program in _SHELL_TERMINATORS:
+                    # Fails closed: wherever it sits (a condition, a branch, a function body, a
+                    # subshell), it may end the script, so later commands are not proven to run.
+                    terminated = True
             argv = []
             if token is None:  # a line ending in an operator continues the list
                 previous = previous if tokens[-1] in {"&&", "||", "|"} else ";"
@@ -2362,8 +2577,9 @@ _TUNED = "<tunable>"
 #: validated by its own check instead. Documented in docs/onboarding.md ("Managed workflows").
 #:   - every job's `runs-on`, and a reusable call's `with.runs_on` (the runner checks);
 #:   - a reusable-implement call's `with.route_budget_usd` (absent or present; the budget check);
-#:   - ci.yml's `test` job `steps` (the gate check: exact policy commands, trusted actions only,
-#:     no environment that changes a gate);
+#: ci.yml's `test` job `steps` are NOT tunable: the template is rendered from the policy's own
+#: `[commands]` and `[ci] python_version`, so the steps must equal it exactly (customize them only
+#: through the policy, then re-run onboard).
 #:   - the automatic callers' label `if:` (the label-condition check: exactly the generated
 #:     condition for the POLICY's labels);
 #:   - the platform pin: the template is rendered at the caller's own pinned SHA (the pin check:
@@ -2372,7 +2588,6 @@ TUNABLE_KNOBS = (
     "jobs.*.runs-on",
     "jobs.*.with.runs_on",
     "jobs.*.with.route_budget_usd",
-    "ci.yml: jobs.test.steps",
     "agent-auto-plan.yml: jobs.plan.if",
     "agent-auto-implement.yml: jobs.preflight.if",
     "platform ref pin",
@@ -2397,8 +2612,6 @@ def _mask_tunables(name: str, doc: object) -> object:
             if "runs_on" in passed:
                 passed["runs_on"] = _TUNED
             passed.pop("route_budget_usd", None)
-        if name == "ci.yml" and job_name == REQUIRED_CHECK and "steps" in job:
-            job["steps"] = _TUNED
         if _LABEL_CONDITION_JOBS.get(name) == job_name:
             job["if"] = _TUNED
     return doc
@@ -2478,11 +2691,11 @@ def managed_workflow_drift(
             continue
         pin = _caller_pin(installed, platform_repository) or "0" * 40
         try:
-            spec = OnboardSpec(
+            spec = _template_spec(
+                policy_doc,
                 project_id=project_id,
                 platform_repository=platform_repository,
                 platform_ref=pin,
-                test_command="-",  # ci.yml's steps are a tunable knob
                 implementer=implementer,
                 default_branch=default_branch,
             )

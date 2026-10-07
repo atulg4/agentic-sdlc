@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import json
 import re
+import tomllib
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -627,7 +629,7 @@ def test_issue_template_carries_the_profile_ready_label():
     template = render_onboarding(spec(ready_label="forge-ready"))[
         ".github/ISSUE_TEMPLATE/agent-work-request.md"
     ]
-    assert "labels: forge-ready, human-review-required" in template
+    assert 'labels: ["forge-ready", "human-review-required"]' in template
     assert "agent-ready" not in template
 
 
@@ -1348,12 +1350,30 @@ def test_doctor_rejects_a_ci_gate_that_only_mentions_the_command(tmp_path, run):
     assert "ci.yml runs the policy gates as 'test'" in _failed(report)
 
 
+STEPS_DIFFER = "job steps differ from the ones onboard renders"
+
+
+def _analysis_only(repo: Path) -> list[str]:
+    """_ci_problems without the template-equality finding: the defense-in-depth analysis."""
+    from agentic_sdlc.onboard import _ci_problems
+
+    return [p for p in _ci_problems(repo) if STEPS_DIFFER not in p]
+
+
+def _assert_only_template_drift(repo: Path) -> None:
+    """A hand-edited test job the gate analysis accepts still fails doctor: the CI test job is
+    fully managed, so its steps must equal the template (the primary guarantee)."""
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    check = _failed(report)["ci.yml runs the policy gates as 'test'"]
+    assert STEPS_DIFFER in check.detail and "onboard --force" in check.detail, check.detail
+    assert _analysis_only(repo) == []
+
+
 def test_doctor_accepts_a_ci_gate_run_as_a_command_among_others(tmp_path):
     repo = _repo(tmp_path)
     write_onboarding(repo, spec())
     _ci_test_step(repo, "set -e  # run the tests\nCI=1 pytest tests -q -m 'not e2e' --maxfail=1")
-    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
-    assert "ci.yml runs the policy gates as 'test'" not in _failed(report)
+    _assert_only_template_drift(repo)
 
 
 def test_doctor_rejects_a_client_id_of_another_publisher_app(tmp_path):
@@ -2291,8 +2311,11 @@ def test_doctor_accepts_a_ci_gate_with_only_output_or_fail_fast_extras(tmp_path,
     repo = _repo(tmp_path)
     write_onboarding(repo, spec())
     _ci_test_step(repo, f"pytest tests -q -m 'not e2e' {suffix}".strip())
-    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
-    assert "ci.yml runs the policy gates as 'test'" not in _failed(report)
+    if suffix:
+        _assert_only_template_drift(repo)
+    else:
+        report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+        assert "ci.yml runs the policy gates as 'test'" not in _failed(report)
 
 
 @pytest.mark.parametrize(
@@ -2629,7 +2652,7 @@ def test_doctor_rejects_a_gate_whose_meaning_is_changed(tmp_path, mutate):
     [
         lambda doc, job, step: step.update({"env": {"PYTHONUNBUFFERED": "1", "CI": "true"}}),
         lambda doc, job, step: step.update({"run": "source .venv/bin/activate\n" + step["run"]}),
-        lambda doc, job, step: job["steps"].insert(1, {"uses": "actions/setup-python@v5"}),
+        lambda doc, job, step: job["steps"].insert(1, {"uses": "actions/cache@v4"}),
         lambda doc, job, step: step.update({"run": "helper() { echo hi; }\n" + step["run"]}),
     ],
 )
@@ -2637,8 +2660,7 @@ def test_doctor_accepts_a_gate_with_benign_surroundings(tmp_path, mutate):
     repo = _repo(tmp_path)
     write_onboarding(repo, spec())
     _mutate_ci_test_step(repo, mutate)
-    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
-    assert "ci.yml runs the policy gates as 'test'" not in failed
+    _assert_only_template_drift(repo)
 
 
 @pytest.mark.parametrize("budget", ["bogus", "${{ vars.ROUTE_BUDGET }}", True, "nan", "-1"])
@@ -2879,13 +2901,6 @@ def test_doctor_tolerates_only_the_tunable_knobs(tmp_path):
         "agent-auto-implement.yml",
         lambda d: d["jobs"]["implement"]["with"].update(route_budget_usd="5"),
     )
-    _edit_workflow(
-        repo,
-        "ci.yml",
-        lambda d: d["jobs"]["test"]["steps"].insert(
-            1, {"uses": "actions/setup-python@v5", "with": {"python-version": "3.12"}}
-        ),
-    )
     assert _drift(repo) is None
 
 
@@ -3043,3 +3058,305 @@ def test_doctor_fails_implementation_on_a_macos_runner(tmp_path):
     detail = failed["implementation runs on Linux runners"].detail
     assert "agent-auto-implement.yml:implement (runs_on)" in detail and "macos-15" in detail
     assert DRIFT not in failed  # the runner is a tunable knob, checked here instead
+
+
+# ---------------------------------------------------------------- review regressions (PR 139, 8)
+# The CI test job is fully managed: its steps must equal what onboard renders from the policy.
+
+SETUP_PYTHON = "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1"
+GATE_CHECK = "ci.yml runs the policy gates as 'test'"
+
+
+def test_ci_template_pins_setup_python_and_checks_out_the_pull_request_itself():
+    from agentic_sdlc.onboard import TUNABLE_KNOBS
+
+    files = render_onboarding(spec(python_version="3.11"))
+    steps = yaml.safe_load(files[".github/workflows/ci.yml"])["jobs"]["test"]["steps"]
+    assert steps[0]["uses"].startswith("actions/checkout@")
+    assert steps[0]["with"] == {"persist-credentials": False}  # no ref/repository
+    assert steps[1] == {"uses": SETUP_PYTHON, "with": {"python-version": "3.11"}}
+    assert [s.get("name") for s in steps[2:]] == ["Setup", "Quality", "Test"]
+    assert "GITHUB_PATH" not in files[".github/workflows/ci.yml"]
+    policy = tomllib.loads(files["agentic-sdlc.toml"])
+    assert policy["ci"] == {"python_version": "3.11"}
+    assert not any("steps" in knob for knob in TUNABLE_KNOBS)
+    with pytest.raises(OnboardError, match="python version"):
+        spec(python_version="3.12; rm -rf /")
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        # Codex 4204654774: a shim directory on $GITHUB_PATH replaces pytest for later steps
+        lambda steps: steps.insert(
+            2, {"run": 'mkdir -p shim && echo "$PWD/shim" >> "$GITHUB_PATH"'}
+        ),
+        # Codex 4204654809: the default branch tested instead of the pull request
+        lambda steps: steps[0]["with"].update(ref="main"),
+        lambda steps: steps[0]["with"].update(repository="someone/else"),
+        # Codex 4204654813: the gate after an unconditional exit never runs
+        lambda steps: steps[-1].update(run="exit 0; " + steps[-1]["run"]),
+        lambda steps: steps[-1].update(run="exec true; " + steps[-1]["run"]),
+        # a harmless-looking hand edit is drift too
+        lambda steps: steps.insert(2, {"uses": "actions/cache@v4"}),
+        lambda steps: steps[1]["with"].update({"python-version": "3.9"}),
+    ],
+)
+def test_doctor_requires_the_ci_test_steps_to_equal_the_template(tmp_path, change):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    _edit_workflow(repo, "ci.yml", lambda d: change(d["jobs"]["test"]["steps"]))
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert STEPS_DIFFER in failed[GATE_CHECK].detail
+    assert "at jobs.test.steps" in failed[DRIFT].detail
+
+
+def test_ci_gate_analysis_flags_github_path_checkout_inputs_and_terminators(tmp_path):
+    """Defense in depth behind template equality: each trick is also caught by the analysis."""
+    cases = {
+        "mentions $GITHUB_PATH": lambda st: st.insert(
+            2, {"run": 'echo "$PWD/shim" >> "$GITHUB_PATH"'}
+        ),
+        "checks out with ref": lambda st: st[0]["with"].update(ref="main"),
+        "checks out with repository": lambda st: st[0]["with"].update(repository="a/b"),
+        "does not run the test command": lambda st: st[-1].update(run="exit 0; " + st[-1]["run"]),
+    }
+    for index, (expected, change) in enumerate(cases.items()):
+        repo = _repo(tmp_path / str(index))
+        write_onboarding(repo, spec())
+        _edit_workflow(repo, "ci.yml", lambda d, c=change: c(d["jobs"]["test"]["steps"]))
+        found = _analysis_only(repo)
+        assert any(expected in p for p in found), (expected, found)
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        "exit 0; pytest",
+        "exit; pytest",
+        "exec true; pytest",
+        "return 0; pytest",
+        "false || exit 0; pytest",
+        "if true; then exit 0; fi; pytest",
+        "f() { exit 0; }; f; pytest",
+        "builtin exit 0; pytest",
+        "exit 0\npytest",
+    ],
+)
+def test_shell_parse_treats_exit_exec_return_as_terminators(script):
+    from agentic_sdlc.onboard import _shell_parse
+
+    commands = _shell_parse(script).commands
+    assert ("pytest",) in [argv for argv, _ in commands]
+    assert not any(enforced for argv, enforced in commands if argv == ("pytest",)), commands
+    assert _shell_parse("pytest; exit 0").commands[0] == (("pytest",), True)
+
+
+@pytest.mark.parametrize("bad", ["true\npytest", "pytest\r", "pytest ${{ github.ref }}", "a\x00b"])
+def test_gate_commands_must_be_single_line_and_expression_free(tmp_path, bad):
+    """Codex 4204654802: `true\\npytest` used to render as `true pytest` (always passing)."""
+    from agentic_sdlc.onboard import _yaml_run
+
+    for field in ("test_command", "setup_command", "quality_command"):
+        with pytest.raises(OnboardError):
+            spec(**{field: bad})
+    with pytest.raises(OnboardError):
+        _yaml_run(bad)
+    # A policy edited by hand to hold one is refused by doctor too, never normalized.
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    toml = repo / "agentic-sdlc.toml"
+    toml.write_text(
+        toml.read_text().replace(
+            "test = \"pytest tests -q -m 'not e2e'\"", f"test = {json.dumps(bad)}"
+        )
+    )
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert "policy [commands] test must" in failed[GATE_CHECK].detail
+
+
+def test_gate_commands_render_byte_for_byte():
+    command = "pytest -k 'a and not b'   --tb=short"
+    files = render_onboarding(spec(test_command=command))
+    steps = yaml.safe_load(files[".github/workflows/ci.yml"])["jobs"]["test"]["steps"]
+    assert steps[-1]["run"] == command
+
+
+# Codex 4204654822: values interpolated into TOML / YAML / Markdown must round-trip.
+
+HOSTILE_LABEL = "-ready: \"q\" #x 'y' \\ ü `z`"
+HOSTILE_COMMANDS = {
+    "setup_command": "python -m pip install -e '.[dev]' # \"deps\" ü",
+    "quality_command": "ruff check . --select 'E9' \\ `x` ``y``",
+    "test_command": '``` pytest -k "a: b" -q',
+}
+
+
+def test_every_template_round_trips_hostile_values(tmp_path):
+    import tomllib
+
+    hostile = spec(ready_label=HOSTILE_LABEL, **HOSTILE_COMMANDS)
+    commands = [HOSTILE_COMMANDS[k] for k in ("setup_command", "quality_command", "test_command")]
+    for implementer in ("route", "cloud-routine"):
+        files = render_onboarding(replace(hostile, implementer=implementer))
+        policy = tomllib.loads(files["agentic-sdlc.toml"])
+        assert policy["automation"]["ready_label"] == HOSTILE_LABEL
+        assert [policy["commands"][g] for g in ("setup", "quality", "test")] == commands
+        assert load_policy_text(files["agentic-sdlc.toml"]).ready_label == HOSTILE_LABEL
+        front = files[".github/ISSUE_TEMPLATE/agent-work-request.md"].split("---")[1]
+        assert yaml.safe_load(front)["labels"] == [HOSTILE_LABEL, "human-review-required"]
+        for name, content in files.items():
+            if name.endswith(".yml"):
+                assert isinstance(yaml.safe_load(content), dict), name
+            if name.endswith(".json"):
+                json.loads(content)
+        steps = yaml.safe_load(files[".github/workflows/ci.yml"])["jobs"]["test"]["steps"]
+        assert [s["run"] for s in steps[2:]] == commands
+        # Markdown: the fenced block holds the commands verbatim and its fence is not closed
+        # early; the inline code span reproduces the command.
+        agents = files["AGENTS.md"]
+        fence = re.search(r"^(`{3,})bash\n(.*?)^\1$", agents, re.MULTILINE | re.DOTALL)
+        assert fence and fence.group(2).splitlines() == commands
+        claude = files["CLAUDE.md"]
+        span = re.search(r"Run (`+) ?(.*?) ?\1 before", claude)
+        assert span and span.group(2) == HOSTILE_COMMANDS["test_command"]
+        if implementer == "cloud-routine":
+            routine = files["docs/forge/cloud-implementer.md"]
+            block = re.search(r"^(`{3,})\n(.*?)^\1$", routine, re.MULTILINE | re.DOTALL)
+            assert block and all(c in block.group(2) for c in commands)
+    repo = _repo(tmp_path)
+    write_onboarding(repo, hostile)
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    for name in (GATE_CHECK, DRIFT, "agentic-sdlc.toml loads"):
+        assert name not in failed, failed.get(name)
+    assert "workflow label conditions match the policy labels" not in failed
+
+
+def load_policy_text(text: str):
+    from agentic_sdlc.policy import load_policy_bytes
+
+    return load_policy_bytes(text.encode())
+
+
+# Codex 4204654830: every parameter of Forge's ruleset is compared, not a hand-picked few.
+
+
+def test_ruleset_requires_stale_review_dismissal():
+    from agentic_sdlc.onboard import merged_ruleset
+
+    weak = json.loads(json.dumps(ruleset_payload(spec())))
+    pr_rule = next(r for r in weak["rules"] if r["type"] == "pull_request")
+    pr_rule["parameters"]["dismiss_stale_reviews_on_push"] = False
+    problems = ruleset_mismatches(weak, spec())
+    assert any("stale approvals are not dismissed" in p for p in problems), problems
+    merged = merged_ruleset(weak, spec())
+    merged_pr = next(r for r in merged["rules"] if r["type"] == "pull_request")
+    assert merged_pr["parameters"]["dismiss_stale_reviews_on_push"] is True
+    assert ruleset_mismatches(merged, spec()) == []
+
+
+def test_ruleset_mismatches_cover_every_payload_parameter():
+    """Flip each parameter Forge sets to its weakest value: every flip must be reported."""
+    payload = ruleset_payload(spec())
+    for index, rule in enumerate(payload["rules"]):
+        for key, value in (rule.get("parameters") or {}).items():
+            if value is False:
+                continue  # Forge does not require it; any value is at least as strict
+            weak = json.loads(json.dumps(payload))
+            params = weak["rules"][index]["parameters"]
+            if value is True:
+                params[key] = False
+            elif isinstance(value, int):
+                if value == 0:
+                    params[key] = -1
+                else:
+                    params[key] = value - 1
+            elif isinstance(value, list):
+                params[key] = []
+            assert ruleset_mismatches(weak, spec()), (rule["type"], key)
+            params.pop(key)
+            assert ruleset_mismatches(weak, spec()), (rule["type"], key, "absent")
+
+
+# Codex 4204654786: git aliases must not hide a commit from the guard.
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git -c alias.ci=commit ci -m x",
+        "git -c alias.CI=commit ci -m x",
+        "git -c alias.c1=c2 -c alias.c2=commit c1 -m x",
+        "git -c 'alias.sc=!git commit' sc",
+        "git --config-env=alias.ci=SOME_ENV ci",
+        "git --config-env alias.ci=SOME_ENV ci",
+        "git -c alias.ci='-c user.name=x commit' ci",
+        "git -c alias.loop=loop loop",
+    ],
+)
+def test_commit_guard_resolves_inline_git_aliases(tmp_path, command):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    assert guard.is_git_commit(command, cwd=str(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["git -c alias.st=status st", "git -c alias.ci=commit status", "git lfs push origin main"],
+)
+def test_commit_guard_keeps_non_committing_aliases(tmp_path, command):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    assert not guard.is_git_commit(command, cwd=str(tmp_path))
+
+
+def test_commit_guard_resolves_repository_and_global_aliases(tmp_path, monkeypatch):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".gitconfig").write_text("[alias]\n\tgci = commit\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("GIT_CONFIG_GLOBAL", raising=False)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    repo = tmp_path / "wt"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "forge/issue-7")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "init")
+    _git(repo, "config", "alias.ci", "commit")
+    _git(repo, "config", "alias.sh", "!git commit -m x")
+    _git(repo, "config", "alias.st", "status")
+    payload = {"tool_name": "Bash", "session_id": "s1", "cwd": str(repo)}
+
+    def code(command, cwd=repo):
+        branches = guard.commit_branches(command, str(cwd))
+        return guard.decide(
+            {**payload, "cwd": str(cwd), "tool_input": {"command": command}},
+            branches,
+            lambda n: None,
+            lambda b: False,
+        )[0]
+
+    for blocked in ("git ci -m x", "git sh", "git gci -m x", "cd wt && git ci -m x"):
+        cwd = tmp_path if blocked.startswith("cd ") else repo
+        assert code(blocked, cwd) == 2, blocked
+    assert code("git st") == 0
+    assert not guard.is_git_commit("git ci -m x", cwd=str(tmp_path))  # no such alias there
+    # GIT_CONFIG_* on the command line is read the way git reads it
+    assert guard.is_git_commit(
+        "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.yy GIT_CONFIG_VALUE_0=commit git yy",
+        cwd=str(tmp_path),
+    )
+
+
+def test_cli_onboard_passes_the_python_version_into_policy_and_ci(tmp_path):
+    from agentic_sdlc import cli
+
+    repo = _repo(tmp_path)
+    args = ["onboard", "--visibility", "private", "--destination", str(repo)]
+    args += ["--project-id", "owner/comic", "--platform-repository", "owner/agentic-sdlc"]
+    args += ["--platform-ref", SHA, "--test", "pytest -q", "--python-version", "3.11"]
+    assert cli.main([*args, "--output", str(tmp_path / "o.json")]) == 0
+    policy = tomllib.loads((repo / "agentic-sdlc.toml").read_text())
+    assert policy["ci"]["python_version"] == "3.11"
+    ci = yaml.safe_load((repo / ".github/workflows/ci.yml").read_text())
+    assert ci["jobs"]["test"]["steps"][1]["with"]["python-version"] == "3.11"
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert GATE_CHECK not in failed and DRIFT not in failed

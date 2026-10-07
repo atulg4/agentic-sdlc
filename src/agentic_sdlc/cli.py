@@ -768,6 +768,7 @@ def _onboard(args: argparse.Namespace) -> int:
         test_command=args.test,
         setup_command=args.setup,
         quality_command=args.quality,
+        python_version=args.python_version,
         implementer=args.implementer,
         runs_on=tuple(args.runs_on.split(",")),
         ci_runs_on=tuple(args.ci_runs_on.split(",")) if args.ci_runs_on else (),
@@ -1225,6 +1226,11 @@ def build_parser() -> argparse.ArgumentParser:
     onboard.add_argument("--test", required=True, help="test command run as the verification gate")
     onboard.add_argument("--setup", default="python -m pip install -r requirements.txt")
     onboard.add_argument("--quality", default="python -m ruff check --select E9,F63,F7,F82 .")
+    onboard.add_argument(
+        "--python-version",
+        default="3.12",
+        help="interpreter ci.yml's pinned actions/setup-python installs ([ci] python_version)",
+    )
     onboard.add_argument(
         "--implementer", choices=("route", "claude", "codex", "cloud-routine"), default="route"
     )
