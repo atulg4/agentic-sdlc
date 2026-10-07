@@ -42,6 +42,9 @@ _SHA = re.compile(r"^[0-9a-f]{40}$")
 _RUNNER_LABEL = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 IMPLEMENTERS = ("route", "claude", "codex", "cloud-routine")
+#: `[agents] implementation_mode` in agentic-sdlc.toml: the single source of truth for whether an
+#: Actions workflow or a Claude Code cloud routine implements approved issues.
+IMPLEMENTATION_MODES = ("actions", "cloud-routine")
 DEFAULT_RUNS_ON = ("self-hosted", "linux", "x64")
 #: Where a PUBLIC repository's CI runs by default: every fork pull request executes its own code
 #: in that job, so it must be a fresh GitHub-hosted VM, never a persistent self-hosted runner.
@@ -137,6 +140,9 @@ class OnboardSpec:
             _RUNNER_LABEL.fullmatch(x) for x in (*self.runs_on, *self.ci_runs_on)
         ):
             raise OnboardError("runs_on labels must be simple tokens")
+        windows = _windows_labels((*self.runs_on, *self.ci_runs_on))
+        if windows:
+            raise OnboardError(f"{WINDOWS_UNSUPPORTED} (got {', '.join(windows)})")
         if self.public and not _github_hosted(set(self.ci_labels)):
             raise OnboardError(
                 "a public repository's CI runs fork pull-request code: it must use a "
@@ -169,6 +175,11 @@ class OnboardSpec:
     def actions_implement(self) -> bool:
         """False when a Claude Code cloud routine implements instead of a GitHub Actions job."""
         return self.implementer != "cloud-routine"
+
+    @property
+    def implementation_mode(self) -> str:
+        """The policy's `[agents] implementation_mode` (IMPLEMENTATION_MODES)."""
+        return "actions" if self.actions_implement else "cloud-routine"
 
     @property
     def labels(self) -> dict[str, tuple[str, str]]:
@@ -286,6 +297,9 @@ default_branch = "{spec.default_branch}"
 planner = "codex"
 implementer = "{implementer}"
 reviewer = "codex"
+# Where implementation runs: "actions" (agent-implement.yml / agent-auto-implement.yml) or
+# "cloud-routine" (docs/forge/cloud-implementer.md). `sdlcctl doctor` reads this, never infers it.
+implementation_mode = "{spec.implementation_mode}"
 
 [automation]
 default_mode = "plan"
@@ -716,7 +730,8 @@ def render_onboarding(spec: OnboardSpec) -> dict[str, str]:
 
 # Files only some implementer modes install. On a forced re-onboard into a different mode the
 # ones the new mode does not render are removed, so a stale workflow cannot keep an Actions
-# implementer live under `cloud-routine`, nor a stale routine doc make doctor misread the mode.
+# implementer live under `cloud-routine` (doctor reads the mode from the policy, and flags a
+# leftover file from the other mode as ambiguous).
 MODE_OWNED_FILES = (
     ".github/workflows/agent-implement.yml",
     ".github/workflows/agent-auto-implement.yml",
@@ -821,6 +836,90 @@ def ruleset_mismatches(actual: dict, spec: OnboardSpec) -> list[str]:
     return problems
 
 
+#: Ruleset fields a PUT accepts; everything else a GET returns (id, source, _links, ...) is
+#: read-only.
+_RULESET_WRITABLE = ("name", "target", "enforcement", "bypass_actors", "conditions", "rules")
+#: Integer parameters where a larger value is stricter.
+_RULESET_MAX_PARAMS = ("required_approving_review_count",)
+
+
+def _merge_rule_parameters(existing: dict, forge: dict) -> dict:
+    """Forge's parameters merged into an existing rule's, never weakening either: every existing
+    key survives, booleans stay true when either side sets them, counts take the larger value,
+    and the required status checks are the union (an existing check keeps its integration)."""
+    merged = dict(existing)
+    for key, want in forge.items():
+        have = merged.get(key)
+        if key not in merged:
+            merged[key] = want
+        elif isinstance(want, bool):
+            merged[key] = bool(have) or want
+        elif key in _RULESET_MAX_PARAMS:
+            try:
+                merged[key] = max(int(have), int(want))
+            except (TypeError, ValueError):
+                merged[key] = want
+        elif key == "required_status_checks":
+            checks = [c for c in have if isinstance(c, dict)] if isinstance(have, list) else []
+            contexts = {c.get("context") for c in checks}
+            merged[key] = checks + [
+                c for c in want if isinstance(c, dict) and c.get("context") not in contexts
+            ]
+    return merged
+
+
+def merged_ruleset(actual: dict, spec: OnboardSpec) -> dict:
+    """The PUT body that makes an existing `Protect main` ruleset enforce Forge's requirements
+    while keeping every stronger control it already has.
+
+    Every existing rule is kept (required signatures, linear history, code scanning, ...); a rule
+    Forge also sets is merged parameter by parameter (`_merge_rule_parameters`); a Forge rule it
+    lacks is added. Forge's own requirements win where they are the stricter side: enforcement
+    active, no bypass actors, the default branch included and nothing excluded.
+    """
+    want = ruleset_payload(spec)
+    out = {k: actual[k] for k in _RULESET_WRITABLE if k in actual}
+    out.update(
+        name=want["name"],
+        target=want["target"],
+        enforcement=want["enforcement"],
+        bypass_actors=[],
+    )
+    conditions = dict(actual.get("conditions") or {})
+    ref_name = dict(conditions.get("ref_name") or {})
+    include = [str(x) for x in ref_name.get("include") or []]
+    if "~DEFAULT_BRANCH" not in include and f"refs/heads/{spec.default_branch}" not in include:
+        include.append("~DEFAULT_BRANCH")
+    conditions["ref_name"] = {**ref_name, "include": include, "exclude": []}
+    out["conditions"] = conditions
+    rules: list[dict] = []
+    index: dict[str, int] = {}
+    for rule in actual.get("rules") or []:
+        if not isinstance(rule, dict):
+            continue
+        kind = str(rule.get("type"))
+        if kind in index:  # a duplicate type: fold it into the first, keeping the stricter
+            first = rules[index[kind]]
+            first["parameters"] = _merge_rule_parameters(
+                first.get("parameters") or {}, rule.get("parameters") or {}
+            )
+            continue
+        index[kind] = len(rules)
+        rules.append(json.loads(json.dumps(rule)))
+    for rule in want["rules"]:
+        kind = rule["type"]
+        if kind not in index:
+            index[kind] = len(rules)
+            rules.append(json.loads(json.dumps(rule)))
+        elif "parameters" in rule:
+            current = rules[index[kind]]
+            current["parameters"] = _merge_rule_parameters(
+                current.get("parameters") or {}, rule["parameters"]
+            )
+    out["rules"] = rules
+    return out
+
+
 def apply_repo_settings(
     spec: OnboardSpec, gh: GhRunner = run_gh, *, variables: dict[str, str] | None = None
 ) -> list[str]:
@@ -859,9 +958,11 @@ def apply_repo_settings(
                     "--input",
                     "-",
                 ],
-                input=json.dumps(ruleset_payload(spec)),
+                input=json.dumps(merged_ruleset(detail, spec)),
             )
-            log.append(f"ruleset '{RULESET_NAME}' updated ({'; '.join(problems)})")
+            log.append(
+                f"ruleset '{RULESET_NAME}' updated, existing rules kept ({'; '.join(problems)})"
+            )
         else:
             log.append(f"ruleset '{RULESET_NAME}' already present")
     else:
@@ -985,17 +1086,47 @@ ANTHROPIC_AUTH_SECRETS = {
     AuthMode.API_KEY: "ANTHROPIC_API_KEY",
 }
 
-#: Standard GitHub-hosted runner labels (docs: "GitHub-hosted runners reference").
-GITHUB_HOSTED_LABELS = tuple(
-    re.compile(p)
-    for p in (
-        r"ubuntu-(?:latest|\d{2}\.04)(?:-arm)?",
-        r"ubuntu-slim",
-        r"windows-(?:latest|20\d{2})",
-        r"windows-11-arm",
-        r"macos-(?:latest|\d{2})(?:-(?:intel|large|xlarge))?",
-    )
-)
+#: Every runner label GitHub hosts, with its OS family: the finite list in GitHub's "GitHub-hosted
+#: runners reference" (standard and larger macOS labels), NOT a version-shaped pattern -- a label
+#: GitHub does not provide (`ubuntu-99.04`, `macos-99`) queues forever. Windows labels are listed
+#: only to be recognised and rejected (`_windows_labels`): the generated workflows are bash/Unix.
+GITHUB_HOSTED_LABELS: dict[str, str] = {
+    **dict.fromkeys(
+        (
+            "ubuntu-latest",
+            "ubuntu-24.04",
+            "ubuntu-22.04",
+            "ubuntu-24.04-arm",
+            "ubuntu-22.04-arm",
+            "ubuntu-slim",
+        ),
+        "linux",
+    ),
+    **dict.fromkeys(
+        (
+            "macos-latest",
+            "macos-26",
+            "macos-15",
+            "macos-14",
+            "macos-13",
+            "macos-15-intel",
+            "macos-latest-large",
+            "macos-15-large",
+            "macos-14-large",
+            "macos-13-large",
+            "macos-latest-xlarge",
+            "macos-26-xlarge",
+            "macos-15-xlarge",
+            "macos-14-xlarge",
+            "macos-13-xlarge",
+        ),
+        "macos",
+    ),
+    **dict.fromkeys(
+        ("windows-latest", "windows-2025", "windows-2022", "windows-2019", "windows-11-arm"),
+        "windows",
+    ),
+}
 
 #: Providers reusable-implement.yml can generate a patch with once routed: Codex, Claude Code and
 #: every provider the OpenAI-compatible adapter configures. Anything else stops at "needs an
@@ -1080,11 +1211,30 @@ def _executor_secret(executor) -> str | None:
     return ROUTED_PROVIDER_SECRETS.get(executor.provider)
 
 
-PUBLISHER_PERMISSIONS = {
-    "contents": ("read", "write"),
-    "issues": ("write",),
-    "pull_requests": ("write",),
-}
+#: The Publisher App's EXACT installation permissions (docs/github-publisher-app.md: Contents
+#: read-only, Issues and Pull requests read/write, everything else "No access"). Its stored key
+#: can mint a token with anything the installation holds, so a broader grant -- Contents write,
+#: Workflows, Administration -- is a finding, not a pass. `metadata: read` is mandatory for every
+#: GitHub App and the only other permission tolerated.
+PUBLISHER_PERMISSIONS = {"contents": "read", "issues": "write", "pull_requests": "write"}
+PUBLISHER_IMPLICIT_PERMISSIONS = {"metadata": "read"}
+
+
+def publisher_permission_problems(perms: dict) -> list[str]:
+    """How an installation's permissions differ from PUBLISHER_PERMISSIONS (empty = exact)."""
+    perms = perms if isinstance(perms, dict) else {}
+    problems = [
+        f"{name}: {perms.get(name, 'none')} (needs exactly {level})"
+        for name, level in PUBLISHER_PERMISSIONS.items()
+        if perms.get(name) != level
+    ]
+    for name, level in sorted(perms.items()):
+        if name in PUBLISHER_PERMISSIONS or str(level).lower() in {"none", ""}:
+            continue
+        if PUBLISHER_IMPLICIT_PERMISSIONS.get(name) == level:
+            continue
+        problems.append(f"{name}: {level} (remove: outside the publisher boundary)")
+    return problems
 
 
 def _workflow_doc(path: Path) -> dict | None:
@@ -1185,14 +1335,33 @@ def _caller_runner_targets(callers: Sequence[Path]) -> dict[str, set[str]]:
 
 
 def _github_hosted(labels: set[str]) -> bool:
-    return len(labels) == 1 and any(
-        p.fullmatch(label) for p in GITHUB_HOSTED_LABELS for label in labels
+    """Exactly one label, and one GitHub actually hosts (any OS: a fresh VM either way)."""
+    return len(labels) == 1 and next(iter(labels)) in GITHUB_HOSTED_LABELS
+
+
+def _windows_labels(labels) -> list[str]:
+    """Labels that put a job on Windows: a hosted Windows image, or a self-hosted runner's
+    `windows` OS label. The generated workflows run `set -euo pipefail` and `.venv/bin`."""
+    return sorted(
+        str(x)
+        for x in labels
+        if GITHUB_HOSTED_LABELS.get(str(x)) == "windows" or str(x).lower() == "windows"
     )
+
+
+WINDOWS_UNSUPPORTED = (
+    "Windows runners are not supported: the generated workflows run bash with Unix paths "
+    "(`set -euo pipefail`, `.venv/bin`); use an ubuntu-*/macos-* GitHub-hosted label or a "
+    "self-hosted Linux/macOS runner"
+)
 
 
 def _runner_available(labels: set[str], runners: Sequence[dict]) -> bool:
     """A standard GitHub-hosted label, or an online runner carrying every label. Anything else --
-    self-hosted, a typo, an unresolved expression, a runner group -- would queue forever."""
+    self-hosted, a typo, an unresolved expression, a runner group -- would queue forever. A
+    Windows target is never available: the generated jobs cannot run there."""
+    if _windows_labels(labels):
+        return False
     if _github_hosted(labels):
         return True
     return bool(labels) and any(
@@ -1212,10 +1381,197 @@ def _triggers(doc: dict) -> set[str]:
     return set()
 
 
-def _pull_request_off_hosted(base: Path) -> list[str]:
-    """`file:job [labels]` for every job of a pull_request-triggered workflow (any
-    `pull_request*` event) that does not run on a GitHub-hosted runner: its own `runs-on`, or the
-    `runs_on` it hands a reusable workflow. On a public repository those jobs run fork code."""
+#: Platform reusable workflows whose EVERY job runs on `${{ fromJSON(inputs.runs_on) }}`
+#: (tests/test_onboard.py pins this against the files): called from the platform repository at a
+#: pinned SHA with an explicit `with.runs_on`, they run exactly there.
+PLATFORM_RUNS_ON_WORKFLOWS = frozenset(
+    {
+        "reusable-ci-repair.yml",
+        "reusable-implement.yml",
+        "reusable-orchestrate.yml",
+        "reusable-plan.yml",
+        "reusable-pre-review.yml",
+        "reusable-protected-merge.yml",
+        "reusable-repair.yml",
+        "reusable-review.yml",
+        "reusable-spec.yml",
+        "reusable-transient-retry.yml",
+    }
+)
+_INPUT_REF = re.compile(r"^\$\{\{\s*inputs\.([A-Za-z0-9_-]+)\s*\}\}$")
+_FROMJSON_INPUT_REF = re.compile(
+    r"^\$\{\{\s*fromJSON\(\s*inputs\.([A-Za-z0-9_-]+)\s*\)\s*\}\}$", re.IGNORECASE
+)
+_REMOTE_REUSABLE = re.compile(r"([^/\s]+/[^/\s]+)/\.github/workflows/([^@\s/]+)@(\S+)")
+
+#: A job's runner target: its labels, or why they cannot be determined (a str).
+RunnerTarget = set[str] | str
+
+
+def _input_text(value: object) -> str | None:
+    """A workflow input's value as the string GitHub passes (None: not a plain scalar)."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int | float | str):
+        return str(value)
+    return None
+
+
+def _resolve_input(value: object, inputs: dict[str, str | None] | None) -> tuple[object, bool]:
+    """(value, resolved): a whole-value `${{ inputs.X }}` or `${{ fromJSON(inputs.X) }}`
+    substituted from `inputs`; any other expression is unresolvable."""
+    if not isinstance(value, str) or "${{" not in value:
+        return value, True
+    text = value.strip()
+    for pattern, parse in ((_INPUT_REF, False), (_FROMJSON_INPUT_REF, True)):
+        found = pattern.match(text)
+        if found and inputs is not None and inputs.get(found.group(1)) is not None:
+            raw = str(inputs[found.group(1)])
+            if not parse:
+                return raw, True
+            try:
+                return json.loads(raw), True
+            except json.JSONDecodeError:
+                return None, False
+    return None, False
+
+
+def _resolved_labels(value: object, inputs: dict[str, str | None] | None) -> set[str] | None:
+    """The labels a `runs-on` value names after input substitution (None: unresolvable, or a
+    runner group, which cannot be proven GitHub-hosted)."""
+    value, ok = _resolve_input(value, inputs)
+    if not ok:
+        return None
+    if isinstance(value, str):
+        return None if "${{" in value else {value.strip()}
+    if isinstance(value, list):
+        labels: set[str] = set()
+        for item in value:
+            item, ok = _resolve_input(item, inputs)
+            if not ok or not isinstance(item, str) or "${{" in item:
+                return None
+            labels.add(item.strip())
+        return labels or None
+    if isinstance(value, dict) and "labels" in value and "group" not in value:
+        return _resolved_labels(value["labels"], inputs)
+    return None
+
+
+def _call_inputs(
+    called: dict, passed: dict, inputs: dict[str, str | None] | None
+) -> dict[str, str | None]:
+    """The inputs a reusable workflow receives: its `workflow_call` defaults, overridden by the
+    caller's `with:` (resolved against the caller's own inputs; None = unresolvable)."""
+    triggers = called.get("on", called.get(True))
+    call = triggers.get("workflow_call") if isinstance(triggers, dict) else None
+    declared = call.get("inputs") if isinstance(call, dict) else None
+    out: dict[str, str | None] = {}
+    for name, spec in (declared if isinstance(declared, dict) else {}).items():
+        if isinstance(spec, dict) and "default" in spec:
+            default, ok = _resolve_input(spec["default"], None)
+            out[str(name)] = _input_text(default) if ok else None
+    for name, value in passed.items():
+        value, ok = _resolve_input(value, inputs)
+        out[str(name)] = _input_text(value) if ok else None
+    return out
+
+
+def _reusable_call_targets(
+    base: Path,
+    where: str,
+    job: dict,
+    platform_repository: str,
+    inputs: dict[str, str | None] | None,
+    seen: tuple[Path, ...],
+) -> dict[str, RunnerTarget]:
+    """Runner targets of a job that `uses:` a reusable workflow."""
+    uses = str(job.get("uses", "")).strip()
+    passed = job.get("with") if isinstance(job.get("with"), dict) else {}
+    if uses.startswith("./"):
+        workflows = (base / ".github/workflows").resolve()
+        target = (base / uses[2:]).resolve()
+        if (
+            "@" in uses
+            or target.parent != workflows
+            or target.suffix not in {".yml", ".yaml"}
+            or not target.is_file()
+        ):
+            return {where: f"local reusable workflow {uses} not found"}
+        if target in seen:
+            return {where: f"reusable workflow cycle through {uses}"}
+        called = _workflow_doc(target)
+        if called is None:
+            return {where: f"{uses} is not a readable workflow"}
+        nested = _job_runner_targets(
+            base,
+            target,
+            platform_repository,
+            _call_inputs(called, passed, inputs),
+            seen,
+        )
+        return {f"{where} > {k}": v for k, v in nested.items()}
+    found = _REMOTE_REUSABLE.fullmatch(uses)
+    if (
+        found
+        and found.group(1) == platform_repository
+        and found.group(2) in PLATFORM_RUNS_ON_WORKFLOWS
+        and _SHA.fullmatch(found.group(3))
+    ):
+        key = f"{where} (runs_on)"
+        if "runs_on" not in passed:
+            return {key: f"calls {found.group(2)} without an explicit runs_on"}
+        raw, ok = _resolve_input(passed["runs_on"], inputs)
+        labels = None
+        if ok and isinstance(raw, str):
+            try:
+                labels = _resolved_labels(json.loads(raw), None)
+            except json.JSONDecodeError:
+                labels = None
+        return {key: labels if labels is not None else f"runs_on {passed['runs_on']!r} unreadable"}
+    return {where: f"calls {uses}: its runners cannot be verified from this repository"}
+
+
+def _job_runner_targets(
+    base: Path,
+    path: Path,
+    platform_repository: str,
+    inputs: dict[str, str | None] | None = None,
+    seen: tuple[Path, ...] = (),
+) -> dict[str, RunnerTarget]:
+    """`file:job` -> where each job of a workflow runs, following local reusable workflows
+    (`./.github/workflows/x.yml`) recursively with their `with:` inputs substituted, and Forge
+    platform reusable workflows through their `runs_on` input. Anything else -- a third-party
+    reusable workflow, an expression that is not a resolvable input, a runner group, a cycle --
+    is a str saying why it cannot be proven."""
+    seen = (*seen, path.resolve())
+    doc = _workflow_doc(path)
+    jobs = doc.get("jobs") if doc is not None else None
+    if not isinstance(jobs, dict) or not jobs:
+        return {path.name: "no readable jobs"}
+    targets: dict[str, RunnerTarget] = {}
+    for name, job in jobs.items():
+        where = f"{path.name}:{name}"
+        if not isinstance(job, dict):
+            targets[where] = "unreadable job"
+        elif "uses" in job:
+            targets.update(
+                _reusable_call_targets(base, where, job, platform_repository, inputs, seen)
+            )
+        elif "runs-on" in job:
+            labels = _resolved_labels(job["runs-on"], inputs)
+            targets[where] = (
+                labels if labels is not None else f"runs-on {job['runs-on']!r} unresolvable"
+            )
+        else:
+            targets[where] = "no runs-on"
+    return targets
+
+
+def _pull_request_off_hosted(base: Path, platform_repository: str) -> list[str]:
+    """Every job a pull_request-triggered workflow (any `pull_request*` event) runs that is not
+    PROVEN to run on a single GitHub-hosted label -- including the jobs of the reusable workflows
+    it calls (`_job_runner_targets`). On a public repository those jobs run fork code, so an
+    unresolvable target fails closed."""
     found = []
     workflows = base / ".github/workflows"
     paths = sorted([*workflows.glob("*.yml"), *workflows.glob("*.yaml")])
@@ -1223,9 +1579,11 @@ def _pull_request_off_hosted(base: Path) -> list[str]:
         doc = _workflow_doc(path)
         if doc is None or not any(t.startswith("pull_request") for t in _triggers(doc)):
             continue
-        for where, labels in _caller_runner_targets([path]).items():
-            if not _github_hosted(labels):
-                found.append(f"{where} {sorted(labels)}")
+        for where, target in _job_runner_targets(base, path, platform_repository).items():
+            if isinstance(target, str):
+                found.append(f"{where} ({target})")
+            elif not _github_hosted(target):
+                found.append(f"{where} {sorted(target)}")
     return found
 
 
@@ -1281,10 +1639,43 @@ def _ci_problems(base: Path) -> list[str]:
         if not command:
             problems.append(f"policy has no [commands] {gate}")
         elif not wanted or not all(
-            any(argv[: len(want)] == want for argv in executed) for want in wanted
+            any(_gate_invocation(argv, want) for argv in executed) for want in wanted
         ):
             problems.append(f"'{REQUIRED_CHECK}' job does not run the {gate} command {command!r}")
     return problems
+
+
+#: Arguments a CI step may append to a policy gate command. The gate must be invoked EXACTLY as
+#: the policy states, plus only these: they change how results are printed or stop at the first
+#: failure, never what runs or whether a failure fails. An allowlist, not a denylist of bad flags,
+#: because the bad set is open-ended and tool-specific (`--help`, `--version`, `--collect-only`,
+#: `--co`, `--setup-plan`, `-k <expr>`, `--ignore`, `--exit-zero`, `--dry-run`, `--fix`, a plugin's
+#: own options ...): anything not listed here fails the gate check.
+BENIGN_GATE_EXTRA_ARGS = frozenset(
+    {"-q", "-qq", "-v", "-vv", "--quiet", "--verbose", "--no-header", "-x", "--exitfirst"}
+)
+BENIGN_GATE_EXTRA_PATTERNS = tuple(
+    re.compile(p)
+    for p in (
+        r"--maxfail=\d+",
+        r"--durations=\d+",
+        r"--tb=(?:auto|long|short|line|native|no)",
+        r"--colou?r=(?:yes|no|auto|always|never)",
+        r"-r[fEsxXpPaAN]+",
+    )
+)
+
+
+def _gate_invocation(argv: Sequence[str], want: Sequence[str]) -> bool:
+    """`argv` runs the policy command `want`: the same words, then only benign extras."""
+    want = tuple(want)
+    if tuple(argv[: len(want)]) != want:
+        return False
+    return all(
+        extra in BENIGN_GATE_EXTRA_ARGS
+        or any(p.fullmatch(extra) for p in BENIGN_GATE_EXTRA_PATTERNS)
+        for extra in argv[len(want) :]
+    )
 
 
 _SHELL_SEPARATORS = {";", "&&", "||", "|", "&", "(", ")", "|&", ";;"}
@@ -1402,6 +1793,102 @@ def _shell_commands(script: str) -> list[tuple[str, ...]]:
     return [argv for argv, _ in _shell_flow(script)]
 
 
+HOOK_SCRIPTS = {
+    "SessionStart": ".claude/hooks/forge_session_start.py",
+    "PreToolUse": ".claude/hooks/forge_commit_guard.py",
+}
+_HOOK_INTERPRETERS = {"python3", "python"}
+_HOOK_DIR_PREFIXES = ("", "$CLAUDE_PROJECT_DIR/", "${CLAUDE_PROJECT_DIR}/")
+
+
+def _hook_runs(entry: object, script: str) -> bool:
+    """A hook handler that runs `python3 <script>` (optionally under $CLAUDE_PROJECT_DIR)."""
+    if not isinstance(entry, dict) or entry.get("type") != "command":
+        return False
+    try:
+        argv = shlex.split(str(entry.get("command", "")))
+    except ValueError:
+        return False
+    return (
+        len(argv) == 2
+        and argv[0] in _HOOK_INTERPRETERS
+        and argv[1] in {prefix + script for prefix in _HOOK_DIR_PREFIXES}
+    )
+
+
+def _matcher_covers(matcher: object, tool: str | None) -> bool:
+    """Whether a hook group's matcher selects `tool` (None: SessionStart, whose matcher names
+    the start source; the group must fire on a fresh `startup`)."""
+    if matcher is None or matcher in ("", "*"):
+        return True
+    if not isinstance(matcher, str):
+        return False
+    if tool is None:
+        return "startup" in {part.strip() for part in matcher.split("|")}
+    try:
+        return re.fullmatch(matcher, tool) is not None
+    except re.error:
+        return False
+
+
+def hook_problems(settings_path: Path) -> list[str]:
+    """Why Claude Code would NOT run the Forge hooks from this settings file (empty = it will):
+    the parsed `hooks` structure must hold a SessionStart group firing on startup that runs the
+    session-start script, and a PreToolUse group matching Bash that runs the commit guard. A
+    mention anywhere else in the file -- a string, a disabled or malformed entry -- is no hook."""
+    try:
+        settings = json.loads(settings_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        return [f".claude/settings.json is not valid JSON ({str(exc)[:80]})"]
+    if not isinstance(settings, dict):
+        return [".claude/settings.json is not a JSON object"]
+    if settings.get("disableAllHooks") is True:
+        return [".claude/settings.json sets disableAllHooks"]
+    hooks = settings.get("hooks")
+    hooks = hooks if isinstance(hooks, dict) else {}
+    problems = []
+    for event, script in HOOK_SCRIPTS.items():
+        tool = "Bash" if event == "PreToolUse" else None
+        groups = hooks.get(event)
+        ok = isinstance(groups, list) and any(
+            isinstance(group, dict)
+            and _matcher_covers(group.get("matcher"), tool)
+            and isinstance(group.get("hooks"), list)
+            and any(_hook_runs(h, script) for h in group["hooks"])
+            for group in groups
+        )
+        if not ok:
+            where = f"{event} (matcher Bash)" if tool else event
+            problems.append(f".claude/settings.json has no {where} hook running python3 {script}")
+    return problems
+
+
+def implementation_mode(toml_path: Path, actions_callers: Sequence[str]) -> tuple[str, str]:
+    """(mode, problem) from the policy's `[agents] implementation_mode`; problem is '' when the
+    mode is explicit and valid. A policy written before the field existed keeps working while its
+    Actions callers are installed (they are the old source of truth), and fails otherwise: a
+    stray docs file never decides that a cloud routine implements."""
+    try:
+        agents = tomllib.loads(toml_path.read_text()).get("agents")
+    except (OSError, tomllib.TOMLDecodeError):
+        agents = None
+    mode = agents.get("implementation_mode") if isinstance(agents, dict) else None
+    if mode in IMPLEMENTATION_MODES:
+        return str(mode), ""
+    if mode is not None:
+        return "actions", (
+            f"[agents] implementation_mode is {mode!r}; expected one of "
+            + ", ".join(IMPLEMENTATION_MODES)
+        )
+    if actions_callers:
+        return "actions", ""
+    return "actions", (
+        "agentic-sdlc.toml has no [agents] implementation_mode and no Actions implement caller "
+        'is installed: set implementation_mode = "cloud-routine" (or re-run `sdlcctl onboard '
+        "--force`) for a cloud routine, or install agent-implement.yml/agent-auto-implement.yml"
+    )
+
+
 def doctor(
     root: str | Path,
     project_id: str,
@@ -1427,8 +1914,26 @@ def doctor(
         ".claude/hooks/forge_commit_guard.py",
         ".claude/hooks/forge_session_start.py",
     ]
-    cloud = (base / "docs/forge/cloud-implementer.md").exists()
-    if not cloud:
+    actions_impl = [
+        n
+        for n in ("agent-implement.yml", "agent-auto-implement.yml")
+        if (base / ".github/workflows" / n).exists()
+    ]
+    routine_doc = "docs/forge/cloud-implementer.md"
+    # The mode is what the policy says, not which files happen to exist.
+    mode, mode_problem = implementation_mode(base / "agentic-sdlc.toml", actions_impl)
+    if (base / "agentic-sdlc.toml").exists():
+        add(
+            Check(
+                "implementation mode is configured",
+                not mode_problem,
+                mode_problem or f"[agents] implementation_mode = {mode!r}",
+            )
+        )
+    cloud = mode == "cloud-routine" and not mode_problem
+    if cloud:
+        required.append(routine_doc)
+    else:
         required += [
             ".github/workflows/agent-implement.yml",
             ".github/workflows/agent-auto-implement.yml",
@@ -1436,27 +1941,27 @@ def doctor(
     missing = [r for r in required if not (base / r).exists()]
     settings = base / ".claude/settings.json"
     if settings.exists():
-        text = settings.read_text()
-        missing += [
-            f".claude/settings.json does not run {hook}"
-            for hook in ("forge_session_start.py", "forge_commit_guard.py")
-            if hook not in text
-        ]
+        missing += hook_problems(settings)
     add(Check("required files present", not missing, ", ".join(missing) if missing else ""))
-    actions_impl = [
-        n
-        for n in ("agent-implement.yml", "agent-auto-implement.yml")
-        if (base / ".github/workflows" / n).exists()
-    ]
     if cloud and actions_impl:
         add(
             Check(
                 "implementation profile is unambiguous",
                 False,
-                "docs/forge/cloud-implementer.md is present alongside "
+                "implementation_mode is cloud-routine but "
                 + ", ".join(actions_impl)
-                + " — a cloud-routine repo must not keep Actions implementer workflows "
-                "(their preflight needs the Publisher App); remove one side",
+                + " are installed — a cloud-routine repo must not keep Actions implementer "
+                "workflows (their preflight needs the Publisher App); remove one side",
+            )
+        )
+    elif not cloud and (base / routine_doc).exists():
+        add(
+            Check(
+                "implementation profile is unambiguous",
+                False,
+                f"{routine_doc} is present but the policy's implementation mode is Actions "
+                f"({', '.join(actions_impl) or 'no implement caller installed'}) — remove the "
+                'stale routine doc or set implementation_mode = "cloud-routine"',
             )
         )
     if (base / ".github/workflows/ci.yml").exists() and (base / "agentic-sdlc.toml").exists():
@@ -1725,7 +2230,9 @@ def doctor(
     remote_branch = actual_branch
     managed = [
         r
-        for r in [*required, *(routing_files if routed else ()), "docs/forge/cloud-implementer.md"]
+        for r in dict.fromkeys(
+            [*required, *(routing_files if routed else ()), "docs/forge/cloud-implementer.md"]
+        )
         if (base / r).is_file()
     ]
     unpushed = []
@@ -1856,8 +2363,22 @@ def doctor(
 
     # --- runners: every job of every active caller, and ci.yml's `test` job, must run somewhere
     # that exists, or the run (or every PR's required check) sits queued forever.
-    targets = _caller_runner_targets(callers)
+    all_targets = _caller_runner_targets(callers)
     ci_labels = _ci_runs_on(base)
+    # (ci.yml's own runner check below reports a Windows CI target.)
+    on_windows = {where: lbls for where, lbls in all_targets.items() if _windows_labels(lbls)}
+    if on_windows:
+        add(
+            Check(
+                "workflows target Unix runners",
+                False,
+                WINDOWS_UNSUPPORTED
+                + ": "
+                + "; ".join(f"{w} {sorted(lbls)}" for w, lbls in sorted(on_windows.items())),
+            )
+        )
+    # Windows targets are reported above, not as a runner to register.
+    targets = {w: lbls for w, lbls in all_targets.items() if w not in on_windows}
     need_runners = any(not _github_hosted(t) for t in [*targets.values(), ci_labels or set()])
     runners = (
         _paged_items(gh, f"repos/{project_id}/actions/runners", "runners") if need_runners else []
@@ -1890,11 +2411,14 @@ def doctor(
         )
     if ci_labels is not None:
         ci_ok = _runner_available(ci_labels, runners)
+        ci_windows = bool(_windows_labels(ci_labels))
         add(
             Check(
                 "ci.yml test job runs on an available runner",
                 ci_ok,
-                ", ".join(sorted(ci_labels))
+                f"labels {sorted(ci_labels)}: {WINDOWS_UNSUPPORTED}"
+                if ci_windows
+                else ", ".join(sorted(ci_labels))
                 if _github_hosted(ci_labels)
                 else f"labels {sorted(ci_labels)}: "
                 + (
@@ -1902,19 +2426,19 @@ def doctor(
                     if ci_ok
                     else "not a GitHub-hosted label and no online runner carries all of them"
                 ),
-                manual=not ci_ok,
+                manual=not ci_ok and not ci_windows,
             )
         )
 
     # --- a public repository's pull-request jobs run fork code: never on a persistent runner
     known = isinstance(repo_info, dict) and ("private" in repo_info or "visibility" in repo_info)
     if known and _is_public(repo_info):
-        exposed = _pull_request_off_hosted(base)
+        exposed = _pull_request_off_hosted(base, platform_repository)
         add(
             Check(
                 "public repository runs pull requests on GitHub-hosted runners",
                 not exposed,
-                "fork pull requests would execute on self-hosted runners: "
+                "fork pull requests would execute on runners not proven GitHub-hosted: "
                 + "; ".join(exposed)
                 + f" → set runs-on to a GitHub-hosted label (e.g. {PUBLIC_CI_RUNS_ON[0]})"
                 if exposed
@@ -1982,18 +2506,16 @@ def doctor(
         if not holding:
             detail = f"add {project_id} under the app's 'Only select repositories'"
         else:
-            shortfalls = []
-            for app in holding:
-                perms = app.get("permissions") or {}
-                shortfalls.append(
-                    [
-                        f"{name}: {perms.get(name, 'none')} (needs {'/'.join(allowed)})"
-                        for name, allowed in PUBLISHER_PERMISSIONS.items()
-                        if perms.get(name) not in allowed
-                    ]
-                )
+            shortfalls = [
+                publisher_permission_problems(app.get("permissions") or {}) for app in holding
+            ]
             weak = min(shortfalls, key=len)
-            detail = ("grant the app " + "; ".join(weak)) if weak else ""
+            detail = (
+                "set the app's repository permissions to exactly contents: read, issues: write, "
+                "pull_requests: write — " + "; ".join(weak)
+                if weak
+                else ""
+            )
         add(
             Check(
                 "Publisher GitHub App installed on this repo",
