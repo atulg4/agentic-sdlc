@@ -1281,7 +1281,10 @@ def test_cli_copy_vars_from_copies_every_registry_model_variable(tmp_path, monke
     args = ["onboard", "--destination", str(repo), "--project-id", "owner/comic"]
     args += ["--platform-repository", "owner/agentic-sdlc", "--platform-ref", SHA]
     args += ["--test", "pytest -q", "--default-branch", "main", "--apply"]
-    assert cli.main([*args, "--copy-vars-from", "owner/music", "--output", "-"]) == 0
+    assert (
+        cli.main([*args, "--copy-vars-from", "owner/music", "--output", str(tmp_path / "o.json")])
+        == 0
+    )
     registry = json.loads((repo / ".forge/executors.json").read_text())
     wanted = {
         e["model"].removeprefix("configured-by-")
