@@ -44,6 +44,7 @@ class FakeGh:
         self._next_comment = 100
         self.poster: dict = {}  # who posts comments made through this fake (default: OWNER)
         self.before_post = None  # one-shot hook: simulate a comment arriving before ours
+        self.posted_at = NOW  # created_at stamped on comments made through this fake
 
     def issue(self, number, labels=(), assignees=(), comments=()):
         self.issues[number] = {
@@ -85,7 +86,7 @@ class FakeGh:
                 hook(n)  # a rival's comment lands first (concurrent claimer)
             self._next_comment += 1
             self.issues[n]["comments"].append(
-                _comment_row(self._next_comment, body, NOW.isoformat(), **self.poster)
+                _comment_row(self._next_comment, body, self.posted_at.isoformat(), **self.poster)
             )
             return json.dumps({"id": self._next_comment})
         if args[:2] == ("issue", "edit"):
@@ -428,8 +429,11 @@ def test_claim_refuses_closed_issues_and_pull_requests_without_writing():
 def test_cli_renew_and_release_honor_output(tmp_path, monkeypatch):
     from agentic_sdlc import cli
 
-    mine = format_claim_marker(Lease(7, "me", "s1", "b", NOW + timedelta(hours=1)))
-    gh = FakeGh().issue(7, labels=[IN_PROGRESS_LABEL], comments=[mine])
+    wall = datetime.now(UTC)  # the CLI runs on the wall clock, and renew refuses expired leases
+    mine = format_claim_marker(Lease(7, "me", "s1", "b", wall + timedelta(hours=1)))
+    gh = FakeGh().issue(7, labels=[IN_PROGRESS_LABEL])
+    gh.posted_at = wall
+    gh.issues[7]["comments"].append(_comment_row(1, mine, wall.isoformat()))
     monkeypatch.setattr(cli, "run_gh", gh)
     base = ["--project", PROJECT, "--issue", "7", "--session", "s1"]
     out = tmp_path / "renew.json"
@@ -514,3 +518,115 @@ def test_open_pr_detection_needs_a_closing_keyword_and_accepts_qualified_forms()
         {"number": 6, "url": "u6", "title": "t", "body": "closes #70", "headRefName": "w"},
     ]
     assert [p["number"] for p in open_prs_for_issue(PROJECT, 7, gh)] == [2, 3, 5]
+
+
+# ------------------------------------------------------- every lease mutation is arbitrated
+
+
+def _rival_claim(gh, session="r1", expires=NOW + timedelta(hours=1), label=False):
+    def land(n):
+        gh._next_comment += 1
+        gh.issues[n]["comments"].append(
+            _comment_row(
+                gh._next_comment,
+                format_claim_marker(Lease(n, "cloud-routine", session, "forge/x", expires)),
+                gh.posted_at.isoformat(),
+            )
+        )
+        if label:
+            gh.issues[n]["labels"].append({"name": IN_PROGRESS_LABEL})
+
+    return land
+
+
+def test_renew_refuses_an_expired_lease_without_posting():
+    stale = format_claim_marker(Lease(7, "me", "s1", "b", NOW - timedelta(minutes=1)))
+    gh = FakeGh().issue(7, labels=[IN_PROGRESS_LABEL], comments=[stale])
+    with pytest.raises(LeaseError, match="expired"):
+        renew(PROJECT, 7, session="s1", ttl_minutes=60, gh=gh, now=NOW)
+    assert len(gh.issues[7]["comments"]) == 1
+
+
+def test_a_lapsed_session_cannot_regain_seniority_over_a_takeover():
+    """Old session's lease lapses, a new claimant takes over, then the old marker lands late."""
+    gh = FakeGh().issue(7)
+    gh.issues[7]["comments"] += [
+        _comment_row(
+            1,
+            format_claim_marker(Lease(7, "a", "old", "b", NOW - timedelta(minutes=30))),
+            "2026-09-30T08:00:00Z",
+        ),
+        _comment_row(
+            2,
+            format_claim_marker(Lease(7, "b", "new", "b", NOW + timedelta(hours=1))),
+            "2026-09-30T11:45:00Z",
+        ),
+        _comment_row(
+            3,
+            format_claim_marker(Lease(7, "a", "old", "b", NOW + timedelta(hours=2))),
+            "2026-09-30T11:50:00Z",
+        ),
+    ]
+    assert current_lease(PROJECT, 7, gh, now=NOW).session == "new"
+
+
+def test_renewal_that_lands_after_expiry_loses_to_the_takeover_and_retracts():
+    read_at = NOW - timedelta(minutes=2)  # the lease is still live when renew() reads it ...
+    mine = format_claim_marker(Lease(7, "me", "old", "b", NOW - timedelta(minutes=1)))
+    gh = FakeGh().issue(7, labels=[IN_PROGRESS_LABEL], comments=[mine])
+    gh.before_post = _rival_claim(gh, "new")  # ... but a takeover lands before the renewal
+    with pytest.raises(LeaseError, match="new"):
+        renew(PROJECT, 7, session="old", ttl_minutes=60, gh=gh, now=read_at)
+    assert "forge-release session=old" in gh.issues[7]["comments"][-1]["body"]
+    assert current_lease(PROJECT, 7, gh, now=read_at).session == "new"
+
+
+def test_claim_retracts_its_marker_when_label_bookkeeping_fails():
+    gh = FakeGh().issue(7)
+    real = gh.__call__
+
+    def failing_assignee(args, input=None):
+        if tuple(args[:2]) == ("issue", "edit") and "--add-assignee" in args:
+            raise RuntimeError("invalid assignee")
+        return real(args, input=input)
+
+    with pytest.raises(RuntimeError):
+        claim(
+            PROJECT,
+            7,
+            agent="me",
+            session="s1",
+            branch="b",
+            gh=failing_assignee,
+            now=NOW,
+            assignee="nobody",
+        )
+    assert "forge-release session=s1" in gh.issues[7]["comments"][-1]["body"]
+    assert current_lease(PROJECT, 7, gh, now=NOW) is None  # not blocked for the TTL
+
+
+def test_release_keeps_the_label_of_a_claimant_that_arrived_before_cleanup():
+    mine = format_claim_marker(Lease(7, "me", "s1", "b", NOW + timedelta(minutes=5)))
+    gh = FakeGh().issue(7, labels=[IN_PROGRESS_LABEL], comments=[mine])
+    gh.before_post = _rival_claim(gh, "r1", label=True)
+    release(PROJECT, 7, session="s1", gh=gh, now=NOW)
+    assert current_lease(PROJECT, 7, gh, now=NOW).session == "r1"
+    assert any(lbl["name"] == IN_PROGRESS_LABEL for lbl in gh.issues[7]["labels"])
+
+
+def test_release_restores_the_label_when_a_claimant_lands_during_removal():
+    mine = format_claim_marker(Lease(7, "me", "s1", "b", NOW + timedelta(minutes=5)))
+    gh = FakeGh().issue(7, labels=[IN_PROGRESS_LABEL], comments=[mine])
+    real = gh.__call__
+    land = _rival_claim(gh, "r1", label=True)
+    fired = []
+
+    def interleaved(args, input=None):
+        if tuple(args[:2]) == ("issue", "edit") and "--remove-label" in args and not fired:
+            fired.append(True)
+            land(7)  # the rival claims and labels just before our stale removal executes
+        return real(args, input=input)
+
+    release(PROJECT, 7, session="s1", gh=interleaved, now=NOW)
+    assert current_lease(PROJECT, 7, gh, now=NOW).session == "r1"
+    assert any(lbl["name"] == IN_PROGRESS_LABEL for lbl in gh.issues[7]["labels"])
