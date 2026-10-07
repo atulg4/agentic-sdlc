@@ -27,7 +27,12 @@ _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@+-]{0,120}$")
 _CLAIM = re.compile(r"<!--\s*forge-claim\s+(?P<fields>[^>]*?)\s*-->")
 _RELEASE = re.compile(r"<!--\s*forge-release\s+(?P<fields>[^>]*?)\s*-->")
 _FIELD = re.compile(r"(\w+)=(\S+)")
-_PR_REF = re.compile(r"(?<![\w/#-])#(\d+)\b")
+_PR_REF = re.compile(
+    r"(?:\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*)"
+    r"(?:(?P<repo>[\w.-]+/[\w.-]+)#|(?<![\w/#-])#|https?://github\.com/(?P<url_repo>[\w.-]+/[\w.-]+)/issues/)"
+    r"(?P<num>\d+)\b",
+    re.IGNORECASE,
+)
 
 
 class LeaseError(ValueError):
@@ -151,13 +156,21 @@ def _trusted(comment: dict) -> bool:
     return (comment.get("user") or {}).get("type") == "Bot"
 
 
-def current_lease(project: str, issue: int, gh: GhRunner) -> Lease | None:
-    """Latest trusted claim not followed by a trusted release from the same session.
+def current_lease(
+    project: str, issue: int, gh: GhRunner, now: datetime | None = None
+) -> Lease | None:
+    """The authoritative lease: the live claim whose session claimed earliest.
 
-    Comments are chronological. A marker's expiry is capped at its post time + MAX_TTL_MINUTES.
+    Comments are chronological. A session's newest marker supersedes its older ones (renewals);
+    a trusted release marker voids that session's claims; expiry is capped at post time +
+    MAX_TTL_MINUTES. Ordering by *first* claim time is what makes acquisition safe: two agents
+    that both post a claim re-read the thread and only the earlier poster keeps it. When no
+    claim is live the most recent expired one is returned so callers can report a takeover.
     """
-    lease: Lease | None = None
-    for comment in _comments(project, issue, gh):
+    now = now or datetime.now(UTC)
+    first_seen: dict[str, int] = {}
+    latest: dict[str, Lease] = {}
+    for position, comment in enumerate(_comments(project, issue, gh)):
         if not _trusted(comment):
             continue
         body = comment.get("body") or ""
@@ -168,11 +181,18 @@ def current_lease(project: str, issue: int, gh: GhRunner) -> Lease | None:
                 continue
             cap = posted + timedelta(minutes=MAX_TTL_MINUTES)
             lease = parsed if parsed.expires <= cap else replace(parsed, expires=cap)
+            first_seen.setdefault(lease.session, position)
+            latest[lease.session] = lease
             continue
         released = _release_session(body)
-        if released and lease is not None and released == lease.session:
-            lease = None
-    return lease
+        if released in latest:
+            del latest[released]
+            del first_seen[released]
+    ordered = [latest[sess] for sess in sorted(latest, key=first_seen.__getitem__)]
+    live = [lease for lease in ordered if lease.live(now)]
+    if live:
+        return live[0]
+    return ordered[-1] if ordered else None
 
 
 def open_prs_for_issue(project: str, issue: int, gh: GhRunner) -> list[dict]:
@@ -196,7 +216,12 @@ def open_prs_for_issue(project: str, issue: int, gh: GhRunner) -> list[dict]:
     hits = []
     for pr in json.loads(raw):
         text = f"{pr.get('title', '')}\n{pr.get('body', '')}"
-        refs = {int(n) for n in _PR_REF.findall(text)}
+        refs = set()
+        for m in _PR_REF.finditer(text):
+            repo = m.group("repo") or m.group("url_repo")
+            if repo and repo.lower() != project.lower():
+                continue  # a closing reference into another repository
+            refs.add(int(m.group("num")))
         head = pr.get("headRefName") or ""
         if issue in refs or re.search(rf"(^|[/-])issue-{issue}($|[^0-9])", head):
             hits.append(pr)
@@ -210,6 +235,24 @@ def _comment(project: str, issue: int, body: str, gh: GhRunner) -> None:
     gh(
         ["api", "-X", "POST", f"repos/{project}/issues/{issue}/comments", "--input", "-"],
         input=json.dumps({"body": body}),
+    )
+
+
+def _ensure_label(project: str, gh: GhRunner) -> None:
+    """Repos onboarded before the lease feature lack the label; create it idempotently."""
+    gh(
+        [
+            "label",
+            "create",
+            IN_PROGRESS_LABEL,
+            "--repo",
+            project,
+            "--color",
+            "fbca04",
+            "--description",
+            "Leased: an agent/session is actively implementing this",
+            "--force",
+        ]
     )
 
 
@@ -272,17 +315,37 @@ def claim(
         return ClaimResult(
             False, None, reason=f"issue #{issue} already has an open pull request: {urls}"
         )
-    flags = ["--add-label", IN_PROGRESS_LABEL]
-    if assignee:
-        flags += ["--add-assignee", assignee]
-    _edit(project, issue, gh, *flags)
     note = (
         f"Claimed by `{agent}` (session `{session}`) on branch `{branch}`; "
         f"lease expires {_iso(lease.expires)}."
     )
     if took_over:
         note = f"Took over an expired lease from session `{took_over}`. " + note
+    # Post-then-verify: GitHub has no compare-and-set, so every contender appends its marker and
+    # re-reads the thread; only the session that claimed earliest keeps the lease, the others
+    # retract. Two concurrent claimers can therefore never both be told they own the issue.
     _comment(project, issue, marker + "\n" + note, gh)
+    winner = current_lease(project, issue, gh, now)
+    if winner is None or winner.session != session:
+        _comment(
+            project,
+            issue,
+            format_release_marker(session)
+            + f"\nLost the claim race to session `{getattr(winner, 'session', '?')}`; retracting.",
+            gh,
+        )
+        return ClaimResult(
+            False,
+            winner,
+            reason=(
+                f"issue #{issue}: lost the claim race to session={getattr(winner, 'session', '?')}"
+            ),
+        )
+    _ensure_label(project, gh)
+    flags = ["--add-label", IN_PROGRESS_LABEL]
+    if assignee:
+        flags += ["--add-assignee", assignee]
+    _edit(project, issue, gh, *flags)
     return ClaimResult(True, lease, took_over_from=took_over)
 
 

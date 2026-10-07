@@ -906,11 +906,36 @@ CALLER_TARGETS = {
     "agent-auto-implement.yml": "reusable-implement.yml",
 }
 # Installation permissions the publisher/lease tokens request in reusable-implement.yml.
+#: API-key secret per routed provider (the Anthropic executor uses the OAuth token instead).
+ROUTED_PROVIDER_SECRETS = {
+    "deepseek": "DEEPSEEK_API_KEY",
+    "zai": "ZAI_API_KEY",
+    "kimi": "KIMI_API_KEY",
+}
+
 PUBLISHER_PERMISSIONS = {
     "contents": ("read", "write"),
     "issues": ("write",),
     "pull_requests": ("write",),
 }
+
+
+def _ci_runs_on(base: Path) -> set[str] | None:
+    """Labels of ci.yml's `test` job runner (None when the file/job cannot be read)."""
+    try:
+        doc = yaml.safe_load((base / ".github/workflows/ci.yml").read_text())
+        job = (doc.get("jobs") or {}).get(REQUIRED_CHECK) or {}
+    except (OSError, yaml.YAMLError, AttributeError):
+        return None
+    runs_on = job.get("runs-on")
+    if isinstance(runs_on, str):
+        return {runs_on.strip()}
+    if isinstance(runs_on, list):
+        return {str(x).strip() for x in runs_on}
+    if isinstance(runs_on, dict):
+        labels = runs_on.get("labels") or []
+        return {str(x).strip() for x in (labels if isinstance(labels, list) else [labels])}
+    return None
 
 
 def _ci_problems(base: Path) -> list[str]:
@@ -985,6 +1010,22 @@ def doctor(
             if hook not in text
         ]
     add(Check("required files present", not missing, ", ".join(missing) if missing else ""))
+    actions_impl = [
+        n
+        for n in ("agent-implement.yml", "agent-auto-implement.yml")
+        if (base / ".github/workflows" / n).exists()
+    ]
+    if cloud and actions_impl:
+        add(
+            Check(
+                "implementation profile is unambiguous",
+                False,
+                "docs/forge/cloud-implementer.md is present alongside "
+                + ", ".join(actions_impl)
+                + " — a cloud-routine repo must not keep Actions implementer workflows "
+                "(their preflight needs the Publisher App); remove one side",
+            )
+        )
     if (base / ".github/workflows/ci.yml").exists() and (base / "agentic-sdlc.toml").exists():
         ci = _ci_problems(base)
         add(Check(f"ci.yml runs the policy gates as '{REQUIRED_CHECK}'", not ci, "; ".join(ci)))
@@ -1013,6 +1054,8 @@ def doctor(
             )
         )
 
+    routed_secrets: set[str] = set()
+    routed_vars: set[str] = set()
     routing_files = (".forge/executors.json", ".forge/routing-policy.json")
     toml_path = base / "agentic-sdlc.toml"
     implement_callers = [
@@ -1040,14 +1083,25 @@ def doctor(
         try:
             executors = load_executors(json.loads((base / ".forge/executors.json").read_text()))
             load_routing_policy(json.loads((base / ".forge/routing-policy.json").read_text()))
-            permitted = all(project_id in e.permitted_repositories for e in executors)
+            usable = [e for e in executors if project_id in e.permitted_repositories]
             add(
                 Check(
                     "routing files valid and permit this repo",
-                    permitted,
-                    "" if permitted else "an executor does not list this repository",
+                    bool(usable),
+                    f"{len(usable)} of {len(executors)} executors permit this repository"
+                    if usable
+                    else "no executor lists this repository",
                 )
             )
+            # Every enabled fallback must be configured, or the router advances into a
+            # missing key after the first recoverable DeepSeek failure.
+            for e in usable:
+                if e.provider not in ROUTED_PROVIDER_SECRETS:
+                    continue  # the Anthropic executor runs on the OAuth token, no repo config
+                routed_secrets.add(ROUTED_PROVIDER_SECRETS[e.provider])
+                var = re.fullmatch(r"configured-by-([A-Z0-9_]+)", e.model or "")
+                if var:
+                    routed_vars.add(var.group(1))
         except (OSError, ExecutorError, json.JSONDecodeError, AttributeError) as exc:
             add(Check("routing files valid and permit this repo", False, str(exc)[:200]))
 
@@ -1215,7 +1269,12 @@ def doctor(
         )
 
     # --- variables & secrets (names only)
-    variables = _paged_names(gh, f"repos/{project_id}/actions/variables", "variables")
+    variable_values = {
+        str(v.get("name")): str(v.get("value") or "")
+        for v in _paged_items(gh, f"repos/{project_id}/actions/variables", "variables")
+    }
+    variables = {name for name, value in variable_values.items() if value.strip()}
+    empty_vars = sorted(name for name, value in variable_values.items() if not value.strip())
     secrets = _paged_names(gh, f"repos/{project_id}/actions/secrets", "secrets")
     need_vars = set() if cloud else {"PUBLISHER_APP_CLIENT_ID"}
     need_secrets = {"CLAUDE_CODE_OAUTH_TOKEN"} | (set() if cloud else {"PUBLISHER_APP_PRIVATE_KEY"})
@@ -1223,15 +1282,27 @@ def doctor(
     if platform_private is True:  # GITHUB_TOKEN cannot check out another private repository
         need_secrets |= {"PLATFORM_READ_TOKEN"}
     if routed:
-        need_vars |= {"DEEPSEEK_MODEL_FLASH", "DEEPSEEK_MODEL_PRO"}
-        need_secrets |= {"DEEPSEEK_API_KEY"}
+        need_vars |= routed_vars or {"DEEPSEEK_MODEL_FLASH", "DEEPSEEK_MODEL_PRO"}
+        need_secrets |= routed_secrets or {"DEEPSEEK_API_KEY"}
     implement_wf = base / ".github/workflows/agent-implement.yml"
     if implement_wf.exists() and re.search(
         r"^\s*agent:\s*codex\s*$", implement_wf.read_text(), re.MULTILINE
     ):
         need_secrets |= {"OPENAI_API_KEY"}
     mv, ms = sorted(need_vars - variables), sorted(need_secrets - secrets)
-    add(Check("repo variables set", not mv, ", ".join(mv) if mv else ", ".join(sorted(need_vars))))
+    empty_required = [name for name in mv if name in empty_vars]
+    add(
+        Check(
+            "repo variables set (non-empty)",
+            not mv,
+            (
+                ", ".join(mv)
+                + (f" (empty value: {', '.join(empty_required)})" if empty_required else "")
+            )
+            if mv
+            else ", ".join(sorted(need_vars)),
+        )
+    )
     add(
         Check(
             "repo secrets set (by name)",
@@ -1275,6 +1346,36 @@ def doctor(
                 manual=True,
             )
         )
+
+    # --- ci.yml's `test` job must run somewhere that exists, or every PR blocks on a queued check
+    ci_labels = _ci_runs_on(base)
+    if ci_labels is not None:
+        if "self-hosted" in ci_labels:
+            all_runners = runners or _paged_items(
+                gh, f"repos/{project_id}/actions/runners", "runners"
+            )
+            ci_ok = any(
+                r.get("status") == "online"
+                and ci_labels <= {str(lbl.get("name")) for lbl in r.get("labels") or []}
+                for r in all_runners
+            )
+            add(
+                Check(
+                    "ci.yml test job runs on an available runner",
+                    ci_ok,
+                    f"labels {sorted(ci_labels)}: "
+                    + ("online runner found" if ci_ok else "no online runner carries all of them"),
+                    manual=not ci_ok,
+                )
+            )
+        else:
+            add(
+                Check(
+                    "ci.yml test job runs on an available runner",
+                    True,
+                    ", ".join(sorted(ci_labels)),
+                )
+            )
 
     # --- publisher app installed on this repo (Actions implementer publishes PRs through it)
     if cloud:

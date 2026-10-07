@@ -43,6 +43,7 @@ class FakeGh:
         self.calls: list[tuple[str, ...]] = []
         self._next_comment = 100
         self.poster: dict = {}  # who posts comments made through this fake (default: OWNER)
+        self.before_post = None  # one-shot hook: simulate a comment arriving before ours
 
     def issue(self, number, labels=(), assignees=(), comments=()):
         self.issues[number] = {
@@ -79,6 +80,9 @@ class FakeGh:
         if args[:3] == ("api", "-X", "POST") and args[3].endswith("/comments"):
             n = int(args[3].split("/")[4])
             body = json.loads(input)["body"]
+            if self.before_post is not None:
+                hook, self.before_post = self.before_post, None
+                hook(n)  # a rival's comment lands first (concurrent claimer)
             self._next_comment += 1
             self.issues[n]["comments"].append(
                 _comment_row(self._next_comment, body, NOW.isoformat(), **self.poster)
@@ -110,6 +114,8 @@ class FakeGh:
             )
         if args[:2] == ("pr", "list"):
             return json.dumps(self.prs)
+        if args[:2] == ("label", "create"):
+            return ""
         raise AssertionError(f"unexpected gh call: {' '.join(args)}")
 
 
@@ -135,6 +141,23 @@ def test_parse_ignores_unrelated_and_malformed_comments():
     )
 
 
+def test_current_lease_prefers_the_session_that_claimed_first():
+    """Two live claims (a race both contenders lost track of): the earlier poster owns it."""
+    gh = FakeGh().issue(
+        7,
+        labels=[IN_PROGRESS_LABEL],
+        comments=[
+            format_claim_marker(Lease(7, "a", "s1", "b1", NOW + timedelta(hours=1))),
+            format_claim_marker(Lease(7, "b", "s2", "b2", NOW + timedelta(hours=2))),
+        ],
+    )
+    assert current_lease(PROJECT, 7, gh, now=NOW).session == "s1"
+    gh.issues[7]["comments"].append(
+        _comment_row(9, "<!-- forge-release session=s1 -->", "2026-09-30T01:00:00Z")
+    )
+    assert current_lease(PROJECT, 7, gh, now=NOW).session == "s2"
+
+
 def test_current_lease_takes_the_latest_claim_unless_released():
     gh = FakeGh().issue(
         7,
@@ -144,9 +167,13 @@ def test_current_lease_takes_the_latest_claim_unless_released():
             format_claim_marker(Lease(7, "b", "s2", "b2", NOW + timedelta(hours=2))),
         ],
     )
-    assert current_lease(PROJECT, 7, gh).session == "s2"
+    assert current_lease(PROJECT, 7, gh, now=NOW).session == "s1"
     gh.issues[7]["comments"].append(
-        _comment_row(9, "<!-- forge-release session=s2 -->", "2026-09-30T01:00:00Z")
+        _comment_row(9, "<!-- forge-release session=s1 -->", "2026-09-30T01:00:00Z")
+    )
+    assert current_lease(PROJECT, 7, gh, now=NOW).session == "s2"
+    gh.issues[7]["comments"].append(
+        _comment_row(10, "<!-- forge-release session=s2 -->", "2026-09-30T01:00:00Z")
     )
     assert current_lease(PROJECT, 7, gh) is None
 
@@ -411,3 +438,79 @@ def test_cli_renew_and_release_honor_output(tmp_path, monkeypatch):
     out = tmp_path / "release.json"
     assert cli.main(["release", *base, "--output", str(out)]) == 0
     assert json.loads(out.read_text()) == {"issue": 7, "released": True, "session": "s1"}
+
+
+def test_claim_loses_the_race_when_a_rival_marker_lands_first_and_retracts():
+    gh = FakeGh().issue(7)
+
+    def rival_first(n):
+        gh._next_comment += 1
+        gh.issues[n]["comments"].append(
+            _comment_row(
+                gh._next_comment,
+                format_claim_marker(
+                    Lease(7, "cloud-routine", "r1", "forge/issue-7", NOW + timedelta(hours=1))
+                ),
+                NOW.isoformat(),
+            )
+        )
+
+    gh.before_post = rival_first
+    result = claim(PROJECT, 7, agent="me", session="s1", branch="b", ttl_minutes=60, gh=gh, now=NOW)
+    assert not result.ok and "r1" in result.reason
+    bodies = [c["body"] for c in gh.issues[7]["comments"]]
+    assert any("forge-release session=s1" in b for b in bodies)  # we retracted
+    assert not any(c[:2] == ("issue", "edit") for c in gh.calls)  # never touched label/assignee
+    assert current_lease(PROJECT, 7, gh, now=NOW).session == "r1"
+
+
+def test_claim_wins_the_race_when_it_posted_first():
+    gh = FakeGh().issue(7)
+    result = claim(PROJECT, 7, agent="me", session="s1", branch="b", ttl_minutes=60, gh=gh, now=NOW)
+    assert result.ok
+    assert (
+        "label",
+        "create",
+        IN_PROGRESS_LABEL,
+        "--repo",
+        PROJECT,
+        "--color",
+        "fbca04",
+        "--description",
+        "Leased: an agent/session is actively implementing this",
+        "--force",
+    ) in gh.calls
+    assert any(lbl["name"] == IN_PROGRESS_LABEL for lbl in gh.issues[7]["labels"])
+
+
+def test_open_pr_detection_needs_a_closing_keyword_and_accepts_qualified_forms():
+    from agentic_sdlc.leases import open_prs_for_issue
+
+    gh = FakeGh().issue(7)
+    gh.prs = [
+        {"number": 1, "url": "u1", "title": "t", "body": "Depends on #7", "headRefName": "feat/x"},
+        {
+            "number": 2,
+            "url": "u2",
+            "title": "t",
+            "body": "Closes owner/repo#7",
+            "headRefName": "feat/y",
+        },
+        {
+            "number": 3,
+            "url": "u3",
+            "title": "t",
+            "body": "Fixes https://github.com/owner/repo/issues/7",
+            "headRefName": "z",
+        },
+        {
+            "number": 4,
+            "url": "u4",
+            "title": "t",
+            "body": "Resolves other/repo#7",
+            "headRefName": "q",
+        },
+        {"number": 5, "url": "u5", "title": "t", "body": "", "headRefName": "forge/issue-7"},
+        {"number": 6, "url": "u6", "title": "t", "body": "closes #70", "headRefName": "w"},
+    ]
+    assert [p["number"] for p in open_prs_for_issue(PROJECT, 7, gh)] == [2, 3, 5]
