@@ -11,6 +11,8 @@ import yaml
 from agentic_sdlc.executors import load_executors, load_routing_policy
 from agentic_sdlc.onboard import (
     IMPLEMENTATION_LABEL,
+    REUSABLE_IMPLEMENT_AGENTS,
+    REUSABLE_IMPLEMENT_DEFAULT_AGENT,
     RULESET_NAME,
     OnboardError,
     OnboardSpec,
@@ -121,8 +123,11 @@ def test_renders_every_file_with_placeholders_resolved():
 def test_workflows_use_self_hosted_runners_and_the_pinned_platform():
     files = render_onboarding(spec())
     plan = files[".github/workflows/agent-plan.yml"]
-    assert f"owner/agentic-sdlc/.github/workflows/reusable-plan.yml@{SHA}" in plan
-    assert 'runs_on: \'["self-hosted","linux","x64"]\'' in plan
+    doc = yaml.safe_load(plan)
+    assert doc["jobs"]["plan"]["uses"] == (
+        f"owner/agentic-sdlc/.github/workflows/reusable-plan.yml@{SHA}"
+    )
+    assert json.loads(doc["jobs"]["plan"]["with"]["runs_on"]) == ["self-hosted", "linux", "x64"]
     assert 'runs-on: ["self-hosted", "linux", "x64"]' in plan
     assert (
         "CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}" in plan
@@ -1576,7 +1581,7 @@ def test_doctor_requires_and_forwards_the_anthropic_key_for_an_api_key_executor(
         )
     )
     failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
-    assert "agent-implement.yml: ANTHROPIC_API_KEY" in (
+    assert "agent-implement.yml:implement: ANTHROPIC_API_KEY" in (
         failed["implement callers forward every routed secret"].detail
     )
 
@@ -1648,7 +1653,9 @@ def test_doctor_validates_the_runner_a_caller_hands_its_reusable_workflow(tmp_pa
     repo = _repo(tmp_path)
     write_onboarding(repo, spec())
     path = repo / ".github/workflows/agent-plan.yml"
-    path.write_text(path.read_text().replace('"x64"]', '"arm64"]'))
+    doc = yaml.safe_load(path.read_text())
+    doc["jobs"]["plan"]["with"]["runs_on"] = '["self-hosted","linux","arm64"]'
+    path.write_text(yaml.safe_dump(doc, sort_keys=False))
     failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh()))
     assert "agent-plan.yml:plan (runs_on)" in (
         failed["self-hosted runner online for this repo"].detail
@@ -2466,3 +2473,298 @@ def test_doctor_accepts_the_publisher_app_with_its_mandatory_metadata_permission
     )
     report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
     assert report.ok, report.render()
+
+
+# ---------------------------------------------------------------- review regressions (PR 139, 6)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "if true; then git commit -m x; fi",
+        "while true; do git commit -m x; done",
+        "until false; do git commit; done",
+        "! git commit -m x",
+        "{ git commit -m x; }",
+        "( git commit -m x )",
+        "time git commit -m x",
+        "if git commit -m x; then :; fi",
+        "for i in 1; do git -C . commit -m x; done",
+        "case a in a) git commit;; esac",
+        "f() { git commit -m x; }; f",
+        "eval git commit -m x",
+        "unknownwrapper --flag git commit",
+    ],
+)
+def test_commit_guard_sees_commits_under_shell_control_flow(tmp_path, command):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    assert guard.is_git_commit(command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["git log --grep commit", "git status && echo commit", "echo hi", "if true; then :; fi"],
+)
+def test_commit_guard_keeps_classified_non_commits(tmp_path, command):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    assert not guard.is_git_commit(command)
+
+
+@pytest.mark.parametrize("name", ["agent-auto-plan.yml", "agent-auto-implement.yml"])
+def test_doctor_requires_the_automatic_callers_to_trigger_on_labeled_issues(tmp_path, name):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    path = repo / ".github/workflows" / name
+    path.write_text(
+        path.read_text().replace("  issues:\n    types: [labeled]\n", "  workflow_dispatch:\n")
+    )
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert name in failed["automatic callers trigger on issue labels"].detail
+    path.write_text(path.read_text().replace("  workflow_dispatch:\n", "  issues:\n"))
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert "automatic callers trigger on issue labels" not in failed  # all types include labeled
+
+
+def _mutate_ci_test_step(repo, mutate):
+    ci = repo / ".github/workflows/ci.yml"
+    doc = yaml.safe_load(ci.read_text())
+    job = doc["jobs"]["test"]
+    mutate(doc, job, next(s for s in job["steps"] if s.get("name") == "Test"))
+    ci.write_text(yaml.safe_dump(doc, sort_keys=False))
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        # an uncalled function only DEFINES the gate
+        lambda doc, job, step: step.update(
+            {"run": "run_tests() {\n  " + step["run"] + "\n}\necho done"}
+        ),
+        lambda doc, job, step: step.update({"run": "function t {\n" + step["run"] + "\n}"}),
+        lambda doc, job, step: step.update({"run": "t() { " + step["run"] + "; }"}),
+        # flags injected through the environment
+        lambda doc, job, step: step.update({"env": {"PYTEST_ADDOPTS": "--collect-only"}}),
+        lambda doc, job, step: job.update({"env": {"PYTEST_ADDOPTS": "--co"}}),
+        lambda doc, job, step: doc.update({"env": {"PYTEST_ADDOPTS": "--co"}}),
+        lambda doc, job, step: step.update({"run": "PYTEST_ADDOPTS=--co " + step["run"]}),
+        lambda doc, job, step: step.update({"run": "export PYTEST_ADDOPTS=--co\n" + step["run"]}),
+        lambda doc, job, step: step.update({"env": {"BASH_ENV": "./evil.sh"}}),
+        lambda doc, job, step: job["steps"].insert(
+            0, {"run": 'echo "PYTEST_ADDOPTS=--co" >> "$GITHUB_ENV"'}
+        ),
+        lambda doc, job, step: step.update({"run": "pytest() { :; }\n" + step["run"]}),
+        lambda doc, job, step: step.update({"run": "source ./env.sh\n" + step["run"]}),
+        lambda doc, job, step: job["steps"].insert(0, {"uses": "someone/export-env@v1"}),
+    ],
+)
+def test_doctor_rejects_a_gate_whose_meaning_is_changed(tmp_path, mutate):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    _mutate_ci_test_step(repo, mutate)
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert "ci.yml runs the policy gates as 'test'" in failed
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda doc, job, step: step.update({"env": {"PYTHONUNBUFFERED": "1", "CI": "true"}}),
+        lambda doc, job, step: step.update({"run": "source .venv/bin/activate\n" + step["run"]}),
+        lambda doc, job, step: job["steps"].insert(1, {"uses": "actions/setup-python@v5"}),
+        lambda doc, job, step: step.update({"run": "helper() { echo hi; }\n" + step["run"]}),
+    ],
+)
+def test_doctor_accepts_a_gate_with_benign_surroundings(tmp_path, mutate):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    _mutate_ci_test_step(repo, mutate)
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert "ci.yml runs the policy gates as 'test'" not in failed
+
+
+@pytest.mark.parametrize("budget", ["bogus", "${{ vars.ROUTE_BUDGET }}", True, "nan", "-1"])
+def test_doctor_fails_an_unreadable_route_budget(tmp_path, budget):
+    repo = _routed_repo(tmp_path)
+    path = repo / ".github/workflows/agent-implement.yml"
+    doc = yaml.safe_load(path.read_text())
+    doc["jobs"]["implement"]["with"]["route_budget_usd"] = budget
+    path.write_text(yaml.safe_dump(doc, sort_keys=False))
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert "agent-implement.yml:implement" in (
+        failed["implement callers pass a readable route_budget_usd"].detail
+    )
+
+
+def test_doctor_judges_secret_forwarding_on_the_implement_call_alone(tmp_path):
+    api = _extra_executor(executorId="claude-api", authMode="api-key", executionType="direct-api")
+    repo = _routed_repo(tmp_path, api)
+    path = repo / ".github/workflows/agent-implement.yml"
+    doc = yaml.safe_load(path.read_text())
+    del doc["jobs"]["implement"]["secrets"]["ANTHROPIC_API_KEY"]
+    # an unrelated reusable call forwarding everything reaches nothing in the implement call
+    doc["jobs"]["other"] = {"uses": "owner/elsewhere/.github/workflows/x.yml@main"}
+    doc["jobs"]["other"]["secrets"] = "inherit"
+    path.write_text(yaml.safe_dump(doc, sort_keys=False))
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert "agent-implement.yml:implement: ANTHROPIC_API_KEY" in (
+        failed["implement callers forward every routed secret"].detail
+    )
+    # `secrets: inherit` on the implement call itself forwards them all
+    doc["jobs"]["implement"]["secrets"] = "inherit"
+    path.write_text(yaml.safe_dump(doc, sort_keys=False))
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert "implement callers forward every routed secret" not in failed
+
+
+def test_doctor_excludes_a_matching_runner_whose_os_is_windows(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _healthy_gh()
+    gh.answers["api repos/owner/comic/actions/runners"] = _pages(
+        "runners",
+        [
+            {
+                "status": "online",
+                "os": "Windows",
+                "labels": [{"name": n} for n in ("self-hosted", "linux", "x64")],
+            }
+        ],
+    )
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))
+    assert "self-hosted runner online for this repo" in failed
+    assert "ci.yml test job runs on an available runner" in failed
+
+
+def test_doctor_fails_closed_on_a_runner_group(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    path = repo / ".github/workflows/agent-plan.yml"
+    doc = yaml.safe_load(path.read_text())
+    doc["jobs"]["preflight"]["runs-on"] = {
+        "group": "builders",
+        "labels": ["self-hosted", "linux", "x64"],
+    }
+    path.write_text(yaml.safe_dump(doc, sort_keys=False))
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh()))
+    detail = failed["workflow runner targets are verifiable"].detail
+    assert "agent-plan.yml:preflight" in detail and "runner group 'builders'" in detail
+
+
+def test_doctor_follows_local_reusable_workflows_for_runner_availability(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    (repo / ".github/workflows/helper.yml").write_text(
+        "on:\n  workflow_call:\njobs:\n  gpu:\n    runs-on: [self-hosted, gpu]\n"
+        "    steps:\n      - run: echo hi\n"
+    )
+    path = repo / ".github/workflows/agent-plan.yml"
+    doc = yaml.safe_load(path.read_text())
+    doc["jobs"]["extra"] = {"uses": "./.github/workflows/helper.yml"}
+    path.write_text(yaml.safe_dump(doc, sort_keys=False))
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh()))
+    assert "agent-plan.yml:extra > helper.yml:gpu" in (
+        failed["self-hosted runner online for this repo"].detail
+    )
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        lambda c: c + " || true",
+        lambda c: "true || " + c,
+        lambda c: c.replace("'human-review-required'", "'other'"),
+    ],
+)
+def test_doctor_requires_the_exact_label_conditions(tmp_path, condition):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    for name, job in (("agent-auto-plan.yml", "plan"), ("agent-auto-implement.yml", "preflight")):
+        path = repo / ".github/workflows" / name
+        doc = yaml.safe_load(path.read_text())
+        original = doc["jobs"][job]["if"]
+        doc["jobs"][job]["if"] = condition(original)
+        assert doc["jobs"][job]["if"] != original
+        path.write_text(yaml.safe_dump(doc, sort_keys=False))
+        failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+        assert name in failed["workflow label conditions match the policy labels"].detail
+        doc["jobs"][job]["if"] = original
+        path.write_text(yaml.safe_dump(doc, sort_keys=False))
+
+
+def test_doctor_reads_the_parsed_agent_of_the_implement_call(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(implementer="codex"))
+    gh = _healthy_gh()
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))
+    assert "OPENAI_API_KEY" in failed["repo secrets set (by name)"].detail
+    path = repo / ".github/workflows/agent-implement.yml"
+    doc = yaml.safe_load(path.read_text())
+    doc["jobs"]["implement"]["with"]["agent"] = "${{ vars.AGENT }}"
+    path.write_text(yaml.safe_dump(doc, sort_keys=False))
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert "agent-implement.yml:implement" in failed["implement callers name a known agent"].detail
+
+
+def test_route_mode_comes_from_the_parsed_policy_not_its_text(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(implementer="claude"))
+    toml = repo / "agentic-sdlc.toml"
+    toml.write_text(toml.read_text() + "\n# [routing] is documented elsewhere\n")
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    assert "routing files valid and permit this repo" not in {c.name for c in report.checks}
+
+
+def test_reusable_implement_agent_default_matches_doctor():
+    root = Path(__file__).parents[1]
+    workflow = yaml.safe_load((root / ".github/workflows/reusable-implement.yml").read_text())
+    inputs = workflow[True]["workflow_call"]["inputs"]
+    assert inputs["agent"]["default"] == REUSABLE_IMPLEMENT_DEFAULT_AGENT
+    text = (root / ".github/workflows/reusable-implement.yml").read_text()
+    assert "codex|route) ;;" in text and "claude)" in text
+    assert {"codex", "route", "claude"} == REUSABLE_IMPLEMENT_AGENTS
+
+
+@pytest.mark.parametrize("value", ["true", "null", "on", "off", "yes", "123", "0x1F", "1e3", "007"])
+def test_every_template_placeholder_round_trips_as_a_string(value):
+    rendered = render_onboarding(
+        spec(
+            default_branch=value,
+            runs_on=("self-hosted", value),
+            ci_runs_on=(value,) if value != "true" else ("ubuntu-latest",),
+            ready_label=f"{value}'s",
+            setup_command=value,
+            quality_command=value,
+            test_command=value,
+        )
+    )
+    workflows = {k: v for k, v in rendered.items() if k.startswith(".github/workflows/")}
+    assert workflows
+    placeholders = re.compile(
+        r"\b(PLATFORM_REPOSITORY|PLATFORM_COMMIT_SHA|REUSABLE_\w+_USES|RUNS_ON_\w+|AGENT|"
+        r"EXECUTOR_REGISTRY_PATH|ROUTING_POLICY_PATH|DEFAULT_BRANCH|\w+_COMMAND|AUTO_\w+_IF|"
+        r"ISSUE_NUMBER_EXPR|READY_LABEL|IMPLEMENTATION_LABEL|IMPLEMENT_JOBS|PREFLIGHT_EXTRA)\b"
+    )
+    for name, text in workflows.items():
+        assert not placeholders.search(text), name
+        doc = yaml.safe_load(text)
+        for job in doc["jobs"].values():
+            for key in ("runs-on",):
+                if key in job:
+                    assert all(isinstance(x, str) for x in job[key]), (name, job[key])
+            passed = job.get("with") or {}
+            for key in ("runs_on", "platform_ref", "platform_repository", "agent"):
+                if key in passed:
+                    assert isinstance(passed[key], str), (name, key)
+            if "runs_on" in passed:
+                assert json.loads(passed["runs_on"]) == ["self-hosted", value]
+            for step in job.get("steps") or []:
+                if "run" in step:
+                    assert isinstance(step["run"], str)
+    ci = yaml.safe_load(workflows[".github/workflows/ci.yml"])
+    assert ci[True]["push"]["branches"] == [value]
+    steps = {s.get("name"): s for s in ci["jobs"]["test"]["steps"]}
+    assert steps["Test"]["run"] == value
+    auto = yaml.safe_load(workflows[".github/workflows/agent-auto-implement.yml"])
+    assert f"'{value}''s'" in auto["jobs"]["preflight"]["if"]
+    hooks = rendered[".claude/hooks/forge_session_start.py"]
+    assert f"DEFAULT_BRANCH = {json.dumps(value)}" in hooks

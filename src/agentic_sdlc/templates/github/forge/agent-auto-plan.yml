@@ -14,19 +14,14 @@ jobs:
   plan:
     # Only the ready label triggers. An issue opened with both labels fires one `labeled` run per
     # label, and both would see both labels and plan twice; the other is required, not a trigger.
-    if: >-
-      github.event.label.name == 'READY_LABEL' &&
-      github.event.issue.pull_request == null &&
-      contains(github.event.issue.labels.*.name, 'READY_LABEL') &&
-      contains(github.event.issue.labels.*.name, 'human-review-required') &&
-      !contains(github.event.issue.labels.*.name, 'implementation-approved')
+    if: AUTO_PLAN_IF
     permissions:
       contents: read
       issues: write
       id-token: write
-    uses: PLATFORM_REPOSITORY/.github/workflows/reusable-plan.yml@PLATFORM_COMMIT_SHA
+    uses: REUSABLE_PLAN_USES
     with:
-      runs_on: 'RUNS_ON_JSON'
+      runs_on: RUNS_ON_JSON
       issue_number: ${{ format('{0}', github.event.issue.number) }}
       trigger_actor: ${{ github.actor }}
       config_path: agentic-sdlc.toml

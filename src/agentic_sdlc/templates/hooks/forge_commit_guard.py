@@ -88,6 +88,13 @@ WRAPPERS = frozenset(WRAPPER_OPTS)
 SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
 OPERATORS = frozenset({";", "&", "&&", "|", "||", "(", ")", ";;", "|&"})
 _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# Reserved words and grouping that may open a simple command without being its program:
+# `if git commit`, `then git commit`, `do git commit`, `! git commit`, `{ git commit; }`, ...
+# (`(`/`)` are separators already; `time` is a wrapper above).
+SHELL_KEYWORDS = frozenset(
+    {"if", "then", "elif", "else", "fi", "while", "until", "do", "done", "!", "{", "}", "esac"}
+    | {"coproc", "function"}
+)
 # Fallback for text shlex cannot tokenize (unbalanced quotes): any `.../git ... commit` word pair.
 _GIT_COMMIT_LOOSE = re.compile(
     r"(?:^|[\s;&|(])(?:\S*/)?git(?:\.exe)?\s(?:.*\s)?commit(?=$|[\s;&|)])"
@@ -155,13 +162,15 @@ def _strip_wrapper(name: str, words: list[str], chdirs: list[str]) -> list[str]:
     return words
 
 
-def _commit_targets(argv: list[str], depth: int = 0) -> list[Target]:
-    """The repository each `git ... commit` in one simple command commits to."""
+def _command_words(argv: list[str], chdirs: list[str], env: list[tuple[str, str]]) -> list[str]:
+    """`argv` without leading reserved words, `VAR=value` prefixes and wrappers (their directory
+    options go to `chdirs`, GIT_DIR/GIT_WORK_TREE assignments to `env`): the program and its
+    arguments."""
     words = list(argv)
-    chdirs: list[str] = []
-    env: list[tuple[str, str]] = []
     while words:
-        if _ASSIGNMENT.match(words[0]):
+        if words[0] in SHELL_KEYWORDS:
+            words.pop(0)
+        elif _ASSIGNMENT.match(words[0]):
             key, _, value = words.pop(0).partition("=")
             if key in GIT_REPO_ENV:
                 env.append((key, value))
@@ -169,6 +178,14 @@ def _commit_targets(argv: list[str], depth: int = 0) -> list[Target]:
             words = _strip_wrapper(os.path.basename(words.pop(0)), words, chdirs)
         else:
             break
+    return words
+
+
+def _commit_targets(argv: list[str], depth: int = 0) -> list[Target]:
+    """The repository each `git ... commit` in one simple command commits to."""
+    chdirs: list[str] = []
+    env: list[tuple[str, str]] = []
+    words = _command_words(argv, chdirs, env)
     if not words:
         return []
     program = os.path.basename(words[0])
@@ -203,17 +220,38 @@ def _commit_targets(argv: list[str], depth: int = 0) -> list[Target]:
     return []
 
 
+def _unclassified_commit(argv: list[str]) -> bool:
+    """A `git` word followed later by `commit` in a simple command whose program is NOT git or a
+    `sh -c` the parser reads (`eval git commit`, an unknown wrapper, ...): fail closed, call it a
+    commit. `git log --grep commit` was classified (git, not committing) and is not one."""
+    words = _command_words(argv, [], [])
+    program = os.path.basename(words[0]) if words else ""
+    if not words or program in ("git", "git.exe") or (program in SHELLS and "-c" in words):
+        return False
+    for index, word in enumerate(words):
+        if os.path.basename(word) in ("git", "git.exe") and "commit" in words[index + 1 :]:
+            return True
+    return False
+
+
 def commit_targets(command: str, depth: int = 0) -> list[Target]:
     """Every `git ... commit` in `command` with the repository it commits to. `cd DIR` before it
     (`cd ../wt && git commit`) counts too."""
     found: list[Target] = []
     cds: list[str] = []
     for seg in _segments(command):
+        while seg and seg[0] in SHELL_KEYWORDS:
+            seg = seg[1:]
+        if not seg:
+            continue
         if seg[0] == "cd":
             operands = [w for w in seg[1:] if not w.startswith("-") or w == "-"]
             cds.append(operands[-1] if operands else "~")
             continue
-        found += [((*cds, *dirs), opts, env) for dirs, opts, env in _commit_targets(seg, depth)]
+        targets = _commit_targets(seg, depth)
+        if not targets and _unclassified_commit(seg):
+            targets = [((), (), ())]  # unknown repository: checked from cwd and the `cd`s
+        found += [((*cds, *dirs), opts, env) for dirs, opts, env in targets]
     return found
 
 

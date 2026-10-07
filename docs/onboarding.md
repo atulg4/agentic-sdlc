@@ -71,6 +71,26 @@ rejected), or a self-hosted runner's labels. Windows labels are refused by `onbo
 - **CI gates** must be invoked exactly as `[commands]` states. Only output and fail-fast extras
   may be appended (`-q`, `-v`, `-x`, `--maxfail=N`, `--tb=…`, `--durations=N`, `-r…`, `--color=…`);
   anything else (`--help`, `--collect-only`, `-k`, `--ignore`, ...) fails the check.
+  A gate counts only as a top-level command: commands inside a shell function body never count,
+  whether or not the function is called. Nothing in the `test` job may change what a gate does
+  without being a visible argument: a `*ADDOPTS*`, `<TOOL>_*` (for the gate tools: `PYTEST_*`,
+  `RUFF_*`, `PIP_*`, ...) or interpreter/shell startup variable (`PYTHONPATH`, `BASH_ENV`, ...)
+  set by workflow/job/step `env:` or by a script; any `$GITHUB_ENV` write; a function or alias
+  named like a gate tool; `eval` or a sourced file other than a virtualenv's `bin/activate`; an
+  action other than `actions/checkout`, `actions/setup-python`, `actions/cache` or
+  `astral-sh/setup-uv`. The setup command itself runs repository code by design; doctor proves
+  the workflow, not what that code does.
+- **Automatic callers** must trigger on `issues: types: [labeled]`, and their `if:` must be
+  exactly the generated label condition (after whitespace normalization) for the policy's labels.
+- **Implement calls** are read from the parsed `with:`/`secrets:` of each job calling
+  `reusable-implement.yml`: `agent` (default `codex`) must be a literal the workflow accepts,
+  `route_budget_usd` a finite non-negative number, and every routed secret must be forwarded by
+  that job itself (or `secrets: inherit` on it). Route mode comes from the parsed policy
+  (`[routing]`), the registry files, or an implement call's `agent: route`.
+- **Runners** are resolved with the same resolver as the public-repository check (local reusable
+  workflows followed). A matching self-hosted runner whose `os` is Windows does not count; a
+  `runs-on: {group: ...}` target fails, because runner-group membership cannot be verified
+  through the repository API.
 - **Claude Code hooks** are read from the parsed `.claude/settings.json`: a `SessionStart` group
   firing on startup that runs `python3 .claude/hooks/forge_session_start.py`, and a `PreToolUse`
   group whose matcher covers `Bash` running `python3 .claude/hooks/forge_commit_guard.py`.
