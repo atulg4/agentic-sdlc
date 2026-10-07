@@ -12,6 +12,7 @@ import yaml
 
 from agentic_sdlc.executors import load_executors, load_routing_policy
 from agentic_sdlc.onboard import (
+    FORK_RUNNER_CHECK,
     IMPLEMENTATION_LABEL,
     REUSABLE_IMPLEMENT_AGENTS,
     REUSABLE_IMPLEMENT_DEFAULT_AGENT,
@@ -445,7 +446,7 @@ def _healthy_gh() -> FakeGh:
                 {"enabled": True, "allowed_actions": "all"}
             ),
             "api repos/owner/comic": json.dumps(
-                {"default_branch": "main", "visibility": "private"}
+                {"default_branch": "main", "visibility": "private", "allow_forking": False}
             ),
             "api /user/installations": _installs(7),
             "api apps/agentic-sdlc-publisher": json.dumps(
@@ -757,7 +758,9 @@ def test_doctor_flags_a_policy_branch_that_is_not_the_repo_default(tmp_path):
     repo = _repo(tmp_path)
     write_onboarding(repo, spec())
     gh = _healthy_gh()
-    gh.answers["api repos/owner/comic"] = json.dumps({"default_branch": "master"})
+    gh.answers["api repos/owner/comic"] = json.dumps(
+        {"default_branch": "master", "visibility": "private", "allow_forking": False}
+    )
     report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
     failed = {c.name: c for c in report.checks if not c.ok}
     assert set(failed) == {"policy default_branch matches the repository"}
@@ -1282,6 +1285,41 @@ def test_session_start_lists_every_in_progress_issue_not_the_default_30(tmp_path
     assert "--limit" in listing and int(listing[listing.index("--limit") + 1]) >= 1000
 
 
+@pytest.mark.parametrize("fetch_ok", [True, False])
+def test_session_start_warns_when_origin_cannot_be_fetched(tmp_path, monkeypatch, fetch_ok):
+    """Codex 4206492773: a failed fetch must not present the cached origin ref as current."""
+    import io
+
+    start = _guard_module(tmp_path, "forge_session_start")
+    calls = []
+
+    def run(cmd):
+        calls.append(cmd)
+        if cmd[:2] == ["git", "fetch"]:
+            return "" if fetch_ok else None
+        if cmd[:2] == ["git", "rev-list"]:
+            return "3"
+        if cmd[:2] == ["git", "log"]:
+            return "abc1234 cached commit"
+        return "[]" if cmd[:3] == ["gh", "issue", "list"] else ""
+
+    monkeypatch.setattr(start, "run", run)
+    monkeypatch.setattr(start, "_lease_lookup", lambda: {}.get)
+    monkeypatch.setattr(start.sys, "stdin", io.StringIO("{}"))
+    out = io.StringIO()
+    monkeypatch.setattr(start.sys, "stdout", out)
+    assert start.main() == 0
+    text = out.getvalue()
+    if fetch_ok:
+        assert "HEAD is 3 commit(s) behind origin/main" in text
+        assert "could not fetch origin" not in text
+    else:
+        assert "WARNING: could not fetch origin" in text and "may be stale" in text
+        assert "3 commit(s) behind" not in text  # no stale count presented as current
+        assert not any(c[:2] == ["git", "rev-list"] for c in calls)
+        assert "CACHED -- possibly stale" in text and "abc1234 cached commit" in text
+
+
 def test_cli_onboard_validates_var_before_writing_any_file(tmp_path, monkeypatch):
     from agentic_sdlc import cli
 
@@ -1782,15 +1820,15 @@ def test_doctor_validates_the_runner_a_caller_hands_its_reusable_workflow(tmp_pa
 
 
 def test_public_repository_ci_defaults_to_a_github_hosted_runner():
-    files = render_onboarding(spec(public=True))
+    files = render_onboarding(spec(fork_exposed=True))
     ci = yaml.safe_load(files[".github/workflows/ci.yml"])
     assert ci["jobs"]["test"]["runs-on"] == ["ubuntu-latest"]
     # issue-triggered agent workflows keep the self-hosted target: they run no fork code
     plan = yaml.safe_load(files[".github/workflows/agent-plan.yml"])
     assert plan["jobs"]["preflight"]["runs-on"] == ["self-hosted", "linux", "x64"]
-    assert spec(public=True, ci_runs_on=("macos-15",)).ci_labels == ("macos-15",)
-    with pytest.raises(OnboardError, match="public repository"):
-        spec(public=True, ci_runs_on=("self-hosted", "linux", "x64"))
+    assert spec(fork_exposed=True, ci_runs_on=("macos-15",)).ci_labels == ("macos-15",)
+    with pytest.raises(OnboardError, match="fork-exposed"):
+        spec(fork_exposed=True, ci_runs_on=("self-hosted", "linux", "x64"))
     # a private repository keeps CI wherever --runs-on says
     assert yaml.safe_load(render_onboarding(spec())[".github/workflows/ci.yml"])["jobs"]["test"][
         "runs-on"
@@ -1811,7 +1849,7 @@ def test_doctor_fails_a_public_repository_running_pull_requests_on_self_hosted(
     gh = _healthy_gh()
     gh.answers["api repos/owner/comic"] = json.dumps({"default_branch": "main", **visibility})
     failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))
-    check = failed["public repository runs pull requests on GitHub-hosted runners"]
+    check = failed[FORK_RUNNER_CHECK]
     assert not check.manual
     assert "ci.yml:test" in check.detail and "lint.yml:lint" in check.detail
     # issue-triggered callers are not pull-request code
@@ -1820,17 +1858,14 @@ def test_doctor_fails_a_public_repository_running_pull_requests_on_self_hosted(
 
 def test_doctor_accepts_a_public_repository_onboarded_with_hosted_ci(tmp_path):
     repo = _repo(tmp_path)
-    write_onboarding(repo, spec(public=True))
+    write_onboarding(repo, spec(fork_exposed=True))
     gh = _healthy_gh()
     gh.answers["api repos/owner/comic"] = json.dumps(
         {"default_branch": "main", "visibility": "public", "private": False}
     )
     report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
     assert report.ok, report.render()
-    assert any(
-        c.name == "public repository runs pull requests on GitHub-hosted runners"
-        for c in report.checks
-    )
+    assert any(c.name == FORK_RUNNER_CHECK for c in report.checks)
 
 
 def test_cli_onboard_reads_visibility_and_refuses_self_hosted_ci_for_public_repos(
@@ -1838,7 +1873,7 @@ def test_cli_onboard_reads_visibility_and_refuses_self_hosted_ci_for_public_repo
 ):
     from agentic_sdlc import cli
 
-    monkeypatch.setattr(cli, "repository_is_public", lambda project: True)
+    monkeypatch.setattr(cli, "repository_fork_exposed", lambda project: True)
     repo = _repo(tmp_path)
     base = ["onboard", "--destination", str(repo), "--project-id", "owner/comic"]
     base += ["--platform-repository", "owner/agentic-sdlc", "--platform-ref", SHA]
@@ -1852,17 +1887,119 @@ def test_cli_onboard_reads_visibility_and_refuses_self_hosted_ci_for_public_repo
     def unreadable(project):
         raise OnboardError("gh failed")
 
-    monkeypatch.setattr(cli, "repository_is_public", unreadable)
+    monkeypatch.setattr(cli, "repository_fork_exposed", unreadable)
     assert cli.main([*base, "--force"]) != 0  # visibility unknown: ask, never guess
 
 
-def test_repository_is_public_reads_visibility():
-    from agentic_sdlc.onboard import repository_is_public
+FORK_POLICY = "api repos/o/r/actions/permissions/fork-pr-workflows-private-repos"
 
-    assert repository_is_public("o/r", lambda args, input=None: '{"visibility": "public"}')
-    assert not repository_is_public("o/r", lambda args, input=None: '{"private": true}')
+
+def _repo_gh(repo: dict, fork_policy: str | None = None):
+    """`repos/o/r` answers `repo`; the fork-PR policy answers `fork_policy`, or 404s (None)."""
+
+    def gh(args, input=None):
+        key = " ".join(args)
+        if key == FORK_POLICY:
+            if fork_policy is None:
+                raise OnboardError("gh: Not Found (HTTP 404)")
+            return fork_policy
+        assert key == "api repos/o/r", key
+        return json.dumps(repo)
+
+    return gh
+
+
+@pytest.mark.parametrize(
+    ("repo", "fork_policy", "state"),
+    [
+        ({"visibility": "public"}, None, "exposed"),
+        ({"private": False}, None, "exposed"),
+        # private, forkable, and the fork-PR workflow policy runs them: exposed
+        (
+            {"visibility": "private", "allow_forking": True},
+            '{"run_workflows_from_fork_pull_requests": true}',
+            "exposed",
+        ),
+        # private, forkable, policy unreadable (403/404): unknown, never safe
+        ({"visibility": "private", "allow_forking": True}, None, "unknown"),
+        # private with forking disabled: safe without consulting the policy
+        ({"visibility": "private", "allow_forking": False}, None, "safe"),
+        # forkable, but fork-PR workflows proven off: safe
+        (
+            {"visibility": "private", "allow_forking": True},
+            '{"run_workflows_from_fork_pull_requests": false}',
+            "safe",
+        ),
+        # internal, forking unknown, policy unreadable: unknown
+        ({"visibility": "internal"}, None, "unknown"),
+        ({"default_branch": "main"}, None, "unknown"),
+    ],
+)
+def test_fork_pull_request_exposure(repo, fork_policy, state):
+    from agentic_sdlc.onboard import fork_pull_request_exposure
+
+    gh = _repo_gh(repo, fork_policy)
+    assert fork_pull_request_exposure(repo, gh, "o/r")[0] == state
+
+
+def test_repository_fork_exposed_is_false_only_when_forks_provably_cannot_run_workflows():
+    from agentic_sdlc.onboard import repository_fork_exposed
+
+    assert repository_fork_exposed("o/r", _repo_gh({"visibility": "public"}))
+    assert repository_fork_exposed("o/r", _repo_gh({"private": True, "allow_forking": True}))
+    assert repository_fork_exposed("o/r", _repo_gh({"visibility": "internal"}))
+    assert not repository_fork_exposed("o/r", _repo_gh({"private": True, "allow_forking": False}))
     with pytest.raises(OnboardError):
-        repository_is_public("o/r", lambda args, input=None: "{}")
+        repository_fork_exposed("o/r", lambda args, input=None: "{}")
+
+
+@pytest.mark.parametrize(
+    ("repo_info", "fork_policy", "manual"),
+    [
+        # private + allow_forking: true, fork-PR workflows enabled -> FAIL
+        (
+            {"visibility": "private", "allow_forking": True},
+            '{"run_workflows_from_fork_pull_requests": true}',
+            False,
+        ),
+        # internal, fork policy unreadable -> TODO, never READY
+        ({"visibility": "internal"}, None, True),
+        # visibility unreadable -> TODO
+        ({}, None, True),
+    ],
+)
+def test_doctor_fails_closed_on_a_forkable_private_repository_with_self_hosted_pr_jobs(
+    tmp_path, repo_info, fork_policy, manual
+):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())  # ci.yml on self-hosted
+    gh = _healthy_gh()
+    key = "api repos/owner/comic/actions/permissions/fork-pr-workflows-private-repos"
+    gh.answers = {key: fork_policy or "", **gh.answers}
+    gh.answers["api repos/owner/comic"] = json.dumps({"default_branch": "main", **repo_info})
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    assert not report.ok and "NOT READY" in report.render()
+    check = _failed(report)[FORK_RUNNER_CHECK]
+    assert check.manual is manual
+    assert "ci.yml:test" in check.detail
+
+
+def test_doctor_accepts_self_hosted_pr_jobs_when_fork_workflows_are_proven_off(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _healthy_gh()
+    key = "api repos/owner/comic/actions/permissions/fork-pr-workflows-private-repos"
+    gh.answers = {key: '{"run_workflows_from_fork_pull_requests": false}', **gh.answers}
+    gh.answers["api repos/owner/comic"] = json.dumps(
+        {"default_branch": "main", "visibility": "internal", "allow_forking": True}
+    )
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    assert report.ok, report.render()
+    # forking disabled outright (the healthy fixture) passes without reading the fork policy
+    gh = _healthy_gh()
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    assert report.ok, report.render()
+    assert not any("fork-pr-workflows" in " ".join(args) for args, _ in gh.calls)
 
 
 def test_runner_labels_render_as_yaml_strings():
@@ -2345,7 +2482,7 @@ def test_public_runner_safety_follows_reusable_workflows(tmp_path, files, expose
     from agentic_sdlc.onboard import _pull_request_off_hosted
 
     repo = _repo(tmp_path)
-    write_onboarding(repo, spec(public=True))
+    write_onboarding(repo, spec(fork_exposed=True))
     for name, text in files.items():
         _wf(repo, name, text)
     found = _pull_request_off_hosted(repo, "owner/agentic-sdlc")
@@ -2355,7 +2492,7 @@ def test_public_runner_safety_follows_reusable_workflows(tmp_path, files, expose
 
 def test_doctor_fails_a_public_repo_whose_pr_workflow_calls_a_self_hosted_reusable(tmp_path):
     repo = _repo(tmp_path)
-    write_onboarding(repo, spec(public=True))
+    write_onboarding(repo, spec(fork_exposed=True))
     _wf(repo, "reuse.yml", REUSE_SELF_HOSTED)
     _wf(repo, "pr.yml", _pr_caller("./.github/workflows/reuse.yml"))
     gh = _healthy_gh()
@@ -2363,7 +2500,7 @@ def test_doctor_fails_a_public_repo_whose_pr_workflow_calls_a_self_hosted_reusab
         {"default_branch": "main", "visibility": "public"}
     )
     failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))
-    check = failed["public repository runs pull requests on GitHub-hosted runners"]
+    check = failed[FORK_RUNNER_CHECK]
     assert "pr.yml:call > reuse.yml:build" in check.detail
 
 
@@ -2420,7 +2557,7 @@ def test_doctor_accepts_a_ci_gate_with_only_output_or_fail_fast_extras(tmp_path,
         {"runs_on": ("windows-latest",)},
         {"runs_on": ("self-hosted", "windows", "x64")},
         {"ci_runs_on": ("windows-11-arm",)},
-        {"public": True, "ci_runs_on": ("windows-latest",)},
+        {"fork_exposed": True, "ci_runs_on": ("windows-latest",)},
     ],
 )
 def test_onboard_rejects_windows_runner_targets(overrides):
@@ -3466,7 +3603,7 @@ def test_cli_onboard_passes_the_python_version_into_policy_and_ci(tmp_path):
 
 # ---------------------------------------------------------------- remote workflows / managed files
 
-PUBLIC_CHECK = "public repository runs pull requests on GitHub-hosted runners"
+PUBLIC_CHECK = FORK_RUNNER_CHECK
 FILES_CHECK = "managed files match the generated files"
 PUSHED_CHECK = "managed files are on the default branch"
 SELF_HOSTED_PR = (
@@ -3499,7 +3636,7 @@ def _remote_workflows(gh: FakeGh, files: dict[str, str]) -> None:
 
 def test_public_runner_safety_reads_the_default_branchs_workflows(tmp_path):
     repo = _repo(tmp_path)
-    write_onboarding(repo, spec(public=True))
+    write_onboarding(repo, spec(fork_exposed=True))
     local = {p.name: p.read_text() for p in (repo / ".github/workflows").glob("*.yml")}
     gh = _public_gh()
     # The checkout is stale: the default branch also runs a self-hosted pull_request workflow.
@@ -3522,7 +3659,7 @@ def test_public_runner_safety_reads_the_default_branchs_workflows(tmp_path):
 
 def test_public_runner_safety_fails_closed_without_the_remote_workflow_set(tmp_path):
     repo = _repo(tmp_path)
-    write_onboarding(repo, spec(public=True))
+    write_onboarding(repo, spec(fork_exposed=True))
     gh = _public_gh()
     gh.answers[CONSUMER_CONTENTS + ".github/workflows?ref=main"] = "not json"
     check = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))[PUBLIC_CHECK]
@@ -3538,7 +3675,7 @@ def test_public_runner_safety_fails_closed_without_the_remote_workflow_set(tmp_p
 
 def test_public_runner_safety_still_checks_local_workflows_as_an_addition(tmp_path):
     repo = _repo(tmp_path)
-    write_onboarding(repo, spec(public=True))
+    write_onboarding(repo, spec(fork_exposed=True))
     remote = {p.name: p.read_text() for p in (repo / ".github/workflows").glob("*.yml")}
     _wf(repo, "lint.yml", SELF_HOSTED_PR)  # not pushed yet
     gh = _public_gh()
@@ -4398,6 +4535,87 @@ def test_selected_actions_patterns_match_like_github():
     assert not check.ok and reusable in check.detail and "actions/checkout" not in check.detail
     own = actions_permissions_check(gh, "plat/comic", {reusable})  # the owner's own workflows
     assert not own.ok  # unreadable for plat/comic in this fake: never READY
+
+
+def test_selected_actions_negative_patterns_block_a_subset_of_an_allowance(tmp_path):
+    from agentic_sdlc.onboard import _action_allowed
+
+    sha = "a" * 40
+    claude = f"anthropics/claude-code-action@{sha}"
+    other = f"anthropics/other-action@{sha}"
+    # Codex 4206492757: GitHub blocks the Claude action here, whatever the entry order.
+    for patterns in (
+        ["anthropics/*", "!anthropics/claude-code-action@*"],
+        ["!anthropics/claude-code-action@*", "anthropics/*"],
+    ):
+        selected = {"patterns_allowed": patterns, "verified_allowed": True}
+        assert _action_allowed(claude, selected, "owner") is False
+        assert _action_allowed(other, selected, "owner") is True
+    # an exclusion overrides the GitHub-owned allowance too
+    blocked = {"github_owned_allowed": True, "patterns_allowed": ["!actions/checkout@*"]}
+    assert _action_allowed(f"actions/checkout@{sha}", blocked, "owner") is False
+    assert _action_allowed(f"actions/setup-python@{sha}", blocked, "owner") is True
+    # end to end: doctor reports the blocked action and is NOT READY
+    check, report = _actions_check(
+        tmp_path,
+        SELECTED,
+        {**ALLOWLIST, "patterns_allowed": ["anthropics/*", "openai/*", "!anthropics/claude-*@*"]},
+    )
+    assert not check.ok and not report.ok and not check.manual
+    assert "anthropics/claude-code-action@" in check.detail
+
+
+# ---------------------------------------------------------------- Codex 4206492761
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_write_onboarding_refuses_a_dangling_managed_symlink(tmp_path, force):
+    repo = _repo(tmp_path / "repo")
+    outside = tmp_path / "outside.txt"  # does not exist yet: the link dangles
+    (repo / "agentic-sdlc.toml").symlink_to(outside)
+    with pytest.raises(OnboardError, match=r"agentic-sdlc.toml is a symlink"):
+        write_onboarding(repo, spec(), force=force)
+    assert not outside.exists()
+    assert not (repo / ".github").exists()  # validated before anything is written
+
+
+def test_write_onboarding_refuses_a_symlink_to_a_file_outside_the_repo(tmp_path):
+    repo = _repo(tmp_path / "repo")
+    outside = tmp_path / "victim.yml"
+    outside.write_text("keep me\n")
+    (repo / ".github/workflows").mkdir(parents=True)
+    (repo / ".github/workflows/ci.yml").symlink_to(outside)
+    with pytest.raises(OnboardError, match=r"ci.yml is a symlink"):
+        write_onboarding(repo, spec(), force=True)
+    assert outside.read_text() == "keep me\n"
+
+
+def test_write_onboarding_refuses_a_symlinked_parent_directory(tmp_path):
+    repo = _repo(tmp_path / "repo")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (repo / ".github").symlink_to(elsewhere, target_is_directory=True)
+    with pytest.raises(OnboardError, match=r"\.github is a symlink"):
+        write_onboarding(repo, spec(), force=True)
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_write_onboarding_replaces_regular_files_atomically_keeping_their_mode(tmp_path):
+    import os
+    import stat
+
+    repo = _repo(tmp_path / "repo")
+    write_onboarding(repo, spec())
+    guard = repo / ".claude/hooks/forge_commit_guard.py"
+    guard.write_text("stale\n")
+    guard.chmod(0o755)
+    inode = guard.stat().st_ino
+    write_onboarding(repo, spec(), force=True)
+    assert guard.read_text() != "stale\n"
+    assert stat.S_IMODE(guard.stat().st_mode) == 0o755
+    assert guard.stat().st_ino != inode  # a new file swapped in, not written in place
+    assert not [p for p in repo.rglob("*.tmp")]
+    assert os.path.isfile(guard) and not guard.is_symlink()
 
 
 # ---------------------------------------------------------------- Codex 4205853975

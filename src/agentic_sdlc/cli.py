@@ -67,7 +67,7 @@ from .onboard import (
     doctor,
     registry_model_vars,
     repository_default_branch,
-    repository_is_public,
+    repository_fork_exposed,
     resolve_platform_ref,
     reusable_calls,
     run_gh,
@@ -753,14 +753,14 @@ def _onboard(args: argparse.Namespace) -> int:
         default_branch = repository_default_branch(args.project_id) if args.apply else "main"
     if args.visibility == "auto":
         try:
-            public = repository_is_public(args.project_id)
+            fork_exposed = repository_fork_exposed(args.project_id)
         except OnboardError as exc:
             raise OnboardError(
                 f"{exc}; pass --visibility public|private (public keeps fork pull-request CI "
                 "off self-hosted runners)"
             ) from exc
     else:
-        public = args.visibility == "public"
+        fork_exposed = args.visibility == "public"
     spec = OnboardSpec(
         project_id=args.project_id,
         platform_repository=args.platform_repository,
@@ -772,7 +772,7 @@ def _onboard(args: argparse.Namespace) -> int:
         implementer=args.implementer,
         runs_on=tuple(args.runs_on.split(",")),
         ci_runs_on=tuple(args.ci_runs_on.split(",")) if args.ci_runs_on else (),
-        public=public,
+        fork_exposed=fork_exposed,
         default_branch=default_branch,
         forbidden_paths=tuple(args.forbidden or ()),
         protected_paths=tuple(args.protected or ()),
@@ -1245,13 +1245,15 @@ def build_parser() -> argparse.ArgumentParser:
     onboard.add_argument(
         "--ci-runs-on",
         help="runner labels for ci.yml (pull_request-triggered); defaults to --runs-on, or "
-        "ubuntu-latest for a public repository, which may not use self-hosted labels here",
+        "ubuntu-latest for a fork-exposed repository, which may not use self-hosted labels here",
     )
     onboard.add_argument(
         "--visibility",
         choices=("auto", "public", "private"),
         default="auto",
-        help="repository visibility; auto reads it from GitHub",
+        help="fork exposure; auto reads visibility and fork policy from GitHub (CI stays "
+        "self-hosted only for a private/internal repository with forking or fork pull-request "
+        "workflows proven disabled); private asserts that offline and doctor verifies it",
     )
     onboard.add_argument(
         "--default-branch",

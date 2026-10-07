@@ -39,21 +39,37 @@ DeepSeek model variables). Trimming executors from the registry, or providers fr
 `.forge/routing-policy.json`, drops their rows; an executor with `authMode: "api-key"` on the
 `anthropic` provider needs `ANTHROPIC_API_KEY` instead of the OAuth token.
 
-### Public repositories and self-hosted runners
+### Fork-exposed repositories and self-hosted runners
 
 GitHub runs every fork pull request's code in `ci.yml`, so a persistent self-hosted runner on a
-public repository would execute untrusted code with whatever the host holds. `onboard` therefore
-reads the repository's visibility (`--visibility auto`, the default; pass `public`/`private` when
-offline) and, for a public repository, renders `ci.yml` on `ubuntu-latest` while the
-issue-triggered agent workflows keep `--runs-on`. `--ci-runs-on` overrides the CI runner, but only
-with GitHub-hosted labels on a public repository: there is no opt-in for self-hosted pull-request
-CI. `doctor` fails a public repository in which any `pull_request*`-triggered job (in any workflow
+repository that fork pull requests can reach would execute untrusted code with whatever the host
+holds. That is every public repository, and also a private or internal one whose repository,
+organization or enterprise policy allows forking AND runs workflows from fork pull requests: an
+enterprise member or read collaborator can then fork it and run PR code on the runner.
+
+A repository counts as **fork-safe** only when GitHub proves one of the two is off: the repository
+is private or internal and `GET repos/{owner}/{repo}` reports `allow_forking: false`, or `GET
+repos/{owner}/{repo}/actions/permissions/fork-pr-workflows-private-repos` reports
+`run_workflows_from_fork_pull_requests: false`. Anything unread (a 403/404 on that endpoint, a
+missing field, an unknown visibility) is not proof. Everything else is **fork-exposed**.
+
+`onboard` reads this (`--visibility auto`, the default; pass `public`/`private` when offline --
+`private` asserts fork-safe, and `doctor` verifies it) and, for a fork-exposed repository, renders
+`ci.yml` on `ubuntu-latest` while the issue-triggered agent workflows keep `--runs-on`.
+`--ci-runs-on` overrides the CI runner, but only with GitHub-hosted labels on a fork-exposed
+repository: there is no opt-in for self-hosted pull-request CI. To keep `ci.yml` self-hosted on a
+private repository, disable forking (or fork pull-request workflows) for it first.
+
+`doctor` checks "fork pull requests cannot reach self-hosted runners". A fork-safe repository
+passes. Otherwise it fails when any `pull_request*`-triggered job (in any workflow
 file on the default branch, read through the contents API -- the set GitHub runs, not this
-checkout's, which is checked in addition; an unreadable remote set fails closed) targets anything but a single GitHub-hosted label, following the jobs of every local
+checkout's, which is checked in addition; an unreadable remote set fails closed) targets anything
+but a single GitHub-hosted label, following the jobs of every local
 reusable workflow it calls (`./.github/workflows/x.yml`, with `with:` inputs substituted). A call
 to a third-party reusable workflow, a runner expression that is not a resolvable input, or a
 Forge platform reusable workflow called without an explicit `runs_on` cannot be proven hosted and
-fails.
+fails. When the fork policy is merely unknown, that failure is an owner TODO (never `READY`):
+disable forking or fork pull-request workflows, or move those jobs to GitHub-hosted runners.
 
 ### Runner labels
 

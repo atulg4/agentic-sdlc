@@ -19,10 +19,13 @@ cleanup is not recorded, so a cleanup that failed after its marker was posted --
 a takeover's, which is best effort and never fails the claim -- is completed by a later one. A
 completed cleanup is recorded (``<!-- forge-cleanup session=… assignee=… -->``) and a retry also
 skips a login that was assigned again after the lease ended, so it can never undo a later human
-assignment. Every removal path (release, takeover, retry) also reads the issue's events first: a
-login a maintainer removed and re-assigned WHILE the lease was active is the maintainer's now, so
-the lease's ownership ends and it stays; events that cannot be read keep it too
-(``reassigned_during``).
+assignment. When a live lease wants a login an ended lease owned, the login stays and the
+ended lease's cleanup is recorded only after its ownership is handed to that live lease (its
+marker re-posted with ``owns_assignee=1``, sticky for the rest of its run), so the live lease's
+release removes it; a hand-over that fails leaves the cleanup pending. Every removal path
+(release, takeover, retry) also reads the issue's events first: a login a maintainer removed and
+re-assigned WHILE the lease was active is the maintainer's now, so the lease's ownership ends and
+it stays; events that cannot be read keep it too (``reassigned_during``).
 
 Markers count only from authors who can write to the repository (``trusted_marker_author``): a
 user whose repository permission is write/maintain/admin, `github-actions[bot]`, or the Forge
@@ -343,6 +346,8 @@ def _open_leases(project: str, issue: int, gh: GhRunner) -> list[Lease]:
             if previous is not None and not previous.live(posted):
                 first_seen[lease.session] = position  # lapsed: seniority is forfeited
                 started[lease.session] = posted
+            else:
+                lease = _keep_ownership(previous, lease)
             first_seen.setdefault(lease.session, position)
             started.setdefault(lease.session, posted)
             latest[lease.session] = replace(lease, claimed_at=started[lease.session])
@@ -353,6 +358,22 @@ def _open_leases(project: str, issue: int, gh: GhRunner) -> list[Lease]:
             del first_seen[released]
             del started[released]
     return [latest[sess] for sess in sorted(latest, key=first_seen.__getitem__)]
+
+
+def _keep_ownership(previous: Lease | None, lease: Lease) -> Lease:
+    """Assignee ownership is sticky within one run of a session's markers: once a marker of the
+    run records `owns_assignee` for a login, a later marker of that run for the same login keeps
+    it. A renewal that read the thread before an ownership transfer (`_transfer_assignee`) was
+    posted would otherwise drop the transferred ownership again."""
+    if (
+        previous is not None
+        and previous.owns_assignee
+        and not lease.owns_assignee
+        and lease.assignee
+        and same_login(previous.assignee, lease.assignee)
+    ):
+        return replace(lease, owns_assignee=True)
+    return lease
 
 
 @dataclass(frozen=True)
@@ -388,7 +409,7 @@ def ended_leases(project: str, issue: int, gh: GhRunner) -> list[ReleasedLease]:
                     ended.append(ReleasedLease(latest.pop(other), posted, cleaned=False))
             previous = latest.get(parsed.session)
             began = previous.claimed_at if previous is not None else posted
-            latest[parsed.session] = replace(parsed, claimed_at=began)
+            latest[parsed.session] = replace(_keep_ownership(previous, parsed), claimed_at=began)
             continue
         released = _release_session(body)
         if released in latest:
@@ -656,7 +677,11 @@ def _drop_owned_assignee(
             return False
         if superseded:
             return True
-    if not _sync_assignee(project, issue, ended.assignee, gh, now) or before is None:
+    if not _sync_assignee(project, issue, ended.assignee, gh, now):
+        # A live lease wants the login: it stays. The ended lease's cleanup is finished only
+        # once that lease OWNS it (so its release removes it); otherwise it stays pending.
+        return _transfer_assignee(project, issue, ended, gh, now)
+    if before is None:
         return True
     # The history check and the removal are not atomic: a maintainer may have assigned the
     # login in between, and the removal just undid that. Re-read and give it back.
@@ -668,6 +693,38 @@ def _drop_owned_assignee(
     if _assigned_after(before, after, ended.assignee):
         _edit(project, issue, gh, "--add-assignee", ended.assignee)  # the maintainer's now
     return True
+
+
+def _transfer_assignee(
+    project: str, issue: int, ended: Lease, gh: GhRunner, now: datetime | None
+) -> bool:
+    """Hand the assignee an ended lease owned to the live lease that wants the same login. That
+    lease found the login already on the issue, so it does not own it, and its release would
+    leave it forever once the ended lease's cleanup is recorded. Posts the holder's marker again
+    with ``owns_assignee=1`` (sticky for the rest of its run, `_keep_ownership`) and re-reads:
+    True only when the authoritative lease now owns the login; anything else leaves the ended
+    lease's cleanup pending for a later reconciliation."""
+    now = now or datetime.now(UTC)
+    holder = current_lease(project, issue, gh, now)
+    if holder is None or not holder.live(now) or not same_login(holder.assignee, ended.assignee):
+        return False
+    if not holder.owns_assignee:
+        owned = replace(holder, owns_assignee=True)
+        _comment(
+            project,
+            issue,
+            format_claim_marker(owned)
+            + f"\nAssignee `{holder.assignee}` handed over from the ended lease of session "
+            f"`{ended.session}`; it is removed when this lease is released.",
+            gh,
+        )
+        holder = current_lease(project, issue, gh, now)
+    return (
+        holder is not None
+        and holder.live(now)
+        and holder.owns_assignee
+        and same_login(holder.assignee, ended.assignee)
+    )
 
 
 def _record_cleanup(project: str, issue: int, ended: Lease, gh: GhRunner) -> None:
