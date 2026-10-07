@@ -12,12 +12,20 @@ already, or it was inherited from the expired lease this one took over). Release
 takeover -- remove only an assignee a lease owned, and only when the authoritative live lease
 does not want the same login; a pre-existing assignee is never touched. A release that finds
 no lease reconciles the owned assignee of the last released one, so retrying a release whose
-cleanup failed after its marker was posted completes that cleanup.
+cleanup failed after its marker was posted completes that cleanup. A completed cleanup is
+recorded (``<!-- forge-cleanup session=… assignee=… -->``) and a retry also skips a login that was
+assigned again after the release, so it can never undo a later human assignment.
+
+Markers count only from authors who can write to the repository (``trusted_marker_author``): a
+user whose repository permission is write/maintain/admin, `github-actions[bot]`, or the Forge
+Publisher App's bot. ``author_association`` is not authority (a read-only organization member
+comments as MEMBER). The commit-guard hook mirrors the same rule.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
@@ -28,12 +36,23 @@ GhRunner = Callable[..., str]
 IN_PROGRESS_LABEL = "in-progress"
 DEFAULT_TTL_MINUTES = 240
 MAX_TTL_MINUTES = 7 * 24 * 60  # policy.lease_ttl_minutes maximum
-TRUSTED_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+#: Repository permissions (`permission` or `role_name` of the collaborator permission API) whose
+#: holders may post lease markers.
+WRITE_PERMISSIONS = frozenset({"admin", "maintain", "write"})
+#: The only GitHub App bots whose markers count: Actions' own token, and the Forge Publisher App
+#: (its slug carries this hint, the same rule `sdlcctl doctor` identifies the App by). Name the
+#: Publisher bot exactly with FORGE_LEASE_BOT_LOGINS (comma-separated) to replace the hint rule.
+GITHUB_ACTIONS_BOT = "github-actions[bot]"
+PUBLISHER_APP_SLUG_HINT = "agentic-sdlc"
+LEASE_BOT_LOGINS_ENV = "FORGE_LEASE_BOT_LOGINS"
+_LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
 CLAIM_MARKER = "forge-claim"
 RELEASE_MARKER = "forge-release"
+CLEANUP_MARKER = "forge-cleanup"
 _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@+-]{0,120}$")
 _CLAIM = re.compile(r"<!--\s*forge-claim\s+(?P<fields>[^>]*?)\s*-->")
 _RELEASE = re.compile(r"<!--\s*forge-release\s+(?P<fields>[^>]*?)\s*-->")
+_CLEANUP = re.compile(r"<!--\s*forge-cleanup\s+(?P<fields>[^>]*?)\s*-->")
 _FIELD = re.compile(r"(\w+)=(\S+)")
 _PR_REF = re.compile(
     r"(?:\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*)"
@@ -122,6 +141,11 @@ def format_release_marker(session: str) -> str:
     return f"<!-- {RELEASE_MARKER} session={session} -->"
 
 
+def format_cleanup_marker(session: str, assignee: str) -> str:
+    """Records that the released lease of `session` no longer holds `assignee` on the issue."""
+    return f"<!-- {CLEANUP_MARKER} session={session} assignee={assignee} -->"
+
+
 def parse_marker(body: str, issue: int) -> Lease | None:
     """Return the lease encoded in a comment body, or None when absent/malformed."""
     matches = list(_CLAIM.finditer(body or ""))
@@ -166,12 +190,86 @@ def _comments(project: str, issue: int, gh: GhRunner) -> list[dict]:
     return _paged(f"repos/{project}/issues/{issue}/comments?per_page=100", gh)
 
 
-def _trusted(comment: dict) -> bool:
-    """Only repository members/collaborators and GitHub Apps (installed by an admin) may post
-    lease markers; anyone else commenting on a public issue must not block or free a ticket."""
-    if comment.get("author_association") in TRUSTED_ASSOCIATIONS:
+def trusted_bot(login: str, configured: str | None = None) -> bool:
+    """`github-actions[bot]`, or the Publisher App's bot: the logins in FORGE_LEASE_BOT_LOGINS
+    when set, else a `<slug>[bot]` whose slug carries PUBLISHER_APP_SLUG_HINT. No other bot."""
+    login = login.lower()
+    if login == GITHUB_ACTIONS_BOT:
         return True
-    return (comment.get("user") or {}).get("type") == "Bot"
+    if configured is None:
+        configured = os.environ.get(LEASE_BOT_LOGINS_ENV, "")
+    named = {part.strip().lower() for part in configured.split(",") if part.strip()}
+    if named:
+        return login in named
+    return login.endswith("[bot]") and PUBLISHER_APP_SLUG_HINT in login[: -len("[bot]")]
+
+
+def trusted_marker_author(
+    comment: dict, permission: Callable[[str], str | None], configured: str | None = None
+) -> bool:
+    """May this comment's author post lease markers? A bot by `trusted_bot`; a user only with
+    write/maintain/admin on the repository (`permission(login)` -> the permission API's
+    `permission`/`role_name`, None when it could not be read: untrusted). Never by
+    `author_association`, which a read-only member or collaborator also carries."""
+    user = comment.get("user") or {}
+    login = str(user.get("login") or "")
+    if not login:
+        return False
+    if user.get("type") == "Bot" or login.endswith("[bot]"):
+        return user.get("type") == "Bot" and trusted_bot(login, configured)
+    if not _LOGIN.fullmatch(login):
+        return False
+    granted = permission(login)
+    return granted is not None and granted in WRITE_PERMISSIONS
+
+
+class PermissionCache:
+    """Repository permission per login, read once per run (`GET .../collaborators/{u}/permission`).
+    A failed read is None (untrusted) and is not retried within the run."""
+
+    def __init__(self, project: str, gh: GhRunner):
+        self.project = project
+        self.gh = gh
+        self._known: dict[str, str | None] = {}
+
+    def __call__(self, login: str) -> str | None:
+        if login not in self._known:
+            self._known[login] = self._read(login)
+        return self._known[login]
+
+    def _read(self, login: str) -> str | None:
+        try:
+            data = json.loads(
+                self.gh(["api", f"repos/{self.project}/collaborators/{login}/permission"]) or "{}"
+            )
+        except Exception:  # noqa: BLE001 -- unreadable means untrusted (fail closed)
+            return None
+        if not isinstance(data, dict):
+            return None
+        # role_name distinguishes maintain (permission reads "write") and custom roles.
+        for key in ("role_name", "permission"):
+            value = str(data.get(key) or "").lower()
+            if value in WRITE_PERMISSIONS:
+                return value
+        return str(data.get("permission") or "") or None
+
+
+_RUN_TRUST: dict[tuple[str, int], PermissionCache] = {}
+
+
+def _trust(project: str, gh: GhRunner) -> PermissionCache:
+    """The permission cache of this run (one per project and gh runner)."""
+    key = (project, id(gh))
+    cache = _RUN_TRUST.get(key)
+    if cache is None or cache.gh is not gh:
+        cache = _RUN_TRUST[key] = PermissionCache(project, gh)
+    return cache
+
+
+def _trusted_comments(project: str, issue: int, gh: GhRunner) -> list[dict]:
+    """The issue's comments whose authors may post lease markers, in order."""
+    permission = _trust(project, gh)
+    return [c for c in _comments(project, issue, gh) if trusted_marker_author(c, permission)]
 
 
 def current_lease(
@@ -191,9 +289,7 @@ def current_lease(
     now = now or datetime.now(UTC)
     first_seen: dict[str, int] = {}
     latest: dict[str, Lease] = {}
-    for position, comment in enumerate(_comments(project, issue, gh)):
-        if not _trusted(comment):
-            continue
+    for position, comment in enumerate(_trusted_comments(project, issue, gh)):
         body = comment.get("body") or ""
         parsed = parse_marker(body, issue)
         if parsed is not None:
@@ -219,15 +315,23 @@ def current_lease(
     return ordered[-1] if ordered else None
 
 
-def last_released_lease(project: str, issue: int, gh: GhRunner) -> Lease | None:
-    """The lease the most recent trusted release (or retraction) marker ended: the claim it
-    voided, with the assignee bookkeeping that claim recorded. None when no release has ended
-    a claim. Lets a retried release finish the cleanup a failed one began after its marker."""
+@dataclass(frozen=True)
+class ReleasedLease:
+    """The lease the most recent trusted release ended, when that release was posted, and
+    whether its assignee cleanup is recorded as done."""
+
+    lease: Lease
+    released_at: datetime | None
+    cleaned: bool
+
+
+def last_release(project: str, issue: int, gh: GhRunner) -> ReleasedLease | None:
+    """The claim the most recent trusted release (or retraction) marker voided, with the
+    assignee bookkeeping that claim recorded; None when no release has ended a claim. A trusted
+    `forge-cleanup` marker for that session and assignee, posted after it, marks it cleaned."""
     latest: dict[str, Lease] = {}
-    ended: Lease | None = None
-    for comment in _comments(project, issue, gh):
-        if not _trusted(comment):
-            continue
+    ended: ReleasedLease | None = None
+    for comment in _trusted_comments(project, issue, gh):
         body = comment.get("body") or ""
         parsed = parse_marker(body, issue)
         if parsed is not None:
@@ -235,8 +339,43 @@ def last_released_lease(project: str, issue: int, gh: GhRunner) -> Lease | None:
             continue
         released = _release_session(body)
         if released in latest:
-            ended = latest.pop(released)
+            posted = _parse_iso(comment.get("created_at") or "")
+            ended = ReleasedLease(latest.pop(released), posted, cleaned=False)
+            continue
+        done = _CLEANUP.search(body)
+        if done and ended is not None:
+            fields = dict(_FIELD.findall(done.group("fields")))
+            if (
+                fields.get("session") == ended.lease.session
+                and fields.get("assignee") == ended.lease.assignee
+            ):
+                ended = replace(ended, cleaned=True)
     return ended
+
+
+def last_released_lease(project: str, issue: int, gh: GhRunner) -> Lease | None:
+    """The lease the most recent trusted release (or retraction) marker ended (`last_release`).
+    Lets a retried release finish the cleanup a failed one began after its marker."""
+    ended = last_release(project, issue, gh)
+    return ended.lease if ended is not None else None
+
+
+def assigned_since(project: str, issue: int, login: str, since: datetime, gh: GhRunner) -> bool:
+    """Was `login` assigned to the issue after `since` (issue `assigned` events)? Errs to True
+    when the events cannot be read: the caller then leaves the assignee alone. (The assignment
+    the lease itself made precedes its release marker, so it does not count.)"""
+    try:
+        events = _paged(f"repos/{project}/issues/{issue}/events?per_page=100", gh)
+    except Exception:  # noqa: BLE001 -- unknown history: do not remove anyone
+        return True
+    for event in events:
+        if event.get("event") != "assigned":
+            continue
+        who = str((event.get("assignee") or {}).get("login") or "")
+        at = _parse_iso(str(event.get("created_at") or ""))
+        if who.lower() == login.lower() and (at is None or at > since):
+            return True
+    return False
 
 
 def open_prs_for_issue(project: str, issue: int, gh: GhRunner) -> list[dict]:
@@ -372,23 +511,42 @@ def _sync_assignee(
 
 def _drop_owned_assignee(
     project: str, issue: int, ended: Lease | None, gh: GhRunner, now: datetime | None
-) -> None:
-    """Undo the assignment an ended lease made (nothing when it did not make one)."""
+) -> bool:
+    """Undo the assignment an ended lease made (nothing when it did not make one). True when the
+    lease owned an assignee, so the caller can record the cleanup as done."""
     if ended is not None and ended.owns_assignee and ended.assignee:
         _sync_assignee(project, issue, ended.assignee, gh, now)
+        return True
+    return False
+
+
+def _record_cleanup(project: str, issue: int, ended: Lease, gh: GhRunner) -> None:
+    """Mark the released lease's assignee cleanup done, so a later retry never repeats it."""
+    _comment(project, issue, format_cleanup_marker(ended.session, ended.assignee), gh)
 
 
 def _reconcile_released_assignee(
     project: str, issue: int, gh: GhRunner, now: datetime | None
 ) -> None:
-    """Drop the assignee the last released lease owned if it is still on the issue and no live
-    lease wants it (`_sync_assignee` re-checks that)."""
-    ended = last_released_lease(project, issue, gh)
-    if ended is None or not ended.owns_assignee or not ended.assignee:
+    """Finish the assignee cleanup of the last released lease -- only when it is not recorded as
+    done, the login is still on the issue, nobody (re)assigned it after the release, and no live
+    lease wants it (`_sync_assignee` re-checks that). Idempotent: it records completion."""
+    ended = last_release(project, issue, gh)
+    if ended is None or ended.cleaned:
+        return
+    lease = ended.lease
+    if not lease.owns_assignee or not lease.assignee:
         return
     target = json.loads(gh(["api", f"repos/{project}/issues/{issue}"]) or "{}")
-    if ended.assignee in _assignee_logins(target if isinstance(target, dict) else {}):
-        _sync_assignee(project, issue, ended.assignee, gh, now)
+    if lease.assignee not in _assignee_logins(target if isinstance(target, dict) else {}):
+        _record_cleanup(project, issue, lease, gh)
+        return
+    if ended.released_at is None or assigned_since(
+        project, issue, lease.assignee, ended.released_at, gh
+    ):
+        return  # assigned again after the release (or unknowable): a later owner's assignment
+    _sync_assignee(project, issue, lease.assignee, gh, now)
+    _record_cleanup(project, issue, lease, gh)
 
 
 def _assignee_logins(target: dict) -> set[str]:
@@ -504,7 +662,8 @@ def claim(
                 gh,
             )
             _sync_label(project, issue, gh, now)
-            _drop_owned_assignee(project, issue, lease, gh, now)
+            if _drop_owned_assignee(project, issue, lease, gh, now):
+                _record_cleanup(project, issue, lease, gh)
         except Exception:  # noqa: BLE001 -- best effort; the original failure is what matters
             pass
         raise
@@ -576,8 +735,10 @@ def release(
     )
     # A new claimant may have taken the lease (and added the label) since we read it.
     _sync_label(project, issue, gh, now)
-    # The assignee this lease added goes too, reconciled the same way.
-    _drop_owned_assignee(project, issue, existing, gh, now)
+    # The assignee this lease added goes too, reconciled the same way; completion is recorded
+    # so a retried release cannot remove a login a maintainer assigns again afterwards.
+    if _drop_owned_assignee(project, issue, existing, gh, now):
+        _record_cleanup(project, issue, existing, gh)
 
 
 def list_claims(project: str, gh: GhRunner, now: datetime | None = None) -> list[ClaimRow]:

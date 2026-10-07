@@ -46,6 +46,9 @@ class FakeGh:
         self.poster: dict = {}  # who posts comments made through this fake (default: OWNER)
         self.before_post = None  # one-shot hook: simulate a comment arriving before ours
         self.posted_at = NOW  # created_at stamped on comments made through this fake
+        # repository permission per login (the collaborator permission API); others: 404
+        self.permissions: dict[str, str] = {"atulg4": "admin"}
+        self.events: dict[int, list[dict]] = {}  # issue events (assigned, ...)
 
     def issue(self, number, labels=(), assignees=(), comments=()):
         self.issues[number] = {
@@ -76,6 +79,16 @@ class FakeGh:
                 if any(lbl["name"] == IN_PROGRESS_LABEL for lbl in i["labels"])
             ]
             return self._pages(labelled, args)
+        if args[0] == "api" and args[1].startswith(f"repos/{PROJECT}/collaborators/"):
+            login = args[1].split("/")[4]
+            if login not in self.permissions:
+                raise RuntimeError("gh: Not Found (HTTP 404)")
+            level = self.permissions[login]
+            legacy = {"maintain": "write", "triage": "read"}.get(level, level)
+            return json.dumps({"permission": legacy, "role_name": level})
+        if args[0] == "api" and args[1].split("?")[0].endswith("/events"):
+            n = int(args[1].split("/")[4])
+            return self._pages(self.events.get(n, []), args)
         if args[0] == "api" and args[1].split("?")[0].endswith("/comments") and "-X" not in args:
             n = int(args[1].split("/")[4])
             return self._pages(self.issues[n]["comments"], args)
@@ -103,6 +116,13 @@ class FakeGh:
                 login = args[args.index("--add-assignee") + 1]
                 if {"login": login} not in self.issues[n]["assignees"]:
                     self.issues[n]["assignees"].append({"login": login})
+                    self.events.setdefault(n, []).append(
+                        {
+                            "event": "assigned",
+                            "assignee": {"login": login},
+                            "created_at": self.posted_at.isoformat(),
+                        }
+                    )
             if "--remove-assignee" in args:
                 login = args[args.index("--remove-assignee") + 1]
                 self.issues[n]["assignees"] = [
@@ -347,7 +367,9 @@ def test_markers_from_a_github_app_bot_are_trusted():
     )
     gh = FakeGh().issue(7)
     gh.issues[7]["comments"].append(
-        _comment_row(60, bot_claim, "2026-09-30T01:00:00Z", "publisher[bot]", "Bot", "NONE")
+        _comment_row(
+            60, bot_claim, "2026-09-30T01:00:00Z", "agentic-sdlc-publisher[bot]", "Bot", "NONE"
+        )
     )
     assert current_lease(PROJECT, 7, gh).session == "run-1"
 
@@ -612,7 +634,9 @@ def test_claim_retracts_its_marker_when_label_bookkeeping_fails():
             now=NOW,
             assignee="nobody",
         )
-    assert "forge-release session=s1" in gh.issues[7]["comments"][-1]["body"]
+    bodies = [c["body"] for c in gh.issues[7]["comments"]]
+    assert "forge-release session=s1" in bodies[-2]
+    assert bodies[-1] == "<!-- forge-cleanup session=s1 assignee=nobody -->"
     assert current_lease(PROJECT, 7, gh, now=NOW) is None  # not blocked for the TTL
 
 
@@ -777,3 +801,250 @@ def test_retried_release_keeps_a_pre_existing_or_newly_wanted_assignee():
     release(PROJECT, 7, session="s2", gh=gh, now=NOW)
     # s2 never owned alice, and the reconciliation only runs when no lease exists at all
     assert _logins(gh) == ["alice"]
+
+
+# ---------------------------------------------------------------- marker authority
+
+
+def test_markers_need_write_permission_not_an_association_label():
+    live = format_claim_marker(Lease(7, "me", "s1", "b", NOW + timedelta(hours=1)))
+    gh = FakeGh().issue(7, labels=[IN_PROGRESS_LABEL], comments=[live])
+    gh.permissions.update({"reader": "read", "triager": "triage"})
+    # a read-only organization member / collaborator carries MEMBER / COLLABORATOR
+    for cid, (login, association) in enumerate(
+        [("reader", "MEMBER"), ("triager", "COLLABORATOR"), ("outsider", "MEMBER")], start=70
+    ):
+        gh.issues[7]["comments"].append(
+            _comment_row(
+                cid,
+                "<!-- forge-release session=s1 -->",
+                "2026-09-30T01:00:00Z",
+                login,
+                "User",
+                association,
+            )
+        )
+    assert current_lease(PROJECT, 7, gh, now=NOW).session == "s1"
+    blocker = format_claim_marker(Lease(8, "x", "squat", "b", NOW + timedelta(days=7)))
+    gh.issue(8)
+    gh.issues[8]["comments"].append(
+        _comment_row(80, blocker, "2026-09-30T01:00:00Z", "reader", "User", "MEMBER")
+    )
+    assert current_lease(PROJECT, 8, gh, now=NOW) is None
+    assert claim(PROJECT, 8, agent="me", session="s2", branch="b", gh=gh, now=NOW).ok
+
+
+def test_maintainers_and_writers_markers_count_and_permissions_are_read_once():
+    gh = FakeGh().issue(7)
+    gh.permissions.update({"maint": "maintain", "writer": "write"})
+    claim_ = format_claim_marker(Lease(7, "me", "s1", "b", NOW + timedelta(hours=1)))
+    gh.issues[7]["comments"] += [
+        _comment_row(90, claim_, "2026-09-30T01:00:00Z", "maint", "User", "NONE"),
+        _comment_row(91, "<!-- forge-release session=s1 -->", "2026-09-30T01:01:00Z", "writer"),
+    ]
+    assert current_lease(PROJECT, 7, gh, now=NOW) is None  # the writer's release counts
+    gh.issues[7]["comments"].pop()
+    assert current_lease(PROJECT, 7, gh, now=NOW).session == "s1"
+    reads = [c for c in gh.calls if "collaborators/maint/permission" in c[1]]
+    assert len(reads) == 1  # cached for the run
+
+
+def test_an_unreadable_permission_makes_the_marker_untrusted():
+    gh = FakeGh().issue(7)
+    real = gh.__call__
+
+    def broken(args, input=None):
+        if "/collaborators/" in args[1]:
+            raise RuntimeError("HTTP 502")
+        return real(args, input=input)
+
+    marker = format_claim_marker(Lease(7, "me", "s1", "b", NOW + timedelta(hours=1)))
+    gh.issues[7]["comments"].append(_comment_row(95, marker, "2026-09-30T01:00:00Z"))
+    assert current_lease(PROJECT, 7, broken, now=NOW) is None
+    # Our own claim cannot be proven authoritative either: the claim fails closed.
+    result = claim(PROJECT, 7, agent="me", session="s9", branch="b", gh=broken, now=NOW)
+    assert not result.ok
+
+
+@pytest.mark.parametrize(
+    ("login", "kind", "configured", "trusted"),
+    [
+        ("github-actions[bot]", "Bot", "", True),
+        ("agentic-sdlc-publisher[bot]", "Bot", "", True),
+        ("dependabot[bot]", "Bot", "", False),
+        ("claude[bot]", "Bot", "", False),
+        ("agentic-sdlc-publisher[bot]", "Bot", "my-forge[bot]", False),
+        ("my-forge[bot]", "Bot", "my-forge[bot]", True),
+        ("github-actions[bot]", "Bot", "my-forge[bot]", True),
+        ("agentic-sdlc-publisher[bot]", "User", "", False),  # not actually an App
+    ],
+)
+def test_only_the_actions_and_publisher_bots_may_post_markers(
+    login, kind, configured, trusted, monkeypatch
+):
+    from agentic_sdlc.leases import LEASE_BOT_LOGINS_ENV
+
+    monkeypatch.setenv(LEASE_BOT_LOGINS_ENV, configured)
+    marker = format_claim_marker(Lease(7, "forge-actions", "run-1", "b", NOW + timedelta(hours=1)))
+    gh = FakeGh().issue(7)
+    gh.issues[7]["comments"].append(
+        _comment_row(60, marker, "2026-09-30T01:00:00Z", login, kind, "NONE")
+    )
+    found = current_lease(PROJECT, 7, gh, now=NOW)
+    assert (found is not None) is trusted
+
+
+def _guard():
+    import importlib.util
+    import tempfile
+    from pathlib import Path
+
+    from agentic_sdlc.onboard import OnboardSpec, render_hooks
+
+    text = render_hooks(
+        OnboardSpec(
+            project_id=PROJECT,
+            platform_repository="owner/agentic-sdlc",
+            platform_ref="e" * 40,
+            test_command="pytest",
+        )
+    )[".claude/hooks/forge_commit_guard.py"]
+    path = Path(tempfile.mkdtemp()) / "guard_parity.py"
+    path.write_text(text)
+    spec = importlib.util.spec_from_file_location("guard_parity", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_commit_guard_and_leases_make_identical_trust_and_lease_decisions(monkeypatch):
+    from agentic_sdlc import leases
+
+    guard = _guard()
+    for name in (
+        "WRITE_PERMISSIONS",
+        "GITHUB_ACTIONS_BOT",
+        "PUBLISHER_APP_SLUG_HINT",
+        "LEASE_BOT_LOGINS_ENV",
+        "MAX_TTL_MINUTES",
+    ):
+        assert getattr(guard, name) == getattr(leases, name), name
+    permissions = {"admin1": "admin", "maint": "maintain", "w": "write", "r": "read", "t": "triage"}
+    later = (NOW + timedelta(hours=2)).isoformat()
+    authors = [
+        ("admin1", "User", "OWNER"),
+        ("maint", "User", "MEMBER"),
+        ("w", "User", "COLLABORATOR"),
+        ("r", "User", "MEMBER"),
+        ("t", "User", "COLLABORATOR"),
+        ("unknown", "User", "MEMBER"),  # permission unreadable
+        ("bad/login", "User", "OWNER"),
+        ("github-actions[bot]", "Bot", "NONE"),
+        ("agentic-sdlc-publisher[bot]", "Bot", "NONE"),
+        ("dependabot[bot]", "Bot", "NONE"),
+        ("fake[bot]", "User", "NONE"),
+        ("", "User", "OWNER"),
+    ]
+    for configured in ("", "agentic-sdlc-publisher[bot]", "other[bot]"):
+        monkeypatch.setenv(leases.LEASE_BOT_LOGINS_ENV, configured)
+        for login, kind, association in authors:
+            row = _comment_row(1, "", later, login, kind, association)
+            assert leases.trusted_marker_author(
+                row, permissions.get
+            ) == guard.trusted_marker_author(row, permissions.get), (login, configured)
+        # and the lease each side derives from the same thread
+        for claimant, releaser in [(a[0], b[0]) for a in authors for b in authors[:4]]:
+            gh = FakeGh().issue(7)
+            gh.permissions = dict(permissions)
+            claim_ = format_claim_marker(Lease(7, "a", "s1", "b", NOW + timedelta(days=1)))
+            rows = [
+                _comment_row(1, claim_, NOW.isoformat(), claimant, *_kind(authors, claimant)),
+                _comment_row(
+                    2,
+                    "<!-- forge-release session=s1 -->",
+                    NOW.isoformat(),
+                    releaser,
+                    *_kind(authors, releaser),
+                ),
+            ]
+            gh.issues[7]["comments"] = rows
+            mine = leases.current_lease(PROJECT, 7, gh, now=NOW)
+            theirs = guard.lease_from_comments(rows, permissions.get, now=NOW)
+            assert (mine.session if mine and mine.live(NOW) else None) == (
+                theirs["session"] if theirs else None
+            ), (claimant, releaser, configured)
+
+
+def _kind(authors, login):
+    return next((kind, association) for name, kind, association in authors if name == login)
+
+
+# ---------------------------------------------------------------- idempotent assignee cleanup
+
+
+def test_a_retried_release_never_removes_a_later_human_reassignment():
+    gh = FakeGh().issue(7)
+    assert claim(
+        PROJECT, 7, agent="a", session="s1", branch="b", gh=gh, now=NOW, assignee="alice"
+    ).ok
+    release(PROJECT, 7, session="s1", gh=gh, now=NOW)
+    assert _logins(gh) == []
+    assert gh.issues[7]["comments"][-1]["body"] == (
+        "<!-- forge-cleanup session=s1 assignee=alice -->"
+    )
+    gh.posted_at = NOW + timedelta(minutes=5)
+    gh(["issue", "edit", "7", "--repo", PROJECT, "--add-assignee", "alice"])  # a maintainer
+    release(PROJECT, 7, session="s1", gh=gh, now=NOW + timedelta(minutes=6))  # retry
+    assert _logins(gh) == ["alice"]
+
+
+def test_a_retry_after_a_failed_cleanup_skips_a_login_reassigned_after_the_release():
+    gh = FakeGh().issue(7)
+    assert claim(
+        PROJECT, 7, agent="a", session="s1", branch="b", gh=gh, now=NOW, assignee="alice"
+    ).ok
+    real = gh.__call__
+
+    def flaky(args, input=None):
+        if tuple(args[:2]) == ("issue", "edit") and "--remove-assignee" in args:
+            raise RuntimeError("transient GitHub failure")
+        return real(args, input=input)
+
+    with pytest.raises(RuntimeError):
+        release(PROJECT, 7, session="s1", gh=flaky, now=NOW)
+    # a maintainer assigns alice again (still listed, since the removal failed) after the release
+    gh.events[7].append(
+        {
+            "event": "assigned",
+            "assignee": {"login": "alice"},
+            "created_at": (NOW + timedelta(minutes=3)).isoformat(),
+        }
+    )
+    before = len(gh.calls)
+    release(PROJECT, 7, session="s1", gh=gh, now=NOW + timedelta(minutes=4))
+    assert _logins(gh) == ["alice"]
+    assert not any("--remove-assignee" in c for c in gh.calls[before:])
+
+
+def test_a_retry_records_the_cleanup_it_completes():
+    gh = FakeGh().issue(7)
+    assert claim(
+        PROJECT, 7, agent="a", session="s1", branch="b", gh=gh, now=NOW, assignee="alice"
+    ).ok
+    real = gh.__call__
+
+    def flaky(args, input=None):
+        if tuple(args[:2]) == ("issue", "edit") and "--remove-assignee" in args:
+            raise RuntimeError("transient GitHub failure")
+        return real(args, input=input)
+
+    with pytest.raises(RuntimeError):
+        release(PROJECT, 7, session="s1", gh=flaky, now=NOW)
+    release(PROJECT, 7, session="s1", gh=gh, now=NOW)
+    assert _logins(gh) == []
+    assert gh.issues[7]["comments"][-1]["body"].startswith("<!-- forge-cleanup session=s1")
+    comments = len(gh.issues[7]["comments"])
+    before = len(gh.calls)
+    release(PROJECT, 7, session="s1", gh=gh, now=NOW)  # nothing left to do
+    assert not any("--remove-assignee" in c for c in gh.calls[before:])
+    assert len(gh.issues[7]["comments"]) == comments

@@ -120,7 +120,9 @@ GitHub-native lease on the issue (`in-progress` label + assignee + a machine-rea
 `<!-- forge-claim … expires=… -->` comment; default TTL 4 h via `[automation] lease_ttl_minutes`).
 The marker records an `--assignee` and whether the lease added it (`owns_assignee=1`); release,
 and a takeover of an expired lease, remove only an assignee the lease added, never one that was
-already on the issue, and only when the live lease does not want the same login.
+already on the issue, and only when the live lease does not want the same login. A completed
+cleanup is recorded (`<!-- forge-cleanup … -->`), and a retried release also skips a login that
+was assigned again after the release, so a retry never undoes a later human assignment.
 
 ```bash
 sdlcctl claim   --project owner/repo --issue 12 --agent claude-code --session "$SESSION" --branch forge/issue-12
@@ -131,8 +133,13 @@ sdlcctl claims  --project owner/repo          # live + expired leases
 
 `claim` exits 2, changing nothing, when another live lease or an open PR for the issue exists;
 expired leases can be taken over (the takeover is commented). Markers count only when posted by
-an OWNER/MEMBER/COLLABORATOR or a GitHub App, and an expiry is capped at post time + 7 days, so
-an outside commenter cannot forge or free a lease. `reusable-implement.yml` claims as the last
+a user whose repository permission (read per run from the collaborator permission API) is
+write, maintain or admin, by `github-actions[bot]`, or by the Forge Publisher App's bot (a
+`<slug>[bot]` whose slug contains `agentic-sdlc`, or exactly the logins in
+`FORGE_LEASE_BOT_LOGINS`); `author_association` is not trusted (a read-only member comments as
+MEMBER) and an unreadable permission is untrusted. An expiry is capped at post time + 7 days, so
+an outside or read-only commenter cannot forge or free a lease; the commit guard applies the same
+rule. `reusable-implement.yml` claims as the last
 step of `prepare` (with an App-minted token: issues write, pull requests read) and releases after
 the draft PR exists or on failure. `sdlcctl onboard` installs two Claude Code hooks in the consumer repo: a SessionStart
 hook that fetches origin and lists PRs and leased issues, and a PreToolUse guard that blocks

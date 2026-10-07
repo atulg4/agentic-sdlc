@@ -30,7 +30,7 @@ from .executors import (
     request_from_mission,
     route_executor,
 )
-from .leases import IN_PROGRESS_LABEL
+from .leases import IN_PROGRESS_LABEL, PUBLISHER_APP_SLUG_HINT
 from .missions import MissionError, load_registry
 from .openai_compatible import PROVIDERS as OPENAI_COMPATIBLE_PROVIDERS
 from .openai_compatible import ROUTED_MIN_CONTEXT_WINDOW
@@ -63,7 +63,6 @@ REQUIRED_CHECK = "test"
 #: The GitHub Actions app: the only integration that reports ci.yml's `test` job. A required
 #: status check pinned (`integration_id`) to any other app can never be satisfied by it.
 GITHUB_ACTIONS_INTEGRATION_ID = 15368
-PUBLISHER_APP_SLUG_HINT = "agentic-sdlc"
 
 LABELS = {
     "claude-ready": ("0e8a16", "Specified precisely enough for the implementation worker"),
@@ -1906,6 +1905,79 @@ def _pull_request_off_hosted(base: Path, platform_repository: str) -> list[str]:
     return found
 
 
+_WORKFLOW_FILE = re.compile(r"^[A-Za-z0-9._-]+\.ya?ml$")
+
+
+def remote_workflow_files(
+    gh: GhRunner, project_id: str, ref: str | None
+) -> tuple[dict[str, bytes] | None, str]:
+    """({file name: bytes}, '') of every workflow in `.github/workflows` on `ref` of the
+    repository -- the set GitHub actually runs, local reusable workflows included (they must live
+    in that same directory) -- or (None, why) when that set cannot be read in full. A file whose
+    name or content cannot be read makes the whole set unreadable: a partial set proves nothing."""
+    if not ref:
+        return None, "the repository's default branch is unknown"
+    listing = _safe_json(gh, ["api", f"repos/{project_id}/contents/.github/workflows?ref={ref}"])
+    if not isinstance(listing, list):
+        return None, f"could not list .github/workflows on {ref}"
+    files: dict[str, bytes] = {}
+    for entry in listing:
+        if not isinstance(entry, dict) or entry.get("type") != "file":
+            continue
+        name = str(entry.get("name") or "")
+        if not name.endswith((".yml", ".yaml")):
+            continue  # GitHub runs only .yml/.yaml files
+        if not _WORKFLOW_FILE.fullmatch(name):
+            return None, f"unexpected workflow file name {name!r} on {ref}"
+        blob = _safe_json(
+            gh, ["api", f"repos/{project_id}/contents/.github/workflows/{name}?ref={ref}"]
+        )
+        if not isinstance(blob, dict) or blob.get("encoding") != "base64":
+            return None, f"could not read .github/workflows/{name} on {ref}"
+        try:
+            files[name] = base64.b64decode(str(blob.get("content") or ""))
+        except ValueError:
+            return None, f"could not decode .github/workflows/{name} on {ref}"
+    return files, ""
+
+
+def _remote_pull_request_off_hosted(files: dict[str, bytes], platform_repository: str) -> list[str]:
+    """`_pull_request_off_hosted` over a workflow set read from GitHub (`remote_workflow_files`),
+    materialized in a scratch checkout so local reusable calls resolve within that same set."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="forge-remote-workflows-") as scratch:
+        root = Path(scratch)
+        workflows = root / ".github/workflows"
+        workflows.mkdir(parents=True)
+        for name, content in files.items():
+            (workflows / name).write_bytes(content)
+        return _pull_request_off_hosted(root, platform_repository)
+
+
+def public_runner_exposure(
+    base: Path,
+    gh: GhRunner,
+    project_id: str,
+    platform_repository: str,
+    ref: str | None,
+) -> list[str]:
+    """Every pull_request-triggered job of a public repository not proven GitHub-hosted. The
+    authority is the default branch's workflow set as GitHub serves it (a stale or partial
+    checkout must not hide a workflow that is live there); the local checkout's workflows are
+    checked IN ADDITION, never instead. An unreadable remote set fails closed."""
+    files, why = remote_workflow_files(gh, project_id, ref)
+    if files is None:
+        return [f"default-branch workflows unverifiable ({why}); doctor fails closed"]
+    exposed = _remote_pull_request_off_hosted(files, platform_repository)
+    exposed += [
+        f"local checkout: {item}"
+        for item in _pull_request_off_hosted(base, platform_repository)
+        if item not in exposed
+    ]
+    return exposed
+
+
 def _ci_runs_on(base: Path) -> RunnerTarget | None:
     """Where ci.yml's `test` job runs: its labels, or why they cannot be proven (None when the
     file or the job cannot be read -- the ci.yml gate check reports that)."""
@@ -2715,6 +2787,115 @@ def managed_workflow_drift(
     return problems
 
 
+#: Forge-managed files doctor compares byte for byte with what `onboard` renders. The hooks are
+#: the lease enforcement itself: a guard replaced by `sys.exit(0)` must not pass as installed.
+EXACT_MANAGED_FILES = (
+    ".claude/hooks/forge_commit_guard.py",
+    ".claude/hooks/forge_session_start.py",
+    ".github/ISSUE_TEMPLATE/agent-work-request.md",
+)
+#: Forge-managed guides doctor requires to CONTAIN the rendered text verbatim: repository notes
+#: may be added around it, but no generated line may be edited or dropped.
+CONTAINED_MANAGED_FILES = ("AGENTS.md", "CLAUDE.md")
+#: The cloud-routine doc is exact apart from the CI runner it names (a tunable knob of ci.yml,
+#: checked by the runner checks).
+ROUTINE_DOC = "docs/forge/cloud-implementer.md"
+_ROUTINE_CI_RUNNER = re.compile(r"runs on\s+`[^`]*`")
+
+
+def _routine_doc_masked(text: str) -> str:
+    return _ROUTINE_CI_RUNNER.sub("runs on `<tunable>`", text)
+
+
+def rendered_managed_files(
+    policy_doc: dict,
+    project_id: str,
+    platform_repository: str,
+    *,
+    cloud: bool,
+) -> tuple[dict[str, str], list[str]]:
+    """({path: rendered text}, problems) for every non-workflow Forge-managed file `onboard`
+    writes, rendered from the repository's own policy (ready label, default branch, caps, gate
+    commands). A file that cannot be rendered is a problem, never silently skipped."""
+    project = policy_doc.get("project") if isinstance(policy_doc.get("project"), dict) else {}
+    automation = (
+        policy_doc.get("automation") if isinstance(policy_doc.get("automation"), dict) else {}
+    )
+    caps = policy_doc.get("policy") if isinstance(policy_doc.get("policy"), dict) else {}
+    fields = dict(
+        project_id=project_id,
+        platform_repository=platform_repository,
+        platform_ref="0" * 40,
+        default_branch=str(project.get("default_branch") or "main"),
+        ready_label=str(automation.get("ready_label") or "claude-ready"),
+        implementer="cloud-routine" if cloud else "claude",
+    )
+    rendered: dict[str, str] = {}
+    problems: list[str] = []
+    try:
+        # The hooks and the issue template depend on the project, branch and label only.
+        basic = OnboardSpec(test_command="-", **fields)
+        hooks = render_hooks(basic)
+        # .claude/settings.json is tunable (other hooks, permissions): `hook_problems` checks it.
+        rendered.update({k: v for k, v in hooks.items() if k in EXACT_MANAGED_FILES})
+        rendered[".github/ISSUE_TEMPLATE/agent-work-request.md"] = render_work_request(basic)
+    except OnboardError as exc:
+        problems.append(f"hooks and issue template cannot be rebuilt ({exc})")
+    try:
+        full = _template_spec(
+            policy_doc,
+            max_changed_files=int(caps.get("max_changed_files", 20)),
+            max_diff_lines=int(caps.get("max_diff_lines", 2500)),
+            **fields,
+        )
+        rendered["AGENTS.md"] = render_agents_md(full)
+        rendered["CLAUDE.md"] = render_claude_md(full)
+        if cloud:
+            rendered[ROUTINE_DOC] = render_cloud_routine_md(full)
+    except (OnboardError, TypeError, ValueError) as exc:
+        problems.append(f"AGENTS.md, CLAUDE.md and the routine doc cannot be rebuilt ({exc})")
+    return rendered, problems
+
+
+def managed_file_problem(relative: str, installed: bytes, rendered: dict[str, str]) -> str | None:
+    """Why an installed copy of a managed file is not what `onboard` renders (None: it is, or
+    the file is not one compared here)."""
+    want = rendered.get(relative)
+    if want is None:
+        return None
+    try:
+        have = installed.decode("utf-8")
+    except UnicodeDecodeError:
+        return f"{relative} is not UTF-8 text"
+    if relative in CONTAINED_MANAGED_FILES:
+        ok = want in have
+    elif relative == ROUTINE_DOC:
+        ok = _routine_doc_masked(have) == _routine_doc_masked(want)
+    else:
+        ok = have == want
+    return None if ok else f"{relative} differs from the generated file"
+
+
+def managed_file_drift(
+    base: Path, policy_doc: dict, project_id: str, platform_repository: str, *, cloud: bool
+) -> list[str]:
+    """Every installed non-workflow Forge-managed file against its rendered form
+    (`rendered_managed_files`): the hook scripts and issue template exactly, the guides by
+    containment, the routine doc exactly apart from its CI runner. Missing files are reported by
+    "required files present"; `.claude/settings.json` is checked structurally (`hook_problems`)
+    and the routing registries semantically (the routing check), since both are tunable."""
+    rendered, problems = rendered_managed_files(
+        policy_doc, project_id, platform_repository, cloud=cloud
+    )
+    for relative in rendered:
+        path = base / relative
+        if path.is_file():
+            problem = managed_file_problem(relative, path.read_bytes(), rendered)
+            if problem:
+                problems.append(problem)
+    return problems
+
+
 def implementation_mode(toml_path: Path, actions_callers: Sequence[str]) -> tuple[str, str]:
     """(mode, problem) from the policy's `[agents] implementation_mode`; problem is '' when the
     mode is explicit and valid. A policy written before the field existed keeps working while its
@@ -3072,6 +3253,21 @@ def doctor(
                     "; ".join(drift) if drift else "tunable only: " + ", ".join(TUNABLE_KNOBS),
                 )
             )
+    if policy is not None:
+        file_drift = managed_file_drift(
+            base, policy_doc, project_id, platform_repository, cloud=cloud
+        )
+        add(
+            Check(
+                "managed files match the generated files",
+                not file_drift,
+                "; ".join(file_drift) + " → re-run `sdlcctl onboard --force`"
+                if file_drift
+                else "hooks and issue template exact; AGENTS.md/CLAUDE.md contain the guide"
+                + ("; routine doc exact" if cloud else ""),
+            )
+        )
+    if plan.exists():
         # The automatic callers do nothing unless adding a label to an issue starts them.
         inert = [
             caller.name
@@ -3139,6 +3335,13 @@ def doctor(
         )
         if (base / r).is_file()
     ]
+    # The remote copies are also compared with their rendered form directly (not only with
+    # this checkout), so a disabled hook on the default branch fails even if it was never pulled.
+    remote_rendered = (
+        rendered_managed_files(policy_doc, project_id, platform_repository, cloud=cloud)[0]
+        if policy is not None
+        else {}
+    )
     unpushed = []
     for relative in managed:
         blob = _safe_json(
@@ -3154,6 +3357,8 @@ def doctor(
             unpushed.append(f"{relative} (missing)")
         elif remote_bytes != (base / relative).read_bytes():
             unpushed.append(f"{relative} (differs)")
+        elif managed_file_problem(relative, remote_bytes, remote_rendered):
+            unpushed.append(f"{relative} (differs from the generated file; onboard --force)")
     add(
         Check(
             "managed files are on the default branch",
@@ -3373,7 +3578,7 @@ def doctor(
     # --- a public repository's pull-request jobs run fork code: never on a persistent runner
     known = isinstance(repo_info, dict) and ("private" in repo_info or "visibility" in repo_info)
     if known and _is_public(repo_info):
-        exposed = _pull_request_off_hosted(base, platform_repository)
+        exposed = public_runner_exposure(base, gh, project_id, platform_repository, actual_branch)
         add(
             Check(
                 "public repository runs pull requests on GitHub-hosted runners",
