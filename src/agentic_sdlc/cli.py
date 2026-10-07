@@ -6,7 +6,6 @@ import argparse
 import hashlib
 import json
 import math
-import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -68,7 +67,9 @@ from .onboard import (
     doctor,
     registry_model_vars,
     repository_default_branch,
+    repository_is_public,
     resolve_platform_ref,
+    reusable_calls,
     run_gh,
     write_onboarding,
 )
@@ -750,6 +751,16 @@ def _onboard(args: argparse.Namespace) -> int:
     default_branch = args.default_branch
     if not default_branch:
         default_branch = repository_default_branch(args.project_id) if args.apply else "main"
+    if args.visibility == "auto":
+        try:
+            public = repository_is_public(args.project_id)
+        except OnboardError as exc:
+            raise OnboardError(
+                f"{exc}; pass --visibility public|private (public keeps fork pull-request CI "
+                "off self-hosted runners)"
+            ) from exc
+    else:
+        public = args.visibility == "public"
     spec = OnboardSpec(
         project_id=args.project_id,
         platform_repository=args.platform_repository,
@@ -759,6 +770,8 @@ def _onboard(args: argparse.Namespace) -> int:
         quality_command=args.quality,
         implementer=args.implementer,
         runs_on=tuple(args.runs_on.split(",")),
+        ci_runs_on=tuple(args.ci_runs_on.split(",")) if args.ci_runs_on else (),
+        public=public,
         default_branch=default_branch,
         forbidden_paths=tuple(args.forbidden or ()),
         protected_paths=tuple(args.protected or ()),
@@ -799,15 +812,18 @@ def _doctor(args: argparse.Namespace) -> int:
         policy = load_policy(destination / "agentic-sdlc.toml")
         project_id = project_id or policy.project_id
         if not platform:
-            plan = (destination / ".github/workflows/agent-plan.yml").read_text(encoding="utf-8")
-            found = re.search(
-                r"uses:\s*([^/\s]+/[^/\s]+)/\.github/workflows/reusable-plan\.yml@", plan
-            )
+            found = [
+                repository
+                for _, repository, workflow, _ in reusable_calls(
+                    destination / ".github/workflows/agent-plan.yml"
+                )
+                if workflow == "reusable-plan.yml"
+            ]
             if not found:
                 raise OnboardError(
                     "cannot infer the platform repository; pass --platform-repository"
                 )
-            platform = found.group(1)
+            platform = found[0]
     report = doctor(destination, project_id, platform, remote=not args.local)
     print(report.render())
     _write(report.as_dict(), args.output) if args.output else None
@@ -1214,6 +1230,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     onboard.add_argument(
         "--runs-on", default="self-hosted,linux,x64", help="comma-separated runner labels"
+    )
+    onboard.add_argument(
+        "--ci-runs-on",
+        help="runner labels for ci.yml (pull_request-triggered); defaults to --runs-on, or "
+        "ubuntu-latest for a public repository, which may not use self-hosted labels here",
+    )
+    onboard.add_argument(
+        "--visibility",
+        choices=("auto", "public", "private"),
+        default="auto",
+        help="repository visibility; auto reads it from GitHub",
     )
     onboard.add_argument(
         "--default-branch",

@@ -11,10 +11,44 @@ sdlcctl doctor --destination .
 
 `onboard --apply` writes the policy, guides, issue template, CI and Forge workflows, creates the
 labels/ruleset/variables, and runs `doctor`. `doctor` lists the owner-only steps that remain:
-`gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo owner/repo` (plus `PUBLISHER_APP_PRIVATE_KEY` and
-`DEEPSEEK_API_KEY` for Actions/routed implementers), installing the Publisher GitHub App, and
-registering a self-hosted runner when `--runs-on` is `self-hosted,...`. Everything below is the
-manual procedure `onboard` automates.
+setting the credentials below, installing the Publisher GitHub App, and registering a self-hosted
+runner when `--runs-on` is `self-hosted,...`. Everything below is the manual procedure `onboard`
+automates.
+
+### Credentials `doctor` requires
+
+Secrets are set with `gh secret set NAME --repo owner/repo`; variables with
+`gh variable set NAME --repo owner/repo --body VALUE` (or `onboard --apply --var NAME=VALUE`, or
+`--copy-vars-from owner/onboarded-repo`). `doctor` derives the list from the installed workflows
+and the routed registry, and `tests/test_onboard.py` checks that every name it can demand appears
+here.
+
+| `--implementer` | Secrets | Variables |
+|---|---|---|
+| every mode | `CLAUDE_CODE_OAUTH_TOKEN` (planning) | |
+| `route`, `claude`, `codex` (Actions implementers) | `PUBLISHER_APP_PRIVATE_KEY` | `PUBLISHER_APP_CLIENT_ID` |
+| `route` (default) | `DEEPSEEK_API_KEY`, `ZAI_API_KEY`, `KIMI_API_KEY` | `DEEPSEEK_MODEL_FLASH`, `DEEPSEEK_MODEL_PRO`, `ZAI_MODEL_GLM`, `KIMI_MODEL_K3` |
+| `codex` | `OPENAI_API_KEY` | |
+| `cloud-routine` | nothing beyond the planning token | |
+| any, with a private platform repository | `PLATFORM_READ_TOKEN` | |
+
+The `route` row is the generated `.forge/executors.json`: every executor the router can select for
+an implementation run needs its provider key and its `configured-by-NAME` model variable, because
+the router falls back across them after a recoverable failure (the preflight also insists on both
+DeepSeek model variables). Trimming executors from the registry, or providers from
+`.forge/routing-policy.json`, drops their rows; an executor with `authMode: "api-key"` on the
+`anthropic` provider needs `ANTHROPIC_API_KEY` instead of the OAuth token.
+
+### Public repositories and self-hosted runners
+
+GitHub runs every fork pull request's code in `ci.yml`, so a persistent self-hosted runner on a
+public repository would execute untrusted code with whatever the host holds. `onboard` therefore
+reads the repository's visibility (`--visibility auto`, the default; pass `public`/`private` when
+offline) and, for a public repository, renders `ci.yml` on `ubuntu-latest` while the
+issue-triggered agent workflows keep `--runs-on`. `--ci-runs-on` overrides the CI runner, but only
+with GitHub-hosted labels on a public repository: there is no opt-in for self-hosted pull-request
+CI. `doctor` fails a public repository in which any `pull_request*`-triggered job (in any workflow
+file) targets anything but a single GitHub-hosted label.
 
 ## Required repository state
 

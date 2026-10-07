@@ -123,7 +123,7 @@ def test_workflows_use_self_hosted_runners_and_the_pinned_platform():
     plan = files[".github/workflows/agent-plan.yml"]
     assert f"owner/agentic-sdlc/.github/workflows/reusable-plan.yml@{SHA}" in plan
     assert 'runs_on: \'["self-hosted","linux","x64"]\'' in plan
-    assert "runs-on: [self-hosted, linux, x64]" in plan
+    assert 'runs-on: ["self-hosted", "linux", "x64"]' in plan
     assert (
         "CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}" in plan
     )  # the secret plan needs
@@ -480,6 +480,8 @@ def test_cli_onboard_and_doctor_local(tmp_path, monkeypatch, capsys):
     code = main(
         [
             "onboard",
+            "--visibility",
+            "private",
             "--destination",
             str(repo),
             "--project-id",
@@ -511,6 +513,8 @@ def test_cli_onboard_and_doctor_local(tmp_path, monkeypatch, capsys):
         main(
             [
                 "onboard",
+                "--visibility",
+                "private",
                 "--destination",
                 str(repo),
                 "--project-id",
@@ -1190,6 +1194,8 @@ def test_cli_onboard_validates_var_before_writing_any_file(tmp_path, monkeypatch
     code = cli.main(
         [
             "onboard",
+            "--visibility",
+            "private",
             "--destination",
             str(repo),
             "--project-id",
@@ -1261,7 +1267,7 @@ def test_doctor_accepts_a_registry_with_one_usable_executor(tmp_path):
     (repo / ".forge/executors.json").write_text(json.dumps(reg))
     report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
     routing = next(c for c in report.checks if c.name == "routing files valid and permit this repo")
-    assert routing.ok and "4 of 5" in routing.detail
+    assert routing.ok and "3 of 5" in routing.detail  # flash is below the medium floor
 
 
 def test_doctor_checks_the_ci_test_job_runner_target(tmp_path):
@@ -1270,7 +1276,7 @@ def test_doctor_checks_the_ci_test_job_runner_target(tmp_path):
     ci = repo / ".github/workflows/ci.yml"
     ci.write_text(
         ci.read_text().replace(
-            "runs-on: [self-hosted, linux, x64]", "runs-on: [self-hosted, linux, arm64]"
+            'runs-on: ["self-hosted", "linux", "x64"]', 'runs-on: ["self-hosted", "linux", "arm64"]'
         )
     )
     gh = _healthy_gh()  # runner carries self-hosted/linux/x64 only
@@ -1363,7 +1369,8 @@ def test_cli_copy_vars_from_copies_every_registry_model_variable(tmp_path, monke
     monkeypatch.setattr(cli, "apply_repo_settings", lambda *a, **k: {})
     monkeypatch.setattr(cli, "doctor", lambda *a, **k: DoctorReport())
     repo = _repo(tmp_path)
-    args = ["onboard", "--destination", str(repo), "--project-id", "owner/comic"]
+    args = ["onboard", "--visibility", "private", "--destination", str(repo)]
+    args += ["--project-id", "owner/comic"]
     args += ["--platform-repository", "owner/agentic-sdlc", "--platform-ref", SHA]
     args += ["--test", "pytest -q", "--default-branch", "main", "--apply"]
     assert (
@@ -1452,7 +1459,7 @@ def test_doctor_rejects_a_routed_provider_without_a_workflow_adapter(tmp_path, p
     write_onboarding(repo, spec())
     path = repo / ".forge/executors.json"
     registry = json.loads(path.read_text())
-    registry["executors"][0]["provider"] = provider
+    registry["executors"][1]["provider"] = provider  # deepseek-v4-pro: routed at medium risk
     path.write_text(json.dumps(registry))
     policy = repo / ".forge/routing-policy.json"
     routing = json.loads(policy.read_text())
@@ -1643,3 +1650,326 @@ def test_doctor_validates_the_runner_a_caller_hands_its_reusable_workflow(tmp_pa
     assert "agent-plan.yml:plan (runs_on)" in (
         failed["self-hosted runner online for this repo"].detail
     )
+
+
+# ---------------------------------------------------------------- review regressions (PR 139, 4)
+
+
+def test_public_repository_ci_defaults_to_a_github_hosted_runner():
+    files = render_onboarding(spec(public=True))
+    ci = yaml.safe_load(files[".github/workflows/ci.yml"])
+    assert ci["jobs"]["test"]["runs-on"] == ["ubuntu-latest"]
+    # issue-triggered agent workflows keep the self-hosted target: they run no fork code
+    plan = yaml.safe_load(files[".github/workflows/agent-plan.yml"])
+    assert plan["jobs"]["preflight"]["runs-on"] == ["self-hosted", "linux", "x64"]
+    assert spec(public=True, ci_runs_on=("macos-15",)).ci_labels == ("macos-15",)
+    with pytest.raises(OnboardError, match="public repository"):
+        spec(public=True, ci_runs_on=("self-hosted", "linux", "x64"))
+    # a private repository keeps CI wherever --runs-on says
+    assert yaml.safe_load(render_onboarding(spec())[".github/workflows/ci.yml"])["jobs"]["test"][
+        "runs-on"
+    ] == ["self-hosted", "linux", "x64"]
+
+
+@pytest.mark.parametrize("visibility", [{"visibility": "public"}, {"private": False}])
+def test_doctor_fails_a_public_repository_running_pull_requests_on_self_hosted(
+    tmp_path, visibility
+):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())  # CI on self-hosted, as a private repo would have it
+    extra = repo / ".github/workflows/lint.yml"
+    extra.write_text(
+        "on: pull_request_target\njobs:\n  lint:\n    runs-on: [self-hosted]\n"
+        "    steps:\n      - run: make lint\n"
+    )
+    gh = _healthy_gh()
+    gh.answers["api repos/owner/comic"] = json.dumps({"default_branch": "main", **visibility})
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))
+    check = failed["public repository runs pull requests on GitHub-hosted runners"]
+    assert not check.manual
+    assert "ci.yml:test" in check.detail and "lint.yml:lint" in check.detail
+    # issue-triggered callers are not pull-request code
+    assert "agent-plan.yml" not in check.detail
+
+
+def test_doctor_accepts_a_public_repository_onboarded_with_hosted_ci(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(public=True))
+    gh = _healthy_gh()
+    gh.answers["api repos/owner/comic"] = json.dumps(
+        {"default_branch": "main", "visibility": "public", "private": False}
+    )
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    assert report.ok, report.render()
+    assert any(
+        c.name == "public repository runs pull requests on GitHub-hosted runners"
+        for c in report.checks
+    )
+
+
+def test_cli_onboard_reads_visibility_and_refuses_self_hosted_ci_for_public_repos(
+    tmp_path, monkeypatch
+):
+    from agentic_sdlc import cli
+
+    monkeypatch.setattr(cli, "repository_is_public", lambda project: True)
+    repo = _repo(tmp_path)
+    base = ["onboard", "--destination", str(repo), "--project-id", "owner/comic"]
+    base += ["--platform-repository", "owner/agentic-sdlc", "--platform-ref", SHA]
+    base += ["--test", "pytest -q", "--output", str(tmp_path / "o.json")]
+    assert cli.main([*base, "--ci-runs-on", "self-hosted,linux,x64"]) != 0
+    assert not (repo / "agentic-sdlc.toml").exists()
+    assert cli.main(base) == 0
+    ci = yaml.safe_load((repo / ".github/workflows/ci.yml").read_text())
+    assert ci["jobs"]["test"]["runs-on"] == ["ubuntu-latest"]
+
+    def unreadable(project):
+        raise OnboardError("gh failed")
+
+    monkeypatch.setattr(cli, "repository_is_public", unreadable)
+    assert cli.main([*base, "--force"]) != 0  # visibility unknown: ask, never guess
+
+
+def test_repository_is_public_reads_visibility():
+    from agentic_sdlc.onboard import repository_is_public
+
+    assert repository_is_public("o/r", lambda args, input=None: '{"visibility": "public"}')
+    assert not repository_is_public("o/r", lambda args, input=None: '{"private": true}')
+    with pytest.raises(OnboardError):
+        repository_is_public("o/r", lambda args, input=None: "{}")
+
+
+def test_runner_labels_render_as_yaml_strings():
+    labels = ("true", "null", "on", "123")
+    files = render_onboarding(spec(runs_on=labels, ci_runs_on=labels))
+    seen = 0
+    for name, content in files.items():
+        if not name.endswith(".yml"):
+            continue
+        for job in (yaml.safe_load(content).get("jobs") or {}).values():
+            if "runs-on" in job:
+                assert job["runs-on"] == list(labels), name
+                seen += 1
+            if "runs_on" in (job.get("with") or {}):
+                assert json.loads(job["with"]["runs_on"]) == list(labels), name
+                seen += 1
+    assert seen >= 8
+
+
+def test_doctor_reads_reusable_calls_from_jobs_not_comments(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    plan = repo / ".github/workflows/agent-plan.yml"
+    doc = yaml.safe_load(plan.read_text())
+    target = doc["jobs"]["plan"]["uses"]
+    doc["jobs"]["plan"] = {"runs-on": "ubuntu-latest", "steps": [{"run": "true"}]}
+    plan.write_text(f"# uses: {target}\n" + yaml.safe_dump(doc, sort_keys=False))
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert "agent-plan.yml calls no reusable workflow" in (
+        failed["workflows pin the platform to a commit SHA"].detail
+    )
+
+
+def test_cli_doctor_infers_the_platform_from_the_plan_job_not_a_comment(tmp_path, capsys):
+    from agentic_sdlc.cli import main
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    plan = repo / ".github/workflows/agent-plan.yml"
+    plan.write_text(
+        "# uses: evil/fork/.github/workflows/reusable-plan.yml@main\n" + plan.read_text()
+    )
+    main(["doctor", "--destination", str(repo), "--local"])
+    out = capsys.readouterr().out
+    assert "[PASS] workflows pin the platform to a commit SHA" in out
+
+
+def test_doctor_routes_the_implementation_mission_the_workflow_routes(tmp_path):
+    """Codex's example: a registry whose only permitted executor is DeepSeek Flash (quality
+    0.76) passes a low-risk floor but never the medium-risk implementation-worker route."""
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    path = repo / ".forge/executors.json"
+    registry = json.loads(path.read_text())
+    for entry in registry["executors"][1:]:
+        entry["permittedRepositories"] = ["owner/other"]
+    path.write_text(json.dumps(registry))
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    detail = failed["routing files valid and permit this repo"].detail
+    assert "implementation-worker" in detail and "quality floor not met" in detail
+
+
+def test_doctor_route_request_matches_the_implement_workflow():
+    """Pin doctor's request to the `route-executor` call in reusable-implement.yml."""
+    from agentic_sdlc.onboard import (
+        ROUTE_DEFAULT_BUDGET_USD,
+        ROUTE_MIN_CONTEXT_WINDOW,
+        ROUTE_MISSION_ID,
+        ROUTE_TASK_CLASS,
+        ROUTE_TOOL_CAPABILITIES,
+    )
+
+    root = Path(__file__).resolve().parents[1]
+    workflow = yaml.safe_load((root / ".github/workflows/reusable-implement.yml").read_text())
+    steps = [s for job in workflow["jobs"].values() for s in job.get("steps") or []]
+    route = next(str(s["run"]) for s in steps if "route-executor" in str(s.get("run", "")))
+    assert re.findall(r"--mission-id (\S+)", route) == [ROUTE_MISSION_ID]
+    assert re.findall(r"--task-class (\S+)", route) == [ROUTE_TASK_CLASS.value]
+    assert tuple(re.findall(r"--required-tool-capability (\S+)", route)) == (
+        ROUTE_TOOL_CAPABILITIES
+    )
+    assert re.findall(r"--min-context-window (\d+)", route) == [str(ROUTE_MIN_CONTEXT_WINDOW)]
+    assert "--missions" not in route  # platform missions only, as doctor loads them
+    assert re.findall(r'--budget-usd "\$(\w+)"', route) == ["ROUTE_BUDGET_USD"]
+    triggers = workflow.get("on", workflow.get(True))  # YAML 1.1: a bare `on` is True
+    budget = triggers["workflow_call"]["inputs"]["route_budget_usd"]["default"]
+    assert float(budget) == ROUTE_DEFAULT_BUDGET_USD
+
+
+def test_doctor_routable_set_is_the_route_executor_cli_decision(tmp_path):
+    from agentic_sdlc.cli import main
+    from agentic_sdlc.onboard import (
+        ROUTE_DEFAULT_BUDGET_USD,
+        ROUTE_MIN_CONTEXT_WINDOW,
+        ROUTE_MISSION_ID,
+        ROUTE_TASK_CLASS,
+        ROUTE_TOOL_CAPABILITIES,
+        implementation_route_request,
+        route_candidates,
+    )
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    out = tmp_path / "route.json"
+    args = ["route-executor", "--config", str(repo / "agentic-sdlc.toml")]
+    args += ["--mission-id", ROUTE_MISSION_ID, "--executors", str(repo / ".forge/executors.json")]
+    args += ["--routing-policy", str(repo / ".forge/routing-policy.json")]
+    args += ["--repository", "owner/comic", "--task-class", ROUTE_TASK_CLASS.value]
+    for tool in ROUTE_TOOL_CAPABILITIES:
+        args += ["--required-tool-capability", tool]
+    args += ["--budget-usd", str(ROUTE_DEFAULT_BUDGET_USD)]
+    args += ["--min-context-window", str(ROUTE_MIN_CONTEXT_WINDOW), "--output", str(out)]
+    main(args)
+    candidates = json.loads(out.read_text())["candidates"]
+    cli_eligible = {c["executorId"] for c in candidates if c["eligible"]}
+    request = implementation_route_request(load_policy(repo / "agentic-sdlc.toml"), "owner/comic")
+    verdict = route_candidates(
+        load_executors(json.loads((repo / ".forge/executors.json").read_text())),
+        load_routing_policy(json.loads((repo / ".forge/routing-policy.json").read_text())),
+        request,
+    )
+    assert {eid for eid, reasons in verdict.items() if not reasons} == cli_eligible
+    assert "deepseek-v4-flash" not in cli_eligible  # 0.76 < the medium floor 0.82
+
+
+def test_doctor_honours_a_caller_route_budget(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    for name in ("agent-implement.yml", "agent-auto-implement.yml"):
+        path = repo / ".github/workflows" / name
+        doc = yaml.safe_load(path.read_text())
+        doc["jobs"]["implement"]["with"]["route_budget_usd"] = "0.1"
+        path.write_text(yaml.safe_dump(doc, sort_keys=False))
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert "budget exceeded" in failed["routing files valid and permit this repo"].detail
+
+
+def test_onboarding_doc_lists_every_default_credential(tmp_path):
+    """Every secret and variable doctor demands of a freshly onboarded repository, in every
+    implementer mode, is named in docs/onboarding.md."""
+    doc = (Path(__file__).resolve().parents[1] / "docs/onboarding.md").read_text()
+    gh = _healthy_gh()
+    gh.answers["api repos/owner/comic/actions/secrets"] = _secret_pages()
+    gh.answers["api repos/owner/comic/actions/variables"] = _var_pages()
+    gh.answers["api repos/owner/agentic-sdlc --jq .private"] = "true"
+    for index, implementer in enumerate(("route", "claude", "codex", "cloud-routine")):
+        repo = _repo(tmp_path / str(index))
+        write_onboarding(repo, spec(implementer=implementer))
+        failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))
+        names = set()
+        for check in ("repo secrets set (by name)", "repo variables set (non-empty)"):
+            if check in failed:
+                detail = failed[check].detail.split("→")[0]
+                names |= set(re.findall(r"\b[A-Z][A-Z0-9_]{3,}\b", detail))
+        assert names, implementer
+        missing = sorted(n for n in names if f"`{n}`" not in doc)
+        assert not missing, (implementer, missing)
+
+
+def test_commit_guard_consumes_the_values_of_wrapper_options(tmp_path):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+
+    def code(command):
+        payload = {"tool_name": "Bash", "session_id": "s1", "tool_input": {"command": command}}
+        return guard.decide(payload, "forge/issue-7", lambda n: None, lambda b: False)[0]
+
+    for blocked in (
+        "env -u HOME git commit -m x",
+        "env --unset HOME git commit -m x",
+        "env --unset=HOME git commit -m x",
+        "env -i -u HOME A=1 git commit -m x",
+        "env -C /tmp git commit -m x",
+        "env -S 'git commit -m x'",
+        "sudo -u bob git commit -m x",
+        "sudo -Eu bob git commit -m x",
+        "sudo -g staff -u bob -- git commit -m x",
+        "sudo --user=bob git commit -m x",
+        "nice -n 5 git commit -m x",
+        "nice -n5 git commit -m x",
+        "timeout 10 git commit -m x",
+        "timeout -s KILL -k 5 10 git commit -m x",
+        "stdbuf -o L git commit -m x",
+        "xargs -n 1 git commit -m",
+        "doas -u bob git commit -m x",
+        "nohup nice -n 5 env -u HOME git commit -m x",
+    ):
+        assert code(blocked) == 2, blocked
+    for allowed in ("env -u HOME git status", "timeout 10 git log", "sudo -u bob ls"):
+        assert code(allowed) == 0, allowed
+
+
+def _git(cwd, *args):
+    import subprocess
+
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *args],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+    )
+
+
+def test_commit_guard_checks_the_repository_git_c_selects(tmp_path):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    main_repo, issue_repo = tmp_path / "main", tmp_path / "wt"
+    for path, branch in ((main_repo, "main"), (issue_repo, "forge/issue-7")):
+        path.mkdir()
+        _git(path, "init", "-q", "-b", branch)
+        _git(path, "commit", "-q", "--allow-empty", "-m", "init")
+    payload = {"tool_name": "Bash", "session_id": "s1"}
+
+    def code(command, cwd=main_repo):
+        branches = guard.commit_branches(command, str(cwd))
+        return guard.decide(
+            {**payload, "tool_input": {"command": command}},
+            branches,
+            lambda n: None,
+            lambda b: False,
+        )[0]
+
+    assert code("git commit -m x") == 0  # main carries no issue
+    for blocked in (
+        "git -C ../wt commit -m x",
+        f"git -C {issue_repo} commit -m x",
+        "git -C .. -C wt commit -m x",
+        "git --git-dir=../wt/.git --work-tree=../wt commit -m x",
+        "GIT_DIR=../wt/.git git commit -m x",
+        "cd ../wt && git commit -m x",
+        "env -C ../wt git commit -m x",
+        "bash -c 'git -C ../wt commit -m x'",
+    ):
+        assert code(blocked) == 2, blocked
+    # -C elsewhere commits there, not to the issue branch the hook runs on
+    assert code("git -C ../main commit -m x", cwd=issue_repo) == 0
+    assert code("git commit -m x", cwd=issue_repo) == 2
+    assert code("git -C ../wt status") == 0
