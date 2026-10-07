@@ -23,6 +23,10 @@ UNAVAILABLE_WARNING = (
     "checked. ({what} could not be read from GitHub: authentication, network or API failure; "
     "fix `gh` and start a new session, or run `sdlcctl claims --project {project}`.)"
 )
+FETCH_WARNING = (
+    "[Forge] WARNING: could not fetch origin -- the remote branch state below is the last "
+    "cached copy and may be stale. Run `git fetch origin` and check before starting work."
+)
 
 
 def run(cmd: list[str]) -> str | None:
@@ -74,8 +78,11 @@ def main() -> int:
     except json.JSONDecodeError:
         payload = {}
     session = str(payload.get("session_id") or "")
-    run(["git", "fetch", "-q", "origin"])
-    behind = run(["git", "rev-list", "--count", f"HEAD..origin/{DEFAULT_BRANCH}"]) or "?"
+    # A failed fetch leaves the cached origin/<default> ref: never present it as current.
+    fetched = run(["git", "fetch", "-q", "origin"]) is not None
+    behind = (
+        run(["git", "rev-list", "--count", f"HEAD..origin/{DEFAULT_BRANCH}"]) if fetched else None
+    )
     warnings: list[str] = []
     recent = run(["git", "log", "--oneline", "-8", f"origin/{DEFAULT_BRANCH}"])
     prs = run(
@@ -131,11 +138,19 @@ def main() -> int:
         warnings.append("at least one issue's lease")
     for what in warnings:
         print(UNAVAILABLE_WARNING.format(what=what, project=PROJECT))
-    print(
-        f"[Forge] {PROJECT}: HEAD is {behind} commit(s) behind origin/{DEFAULT_BRANCH}. "
-        "Recent on main:"
-    )
-    print(recent or "  (unavailable)")
+    if fetched:
+        print(
+            f"[Forge] {PROJECT}: HEAD is {behind or '?'} commit(s) behind "
+            f"origin/{DEFAULT_BRANCH}. Recent on main:"
+        )
+        print(recent or "  (unavailable)")
+    else:
+        print(FETCH_WARNING)
+        print(
+            f"[Forge] {PROJECT}: how far HEAD is behind origin/{DEFAULT_BRANCH} is UNKNOWN "
+            "(origin could not be fetched). Recent on main, CACHED -- possibly stale:"
+        )
+        print(recent or "  (unavailable)")
     if prs is None:
         print("[Forge] Open PRs:\n  (unavailable -- the PR list could not be read from GitHub)")
     else:

@@ -12,8 +12,11 @@ import base64
 import importlib.resources
 import json
 import math
+import os
 import re
+import secrets
 import shlex
+import stat
 import subprocess
 import tomllib
 import unicodedata
@@ -49,8 +52,9 @@ IMPLEMENTERS = ("route", "claude", "codex", "cloud-routine")
 #: Actions workflow or a Claude Code cloud routine implements approved issues.
 IMPLEMENTATION_MODES = ("actions", "cloud-routine")
 DEFAULT_RUNS_ON = ("self-hosted", "linux", "x64")
-#: Where a PUBLIC repository's CI runs by default: every fork pull request executes its own code
-#: in that job, so it must be a fresh GitHub-hosted VM, never a persistent self-hosted runner.
+#: Where a FORK-EXPOSED repository's CI runs by default (`fork_pull_request_exposure`): every
+#: fork pull request executes its own code in that job, so it must be a fresh GitHub-hosted VM,
+#: never a persistent self-hosted runner.
 PUBLIC_CI_RUNS_ON = ("ubuntu-latest",)
 DEFAULT_QUALITY = "python -m ruff check --select E9,F63,F7,F82 ."
 #: The interpreter ci.yml's pinned actions/setup-python installs (`[ci] python_version`).
@@ -338,10 +342,11 @@ class OnboardSpec:
     implementer: str = "route"
     runs_on: tuple[str, ...] = DEFAULT_RUNS_ON
     #: Runner for ci.yml (the only pull_request-triggered workflow); () = `runs_on`, or
-    #: PUBLIC_CI_RUNS_ON for a public repository.
+    #: PUBLIC_CI_RUNS_ON for a fork-exposed repository.
     ci_runs_on: tuple[str, ...] = ()
-    #: The repository is public: fork pull requests reach ci.yml.
-    public: bool = False
+    #: Fork pull requests may reach ci.yml: the repository is public, or private/internal without
+    #: forking or fork pull-request workflows PROVEN disabled (`fork_pull_request_exposure`).
+    fork_exposed: bool = False
     default_branch: str = "main"
     ready_label: str = "claude-ready"
     forbidden_paths: tuple[str, ...] = ()
@@ -368,9 +373,10 @@ class OnboardSpec:
             raise OnboardError(f"{WINDOWS_UNSUPPORTED} (got {', '.join(windows)})")
         if not _linux_labels(self.runs_on):
             raise OnboardError(f"{LINUX_RUNNER_REQUIRED} (got --runs-on {','.join(self.runs_on)})")
-        if self.public and not _github_hosted(set(self.ci_labels)):
+        if self.fork_exposed and not _github_hosted(set(self.ci_labels)):
             raise OnboardError(
-                "a public repository's CI runs fork pull-request code: it must use a "
+                "a fork-exposed (public, or forkable private/internal) repository's CI runs fork "
+                "pull-request code: it must use a "
                 f"GitHub-hosted runner (e.g. --ci-runs-on {PUBLIC_CI_RUNS_ON[0]}), not "
                 + ",".join(self.ci_labels)
             )
@@ -393,7 +399,7 @@ class OnboardSpec:
         """Runner labels of ci.yml's `test` job."""
         if self.ci_runs_on:
             return self.ci_runs_on
-        return PUBLIC_CI_RUNS_ON if self.public else self.runs_on
+        return PUBLIC_CI_RUNS_ON if self.fork_exposed else self.runs_on
 
     @property
     def routed(self) -> bool:
@@ -445,18 +451,53 @@ def resolve_platform_ref(platform_repository: str, ref: str, gh: GhRunner = run_
     return sha
 
 
-def repository_is_public(project_id: str, gh: GhRunner = run_gh) -> bool:
-    """Whether GitHub reports the repository as public (fork pull requests can reach its CI)."""
-    info = json.loads(gh(["api", f"repos/{project_id}"]) or "null")
-    if not isinstance(info, dict) or ("private" not in info and "visibility" not in info):
+FORK_PR_WORKFLOWS_PRIVATE = "actions/permissions/fork-pr-workflows-private-repos"
+
+
+def fork_pull_request_exposure(repo_info: object, gh: GhRunner, project_id: str) -> tuple[str, str]:
+    """("safe" | "exposed" | "unknown", why): can fork pull requests run workflows here?
+
+    A PUBLIC repository always can. A private or internal one can too when forking is allowed
+    (repository/organization/enterprise policy) and fork pull-request workflows are enabled for
+    private repositories -- an enterprise member or read collaborator then runs PR code on
+    whatever runner the job targets. Safe only when GitHub PROVES one of the two is off:
+    `allow_forking == false` on the repository, or `run_workflows_from_fork_pull_requests ==
+    false` from the fork-PR workflow policy. Anything unread (a 403/404 on that endpoint, a
+    missing field, an unknown visibility) is "unknown", never safe."""
+    visibility = _visibility(repo_info)
+    if visibility is None:
+        return "unknown", "the repository's visibility could not be read"
+    if visibility == "public":
+        return "exposed", "public repository: anyone can fork it and open a pull request"
+    if visibility not in ("private", "internal"):
+        return "unknown", f"unrecognised visibility {visibility!r}"
+    assert isinstance(repo_info, dict)
+    if repo_info.get("allow_forking") is False:
+        return "safe", f"{visibility} repository with forking disabled"
+    policy = _safe_json(gh, ["api", f"repos/{project_id}/{FORK_PR_WORKFLOWS_PRIVATE}"])
+    runs = policy.get("run_workflows_from_fork_pull_requests") if isinstance(policy, dict) else None
+    if runs is False:
+        return "safe", f"{visibility} repository with fork pull-request workflows disabled"
+    forking = repo_info.get("allow_forking")
+    if runs is True:
+        return "exposed", (
+            f"{visibility} repository runs workflows from fork pull requests"
+            + (" and allows forking" if forking is True else "")
+        )
+    return "unknown", (
+        f"{visibility} repository: "
+        + ("forking is allowed" if forking is True else "whether forking is allowed is unknown")
+        + " and the fork pull-request workflow policy could not be read"
+    )
+
+
+def repository_fork_exposed(project_id: str, gh: GhRunner = run_gh) -> bool:
+    """Whether onboarding must treat the repository as fork-exposed (`fork_pull_request_exposure`
+    not proven "safe"). Raises when even the visibility cannot be read: ask, never guess."""
+    info = _safe_json(gh, ["api", f"repos/{project_id}"])
+    if _visibility(info) is None:
         raise OnboardError(f"could not read the visibility of {project_id}")
-    return _is_public(info)
-
-
-def _is_public(repo_info: dict) -> bool:
-    if "visibility" in repo_info:
-        return str(repo_info["visibility"]).lower() == "public"
-    return repo_info.get("private") is False
+    return fork_pull_request_exposure(info, gh, project_id)[0] != "safe"
 
 
 def repository_default_branch(project_id: str, gh: GhRunner = run_gh) -> str:
@@ -1056,6 +1097,56 @@ MODE_OWNED_FILES = (
 )
 
 
+def _managed_path_state(base: Path, rel: str) -> str:
+    """`"absent"` or `"file"` for a managed path that is safe to write, else why it is not.
+
+    Never follow a link: every component from `base` down is `lstat`ed, and a symlink anywhere
+    (dangling or not) is refused, as is a parent that is not a directory, a destination that
+    exists but is not a regular file, or a path that leaves the repository. A write through a
+    link could create or overwrite a file outside the checkout."""
+    parts = Path(rel).parts
+    if not parts or Path(rel).is_absolute() or any(p in ("", ".", "..") for p in parts):
+        return "is not a plain repository-relative path"
+    current = base
+    for index, part in enumerate(parts):
+        current = current / part
+        try:
+            mode = os.lstat(current).st_mode
+        except FileNotFoundError:
+            return "absent"
+        if stat.S_ISLNK(mode):
+            return f"{current.relative_to(base)} is a symlink"
+        last = index == len(parts) - 1
+        if not last and not stat.S_ISDIR(mode):
+            return f"{current.relative_to(base)} is not a directory"
+        if last and not stat.S_ISREG(mode):
+            return "exists but is not a regular file"
+    if not current.resolve().is_relative_to(base):
+        return "resolves outside the repository"
+    return "file"
+
+
+def _replace_file(path: Path, content: str) -> None:
+    """Write `content` to `path` atomically: a fresh temporary file in the same directory
+    (O_EXCL, never through a link), then `os.replace`, which swaps the directory entry itself. An
+    existing file's permission bits carry over."""
+    try:
+        mode = stat.S_IMODE(os.lstat(path).st_mode)
+    except FileNotFoundError:
+        mode = None
+    tmp = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o666)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        if mode is not None:
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def write_onboarding(
     root: str | Path, spec: OnboardSpec, *, force: bool = False
 ) -> tuple[Path, ...]:
@@ -1063,7 +1154,14 @@ def write_onboarding(
     if not base.is_dir() or not (base / ".git").exists():
         raise OnboardError("destination must be an existing Git repository")
     files = render_onboarding(spec)
-    existing = sorted(rel for rel in files if (base / rel).exists())
+    owned = [rel for rel in MODE_OWNED_FILES if rel not in files] if force else []
+    states = {rel: _managed_path_state(base, rel) for rel in (*files, *owned)}
+    unsafe = sorted(
+        f"{rel} ({why})" for rel, why in states.items() if why not in ("absent", "file")
+    )
+    if unsafe:
+        raise OnboardError("refusing to write unsafe managed paths: " + "; ".join(unsafe))
+    existing = sorted(rel for rel in files if states[rel] == "file")
     if existing and not force:
         raise OnboardError(
             "refusing to overwrite existing files (use --force): " + ", ".join(existing)
@@ -1072,12 +1170,11 @@ def write_onboarding(
     for rel, content in files.items():
         path = base / rel
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        _replace_file(path, content)
         written.append(path)
-    if force:
-        for rel in MODE_OWNED_FILES:
-            if rel not in files and (base / rel).is_file():
-                (base / rel).unlink()
+    for rel in owned:
+        if states[rel] == "file":
+            (base / rel).unlink()
     return tuple(sorted(written))
 
 
@@ -1443,6 +1540,7 @@ def _remote_file_state(gh: GhRunner, args: Sequence[str]) -> str:
 
 
 PLATFORM_ACCESS_CHECK = "private platform lets this repository call its workflows"
+FORK_RUNNER_CHECK = "fork pull requests cannot reach self-hosted runners"
 
 
 def _visibility(repo_info: object) -> str | None:
@@ -1591,17 +1689,25 @@ def _action_pattern_matches(pattern: str, action: str) -> bool:
 
 def _action_allowed(action: str, selected: dict, consumer_owner: str) -> bool | None:
     """Is `action` allowed by a `selected` policy? None when only a verified-creator allowance
-    could admit it, which the API does not let doctor verify."""
+    could admit it, which the API does not let doctor verify.
+
+    GitHub's semantics: an action runs when an allowance admits it (the owner's own, GitHub-owned,
+    a positive pattern, a verified creator) AND no `!` pattern blocks it -- a `!`-prefixed entry
+    of `patterns_allowed` carves a subset out of a broader allowance, whatever its order in the
+    list (`["anthropics/*", "!anthropics/claude-code-action@*"]` blocks the Claude action). An
+    exclusion is applied to every allowance, the owner's own included: doctor fails closed."""
+    raw = selected.get("patterns_allowed")
+    entries = [str(p).strip() for p in (raw if isinstance(raw, list) else [])]
+    blocked = [p[1:] for p in entries if p.startswith("!")]
+    if any(_action_pattern_matches(p, action) for p in blocked):
+        return False
     owner = action.split("/", 1)[0].casefold()
     if owner == consumer_owner.casefold():
         return True  # the repository owner's own actions and workflows are always allowed
     if selected.get("github_owned_allowed") is True and owner in GITHUB_OWNED_ACTION_OWNERS:
         return True
-    patterns = selected.get("patterns_allowed")
-    if any(
-        _action_pattern_matches(str(p), action)
-        for p in (patterns if isinstance(patterns, list) else [])
-    ):
+    allowed = [p for p in entries if not p.startswith("!")]
+    if any(_action_pattern_matches(p, action) for p in allowed):
         return True
     return None if selected.get("verified_allowed") is True else False
 
@@ -2440,7 +2546,7 @@ def _job_runner_targets(
 def _pull_request_off_hosted(base: Path, platform_repository: str) -> list[str]:
     """Every job a pull_request-triggered workflow (any `pull_request*` event) runs that is not
     PROVEN to run on a single GitHub-hosted label -- including the jobs of the reusable workflows
-    it calls (`_job_runner_targets`). On a public repository those jobs run fork code, so an
+    it calls (`_job_runner_targets`). On a fork-exposed repository those jobs run fork code, so an
     unresolvable target fails closed."""
     found = []
     workflows = base / ".github/workflows"
@@ -2507,14 +2613,14 @@ def _remote_pull_request_off_hosted(files: dict[str, bytes], platform_repository
         return _pull_request_off_hosted(root, platform_repository)
 
 
-def public_runner_exposure(
+def fork_runner_exposure(
     base: Path,
     gh: GhRunner,
     project_id: str,
     platform_repository: str,
     ref: str | None,
 ) -> list[str]:
-    """Every pull_request-triggered job of a public repository not proven GitHub-hosted. The
+    """Every pull_request-triggered job of a fork-exposed repository not proven GitHub-hosted. The
     authority is the default branch's workflow set as GitHub serves it (a stale or partial
     checkout must not hide a workflow that is live there); the local checkout's workflows are
     checked IN ADDITION, never instead. An unreadable remote set fails closed."""
@@ -4334,7 +4440,7 @@ def doctor(
 
     # --- runners: every job of every active caller, and ci.yml's `test` job, must run somewhere
     # that exists, or the run (or every PR's required check) sits queued forever.
-    # The same resolver as the public-repository check: local reusable workflows are followed
+    # The same resolver as the fork-exposure check: local reusable workflows are followed
     # into their own jobs, platform calls through their `runs_on` input; anything it cannot
     # prove (a runner group, an expression, a third-party workflow) is a str reason.
     all_targets: dict[str, RunnerTarget] = {}
@@ -4439,19 +4545,31 @@ def doctor(
             )
         )
 
-    # --- a public repository's pull-request jobs run fork code: never on a persistent runner
-    known = isinstance(repo_info, dict) and ("private" in repo_info or "visibility" in repo_info)
-    if known and _is_public(repo_info):
-        exposed = public_runner_exposure(base, gh, project_id, platform_repository, actual_branch)
+    # --- fork pull-request jobs run fork code: never on a persistent runner. Public repositories,
+    # and private/internal ones unless forking or fork-PR workflows are PROVEN off; an unread
+    # policy fails closed as an owner TODO.
+    fork_state, fork_why = fork_pull_request_exposure(repo_info, gh, project_id)
+    if fork_state == "safe":
+        add(Check(FORK_RUNNER_CHECK, True, f"{fork_why}: fork pull requests run no workflows"))
+    else:
+        exposed = fork_runner_exposure(base, gh, project_id, platform_repository, actual_branch)
         add(
             Check(
-                "public repository runs pull requests on GitHub-hosted runners",
+                FORK_RUNNER_CHECK,
                 not exposed,
-                "fork pull requests would execute on runners not proven GitHub-hosted: "
+                f"{fork_why}; fork pull requests "
+                + ("would" if fork_state == "exposed" else "may")
+                + " execute on runners not proven GitHub-hosted: "
                 + "; ".join(exposed)
                 + f" → set runs-on to a GitHub-hosted label (e.g. {PUBLIC_CI_RUNS_ON[0]})"
+                + (
+                    ", or disable forking / fork pull-request workflows for this repository"
+                    if fork_state == "unknown" or fork_why.startswith(("private", "internal"))
+                    else ""
+                )
                 if exposed
-                else "every pull_request-triggered job is GitHub-hosted",
+                else f"{fork_why}; every pull_request-triggered job is GitHub-hosted",
+                manual=bool(exposed) and fork_state == "unknown",
             )
         )
 

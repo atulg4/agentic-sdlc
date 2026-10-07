@@ -1577,3 +1577,64 @@ def test_claim_does_not_own_an_assignee_when_events_cannot_be_read():
         PROJECT, 7, agent="a", session="s1", branch="b", gh=no_events, now=NOW, assignee="alice"
     )
     assert result.ok and not result.lease.owns_assignee and _logins(gh) == ["alice"]
+
+
+# ---------------------------------------------------------------- Codex 4206492751
+
+
+def test_a_pending_cleanup_hands_its_assignee_to_the_live_lease_that_wants_it():
+    gh = FakeGh().issue(7)
+    assert claim(
+        PROJECT, 7, agent="a", session="A", branch="b", gh=gh, now=NOW, assignee="alice"
+    ).ok
+    with pytest.raises(RuntimeError):
+        release(PROJECT, 7, session="A", gh=_failing_removal(gh), now=NOW)
+    assert _logins(gh) == ["alice"]  # A's cleanup is pending
+    # B wants alice too: it finds her assigned already, so its own claim does not own her...
+    assert claim(
+        PROJECT, 7, agent="b", session="B", branch="b", gh=gh, now=NOW, assignee="alice"
+    ).ok
+    assert _logins(gh) == ["alice"]
+    # ...so A's cleanup is recorded only together with an explicit hand-over to B.
+    held = current_lease(PROJECT, 7, gh, now=NOW)
+    assert held.session == "B" and held.owns_assignee
+    bodies = [c["body"] for c in gh.issues[7]["comments"]]
+    assert "<!-- forge-cleanup session=A assignee=alice -->" in bodies
+    handed = next(i for i, b in enumerate(bodies) if "handed over" in b)
+    assert handed < bodies.index("<!-- forge-cleanup session=A assignee=alice -->")
+    # A renewal that read the thread before the hand-over cannot drop it again.
+    stale = Lease(7, "b", "B", "b", NOW + timedelta(hours=2), "alice", False)
+    gh.issues[7]["comments"].append(_comment_row(900, format_claim_marker(stale), NOW.isoformat()))
+    assert current_lease(PROJECT, 7, gh, now=NOW).owns_assignee
+    release(PROJECT, 7, session="B", gh=gh, now=NOW)
+    assert _logins(gh) == []  # B's release removes the login it was handed
+
+
+def test_a_failed_hand_over_leaves_the_ended_leases_cleanup_pending():
+    gh = FakeGh().issue(7)
+    assert claim(
+        PROJECT, 7, agent="a", session="A", branch="b", gh=gh, now=NOW, assignee="alice"
+    ).ok
+    with pytest.raises(RuntimeError):
+        release(PROJECT, 7, session="A", gh=_failing_removal(gh), now=NOW)
+    real = gh.__call__
+    posts = []
+
+    def no_handover(args, input=None):
+        if tuple(args[:3]) == ("api", "-X", "POST") and input and "handed over" in input:
+            posts.append(True)
+            raise RuntimeError("comment failed")
+        return real(args, input=input)
+
+    # the claim itself succeeds (the reconciliation is best effort) ...
+    assert claim(
+        PROJECT, 7, agent="b", session="B", branch="b", gh=no_handover, now=NOW, assignee="alice"
+    ).ok
+    assert posts
+    bodies = [c["body"] for c in gh.issues[7]["comments"]]
+    # ... and A's cleanup is NOT recorded: the login is nobody's to remove yet
+    assert not any("forge-cleanup session=A" in b for b in bodies)
+    assert not current_lease(PROJECT, 7, gh, now=NOW).owns_assignee
+    # a later operation (B's own release) finishes A's cleanup once nobody wants alice
+    release(PROJECT, 7, session="B", gh=gh, now=NOW)
+    assert _logins(gh) == []
