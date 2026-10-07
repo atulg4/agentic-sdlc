@@ -123,6 +123,9 @@ and a takeover of an expired lease, remove only an assignee the lease added, nev
 already on the issue, and only when the live lease does not want the same login. A completed
 cleanup is recorded (`<!-- forge-cleanup … -->`), and a retried release also skips a login that
 was assigned again after the release, so a retry never undoes a later human assignment.
+A marker counts only as the whole first line of a comment, alone; free text the tool adds
+(`release --note`) has `<!--`/`-->` escaped. A session whose claim is queued behind a live
+holder (a lost race whose retraction failed) can `release` it without touching the holder.
 
 ```bash
 sdlcctl claim   --project owner/repo --issue 12 --agent claude-code --session "$SESSION" --branch forge/issue-12

@@ -500,6 +500,27 @@ def repository_fork_exposed(project_id: str, gh: GhRunner = run_gh) -> bool:
     return fork_pull_request_exposure(info, gh, project_id)[0] != "safe"
 
 
+def _canonical_full_name(repo_info: object, project_id: str) -> str | None:
+    """GitHub's own `owner/name` spelling of `project_id` from `GET repos/{project_id}`, when
+    it names the same repository (logins and repository names are case-insensitive, so the API
+    answers any spelling); None when unread or naming another repository (a rename)."""
+    name = repo_info.get("full_name") if isinstance(repo_info, dict) else None
+    if not isinstance(name, str) or name.casefold() != project_id.casefold():
+        return None
+    return name
+
+
+def canonical_project_id(project_id: str, gh: GhRunner = run_gh) -> str:
+    """`project_id` as GitHub spells it (`full_name`): every workflow run passes the canonical
+    `$GITHUB_REPOSITORY` to `prepare-request`, which compares it EXACTLY with the policy's id, so
+    the policy must carry that spelling. Unreadable: the given spelling (doctor checks it)."""
+    try:
+        info = _safe_json(gh, ["api", f"repos/{project_id}"])
+    except Exception:  # noqa: BLE001 -- best effort; doctor reports a mismatch
+        return project_id
+    return _canonical_full_name(info, project_id) or project_id
+
+
 def repository_default_branch(project_id: str, gh: GhRunner = run_gh) -> str:
     """The repository's default branch as GitHub reports it (the workflows compare against it)."""
     branch = gh(["api", f"repos/{project_id}", "--jq", ".default_branch"]).strip()
@@ -1890,9 +1911,10 @@ def effective_rule_problems(
 ) -> list[str]:
     """The requirements in the default branch's EFFECTIVE rules (`rules/branches/{branch}`:
     repository, organization and enterprise rulesets alike) that a Forge PR cannot meet, or that
-    doctor cannot verify: required status contexts no installed workflow job reports, required
-    deployments, required workflows, a merge queue no workflow serves, required signatures,
-    update restrictions and code-scanning gates."""
+    doctor cannot verify: required status contexts no installed workflow job reports (or bound to
+    an app other than GitHub Actions, which those jobs report through), required deployments,
+    required workflows, a merge queue no workflow serves, required signatures, update
+    restrictions and code-scanning gates."""
     exact, prefixes, merge_group = produced
     problems: list[str] = []
     for rule in rules:
@@ -1909,6 +1931,15 @@ def effective_rule_problems(
                     problems.append(
                         f"{source}: requires status check '{context}', which no installed "
                         "workflow job reports"
+                    )
+                elif context and _foreign_integration(check or {}):
+                    # The installed workflows report it through GitHub Actions; a check bound
+                    # to another app can never be satisfied by them (as for repository rulesets).
+                    problems.append(
+                        f"{source}: requires status check '{context}' from integration "
+                        f"{check.get('integration_id')}, not GitHub Actions "
+                        f"({GITHUB_ACTIONS_INTEGRATION_ID}): the installed workflow job can "
+                        "never satisfy it"
                     )
         elif kind == "required_deployments":
             envs = ", ".join(params.get("required_deployment_environments") or []) or "?"
@@ -3821,16 +3852,23 @@ def doctor(
         )
     except Exception as exc:  # noqa: BLE001 - report any loader failure
         add(Check("agentic-sdlc.toml loads", False, str(exc)[:200]))
+    repo_info = _safe_json(gh, ["api", f"repos/{project_id}"]) if remote else None
     if policy is not None:
-        # Every plan/implement run passes $GITHUB_REPOSITORY as --expected-project-id.
-        same = policy.project_id == project_id
-        add(
-            Check(
-                "policy project id matches the repository",
-                same,
-                "" if same else f"policy names {policy.project_id}, not {project_id}",
+        # Every plan/implement run passes $GITHUB_REPOSITORY -- GitHub's canonical spelling --
+        # as --expected-project-id, and prepare-request compares it EXACTLY: the policy must
+        # carry the canonical `full_name`, not merely a spelling the API also answers to.
+        canonical = _canonical_full_name(repo_info, project_id) or project_id
+        same = policy.project_id == canonical
+        if same:
+            detail = ""
+        elif policy.project_id.casefold() == canonical.casefold():
+            detail = (
+                f"policy names {policy.project_id}; use {canonical} (GitHub's spelling, which "
+                "every run passes as $GITHUB_REPOSITORY and prepare-request compares exactly)"
             )
-        )
+        else:
+            detail = f"policy names {policy.project_id}, not {canonical}"
+        add(Check("policy project id matches the repository", same, detail))
 
     routed_secrets: set[str] = set()
     routed_vars: set[str] = set()
@@ -4198,7 +4236,8 @@ def doctor(
         )
 
     # --- a private platform must also admit this repository as a caller (Actions access)
-    repo_info = _safe_json(gh, ["api", f"repos/{project_id}"])
+    if repo_info is None:
+        repo_info = _safe_json(gh, ["api", f"repos/{project_id}"])
     platform_private = _safe_json(gh, ["api", f"repos/{platform_repository}", "--jq", ".private"])
     if platform_private is True:
         add(
