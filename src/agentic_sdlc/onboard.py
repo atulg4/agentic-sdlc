@@ -22,13 +22,15 @@ from pathlib import Path
 from .executors import (
     AuthMode,
     ExecutorError,
-    RuntimeStatus,
+    RouteRequest,
     TaskClass,
     load_executors,
     load_routing_policy,
+    request_from_mission,
+    route_executor,
 )
 from .leases import IN_PROGRESS_LABEL
-from .models import RiskLevel
+from .missions import MissionError, load_registry
 from .openai_compatible import PROVIDERS as OPENAI_COMPATIBLE_PROVIDERS
 from .openai_compatible import ROUTED_MIN_CONTEXT_WINDOW
 from .policy import load_policy
@@ -41,6 +43,9 @@ _RUNNER_LABEL = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 IMPLEMENTERS = ("route", "claude", "codex", "cloud-routine")
 DEFAULT_RUNS_ON = ("self-hosted", "linux", "x64")
+#: Where a PUBLIC repository's CI runs by default: every fork pull request executes its own code
+#: in that job, so it must be a fresh GitHub-hosted VM, never a persistent self-hosted runner.
+PUBLIC_CI_RUNS_ON = ("ubuntu-latest",)
 DEFAULT_QUALITY = "python -m ruff check --select E9,F63,F7,F82 ."
 HUMAN_REVIEW_LABEL = "human-review-required"
 IMPLEMENTATION_LABEL = "implementation-approved"
@@ -105,6 +110,11 @@ class OnboardSpec:
     quality_command: str = DEFAULT_QUALITY
     implementer: str = "route"
     runs_on: tuple[str, ...] = DEFAULT_RUNS_ON
+    #: Runner for ci.yml (the only pull_request-triggered workflow); () = `runs_on`, or
+    #: PUBLIC_CI_RUNS_ON for a public repository.
+    ci_runs_on: tuple[str, ...] = ()
+    #: The repository is public: fork pull requests reach ci.yml.
+    public: bool = False
     default_branch: str = "main"
     ready_label: str = "claude-ready"
     forbidden_paths: tuple[str, ...] = ()
@@ -123,8 +133,16 @@ class OnboardSpec:
             )
         if self.implementer not in IMPLEMENTERS:
             raise OnboardError(f"implementer must be one of {', '.join(IMPLEMENTERS)}")
-        if not self.runs_on or not all(_RUNNER_LABEL.fullmatch(x) for x in self.runs_on):
+        if not self.runs_on or not all(
+            _RUNNER_LABEL.fullmatch(x) for x in (*self.runs_on, *self.ci_runs_on)
+        ):
             raise OnboardError("runs_on labels must be simple tokens")
+        if self.public and not _github_hosted(set(self.ci_labels)):
+            raise OnboardError(
+                "a public repository's CI runs fork pull-request code: it must use a "
+                f"GitHub-hosted runner (e.g. --ci-runs-on {PUBLIC_CI_RUNS_ON[0]}), not "
+                + ",".join(self.ci_labels)
+            )
         if not self.test_command.strip():
             raise OnboardError("a test command is required; the gate fails closed without one")
         if len({self.ready_label, HUMAN_REVIEW_LABEL, IMPLEMENTATION_LABEL}) != 3:
@@ -135,6 +153,13 @@ class OnboardSpec:
     @property
     def name(self) -> str:
         return self.project_id.split("/")[1]
+
+    @property
+    def ci_labels(self) -> tuple[str, ...]:
+        """Runner labels of ci.yml's `test` job."""
+        if self.ci_runs_on:
+            return self.ci_runs_on
+        return PUBLIC_CI_RUNS_ON if self.public else self.runs_on
 
     @property
     def routed(self) -> bool:
@@ -181,6 +206,20 @@ def resolve_platform_ref(platform_repository: str, ref: str, gh: GhRunner = run_
     return sha
 
 
+def repository_is_public(project_id: str, gh: GhRunner = run_gh) -> bool:
+    """Whether GitHub reports the repository as public (fork pull requests can reach its CI)."""
+    info = json.loads(gh(["api", f"repos/{project_id}"]) or "null")
+    if not isinstance(info, dict) or ("private" not in info and "visibility" not in info):
+        raise OnboardError(f"could not read the visibility of {project_id}")
+    return _is_public(info)
+
+
+def _is_public(repo_info: dict) -> bool:
+    if "visibility" in repo_info:
+        return str(repo_info["visibility"]).lower() == "public"
+    return repo_info.get("private") is False
+
+
 def repository_default_branch(project_id: str, gh: GhRunner = run_gh) -> str:
     """The repository's default branch as GitHub reports it (the workflows compare against it)."""
     branch = gh(["api", f"repos/{project_id}", "--jq", ".default_branch"]).strip()
@@ -207,6 +246,12 @@ def _toml_list(items: Sequence[str], indent: str = "  ") -> str:
         return "[]"
     body = "".join(f"{indent}{_toml_str(item)},\n" for item in items)
     return f"[\n{body}]"
+
+
+def _yaml_labels(labels: Sequence[str]) -> str:
+    """A YAML flow sequence of quoted strings: `true`, `null`, `on` or `123` stay runner labels,
+    not a boolean, a null or an integer."""
+    return "[" + ", ".join(json.dumps(label) for label in labels) + "]"
 
 
 def _yaml_run(command: str) -> str:
@@ -366,7 +411,7 @@ Repository: {spec.project_id}. Every run:
 Required GitHub state (created by `sdlcctl onboard --apply`): the three labels, the
 `{RULESET_NAME}` ruleset requiring the `{REQUIRED_CHECK}` check and review-thread resolution.
 CI (`.github/workflows/ci.yml`) provides the `{REQUIRED_CHECK}` check and runs on
-`{", ".join(spec.runs_on)}`.
+`{", ".join(spec.ci_labels)}`.
 """
 
 
@@ -560,7 +605,8 @@ def _render_workflow(name: str, spec: OnboardSpec, issue_expr: str | None = None
         "PLATFORM_REPOSITORY": spec.platform_repository,
         "PLATFORM_COMMIT_SHA": spec.platform_ref,
         "RUNS_ON_JSON": json.dumps(list(spec.runs_on), separators=(",", ":")),
-        "RUNS_ON_YAML": "[" + ", ".join(spec.runs_on) + "]",
+        "CI_RUNS_ON_YAML": _yaml_labels(spec.ci_labels),
+        "RUNS_ON_YAML": _yaml_labels(spec.runs_on),
         "IMPLEMENTATION_LABEL": IMPLEMENTATION_LABEL,
         "READY_LABEL": spec.ready_label,
         "AGENT": spec.implementer,
@@ -660,7 +706,7 @@ def render_onboarding(spec: OnboardSpec) -> dict[str, str]:
         )
     for name, content in files.items():
         leftover = re.search(
-            r"\b(PLATFORM_REPOSITORY|PLATFORM_COMMIT_SHA|RUNS_ON_(?:JSON|YAML)|(?:SETUP|QUALITY|TEST)_COMMAND|ISSUE_NUMBER_EXPR|IMPLEMENT_JOBS|PREFLIGHT_EXTRA)\b",
+            r"\b(PLATFORM_REPOSITORY|PLATFORM_COMMIT_SHA|(?:CI_)?RUNS_ON_(?:JSON|YAML)|(?:SETUP|QUALITY|TEST)_COMMAND|ISSUE_NUMBER_EXPR|IMPLEMENT_JOBS|PREFLIGHT_EXTRA)\b",
             content,
         )
         if leftover:
@@ -970,52 +1016,61 @@ def _adapter_gap(executor) -> str:
     return ""
 
 
-#: What reusable-implement.yml asks `route-executor` for on every implementation run.
+#: The request reusable-implement.yml's "Route executor" step hands `route-executor` on every
+#: implementation run (`--mission-id`, `--task-class`, `--required-tool-capability`,
+#: `--min-context-window`, and the `route_budget_usd` input's default). The CLI turns the mission
+#: into risk and required capabilities exactly as `implementation_route_request` does below;
+#: test_onboard pins these constants to the workflow text.
+ROUTE_MISSION_ID = "implementation-worker"
 ROUTE_TASK_CLASS = TaskClass.IMPLEMENTATION
-ROUTE_TOOL_CAPABILITIES = frozenset({"structured-output"})
+ROUTE_TOOL_CAPABILITIES = ("structured-output",)
+ROUTE_MIN_CONTEXT_WINDOW = ROUTED_MIN_CONTEXT_WINDOW
+ROUTE_DEFAULT_BUDGET_USD = 10.0
 
 
-def _route_rejections(executor, routing_policy, project_id: str) -> list[str]:
-    """Why `route-executor` can never select this executor for this repository's implementation
-    runs: the request-independent predicates of `executors.route_executor()`, evaluated against
-    the request reusable-implement.yml sends. Risk, budget and live capacity vary per run and are
-    left to the router."""
-    reasons = []
-    if not executor.available:
-        reasons.append("unavailable")
-    if executor.runtime_status is not RuntimeStatus.READY:
-        reasons.append(executor.runtime_status.value)
-    if executor.provider not in routing_policy.allowed_providers:
-        reasons.append("provider not allowed")
-    if executor.provider in routing_policy.denied_providers:
-        reasons.append("provider denied")
-    if executor.permitted_repositories and project_id not in executor.permitted_repositories:
-        reasons.append("repository not permitted")
-    if ROUTE_TASK_CLASS not in executor.task_classes:
-        reasons.append(f"no {ROUTE_TASK_CLASS.value} task class")
-    missing_tools = sorted(ROUTE_TOOL_CAPABILITIES - set(executor.tool_capabilities))
-    if missing_tools:
-        reasons.append("missing tool capabilities: " + ", ".join(missing_tools))
-    if executor.context_window < ROUTED_MIN_CONTEXT_WINDOW:
-        reasons.append(f"context window < {ROUTED_MIN_CONTEXT_WINDOW}")
-    if executor.data_residency not in routing_policy.allowed_data_residency:
-        reasons.append("data residency not allowed")
-    if routing_policy.require_no_training_storage and executor.stores_training_data:
-        reasons.append("training-data storage not allowed")
-    if executor.quality_lower_bound <= 0 or executor.quality_lower_bound < (
-        routing_policy.floor_for(RiskLevel.LOW)
-    ):
-        reasons.append("below every quality floor")
-    return reasons
+def implementation_route_request(
+    policy, project_id: str, budget_usd: float = ROUTE_DEFAULT_BUDGET_USD
+) -> RouteRequest:
+    """The `RouteRequest` an implementation run of this repository sends the router."""
+    mission = load_registry(None, policy).get(ROUTE_MISSION_ID)
+    return request_from_mission(
+        mission,
+        repository=project_id,
+        task_class=ROUTE_TASK_CLASS,
+        budget_usd=budget_usd,
+        required_tool_capabilities=ROUTE_TOOL_CAPABILITIES,
+        min_context_window=ROUTE_MIN_CONTEXT_WINDOW,
+    )
 
 
-def routable_executors(executors, routing_policy, project_id: str) -> list:
-    """Every executor the router may pick for an implementation run in this repository.
+def _caller_route_budgets(callers: Sequence[Path]) -> set[float]:
+    """The `route_budget_usd` each installed implement caller hands reusable-implement.yml (the
+    workflow input's default when a caller passes none). Unreadable values are left out."""
+    budgets: set[float] = set()
+    for caller in callers:
+        for job in _workflow_jobs(caller).values():
+            if not str(job.get("uses", "")).split("@")[0].endswith("/reusable-implement.yml"):
+                continue
+            raw = (job.get("with") or {}).get("route_budget_usd", ROUTE_DEFAULT_BUDGET_USD)
+            try:
+                budgets.add(float(raw))
+            except (TypeError, ValueError):
+                continue
+    return budgets or {ROUTE_DEFAULT_BUDGET_USD}
 
-    The ONE eligibility rule behind every routed doctor check (selectable executor, workflow
-    adapter, required secrets and variables), so READY cannot drift from what the router does.
+
+def route_candidates(executors, routing_policy, request: RouteRequest) -> dict[str, list[str]]:
+    """executor id -> the router's own rejection reasons for `request` (empty = selectable).
+
+    Calls `executors.route_executor()` itself: the ONE eligibility rule behind every routed doctor
+    check (selectable executor, workflow adapter, required secrets and variables), so READY
+    cannot drift from what the router does.
     """
-    return [e for e in executors if not _route_rejections(e, routing_policy, project_id)]
+    decision = route_executor(request, executors, routing_policy)
+    return {
+        str(c["executorId"]): [str(r) for r in c.get("rejectionReasons") or []]
+        for c in decision.candidates
+    }
 
 
 def _executor_secret(executor) -> str | None:
@@ -1067,6 +1122,19 @@ def _preflight_requirements(callers: Sequence[Path]) -> tuple[set[str], set[str]
                 if ref and re.search(rf'test -n "?\${{?{re.escape(str(name))}\b', script):
                     (secrets if ref.group(1) == "secrets" else variables).add(ref.group(2))
     return secrets, variables
+
+
+def reusable_calls(caller: Path) -> list[tuple[str, str, str, str]]:
+    """(job, repository, workflow file, ref) of every job whose parsed `uses` calls a remote
+    reusable workflow (`owner/repo/.github/workflows/<file>@<ref>`)."""
+    calls = []
+    for name, job in _workflow_jobs(caller).items():
+        found = re.fullmatch(
+            r"([^/\s]+/[^/\s]+)/\.github/workflows/([^@\s/]+)@(\S+)", str(job.get("uses", ""))
+        )
+        if found:
+            calls.append((name, found.group(1), found.group(2), found.group(3)))
+    return calls
 
 
 def _forwarded_secrets(caller: Path) -> set[str] | None:
@@ -1134,6 +1202,33 @@ def _runner_available(labels: set[str], runners: Sequence[dict]) -> bool:
     )
 
 
+def _triggers(doc: dict) -> set[str]:
+    """Event names a workflow triggers on (YAML 1.1 reads a bare `on` key as True)."""
+    triggers = doc.get("on", doc.get(True))
+    if isinstance(triggers, str):
+        return {triggers}
+    if isinstance(triggers, list | dict):
+        return {str(t) for t in triggers}
+    return set()
+
+
+def _pull_request_off_hosted(base: Path) -> list[str]:
+    """`file:job [labels]` for every job of a pull_request-triggered workflow (any
+    `pull_request*` event) that does not run on a GitHub-hosted runner: its own `runs-on`, or the
+    `runs_on` it hands a reusable workflow. On a public repository those jobs run fork code."""
+    found = []
+    workflows = base / ".github/workflows"
+    paths = sorted([*workflows.glob("*.yml"), *workflows.glob("*.yaml")])
+    for path in paths:
+        doc = _workflow_doc(path)
+        if doc is None or not any(t.startswith("pull_request") for t in _triggers(doc)):
+            continue
+        for where, labels in _caller_runner_targets([path]).items():
+            if not _github_hosted(labels):
+                found.append(f"{where} {sorted(labels)}")
+    return found
+
+
 def _ci_runs_on(base: Path) -> set[str] | None:
     """Labels of ci.yml's `test` job runner (None when the file/job cannot be read)."""
     import yaml  # deferred: the CLI must import without site dependencies
@@ -1157,12 +1252,8 @@ def _ci_problems(base: Path) -> list[str]:
         return [str(exc)[:200]]
     if not isinstance(doc, dict):
         return ["not a workflow mapping"]
-    triggers = doc.get("on", doc.get(True))  # YAML 1.1 reads a bare `on` key as True
     problems = []
-    if not (
-        triggers == "pull_request"
-        or (isinstance(triggers, list | dict) and "pull_request" in triggers)
-    ):
+    if "pull_request" not in _triggers(doc):
         problems.append("not triggered on pull_request")
     job = (doc.get("jobs") or {}).get(REQUIRED_CHECK)
     if not isinstance(job, dict):
@@ -1427,7 +1518,14 @@ def doctor(
             routing_policy = load_routing_policy(
                 json.loads((base / ".forge/routing-policy.json").read_text())
             )
-            routable = routable_executors(executors, routing_policy, project_id)
+            if policy is None:
+                raise ExecutorError("agentic-sdlc.toml must load to build the route request")
+            # The exact request each installed implement caller makes (one per distinct
+            # route_budget_usd), evaluated by the router itself.
+            budgets = sorted(_caller_route_budgets([c for c in implement_callers if c.exists()]))
+            requests = [implementation_route_request(policy, project_id, b) for b in budgets]
+            verdicts = [route_candidates(executors, routing_policy, r) for r in requests]
+            routable = [e for e in executors if any(not v[e.executor_id] for v in verdicts)]
             # The router may pick any of these; one the implement workflow cannot run fails at
             # "adapter is not installed" after doctor said READY.
             unsupported = [
@@ -1436,21 +1534,29 @@ def doctor(
                 for reason in [_adapter_gap(e)]
                 if reason
             ]
-            runnable = [e for e in routable if not _adapter_gap(e)]
+            stuck = [
+                budget
+                for budget, verdict in zip(budgets, verdicts, strict=True)
+                if not any(not verdict[e.executor_id] and not _adapter_gap(e) for e in executors)
+            ]
             rejected = "; ".join(
-                f"{e.executor_id}: {', '.join(_route_rejections(e, routing_policy, project_id))}"
+                f"{e.executor_id}: {', '.join(verdicts[0][e.executor_id])}"
                 for e in executors
-                if e not in routable
+                if verdicts[0][e.executor_id]
+            )
+            what = (
+                f"the {ROUTE_MISSION_ID} mission ({requests[0].risk.value} risk, "
+                f"{ROUTE_TASK_CLASS.value})"
             )
             add(
                 Check(
                     "routing files valid and permit this repo",
-                    bool(runnable),
-                    f"{len(routable)} of {len(executors)} executors are selectable for "
-                    f"{ROUTE_TASK_CLASS.value} in this repository"
-                    if runnable
-                    else "no executor the router can select for "
-                    f"{ROUTE_TASK_CLASS.value} here has a workflow adapter"
+                    not stuck,
+                    f"{len(routable)} of {len(executors)} executors are selectable for {what} "
+                    "in this repository"
+                    if not stuck
+                    else f"no executor the router can select for {what} here has a workflow "
+                    f"adapter (budget ${', $'.join(f'{b:g}' for b in stuck)})"
                     + (f" ({rejected})" if rejected else ""),
                 )
             )
@@ -1472,7 +1578,13 @@ def doctor(
                 var = re.fullmatch(r"configured-by-([A-Z0-9_]+)", e.model or "")
                 if var:
                     routed_vars.add(var.group(1))
-        except (OSError, ExecutorError, json.JSONDecodeError, AttributeError) as exc:
+        except (
+            OSError,
+            ExecutorError,
+            MissionError,
+            json.JSONDecodeError,
+            AttributeError,
+        ) as exc:
             add(Check("routing files valid and permit this repo", False, str(exc)[:200]))
         # A secret the repository holds is still empty inside the reusable workflow unless the
         # caller passes it on.
@@ -1509,19 +1621,19 @@ def doctor(
         pins: set[str] = set()
         problems: list[str] = []
         for caller in callers:
-            uses = re.findall(
-                r"uses:\s*(\S+/\.github/workflows/reusable-[\w-]+\.yml@\S+)", caller.read_text()
-            )
-            if not uses:
+            # The parsed jobs' `uses`, not the file text: a commented-out call is no call.
+            calls = reusable_calls(caller)
+            expected = CALLER_TARGETS.get(caller.name)
+            if not calls:
                 problems.append(f"{caller.name} calls no reusable workflow")
-            for target in uses:
-                repo_part, _, rest = target.partition("/.github/workflows/")
-                workflow, _, pin = rest.rpartition("@")
-                expected = CALLER_TARGETS.get(caller.name)
+            elif expected and not any(wf == expected for _, _, wf, _ in calls):
+                problems.append(f"{caller.name} calls no {expected}")
+            for job, repo_part, workflow, pin in calls:
+                target = f"{repo_part}/.github/workflows/{workflow}@{pin}"
                 if expected and workflow != expected:
-                    problems.append(f"{caller.name} calls {workflow}, expected {expected}")
+                    problems.append(f"{caller.name}:{job} calls {workflow}, expected {expected}")
                 elif repo_part != platform_repository or not _SHA.fullmatch(pin):
-                    problems.append(f"{caller.name} uses {target}")
+                    problems.append(f"{caller.name}:{job} uses {target}")
                 else:
                     pins.add(pin)
         if len(pins) > 1:
@@ -1791,6 +1903,22 @@ def doctor(
                     else "not a GitHub-hosted label and no online runner carries all of them"
                 ),
                 manual=not ci_ok,
+            )
+        )
+
+    # --- a public repository's pull-request jobs run fork code: never on a persistent runner
+    known = isinstance(repo_info, dict) and ("private" in repo_info or "visibility" in repo_info)
+    if known and _is_public(repo_info):
+        exposed = _pull_request_off_hosted(base)
+        add(
+            Check(
+                "public repository runs pull requests on GitHub-hosted runners",
+                not exposed,
+                "fork pull requests would execute on self-hosted runners: "
+                + "; ".join(exposed)
+                + f" → set runs-on to a GitHub-hosted label (e.g. {PUBLIC_CI_RUNS_ON[0]})"
+                if exposed
+                else "every pull_request-triggered job is GitHub-hosted",
             )
         )
 

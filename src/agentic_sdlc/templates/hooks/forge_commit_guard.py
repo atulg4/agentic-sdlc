@@ -25,8 +25,66 @@ RELEASE = re.compile(r"<!--\s*forge-release\s+([^>]*?)\s*-->")
 GIT_VALUE_OPTS = frozenset(
     {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"}
 )
-# Words that run the rest of the command line as a new command (`env X=1 git commit`, ...).
-WRAPPERS = frozenset({"env", "command", "exec", "nohup", "time", "builtin", "sudo", "xargs"})
+# Words that run the rest of the command line as a new command (`env X=1 git commit`, ...), each
+# with the options that take a SEPARATE value (`env -u HOME`, `sudo -u bob`, `nice -n 5`): short
+# letters (also clustered, `sudo -Eu bob`), long names (also as `--name=value`), how many
+# positional words precede the command (`timeout 10 git ...`), and the options that change the
+# working directory (`env -C dir`, `sudo -D dir`).
+WRAPPER_OPTS: dict[str, tuple[str, frozenset[str], int, frozenset[str]]] = {
+    "env": (
+        "uCS",
+        frozenset({"--unset", "--chdir", "--split-string"}),
+        0,
+        frozenset({"-C", "--chdir"}),
+    ),
+    "sudo": (
+        "CDgprRtTUu",
+        frozenset(
+            {
+                "--close-from",
+                "--chdir",
+                "--group",
+                "--prompt",
+                "--chroot",
+                "--role",
+                "--type",
+                "--command-timeout",
+                "--other-user",
+                "--user",
+                "--host",
+            }
+        ),
+        0,
+        frozenset({"-D", "--chdir"}),
+    ),
+    "doas": ("uC", frozenset(), 0, frozenset()),
+    "nice": ("n", frozenset({"--adjustment"}), 0, frozenset()),
+    "ionice": ("cn", frozenset({"--class", "--classdata"}), 0, frozenset()),
+    "timeout": ("sk", frozenset({"--signal", "--kill-after"}), 1, frozenset()),
+    "stdbuf": ("ioe", frozenset({"--input", "--output", "--error"}), 0, frozenset()),
+    "xargs": (
+        "aEdILnPs",
+        frozenset(
+            {
+                "--arg-file",
+                "--delimiter",
+                "--max-args",
+                "--max-procs",
+                "--max-chars",
+                "--process-slot-var",
+            }
+        ),
+        0,
+        frozenset(),
+    ),
+    "time": ("fo", frozenset({"--format", "--output"}), 0, frozenset()),
+    "exec": ("a", frozenset(), 0, frozenset()),
+    "command": ("", frozenset(), 0, frozenset()),
+    "builtin": ("", frozenset(), 0, frozenset()),
+    "nohup": ("", frozenset(), 0, frozenset()),
+    "setsid": ("", frozenset(), 0, frozenset()),
+}
+WRAPPERS = frozenset(WRAPPER_OPTS)
 SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
 OPERATORS = frozenset({";", "&", "&&", "|", "||", "(", ")", ";;", "|&"})
 _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
@@ -52,49 +110,161 @@ def _segments(command: str) -> list[list[str]]:
     return [seg for seg in segments if seg]
 
 
-def _invokes_git_commit(argv: list[str], depth: int = 0) -> bool:
-    words = list(argv)
-    while words and (_ASSIGNMENT.match(words[0]) or os.path.basename(words[0]) in WRAPPERS):
-        words.pop(0)
-        while words and words[0].startswith("-"):  # wrapper flags: `env -i`, `sudo -u x`
+# A commit invocation: (directories to change into, in order, from the hook's cwd; the git
+# options that select the repository: -C/--git-dir/--work-tree; GIT_DIR/GIT_WORK_TREE set on the
+# command line).
+Target = tuple[tuple[str, ...], tuple[str, ...], tuple[tuple[str, str], ...]]
+GIT_REPO_OPTS = frozenset({"-C", "--git-dir", "--work-tree"})
+GIT_REPO_ENV = frozenset({"GIT_DIR", "GIT_WORK_TREE"})
+
+
+def _strip_wrapper(name: str, words: list[str], chdirs: list[str]) -> list[str]:
+    """`words` after one wrapper's options and leading positionals (the wrapped command).
+    A directory option is appended to `chdirs`; `env -S "..."` splits its string in."""
+    short, long, positionals, chdir_opts = WRAPPER_OPTS[name]
+    while words:
+        word = words[0]
+        if word == "--":
             words.pop(0)
+            break
+        if _ASSIGNMENT.match(word):
+            break  # `env -i A=1 git`: the caller reads the assignments, then the command
+        if word.startswith("--") and len(word) > 2:
+            words.pop(0)
+            option, eq, value = word.partition("=")
+            if option in long and not eq and words:
+                value = words.pop(0)
+            if option in chdir_opts and value:
+                chdirs.append(value)
+            if option == "--split-string" and value:
+                words[:0] = shlex.split(value)
+            continue
+        if word.startswith("-") and len(word) > 1:
+            words.pop(0)
+            for index, letter in enumerate(word[1:], start=2):
+                if letter in short:
+                    value = word[index:] or (words.pop(0) if words else "")
+                    if f"-{letter}" in chdir_opts and value:
+                        chdirs.append(value)
+                    if name == "env" and letter == "S" and value:
+                        words[:0] = shlex.split(value)
+                    break
+            continue
+        break
+    del words[: min(positionals, len(words))]
+    return words
+
+
+def _commit_targets(argv: list[str], depth: int = 0) -> list[Target]:
+    """The repository each `git ... commit` in one simple command commits to."""
+    words = list(argv)
+    chdirs: list[str] = []
+    env: list[tuple[str, str]] = []
+    while words:
+        if _ASSIGNMENT.match(words[0]):
+            key, _, value = words.pop(0).partition("=")
+            if key in GIT_REPO_ENV:
+                env.append((key, value))
+        elif os.path.basename(words[0]) in WRAPPERS:
+            words = _strip_wrapper(os.path.basename(words.pop(0)), words, chdirs)
+        else:
+            break
     if not words:
-        return False
+        return []
     program = os.path.basename(words[0])
     if program in SHELLS and "-c" in words[1:-1] and depth < 3:
-        return is_git_commit(words[words.index("-c") + 1], depth + 1)
+        return [
+            ((*chdirs, *inner_dirs), opts, (*env, *inner_env))
+            for inner_dirs, opts, inner_env in commit_targets(
+                words[words.index("-c") + 1], depth + 1
+            )
+        ]
     if program not in ("git", "git.exe"):
-        return False
+        return []
     rest = words[1:]
+    repo_opts: list[str] = []
     while rest:
         word = rest.pop(0)
         if word in GIT_VALUE_OPTS:
             if rest:
-                rest.pop(0)  # the option's value, e.g. the path after -C
+                value = rest.pop(0)  # the option's value, e.g. the path after -C
+                if word in GIT_REPO_OPTS:
+                    repo_opts += [word, value]
+            continue
+        if word.startswith(("--git-dir=", "--work-tree=")):
+            repo_opts.append(word)
+            continue
+        if word.startswith("-C") and len(word) > 2:
+            repo_opts += ["-C", word[2:]]
             continue
         if word.startswith("-"):
-            continue  # --no-pager, --exec-path=..., -C. forms with an attached value
-        return word == "commit"
-    return False
+            continue  # --no-pager, --exec-path=..., ...
+        return [(tuple(chdirs), tuple(repo_opts), tuple(env))] if word == "commit" else []
+    return []
+
+
+def commit_targets(command: str, depth: int = 0) -> list[Target]:
+    """Every `git ... commit` in `command` with the repository it commits to. `cd DIR` before it
+    (`cd ../wt && git commit`) counts too."""
+    found: list[Target] = []
+    cds: list[str] = []
+    for seg in _segments(command):
+        if seg[0] == "cd":
+            operands = [w for w in seg[1:] if not w.startswith("-") or w == "-"]
+            cds.append(operands[-1] if operands else "~")
+            continue
+        found += [((*cds, *dirs), opts, env) for dirs, opts, env in _commit_targets(seg, depth)]
+    return found
 
 
 def is_git_commit(command: str, depth: int = 0) -> bool:
     """True when any simple command in `command` runs `git ... commit`, however git is spelled
-    (`git`, `/usr/bin/git`, `./git`) and whatever global options precede the subcommand."""
+    (`git`, `/usr/bin/git`, `./git`), whatever wrapper (with its options) runs it, and whatever
+    global options precede the subcommand."""
     try:
-        segments = _segments(command)
-    except (
-        ValueError
-    ):  # unbalanced quotes: be conservative, block-check anything that looks like one
+        return bool(commit_targets(command, depth))
+    except ValueError:  # unbalanced quotes: be conservative, block-check anything like one
         return bool(_GIT_COMMIT_LOOSE.search(command))
-    return any(_invokes_git_commit(seg, depth) for seg in segments)
 
 
-def current_branch(cwd: str | None) -> str:
+def target_branch(target: Target, cwd: str | None) -> str:
+    """The branch `git <repo options> commit` would commit to, asked of git itself."""
+    chdirs, opts, env = target
+    where = cwd or os.getcwd()
+    for directory in chdirs:
+        if directory == "-":
+            continue  # `cd -`: unknowable here; stay put
+        where = os.path.join(where, os.path.expanduser(directory))
+    return current_branch(where, opts, dict(env))
+
+
+def commit_branches(command: str, cwd: str | None) -> list[str]:
+    """The branches the commits in `command` land on. Each commit is checked both where its
+    `cd`s lead and from the hook's cwd (a `cd` inside a subshell does not persist), so the guard
+    errs towards checking more, never fewer."""
+    try:
+        targets = commit_targets(command)
+    except ValueError:
+        targets = []
+    if not targets:
+        return [current_branch(cwd)]
+    branches: list[str] = []
+    for target in targets:
+        for candidate in (target, ((), target[1], target[2])):
+            branch = target_branch(candidate, cwd)
+            if branch not in branches:
+                branches.append(branch)
+    return branches
+
+
+def current_branch(
+    cwd: str | None, git_opts: tuple[str, ...] = (), env: dict[str, str] | None = None
+) -> str:
     try:
         return subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            ["git", *git_opts, "rev-parse", "--abbrev-ref", "HEAD"],
             cwd=cwd,
+            env={**os.environ, **env} if env else None,
             capture_output=True,
             text=True,
             check=True,
@@ -197,13 +367,23 @@ def open_pr_for(branch: str) -> bool:
 
 
 def decide(
-    payload: dict, branch: str, lease_lookup=lease_for, pr_lookup=open_pr_for
+    payload: dict, branch: str | list[str], lease_lookup=lease_for, pr_lookup=open_pr_for
 ) -> tuple[int, str]:
+    """Block (2, why) a commit onto an issue branch this session does not lease. `branch` is the
+    branch the commit lands on, or every candidate (`commit_branches`); any unleased one blocks."""
     if payload.get("tool_name") != "Bash":
         return 0, ""
     command = str((payload.get("tool_input") or {}).get("command", ""))
     if not is_git_commit(command):
         return 0, ""
+    for candidate in [branch] if isinstance(branch, str) else branch:
+        verdict = _decide_branch(payload, candidate, lease_lookup, pr_lookup)
+        if verdict[0]:
+            return verdict
+    return 0, ""
+
+
+def _decide_branch(payload: dict, branch: str, lease_lookup, pr_lookup) -> tuple[int, str]:
     m = ISSUE_BRANCH.search(branch or "")
     if not m:
         return 0, ""
@@ -232,7 +412,9 @@ def main() -> int:
         payload = json.loads(sys.stdin.read() or "{}")
     except json.JSONDecodeError:
         return 0
-    code, message = decide(payload, current_branch(payload.get("cwd")))
+    command = str((payload.get("tool_input") or {}).get("command", ""))
+    branches = commit_branches(command, payload.get("cwd")) if is_git_commit(command) else []
+    code, message = decide(payload, branches)
     if message:
         print(message, file=sys.stderr)
     return code
