@@ -4,6 +4,23 @@
 Installed by `sdlcctl onboard`. Reads the hook payload on stdin; exit 2 blocks the tool call and
 shows the message to the agent. Only Bash commands that commit on `*/issue-N*` branches are
 examined; everything else passes.
+
+Posture: FAIL CLOSED. Two layers decide whether a command is a commit:
+
+1. The precise parser (`_commit_targets`) PROVES a commit and finds the repository it lands in:
+   wrappers, `sh -c`, git global options, aliases, `cd`, and the bodies of `$(...)` and
+   backtick substitutions, which are parsed recursively with the same parser.
+2. A conservative pre-check over the RAW command: when the text holds a `git` word and a
+   `commit` word anywhere -- inside quotes, `$(...)`, backticks, `eval`, here-strings -- the
+   command is a commit UNLESS every simple command in it is positively proven not to be one
+   (`_segment_proven`): it holds no `$`/backtick expansion or here-string, and it either lacks
+   one of the two words, or is git itself running one of its own non-commit subcommands
+   (`git log --grep commit`), or is a `sh -c` whose string is proven the same way.
+
+Anything the parser cannot prove is treated as a commit and goes to the lease check. Only an
+unleased issue branch is ever blocked, so over-blocking (`echo "git commit"`) costs nothing on a
+leased branch or off issue branches; a missed commit costs the lease. Unparseable text (unbalanced
+quotes) holding both words is a commit too.
 """
 
 from __future__ import annotations
@@ -95,10 +112,13 @@ SHELL_KEYWORDS = frozenset(
     {"if", "then", "elif", "else", "fi", "while", "until", "do", "done", "!", "{", "}", "esac"}
     | {"coproc", "function"}
 )
-# Fallback for text shlex cannot tokenize (unbalanced quotes): any `.../git ... commit` word pair.
-_GIT_COMMIT_LOOSE = re.compile(
-    r"(?:^|[\s;&|(])(?:\S*/)?git(?:\.exe)?\s(?:.*\s)?commit(?=$|[\s;&|)])"
-)
+# The fail-closed pre-check's words (see the module docstring), anywhere in the raw text.
+_GIT_WORD = re.compile(r"\bgit\b")
+_COMMIT_WORD = re.compile(r"\bcommit\b")
+# Text that expands into words the parser cannot see: `$x`, `${x}`, `$(...)`, backticks, and a
+# here-string / here-document feeding a command its input.
+_EXPANSION = re.compile(r"[$`]|^<<")
+MAX_SUBST_DEPTH = 3
 MAX_TTL_MINUTES = 7 * 24 * 60  # leases.MAX_TTL_MINUTES
 # Who may post lease markers -- the SAME rule as leases.trusted_marker_author (a test holds the
 # two to identical decisions): a user with write/maintain/admin on the repository, read from the
@@ -335,6 +355,8 @@ def _commit_targets(argv: list[str], depth: int = 0, cwd: str | None = None) -> 
             return target
         if word in GIT_BUILTINS:
             return []
+        if _EXPANSION.search(word):
+            return target  # `git $sub`: the subcommand is unknowable here, fail closed
         expansion: str | None
         if word.lower() in inline:
             expansion = inline[word.lower()]
@@ -356,23 +378,93 @@ def _commit_targets(argv: list[str], depth: int = 0, cwd: str | None = None) -> 
     return []
 
 
-def _unclassified_commit(argv: list[str]) -> bool:
-    """A `git` word followed later by `commit` in a simple command whose program is NOT git or a
-    `sh -c` the parser reads (`eval git commit`, an unknown wrapper, ...): fail closed, call it a
-    commit. `git log --grep commit` was classified (git, not committing) and is not one."""
-    words = _command_words(argv, [], [])
-    program = os.path.basename(words[0]) if words else ""
-    if not words or program in ("git", "git.exe") or _shell_command_string(words) is not None:
+def _mentions_commit(text: str) -> bool:
+    """The pre-check: a `git` word and a `commit` word, in any order, anywhere in `text`."""
+    return bool(_GIT_WORD.search(text) and _COMMIT_WORD.search(text))
+
+
+def _substitutions(word: str) -> list[str]:
+    """The bodies of every `$(...)` and backtick substitution in one shell word (nested ones are
+    found when the body is parsed). Quoting is gone after shlex, so a single-quoted literal
+    counts too -- over-blocking, never under-. An unclosed one runs to the end of the word."""
+    bodies: list[str] = []
+    index = 0
+    while index < len(word):
+        if word.startswith("$(", index):
+            depth, end = 1, index + 2
+            while end < len(word) and depth:
+                depth += {"(": 1, ")": -1}.get(word[end], 0)
+                end += 1
+            bodies.append(word[index + 2 : end - 1 if not depth else end])
+            index = end
+        elif word[index] == "`":
+            close = word.find("`", index + 1)
+            end = close if close != -1 else len(word)
+            bodies.append(word[index + 1 : end])
+            index = end + 1
+        else:
+            index += 1
+    return bodies
+
+
+def _git_subcommand(words: list[str]) -> str | None:
+    """The subcommand of `git [global options] SUB ...` (None when there is none)."""
+    rest = list(words[1:])
+    while rest:
+        word = rest.pop(0)
+        if word in GIT_VALUE_OPTS:
+            if rest:
+                rest.pop(0)
+            continue
+        if word.startswith("-"):
+            continue
+        return word
+    return None
+
+
+def _segment_proven(seg: list[str], depth: int, cwd: str | None) -> bool:
+    """Is this simple command positively proven NOT to commit (the fail-closed pre-check)? No
+    expansion the parser cannot see, and: it lacks a `git` or a `commit` word, or it is git
+    itself running one of git's own non-commit subcommands, or a `sh -c` whose string is proven.
+    Anything else that mentions both words (`eval`, `echo "git commit"`, `bash <<< ...`, an
+    unknown wrapper, a git alias or external `git-foo`) is not proven."""
+    if any(_EXPANSION.search(word) for word in seg):
         return False
-    for index, word in enumerate(words):
-        if os.path.basename(word) in ("git", "git.exe") and "commit" in words[index + 1 :]:
+    if not _mentions_commit(" ".join(seg)):
+        return True
+    words = _command_words(seg, [], [])
+    if not words:
+        return True  # assignments only (`MSG="git commit"`): nothing runs
+    inner = _shell_command_string(words)
+    if inner is not None:
+        return depth < MAX_SUBST_DEPTH and not _unproven(inner, depth + 1, cwd)
+    if os.path.basename(words[0]) in ("git", "git.exe"):
+        sub = _git_subcommand(words)
+        return sub is not None and sub != "commit" and sub in GIT_BUILTINS
+    return False
+
+
+def _unproven(command: str, depth: int, cwd: str | None) -> bool:
+    """Does any simple command in `command` escape proof (see `_segment_proven`)?"""
+    if not _mentions_commit(command):
+        return False
+    try:
+        segments = _segments(command)
+    except ValueError:
+        return True
+    for seg in segments:
+        while seg and seg[0] in SHELL_KEYWORDS:
+            seg = seg[1:]
+        if seg and not _segment_proven(seg, depth, cwd):
             return True
     return False
 
 
 def commit_targets(command: str, depth: int = 0, cwd: str | None = None) -> list[Target]:
     """Every `git ... commit` in `command` with the repository it commits to. `cd DIR` before it
-    (`cd ../wt && git commit`) counts too."""
+    (`cd ../wt && git commit`) counts too. Fails closed: a simple command that is not proven
+    to be a non-commit while the text mentions `git` and `commit` counts as one."""
+    suspicious = _mentions_commit(command)
     found: list[Target] = []
     cds: list[str] = []
     for seg in _segments(command):
@@ -380,14 +472,24 @@ def commit_targets(command: str, depth: int = 0, cwd: str | None = None) -> list
             seg = seg[1:]
         if not seg:
             continue
-        if seg[0] == "cd":
+        where = _where(cwd, cds)
+        is_cd = seg[0] == "cd"
+        if is_cd:  # changes where later commands run; its own substitutions run here
             operands = [w for w in seg[1:] if not w.startswith("-") or w == "-"]
             cds.append(operands[-1] if operands else "~")
-            continue
-        targets = _commit_targets(seg, depth, _where(cwd, cds))
-        if not targets and _unclassified_commit(seg):
+        targets = [] if is_cd else _commit_targets(seg, depth, where)
+        for body in (body for word in seg for body in _substitutions(word)):
+            if depth >= MAX_SUBST_DEPTH:
+                targets += [((), (), ())] if _mentions_commit(body) else []
+                continue
+            try:  # a substitution runs where the command runs: same `cd`s
+                targets += commit_targets(body, depth + 1, where)
+            except ValueError:
+                targets += [((), (), ())] if _mentions_commit(body) else []
+        if not targets and suspicious and not _segment_proven(seg, depth, where):
             targets = [((), (), ())]  # unknown repository: checked from cwd and the `cd`s
-        found += [((*cds, *dirs), opts, env) for dirs, opts, env in targets]
+        prefix = cds[:-1] if is_cd else cds
+        found += [((*prefix, *dirs), opts, env) for dirs, opts, env in targets]
     return found
 
 
@@ -397,8 +499,8 @@ def is_git_commit(command: str, depth: int = 0, cwd: str | None = None) -> bool:
     global options precede the subcommand, and whatever alias (`git ci`) stands for it."""
     try:
         return bool(commit_targets(command, depth, cwd))
-    except ValueError:  # unbalanced quotes: be conservative, block-check anything like one
-        return bool(_GIT_COMMIT_LOOSE.search(command))
+    except ValueError:  # unparseable (unbalanced quotes): fail closed on the two words
+        return _mentions_commit(command)
 
 
 def target_branch(target: Target, cwd: str | None) -> str:

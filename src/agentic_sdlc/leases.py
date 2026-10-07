@@ -10,11 +10,13 @@ A claim with an assignee records it in the marker (``assignee=<login>``), and
 ``owns_assignee=1`` when the lease itself put that assignee on the issue (it was not assigned
 already, or it was inherited from the expired lease this one took over). Release -- and a
 takeover -- remove only an assignee a lease owned, and only when the authoritative live lease
-does not want the same login; a pre-existing assignee is never touched. A release that finds
-no lease reconciles the owned assignee of the last released one, so retrying a release whose
-cleanup failed after its marker was posted completes that cleanup. A completed cleanup is
-recorded (``<!-- forge-cleanup session=… assignee=… -->``) and a retry also skips a login that was
-assigned again after the release, so it can never undo a later human assignment.
+does not want the same login; a pre-existing assignee is never touched. Every claim and release
+reconciles the owned assignees of ALL ended leases (released, or expired and taken over) whose
+cleanup is not recorded, so a cleanup that failed after its marker was posted -- a release's, or
+a takeover's, which is best effort and never fails the claim -- is completed by a later one. A
+completed cleanup is recorded (``<!-- forge-cleanup session=… assignee=… -->``) and a retry also
+skips a login that was assigned again after the lease ended, so it can never undo a later human
+assignment.
 
 Markers count only from authors who can write to the repository (``trusted_marker_author``): a
 user whose repository permission is write/maintain/admin, `github-actions[bot]`, or the Forge
@@ -25,6 +27,7 @@ comments as MEMBER). The commit-guard hook mirrors the same rule.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from collections.abc import Callable, Sequence
@@ -32,6 +35,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
 GhRunner = Callable[..., str]
+_log = logging.getLogger(__name__)
 
 IN_PROGRESS_LABEL = "in-progress"
 DEFAULT_TTL_MINUTES = 240
@@ -317,47 +321,49 @@ def current_lease(
 
 @dataclass(frozen=True)
 class ReleasedLease:
-    """The lease the most recent trusted release ended, when that release was posted, and
-    whether its assignee cleanup is recorded as done."""
+    """A lease that ended -- by a trusted release (or retraction) marker, or by a takeover after
+    it expired -- when it ended, and whether its assignee cleanup is recorded as done."""
 
     lease: Lease
     released_at: datetime | None
     cleaned: bool
 
 
-def last_release(project: str, issue: int, gh: GhRunner) -> ReleasedLease | None:
-    """The claim the most recent trusted release (or retraction) marker voided, with the
-    assignee bookkeeping that claim recorded; None when no release has ended a claim. A trusted
-    `forge-cleanup` marker for that session and assignee, posted after it, marks it cleaned."""
+def ended_leases(project: str, issue: int, gh: GhRunner) -> list[ReleasedLease]:
+    """Every lease that has ended, oldest first, with the assignee bookkeeping it recorded. A
+    lease ends at a trusted release marker for its session, or when another session claims after
+    it expired (a takeover: it can never release now). A trusted `forge-cleanup` marker for a
+    session and assignee marks every earlier ended lease of that pair cleaned."""
     latest: dict[str, Lease] = {}
-    ended: ReleasedLease | None = None
+    ended: list[ReleasedLease] = []
     for comment in _trusted_comments(project, issue, gh):
         body = comment.get("body") or ""
+        posted = _parse_iso(comment.get("created_at") or "")
         parsed = parse_marker(body, issue)
         if parsed is not None:
+            if posted is not None:
+                cap = posted + timedelta(minutes=MAX_TTL_MINUTES)
+                parsed = parsed if parsed.expires <= cap else replace(parsed, expires=cap)
+                for other in [o for o in latest if o != parsed.session]:
+                    if not latest[other].live(posted):  # taken over after it expired
+                        ended.append(ReleasedLease(latest.pop(other), posted, cleaned=False))
             latest[parsed.session] = parsed
             continue
         released = _release_session(body)
         if released in latest:
-            posted = _parse_iso(comment.get("created_at") or "")
-            ended = ReleasedLease(latest.pop(released), posted, cleaned=False)
+            ended.append(ReleasedLease(latest.pop(released), posted, cleaned=False))
             continue
         done = _CLEANUP.search(body)
-        if done and ended is not None:
+        if done:
             fields = dict(_FIELD.findall(done.group("fields")))
-            if (
-                fields.get("session") == ended.lease.session
-                and fields.get("assignee") == ended.lease.assignee
-            ):
-                ended = replace(ended, cleaned=True)
+            ended = [
+                replace(e, cleaned=True)
+                if e.lease.session == fields.get("session")
+                and e.lease.assignee == fields.get("assignee")
+                else e
+                for e in ended
+            ]
     return ended
-
-
-def last_released_lease(project: str, issue: int, gh: GhRunner) -> Lease | None:
-    """The lease the most recent trusted release (or retraction) marker ended (`last_release`).
-    Lets a retried release finish the cleanup a failed one began after its marker."""
-    ended = last_release(project, issue, gh)
-    return ended.lease if ended is not None else None
 
 
 def assigned_since(project: str, issue: int, login: str, since: datetime, gh: GhRunner) -> bool:
@@ -525,28 +531,40 @@ def _record_cleanup(project: str, issue: int, ended: Lease, gh: GhRunner) -> Non
     _comment(project, issue, format_cleanup_marker(ended.session, ended.assignee), gh)
 
 
-def _reconcile_released_assignee(
+def _reconcile_released_assignees(
     project: str, issue: int, gh: GhRunner, now: datetime | None
 ) -> None:
-    """Finish the assignee cleanup of the last released lease -- only when it is not recorded as
-    done, the login is still on the issue, nobody (re)assigned it after the release, and no live
-    lease wants it (`_sync_assignee` re-checks that). Idempotent: it records completion."""
-    ended = last_release(project, issue, gh)
-    if ended is None or ended.cleaned:
-        return
-    lease = ended.lease
-    if not lease.owns_assignee or not lease.assignee:
-        return
-    target = json.loads(gh(["api", f"repos/{project}/issues/{issue}"]) or "{}")
-    if lease.assignee not in _assignee_logins(target if isinstance(target, dict) else {}):
+    """Finish the assignee cleanup of EVERY ended lease (`ended_leases`) not recorded as done --
+    not only the latest, since another session may claim and release before a failed cleanup is
+    retried. Each owned login is removed only when it is still on the issue, nobody (re)assigned
+    it after that lease ended, and no live lease wants it (`_sync_assignee` re-checks that).
+    Idempotent: each completion is recorded."""
+    pending: dict[tuple[str, str], ReleasedLease] = {}
+    for ended in ended_leases(project, issue, gh):
+        lease = ended.lease
+        if not ended.cleaned and lease.owns_assignee and lease.assignee:
+            pending[(lease.session, lease.assignee)] = ended  # the latest end of that pair
+    for ended in pending.values():
+        lease = ended.lease
+        target = json.loads(gh(["api", f"repos/{project}/issues/{issue}"]) or "{}")
+        if lease.assignee not in _assignee_logins(target if isinstance(target, dict) else {}):
+            _record_cleanup(project, issue, lease, gh)
+            continue
+        if ended.released_at is None or assigned_since(
+            project, issue, lease.assignee, ended.released_at, gh
+        ):
+            continue  # assigned again after the lease ended (or unknowable): a later owner's
+        _sync_assignee(project, issue, lease.assignee, gh, now)
         _record_cleanup(project, issue, lease, gh)
-        return
-    if ended.released_at is None or assigned_since(
-        project, issue, lease.assignee, ended.released_at, gh
-    ):
-        return  # assigned again after the release (or unknowable): a later owner's assignment
-    _sync_assignee(project, issue, lease.assignee, gh, now)
-    _record_cleanup(project, issue, lease, gh)
+
+
+def _reconcile_best_effort(project: str, issue: int, gh: GhRunner, now: datetime | None) -> None:
+    """`_reconcile_released_assignees` where its failure must not fail the caller (a claim or a
+    release whose own work is done): logged, and retried by the next claim or release."""
+    try:
+        _reconcile_released_assignees(project, issue, gh, now)
+    except Exception as exc:  # noqa: BLE001 -- retryable bookkeeping, never the operation
+        _log.warning("issue #%s: assignee cleanup of ended leases deferred: %s", issue, exc)
 
 
 def _assignee_logins(target: dict) -> set[str]:
@@ -612,6 +630,7 @@ def claim(
                 winner,
                 reason=f"issue #{issue}: renewal lost to session={getattr(winner, 'session', '?')}",
             )
+        _reconcile_best_effort(project, issue, gh, now)
         return ClaimResult(True, lease, renewed=True)
     if existing is not None:
         took_over = existing.session
@@ -668,9 +687,21 @@ def claim(
             pass
         raise
     # A takeover ends the expired lease: an assignee it added (and this lease does not want)
-    # would otherwise stay on the issue forever, accumulating one per takeover.
+    # would otherwise stay on the issue forever, accumulating one per takeover. The new claim is
+    # already authoritative, so this cleanup is best effort: a failure is logged and left to the
+    # reconciliation of ended leases, which every later claim and release retries.
     if existing is not None and existing.assignee != lease.assignee:
-        _drop_owned_assignee(project, issue, existing, gh, now)
+        try:
+            if _drop_owned_assignee(project, issue, existing, gh, now):
+                _record_cleanup(project, issue, existing, gh)
+        except Exception as exc:  # noqa: BLE001 -- retryable; never fails the claim
+            _log.warning(
+                "issue #%s: assignee cleanup of the expired lease of session %s deferred: %s",
+                issue,
+                existing.session,
+                exc,
+            )
+    _reconcile_best_effort(project, issue, gh, now)
     return ClaimResult(True, lease, took_over_from=took_over)
 
 
@@ -716,7 +747,7 @@ def release(
         # Nothing to release -- possibly because an earlier release posted its marker and then
         # failed: finish that release's cleanup (idempotent, so a retry completes it).
         _sync_label(project, issue, gh, now)
-        _reconcile_released_assignee(project, issue, gh, now)
+        _reconcile_released_assignees(project, issue, gh, now)
         return
     if existing.session != session and not force:
         raise LeaseError(f"issue #{issue} is leased by session {existing.session}, not {session}")
@@ -739,6 +770,8 @@ def release(
     # so a retried release cannot remove a login a maintainer assigns again afterwards.
     if _drop_owned_assignee(project, issue, existing, gh, now):
         _record_cleanup(project, issue, existing, gh)
+    # Earlier ended leases whose cleanup failed (a release's, a takeover's) are finished too.
+    _reconcile_best_effort(project, issue, gh, now)
 
 
 def list_claims(project: str, gh: GhRunner, now: datetime | None = None) -> list[ClaimRow]:
