@@ -10,6 +10,8 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "PyYAML>=6.0.3,<7",
+  "jsonschema>=4.26,<5",
+  "rfc8785>=0.1.4,<0.2",
 ]
 
 [project.optional-dependencies]
@@ -25,7 +27,7 @@ sdlcctl = "agentic_sdlc.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-agentic_sdlc = ["templates/*.md", "templates/github/*.yml", "templates/gitlab/*.yml"]
+agentic_sdlc = ["templates/*.md", "templates/github/*.yml", "templates/gitlab/*.yml", "schemas/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

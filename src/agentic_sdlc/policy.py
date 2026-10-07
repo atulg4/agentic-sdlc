@@ -97,8 +97,14 @@ def _patterns(
 
 
 def load_policy(path: str | Path) -> ProjectPolicy:
-    with Path(path).open("rb") as handle:
-        data = tomllib.load(handle)
+    return load_policy_bytes(Path(path).read_bytes())
+
+
+def load_policy_bytes(raw: bytes) -> ProjectPolicy:
+    """Parse a policy from one byte snapshot (so a digest of `raw` binds what is enforced)."""
+    if type(raw) is not bytes:
+        raise TypeError("policy input must be immutable bytes")
+    data = tomllib.loads(raw.decode("utf-8"))
     if data.get("version") != 1:
         raise ValueError("policy version must be 1")
     project = _table(data, "project")

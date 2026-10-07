@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "executors": [
+    {
+      "executorId": "example-api-worker",
+      "provider": "openai",
+      "adapter": "example-adapter",
+      "adapterVersion": "1.0.0",
+      "executionType": "direct-api",
+      "authMode": "api-key",
+      "model": "example-model",
+      "modelAlias": "gpt-5",
+      "taskClasses": ["implementation"],
+      "capabilities": ["edit-code", "author-tests", "run-commands"],
+      "toolCapabilities": ["code-edit", "structured-output"],
+      "contextWindow": 64000,
+      "maxRisk": "high",
+      "qualityLowerBound": 0.95,
+      "directCostUsd": 0.25,
+      "dataResidency": "us",
+      "storesTrainingData": false,
+      "permittedRepositories": ["example/project"]
+    }
+  ]
+}
