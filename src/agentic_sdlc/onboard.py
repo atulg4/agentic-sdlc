@@ -1827,19 +1827,93 @@ def _workflow_call_interface(doc: object) -> tuple[dict, dict] | None:
     return {str(k): v for k, v in inputs.items()}, {str(k): v for k, v in secrets.items()}
 
 
+_WORKFLOW_CALL_INPUT_TYPES = ("string", "number", "boolean")
+_WHOLE_EXPRESSION = re.compile(r"^\$\{\{(.*)\}\}$", re.DOTALL)
+# Contexts GitHub documents as numbers: safe to pass, bare, to a `type: number` input.
+_NUMBER_CONTEXTS = frozenset(
+    {
+        "github.run_number",
+        "github.run_attempt",
+        "github.event.number",
+        "github.event.issue.number",
+        "github.event.pull_request.number",
+        "github.event.workflow_run.run_number",
+        "github.event.workflow_run.run_attempt",
+        "strategy.job-index",
+        "strategy.job-total",
+        "strategy.max-parallel",
+    }
+)
+
+
+def _input_value_types(value: object) -> frozenset[str] | None:
+    """The workflow_call input types a caller's `with:` value satisfies; None when it is an
+    expression whose type doctor cannot determine. A literal YAML bool is a boolean, an int or
+    float a number, a string a string; an expression is a string unless the whole value is
+    `${{ fromJSON(...) }}` (any type: GitHub parses it) or a context GitHub documents as a
+    number. Any other whole-value expression is undetermined (None): its result reaches a
+    `string` input as text, but doctor cannot prove it is a number or a boolean."""
+    if isinstance(value, bool):
+        return frozenset({"boolean"})
+    if isinstance(value, (int, float)):
+        return frozenset({"number"})
+    if not isinstance(value, str):
+        return frozenset()  # null, a list or a mapping fits no input type
+    whole = _WHOLE_EXPRESSION.fullmatch(value.strip())
+    if whole is None or "${{" in whole.group(1):
+        return frozenset({"string"})  # a literal, or text with expressions interpolated into it
+    body = whole.group(1).strip()
+    if re.fullmatch(r"fromJSON\(.*\)", body, re.DOTALL | re.IGNORECASE) and body.count("(") == 1:
+        return frozenset(_WORKFLOW_CALL_INPUT_TYPES)
+    if body in _NUMBER_CONTEXTS:
+        return frozenset({"number"})
+    return None
+
+
 def reusable_call_mismatches(where: str, job: dict, callee: str, callee_doc: object) -> list[str]:
     """Why GitHub would reject `job`'s call of `callee` (parsed `callee_doc`): an input or secret
-    the caller passes that the callee does not declare, or one the callee requires that the
-    caller does not pass (`secrets: inherit` passes every secret)."""
+    the caller passes that the callee does not declare, one the callee requires that the caller
+    does not pass (`secrets: inherit` passes every secret), a callee input with no valid `type`
+    (GitHub rejects the callee itself), and a passed value that does not fit the declared type
+    (or whose type doctor cannot determine, for a `number`/`boolean` input)."""
     interface = _workflow_call_interface(callee_doc)
     if interface is None:
         return [f"{where}: {callee} at the pin has no on.workflow_call trigger"]
     inputs, secrets = interface
     problems = []
-    passed = job.get("with") if isinstance(job.get("with"), dict) else {}
-    for name in sorted(str(k) for k in passed):
+    for name, spec in sorted(inputs.items()):
+        declared = spec.get("type") if isinstance(spec, dict) else None
+        if declared not in _WORKFLOW_CALL_INPUT_TYPES:
+            problems.append(
+                f"{where}: {callee} declares input {name!r} with "
+                + (f"type {declared!r}" if declared is not None else "no type")
+                + " (workflow_call inputs need string, number or boolean)"
+            )
+    given_inputs = job.get("with") if isinstance(job.get("with"), dict) else {}
+    passed = {str(k): v for k, v in given_inputs.items()}
+    for name in sorted(passed):
         if name not in inputs:
             problems.append(f"{where}: passes input {name!r}, which {callee} does not declare")
+            continue
+        spec = inputs[name]
+        declared = spec.get("type") if isinstance(spec, dict) else None
+        if declared not in _WORKFLOW_CALL_INPUT_TYPES:
+            continue  # reported above
+        value = passed[name]
+        fits = _input_value_types(value)
+        if fits is None and declared == "string":
+            continue  # an expression's result reaches a string input as text
+        if fits is None:
+            problems.append(
+                f"{where}: passes input {name!r} as {value!r}, whose type doctor cannot "
+                f"determine, but {callee} declares it {declared}"
+            )
+        elif declared not in fits:
+            problems.append(
+                f"{where}: passes input {name!r} as {value!r} ("
+                + ("/".join(sorted(fits)) or type(value).__name__)
+                + f"), but {callee} declares it {declared}"
+            )
     for name, spec in sorted(inputs.items()):
         if isinstance(spec, dict) and spec.get("required") is True and name not in passed:
             problems.append(f"{where}: does not pass input {name!r}, which {callee} requires")
@@ -1875,11 +1949,84 @@ def _repo_rulesets(project_id: str, gh: GhRunner) -> list[dict]:
 EFFECTIVE_RULES_CHECK = "effective default-branch rules (org/enterprise rulesets too) fit Forge"
 
 
+_MATRIX_REF = re.compile(r"\$\{\{\s*matrix\.([A-Za-z_][A-Za-z0-9_-]*)\s*\}\}")
+
+
+def _matrix_scalar(value: object) -> str | None:
+    """How GitHub renders a matrix value inside a job name; None for a value doctor cannot
+    render (an expression, a list or a mapping)."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str) and "${{" not in value:
+        return value
+    return None
+
+
+def _matrix_combinations(matrix: object) -> list[dict] | None:
+    """The finite combinations of a literal `strategy.matrix` (product of the value lists, minus
+    `exclude`, then `include` extending matching combinations or adding new ones); None when any
+    part is an expression or not literal data."""
+    if not isinstance(matrix, dict):
+        return None
+    combos: list[dict] = [{}]
+    for key, values in matrix.items():
+        if key in ("include", "exclude"):
+            continue
+        if not isinstance(values, list) or not values:
+            return None
+        combos = [{**c, str(key): v} for c in combos for v in values]
+    for part in ("exclude", "include"):
+        entries = matrix.get(part, [])
+        if not isinstance(entries, list) or not all(isinstance(e, dict) for e in entries):
+            return None
+    base_keys = {str(k) for k in matrix if k not in ("include", "exclude")}
+    for entry in matrix.get("exclude", []):
+        entry = {str(k): v for k, v in entry.items()}
+        combos = [c for c in combos if any(c.get(k) != v for k, v in entry.items())]
+    if not base_keys:
+        combos = []
+    originals = [dict(c) for c in combos]
+    for entry in matrix.get("include", []):
+        entry = {str(k): v for k, v in entry.items()}
+        matched = False
+        for original, combo in zip(originals, combos, strict=False):  # appended ones extend nothing
+            if all(original.get(k, v) == v for k, v in entry.items() if k in base_keys):
+                combo.update(entry)
+                matched = True
+        if not matched:
+            combos.append(dict(entry))
+    return combos
+
+
+def _matrix_job_names(name: str, strategy: object) -> list[str] | None:
+    """Every name a job named with `${{ matrix.* }}` expressions reports, over a finite literal
+    matrix; None when the name holds any other expression or the matrix is not literal."""
+    if "${{" in _MATRIX_REF.sub("", name):
+        return None
+    matrix = strategy.get("matrix") if isinstance(strategy, dict) else None
+    combos = _matrix_combinations(matrix)
+    if not combos:
+        return None
+    names: set[str] = set()
+    for combo in combos:
+        parts: dict[str, str] = {}
+        for key in _MATRIX_REF.findall(name):
+            rendered = _matrix_scalar(combo[key]) if key in combo else ""  # absent renders empty
+            if rendered is None:
+                return None
+            parts[key] = rendered
+        names.add(_MATRIX_REF.sub(lambda m, parts=parts: parts[m.group(1)], name))
+    return sorted(names)
+
+
 def workflow_check_contexts(base: Path) -> tuple[set[str], tuple[str, ...], bool]:
     """What the installed workflows can report as status-check contexts: exact job names (`name:`
     else the job id), prefixes for the contexts GitHub derives (`caller / callee` for a reusable
-    call, `name (...)` for a matrix, the literal part of a name holding an expression), and
-    whether any workflow runs on `merge_group` (a merge queue's checks)."""
+    call, `name (...)` for a matrix), the evaluated names of a job named with `matrix.*` over a
+    finite literal matrix (any other expression in a name contributes nothing), and whether any
+    workflow runs on `merge_group` (a merge queue's checks)."""
     exact: set[str] = set()
     prefixes: list[str] = []
     merge_group = False
@@ -1895,7 +2042,14 @@ def workflow_check_contexts(base: Path) -> tuple[set[str], tuple[str, ...], bool
         for job_id, job in _workflow_jobs(path).items():
             name = str(job.get("name") or job_id)
             if "${{" in name:
-                prefixes.append(name.split("${{")[0])
+                # GitHub reports the evaluated name (with no `(...)` matrix suffix). Doctor
+                # can evaluate only `matrix.*` over a finite literal matrix; any other
+                # expression proves nothing (an empty literal prefix would match every context).
+                for rendered in _matrix_job_names(name, job.get("strategy")) or ():
+                    if rendered.strip():
+                        exact.add(rendered)
+                        if job.get("uses"):
+                            prefixes.append(f"{rendered} / ")
                 continue
             exact.add(name)
             if job.get("uses"):
@@ -1916,6 +2070,7 @@ def effective_rule_problems(
     required workflows, a merge queue no workflow serves, required signatures, update
     restrictions and code-scanning gates."""
     exact, prefixes, merge_group = produced
+    prefixes = tuple(p for p in prefixes if p.strip())  # an empty prefix proves every context
     problems: list[str] = []
     for rule in rules:
         kind = str(rule.get("type") or "")

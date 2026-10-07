@@ -4706,24 +4706,142 @@ def test_reusable_call_contract_rules():
     callee = {
         "on": {
             "workflow_call": {
-                "inputs": {"a": {"required": True}, "b": {"required": False}},
+                "inputs": {
+                    "a": {"type": "string", "required": True},
+                    "b": {"type": "string", "required": False},
+                },
                 "secrets": {"S": {"required": True}, "T": {}},
             }
         }
     }
     ok = {"with": {"a": "1"}, "secrets": {"S": "${{ secrets.S }}"}}
     assert reusable_call_mismatches("c:j", ok, "x.yml", callee) == []
-    assert (
-        reusable_call_mismatches("c:j", {"with": {"a": 1}, "secrets": "inherit"}, "x.yml", callee)
-        == []
-    )
-    gaps = reusable_call_mismatches("c:j", {"with": {"b": 2, "z": 3}}, "x.yml", callee)
+    inherit = {"with": {"a": "${{ inputs.a }}"}, "secrets": "inherit"}
+    assert reusable_call_mismatches("c:j", inherit, "x.yml", callee) == []
+    gaps = reusable_call_mismatches("c:j", {"with": {"b": "2", "z": 3}}, "x.yml", callee)
     assert gaps == [
         "c:j: passes input 'z', which x.yml does not declare",
         "c:j: does not pass input 'a', which x.yml requires",
         "c:j: does not pass secret 'S', which x.yml requires",
     ]
     assert "no on.workflow_call" in reusable_call_mismatches("c:j", {}, "x.yml", {"on": "push"})[0]
+
+
+# Codex 4207036775: names and requiredness matching is not enough. GitHub rejects a call whose
+# value does not fit the callee input's declared `type` (and a callee input with no type at all)
+# before any job starts, so doctor checks each passed value against the declaration and treats
+# an expression it cannot type as unverified for a number/boolean input.
+def test_reusable_call_contract_checks_input_types():
+    from agentic_sdlc.onboard import reusable_call_mismatches
+
+    def callee(**types):
+        inputs = {k: ({"type": t} if t else {}) for k, t in types.items()}
+        return {"on": {"workflow_call": {"inputs": inputs}}}
+
+    def gaps(types, passed):
+        return reusable_call_mismatches("c:j", {"with": passed}, "x.yml", callee(**types))
+
+    # Compatible: literals of the declared type, fromJSON for any type, numeric contexts,
+    # and any expression (or interpolated text) into a string.
+    assert gaps({"n": "number", "b": "boolean", "s": "string"}, {"n": 3, "b": True, "s": "x"}) == []
+    assert gaps({"n": "number", "b": "boolean"}, {"n": 1.5, "b": False}) == []
+    assert gaps({"n": "number"}, {"n": "${{ fromJSON(inputs.n) }}"}) == []
+    assert gaps({"b": "boolean"}, {"b": "${{ fromJSON(inputs.b) }}"}) == []
+    assert gaps({"n": "number"}, {"n": "${{ github.event.issue.number }}"}) == []
+    assert gaps({"s": "string"}, {"s": "${{ needs.a.outputs.n }}"}) == []
+    assert gaps({"s": "string"}, {"s": "pr-${{ github.event.issue.number }}"}) == []
+
+    # A string where the pin now declares a number or a boolean: rejected by GitHub.
+    for declared in ("number", "boolean"):
+        found = gaps({"i": declared}, {"i": "42"})
+        assert found == [
+            f"c:j: passes input 'i' as '42' (string), but x.yml declares it {declared}"
+        ]
+        found = gaps({"i": declared}, {"i": "pr-${{ inputs.i }}"})
+        assert found and f"declares it {declared}" in found[0]
+    # ...and the reverse.
+    assert "(number), but x.yml declares it string" in gaps({"s": "string"}, {"s": 7})[0]
+    assert "(boolean), but x.yml declares it number" in gaps({"n": "number"}, {"n": True})[0]
+    assert (
+        "(number), but x.yml declares it string"
+        in (gaps({"s": "string"}, {"s": "${{ github.event.issue.number }}"})[0])
+    )
+    assert "but x.yml declares it number" in gaps({"n": "number"}, {"n": None})[0]
+
+    # An expression doctor cannot type, into a number/boolean: unverified, never compatible.
+    for declared in ("number", "boolean"):
+        found = gaps({"i": declared}, {"i": "${{ inputs.i }}"})
+        assert found == [
+            "c:j: passes input 'i' as '${{ inputs.i }}', whose type doctor cannot determine, "
+            f"but x.yml declares it {declared}"
+        ]
+    assert gaps({"n": "number"}, {"n": "${{ fromJSON(a) || fromJSON(b) }}"})
+
+    # A callee input with no type, or one workflow_call does not support: malformed.
+    assert gaps({"i": None}, {}) == [
+        "c:j: x.yml declares input 'i' with no type (workflow_call inputs need string, number "
+        "or boolean)"
+    ]
+    assert gaps({"i": "choice"}, {"i": "a"}) == [
+        "c:j: x.yml declares input 'i' with type 'choice' (workflow_call inputs need string, "
+        "number or boolean)"
+    ]
+
+
+# Codex 4207036789: a job named `${{ matrix.name }}` has an empty literal prefix, and every
+# context starts with ''. Doctor now evaluates matrix names over a finite literal matrix and
+# otherwise counts an expression-named job as reporting nothing (fail closed).
+def test_expression_job_names_do_not_satisfy_every_required_check(tmp_path):
+    from agentic_sdlc.onboard import effective_rule_problems, workflow_check_contexts
+
+    workflows = tmp_path / ".github/workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "ci.yml").write_text(
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    name: ${{ matrix.name }}\n"
+        "    strategy:\n"
+        "      matrix:\n"
+        "        name: [ruff, mypy]\n"
+        "        exclude:\n"
+        "          - name: mypy\n"
+        "        include:\n"
+        "          - name: pyright\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps: [{run: 'true'}]\n"
+        "  test:\n"
+        "    name: test-${{ matrix.py }}-${{ matrix.fast }}\n"
+        "    strategy: {matrix: {py: ['3.11', 3.12], fast: [true]}}\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps: [{run: 'true'}]\n"
+        "  dyn:\n"
+        "    name: ${{ matrix.x }}\n"
+        "    strategy: {matrix: {x: '${{ fromJSON(inputs.xs) }}'}}\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps: [{run: 'true'}]\n"
+        "  other:\n"
+        "    name: ${{ inputs.label }}\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps: [{run: 'true'}]\n"
+    )
+    produced = workflow_check_contexts(tmp_path)
+    exact, prefixes, _ = produced
+    assert {"ruff", "pyright", "test-3.11-true", "test-3.12-true"} <= exact
+    assert "mypy" not in exact
+    assert not [p for p in prefixes if not p.strip()]
+
+    def required(*contexts):
+        checks = [{"context": c, "integration_id": 15368} for c in contexts]
+        return [
+            {"type": "required_status_checks", "parameters": {"required_status_checks": checks}}
+        ]
+
+    assert effective_rule_problems(required("ruff", "pyright", "test-3.12-true"), produced) == []
+    problems = effective_rule_problems(required("mypy", "deploy", "anything"), produced)
+    assert len(problems) == 3 and all("no installed workflow job reports" in p for p in problems)
+    # Even a hand-built empty prefix cannot prove a context.
+    assert effective_rule_problems(required("anything"), (set(), ("", " "), False))
 
 
 # Codex 4206173667 / 4206173686: the guard is deny-by-default for git. On an issue branch every
