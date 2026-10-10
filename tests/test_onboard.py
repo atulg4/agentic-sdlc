@@ -1588,7 +1588,7 @@ def test_doctor_accepts_github_hosted_runner_labels(tmp_path, runs_on):
 
 def test_auto_plan_triggers_on_the_ready_label_only():
     doc = yaml.safe_load(render_onboarding(spec())[".github/workflows/agent-auto-plan.yml"])
-    cond = doc["jobs"]["plan"]["if"]
+    cond = doc["jobs"]["preflight"]["if"]
     assert "github.event.label.name == 'claude-ready'" in cond
     assert "github.event.label.name == 'human-review-required'" not in cond
     assert "contains(github.event.issue.labels.*.name, 'human-review-required')" in cond
@@ -2026,7 +2026,10 @@ def test_runner_labels_render_as_yaml_strings():
         if not name.endswith(".yml"):
             continue
         want = list(labels) if name.endswith("/ci.yml") else list(agent_labels)
-        for job in (yaml.safe_load(content).get("jobs") or {}).values():
+        for job_name, job in (yaml.safe_load(content).get("jobs") or {}).items():
+            if name.endswith("/agent-auto-plan.yml") and job_name == "preflight":
+                assert job["runs-on"] == "ubuntu-latest"  # authorizes before RUNS_ON is used
+                continue
             if "runs-on" in job:
                 assert job["runs-on"] == want, name
                 seen += 1
@@ -3057,7 +3060,10 @@ def test_doctor_follows_local_reusable_workflows_for_runner_availability(tmp_pat
 def test_doctor_requires_the_exact_label_conditions(tmp_path, condition):
     repo = _repo(tmp_path)
     write_onboarding(repo, spec())
-    for name, job in (("agent-auto-plan.yml", "plan"), ("agent-auto-implement.yml", "preflight")):
+    for name, job in (
+        ("agent-auto-plan.yml", "preflight"),
+        ("agent-auto-implement.yml", "preflight"),
+    ):
         path = repo / ".github/workflows" / name
         doc = yaml.safe_load(path.read_text())
         original = doc["jobs"][job]["if"]
@@ -3180,8 +3186,8 @@ def test_doctor_tolerates_only_the_tunable_knobs(tmp_path):
     write_onboarding(repo, spec())
 
     def runners(doc):
-        for job in doc["jobs"].values():
-            if "runs-on" in job:
+        for job in doc["jobs"].values():  # not the auto-plan authorization: GitHub-hosted
+            if "runs-on" in job and "authorized" not in (job.get("outputs") or {}):
                 job["runs-on"] = "ubuntu-24.04"
             if "runs_on" in (job.get("with") or {}):
                 job["with"]["runs_on"] = '["ubuntu-24.04"]'
@@ -5566,3 +5572,49 @@ def test_doctor_judges_required_contexts_on_the_default_branchs_workflows(tmp_pa
         if c.name == EFFECTIVE_RULES_CHECK
     )
     assert not check.ok and check.manual and "cannot be verified" in check.detail
+
+
+# Codex 4238832976: anyone can open the work-request template, which applies the planning labels;
+# the labeler is authorized on a GitHub-hosted runner before anything is scheduled on RUNS_ON.
+def test_auto_plan_authorizes_the_labeler_on_a_hosted_runner_first():
+    doc = yaml.safe_load(
+        render_onboarding(spec(runs_on=("self-hosted", "linux")))[
+            ".github/workflows/agent-auto-plan.yml"
+        ]
+    )
+    preflight, plan = doc["jobs"]["preflight"], doc["jobs"]["plan"]
+    assert preflight["runs-on"] == "ubuntu-latest"
+    assert "github.event.label.name == 'claude-ready'" in preflight["if"]
+    assert preflight["outputs"]["authorized"] == "${{ steps.authorize.outputs.authorized }}"
+    step = preflight["steps"][0]
+    assert step["env"]["SENDER"] == "${{ github.event.sender.login }}"
+    assert step["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert "collaborators/${encoded}/permission" in step["run"]
+    assert "admin|write) ;;" in step["run"]
+    assert plan["needs"] == "preflight"
+    assert plan["if"] == "needs.preflight.outputs.authorized == 'true'"
+    assert plan["uses"].startswith("owner/agentic-sdlc/.github/workflows/reusable-plan.yml@")
+    # every job that can reach a self-hosted runner waits on the authorization
+    for name, job in doc["jobs"].items():
+        if name != "preflight" and job.get("runs-on") != "ubuntu-latest":
+            needs = job.get("needs")
+            needs = [needs] if isinstance(needs, str) else needs or []
+            assert "preflight" in needs or "plan" in needs, name
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda d: d["jobs"]["preflight"].update({"runs-on": ["self-hosted", "linux"]}),
+        lambda d: d["jobs"]["plan"].pop("if"),
+        lambda d: d["jobs"]["plan"].pop("needs"),
+        lambda d: d["jobs"].pop("preflight"),
+    ],
+)
+def test_doctor_requires_the_auto_plan_authorization_preflight(tmp_path, change):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    assert _drift(repo) is None
+    _edit_workflow(repo, "agent-auto-plan.yml", change)
+    drift = _drift(repo)
+    assert drift is not None and "agent-auto-plan.yml" in drift
