@@ -31,6 +31,22 @@
    its private key as the Actions secret `PUBLISHER_APP_PRIVATE_KEY`.
 8. Start with manual `workflow_dispatch` plan runs.
 
+### Kubernetes runners
+
+Set the consumer's Actions repository variable `FORGE_RUNNER` to its ARC scale
+set name, for example `marketmaestro-runners`. Generated callers use this target
+for both their own jobs and the `runs_on` input to reusable Forge workflows.
+Without the variable, generated workflows retain the `ubuntu-latest` default.
+Passing `runs_on` is essential: a caller's runner choice does not automatically
+propagate into a reusable workflow. Older generated files must be updated too.
+
+Use a reviewed immutable platform revision that declares the `runs_on` input.
+Validate its required secrets and permissions before updating a consumer pin;
+older releases may use a different model authentication interface.
+
+See [the ARC deployment runbook](../infra/arc/README.md) for the pinned runner
+image, scale-to-zero pool values, isolation checks and rollout procedure.
+
 Automation levels are deliberately staged:
 
 | Level | Behavior |
