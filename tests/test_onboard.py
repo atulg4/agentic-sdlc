@@ -5339,3 +5339,105 @@ def test_doctor_checks_classic_branch_protection(tmp_path):
     gh.answers[key] = OnboardError("gh: Must have admin rights to Repository. (HTTP 403)")
     check = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))[LEGACY]
     assert check.manual and "cannot read branch protection" in check.detail
+
+
+# ---------------------------------------------------------------- review regressions (PR 139, 6)
+# Codex 4238832970: a branch change earlier in one command re-targets the git after it.
+
+
+def _branch_flow_repo(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "init")
+    _git(repo, "branch", "forge/issue-7")
+    (tmp_path / "wt").mkdir()
+    _git(tmp_path / "wt", "init", "-q", "-b", "forge/issue-9")
+    _git(tmp_path / "wt", "commit", "-q", "--allow-empty", "-m", "init")
+    return repo
+
+
+def _flow_code(guard, command, cwd, leased=()):
+    branches = guard.commit_branches(command, str(cwd))
+    payload = {"tool_name": "Bash", "session_id": "s1", "cwd": str(cwd)}
+    lease = {"session": "s1", "agent": "claude-code"}
+    return guard.decide(
+        {**payload, "tool_input": {"command": command}},
+        branches,
+        lambda n: dict(lease) if n in leased else None,
+        lambda b: False,
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git switch forge/issue-7 && git commit -m x",
+        "git checkout forge/issue-7 && git commit -m x",
+        "git checkout -b forge/issue-7 && git commit -m x",
+        "git switch -c forge/issue-7 && git commit -m x",
+        "git checkout -q forge/issue-7; git commit -m x",
+        "git switch forge/issue-7 && git add . && git commit -m x",
+        "bash -c 'git switch forge/issue-7 && git commit -m x'",
+        "git switch forge/issue-7 && echo ok && git merge main",
+    ],
+)
+def test_commit_guard_follows_a_static_branch_change_in_the_same_command(tmp_path, command):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    repo = _branch_flow_repo(tmp_path)
+    code, message = _flow_code(guard, command, repo)
+    assert code == 2 and "issue #7" in message, command
+    assert _flow_code(guard, command, repo, leased=(7,))[0] == 0, command
+
+
+def test_commit_guard_a_switch_off_an_issue_branch_is_checked_against_its_target(tmp_path):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    repo = _branch_flow_repo(tmp_path)
+    _git(repo, "switch", "-q", "forge/issue-7")
+    # a pure switch to an existing branch rewrites nothing; the commit lands on main
+    assert _flow_code(guard, "git switch main && git commit -m x", repo)[0] == 0
+    assert _flow_code(guard, "git switch main", repo)[0] == 0
+    # `;` does not prove the switch happened: the commit may still land on issue 7
+    assert _flow_code(guard, "git switch main; git commit -m x", repo)[0] == 2
+    assert _flow_code(guard, "git commit -m x", repo)[0] == 2
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'git checkout "$B" && git commit -m x',
+        "git checkout - && git commit -m x",
+        "git switch @{-1} && git commit -m x",
+        "git bisect start && git commit -m x",
+        "git co forge/issue-7 && git commit -m x",
+        "source switch.sh && git commit -m x",
+        'eval "$SWITCH" && git commit -m x',
+        "pushd ../wt && git commit -m x",
+        'cd "$WT" && git commit -m x',
+        "export GIT_DIR=../wt/.git; git commit -m x",
+        "echo forge/issue-7 | xargs git switch && git commit -m x",
+        'git commit -m "$(git switch forge/issue-7)"',
+    ],
+)
+def test_commit_guard_blocks_an_unknowable_branch_change_before_git(tmp_path, command):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    repo = _branch_flow_repo(tmp_path)
+    code, message = _flow_code(guard, command, repo, leased=(7, 9))
+    assert code == 2 and "SEPARATE commands" in message, command
+
+
+def test_commit_guard_branch_flow_keeps_existing_cd_and_plain_commands(tmp_path):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    repo = _branch_flow_repo(tmp_path)
+    assert _flow_code(guard, "cd ../wt && git commit -m x", repo)[0] == 2  # issue 9, no lease
+    assert _flow_code(guard, "cd ../wt && git commit -m x", repo, leased=(9,))[0] == 0
+    for allowed in (
+        "git commit -m x",
+        "ruff check . && pytest -q && git commit -m x",
+        "git add . && git commit -m x && git push",
+        "git checkout -- README.md && git commit -m x",
+        "git stash && git switch main && git stash pop",
+        'gh pr create --title "git: tidy" && git push',
+        "git checkout -b feature && git commit -m x",
+    ):
+        assert _flow_code(guard, allowed, repo)[0] == 0, allowed
