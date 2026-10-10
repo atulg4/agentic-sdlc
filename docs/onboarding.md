@@ -241,12 +241,17 @@ something that runs differently.
 - **Effective rules**: `doctor` also reads the rules that actually apply to the default branch
   (`GET repos/{owner}/{repo}/rules/branches/{branch}`), so organization and enterprise rulesets
   count. A required status context no installed workflow job reports, required deployments,
-  required workflows, a merge queue no workflow runs on `merge_group` for, required signatures,
-  update restrictions and code-scanning gates are reported as a manual TODO, as is an
-  unreadable answer. The contexts a PR can receive are computed from the default branch's
-  workflow set as GitHub serves it (the checkout only adds a drift note for a workflow not yet
-  pushed; an unreadable set is a manual TODO): job names, evaluated `matrix.*` names, and for a
-  reusable call `caller / callee-job` for each job of the callee as fetched (a local callee, or
+  required workflows, a merge queue no workflow runs on `merge_group` for -- or, with a merge
+  queue, a required context no workflow running on `merge_group` reports (the queue waits for
+  every required check in the merge group, not on the PR) -- required signatures, update
+  restrictions and code-scanning gates are reported as a manual TODO, as is an unreadable
+  answer. The contexts a PR (and, separately, a merge group) can receive are computed from the
+  default branch's workflow set as GitHub serves it (the checkout only adds a drift note for a
+  workflow not yet pushed; an unreadable set is a manual TODO), always as EXACT names: job
+  names; for a matrix job one context per literal combination -- `name (v1, v2, ...)`, the axes'
+  values in axis order then the values an `include` adds, minus `exclude`d ones -- or exactly
+  the expanded name when the name itself holds `matrix.*` expressions (a matrix doctor cannot
+  enumerate reports nothing; no `name (` prefix is ever accepted); and for a reusable call `caller / callee-job` for each job of the callee as fetched (a local callee, or
   a platform callee at its pinned SHA, recursively); an unresolvable callee reports nothing, so
   `plan / anything` is never assumed. `onboard --apply` still changes only the repository's own
   ruleset.

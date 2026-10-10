@@ -2132,19 +2132,29 @@ def _reports_on_protected_pull_requests(doc: dict, default_branch: str) -> bool:
     return False
 
 
-def _job_context_names(job_id: str, job: dict) -> tuple[list[str], list[str]]:
-    """(exact names, matrix prefixes) one job reports under: its `name:` (else its id), the
-    evaluated names of a `matrix.*`-named job over a finite literal matrix (any other expression
-    contributes nothing: an empty literal prefix would match every context), and `name (` for a
-    matrix job GitHub suffixes with its values."""
+def _job_context_names(job_id: str, job: dict) -> list[str]:
+    """Every exact context name one job reports. A plain job: its `name:` (else its id). A job
+    named with `${{ matrix.* }}` expressions: that name evaluated for each combination of a finite
+    literal matrix (`_matrix_job_names`). Any other matrix job: GitHub appends the combination's
+    values, `name (v1, v2, ...)` -- the axes' values in axis order, then the values `include`
+    adds -- so one context per literal combination (`_matrix_combinations`). Anything doctor
+    cannot enumerate (another expression in the name, a non-literal matrix or value) contributes
+    nothing: a required context must be proven, never matched by a prefix."""
     name = str(job.get("name") or job_id)
-    if "${{" in name:
-        rendered = _matrix_job_names(name, job.get("strategy")) or ()
-        return [r for r in rendered if r.strip()], []
     strategy = job.get("strategy")
-    if isinstance(strategy, dict) and strategy.get("matrix"):
-        return [name], [f"{name} ("]
-    return [name], []
+    if "${{" in name:
+        rendered = _matrix_job_names(name, strategy) or ()
+        return [r for r in rendered if r.strip()]
+    matrix = strategy.get("matrix") if isinstance(strategy, dict) else None
+    if not matrix:
+        return [name]
+    names: set[str] = set()
+    for combo in _matrix_combinations(matrix) or ():
+        values = [_matrix_scalar(value) for value in combo.values()]
+        if not combo or any(value is None for value in values):
+            return []
+        names.add(f"{name} ({', '.join(str(v) for v in values)})")
+    return sorted(names)
 
 
 def _callee_doc(
@@ -2185,36 +2195,74 @@ def _workflow_job_contexts(
     platform_repository: str | None,
     load_callee: CalleeLoader | None,
     seen: tuple[object, ...],
-) -> tuple[set[str], list[str]]:
-    """(exact contexts, matrix prefixes) the jobs of one workflow report. A job that calls a
-    reusable workflow reports `caller / callee-job` for each job of the callee as GitHub would
-    run it (`_callee_doc`), recursively; an unresolvable callee contributes nothing (fail
+) -> set[str]:
+    """The exact contexts the jobs of one workflow report (`_job_context_names`). A job that
+    calls a reusable workflow reports `caller / callee-job` for each job of the callee as GitHub
+    would run it (`_callee_doc`), recursively; an unresolvable callee contributes nothing (fail
     closed), and so does a matrix caller (its `name (...) / ...` contexts are not enumerated)."""
     exact: set[str] = set()
-    prefixes: list[str] = []
     jobs = doc.get("jobs")
     for job_id, job in (jobs if isinstance(jobs, dict) else {}).items():
         if not isinstance(job, dict):
             continue
-        names, matrix = _job_context_names(str(job_id), job)
+        names = _job_context_names(str(job_id), job)
         if not job.get("uses"):
             exact.update(names)
-            prefixes += matrix
             continue
-        if matrix:
+        strategy = job.get("strategy")
+        if isinstance(strategy, dict) and strategy.get("matrix"):
             continue
         called, key = _callee_doc(
             base, str(job["uses"]).strip(), platform_repository, load_callee, seen
         )
         if called is None:
             continue
-        inner_exact, inner_prefixes = _workflow_job_contexts(
-            base, called, platform_repository, load_callee, (*seen, key)
-        )
+        inner = _workflow_job_contexts(base, called, platform_repository, load_callee, (*seen, key))
         for name in names:
-            exact.update(f"{name} / {inner}" for inner in inner_exact)
-            prefixes += [f"{name} / {inner}" for inner in inner_prefixes]
-    return exact, prefixes
+            exact.update(f"{name} / {context}" for context in inner)
+    return exact
+
+
+def _reports_on_merge_groups(doc: dict, default_branch: str) -> bool:
+    """Whether a workflow runs for EVERY merge group a merge queue on `default_branch` creates:
+    a `merge_group` trigger with no `branches-ignore` and no negated pattern (fail closed), a
+    `branches` filter only when one of its globs matches the default branch, and activity types
+    (if listed) including `checks_requested`."""
+    if "merge_group" not in _triggers(doc):
+        return False
+    triggers = doc.get("on", doc.get(True))
+    spec = triggers.get("merge_group") if isinstance(triggers, dict) else None
+    if spec is None:
+        return True
+    if not isinstance(spec, dict) or "branches-ignore" in spec:
+        return False
+    if "branches" in spec:
+        branches = spec["branches"]
+        listed = [branches] if isinstance(branches, str) else branches
+        if not isinstance(listed, list):
+            return False
+        patterns = [str(b) for b in listed]
+        if any(p.startswith("!") for p in patterns) or not any(
+            _branch_glob_matches(p, default_branch) for p in patterns
+        ):
+            return False
+    if "types" in spec:
+        types = spec["types"]
+        listed = [types] if isinstance(types, str) else types
+        if not isinstance(listed, list) or "checks_requested" not in [str(x) for x in listed]:
+            return False
+    return True
+
+
+@dataclass(frozen=True)
+class ProducedContexts:
+    """What a workflow set reports: the exact contexts of the workflows that run on every pull
+    request into the default branch, those of the workflows that run on every merge group (a
+    merge queue's checks), and whether any workflow declares `merge_group` at all."""
+
+    pull_request: frozenset[str] = frozenset()
+    merge_group: frozenset[str] = frozenset()
+    merge_group_declared: bool = False
 
 
 def workflow_check_contexts(
@@ -2222,62 +2270,54 @@ def workflow_check_contexts(
     default_branch: str = "main",
     platform_repository: str | None = None,
     load_callee: CalleeLoader | None = None,
-) -> tuple[set[str], tuple[str, ...], bool]:
-    """What the workflows under `base` can report as status-check contexts ON A PULL REQUEST INTO
-    `default_branch` (only workflows `_reports_on_protected_pull_requests` admits count): exact
-    contexts (`_workflow_job_contexts`: job names, evaluated matrix names, and `caller /
-    callee-job` for every job of a resolvable reusable workflow), `name (` prefixes for the
-    contexts GitHub derives for a matrix job, and whether any workflow runs on `merge_group` (a
-    merge queue's checks). Doctor passes the DEFAULT BRANCH's workflow set, not the checkout."""
-    exact: set[str] = set()
-    prefixes: list[str] = []
-    merge_group = False
+    inactive: frozenset[str] = frozenset(),
+) -> ProducedContexts:
+    """What the workflows under `base` can report as status-check contexts into `default_branch`
+    (`_workflow_job_contexts`: job names, every literal matrix combination, and `caller /
+    callee-job` for every job of a resolvable reusable workflow), separately ON A PULL REQUEST
+    (`_reports_on_protected_pull_requests`) and IN A MERGE GROUP (`_reports_on_merge_groups`).
+    A workflow whose file name is in `inactive` (disabled in Actions) reports nothing: it does
+    not respond to its triggers. Doctor passes the DEFAULT BRANCH's workflow set, not the
+    checkout."""
+    pull_request: set[str] = set()
+    merge_group: set[str] = set()
+    declared = False
     workflows = base / ".github/workflows"
     paths = sorted([*workflows.glob("*.yml"), *workflows.glob("*.yaml")])
     for path in paths:
-        doc = _workflow_doc(path) or {}
-        triggers = doc.get("on", doc.get(True))  # YAML 1.1 reads a bare `on:` key as True
-        if triggers == "merge_group" or (
-            isinstance(triggers, (list, dict)) and "merge_group" in triggers
-        ):
-            merge_group = True
-        if not _reports_on_protected_pull_requests(doc, default_branch):
+        if path.name in inactive:
             continue
-        found, matrix = _workflow_job_contexts(
+        doc = _workflow_doc(path) or {}
+        declared = declared or "merge_group" in _triggers(doc)
+        on_pull_request = _reports_on_protected_pull_requests(doc, default_branch)
+        on_merge_group = _reports_on_merge_groups(doc, default_branch)
+        if not (on_pull_request or on_merge_group):
+            continue
+        found = _workflow_job_contexts(
             base, doc, platform_repository, load_callee, (path.resolve(),)
         )
-        exact |= found
-        prefixes += matrix
-    return exact, tuple(prefixes), merge_group
+        if on_pull_request:
+            pull_request |= found
+        if on_merge_group:
+            merge_group |= found
+    return ProducedContexts(frozenset(pull_request), frozenset(merge_group), declared)
 
 
-def context_produced(context: str, produced: tuple[set[str], tuple[str, ...], bool]) -> bool:
-    """Does `produced` (`workflow_check_contexts`) report `context`? Exactly, or as the values of
-    a matrix job: `name (` + values + `)`, nothing after the parenthesis (so a matrix prefix never
-    admits `name (x) / anything`). Any other prefix -- an empty one above all -- proves nothing."""
-    exact, prefixes, _ = produced
-    if context in exact:
-        return True
-    return any(
-        prefix.strip()
-        and prefix.endswith(" (")
-        and context.startswith(prefix)
-        and context.endswith(")")
-        and " / " not in context[len(prefix) :]
-        for prefix in prefixes
-    )
+def context_produced(context: str, produced: ProducedContexts) -> bool:
+    """Does `produced` (`workflow_check_contexts`) report `context` on pull requests? Exactly:
+    no prefix ever proves a context (a matrix job's contexts are enumerated)."""
+    return context in produced.pull_request
 
 
-def effective_rule_problems(
-    rules: Sequence[dict], produced: tuple[set[str], tuple[str, ...], bool]
-) -> list[str]:
+def effective_rule_problems(rules: Sequence[dict], produced: ProducedContexts) -> list[str]:
     """The requirements in the default branch's EFFECTIVE rules (`rules/branches/{branch}`:
     repository, organization and enterprise rulesets alike) that a Forge PR cannot meet, or that
     doctor cannot verify: required status contexts no installed workflow job reports (or bound to
     an app other than GitHub Actions, which those jobs report through), required deployments,
-    required workflows, a merge queue no workflow serves, required signatures, update
+    required workflows, a merge queue no workflow serves -- or a required context no workflow
+    reports in the merge group, where the queue waits for it -- required signatures, update
     restrictions and code-scanning gates."""
-    merge_group = produced[2]
+    queued = any(str(rule.get("type") or "") == "merge_queue" for rule in rules)
     problems: list[str] = []
     for rule in rules:
         kind = str(rule.get("type") or "")
@@ -2293,6 +2333,12 @@ def effective_rule_problems(
                     problems.append(
                         f"{source}: requires status check '{context}', which no installed "
                         "workflow job reports"
+                    )
+                elif context and queued and context not in produced.merge_group:
+                    problems.append(
+                        f"{source}: requires status check '{context}' and a merge queue, but no "
+                        "installed workflow job reports it on merge_group, so the queue never "
+                        "receives it"
                     )
                 elif context and _foreign_integration(check or {}):
                     # The installed workflows report it through GitHub Actions; a check bound
@@ -2316,7 +2362,7 @@ def effective_rule_problems(
                 f"{source}: requires workflows ({paths or '?'}) to pass; verify they run on "
                 "Forge PRs"
             )
-        elif kind == "merge_queue" and not merge_group:
+        elif kind == "merge_queue" and not produced.merge_group_declared:
             problems.append(
                 f"{source}: requires a merge queue, but no installed workflow runs on "
                 "merge_group, so its required checks never report"
@@ -2347,9 +2393,7 @@ def _enabled(value: object) -> bool:
     return isinstance(value, dict) and value.get("enabled") is True
 
 
-def legacy_protection_problems(
-    protection: dict, produced: tuple[set[str], tuple[str, ...], bool]
-) -> list[str]:
+def legacy_protection_problems(protection: dict, produced: ProducedContexts) -> list[str]:
     """What a CLASSIC branch-protection rule (`branches/{branch}/protection`, enforced alongside
     rulesets) requires that a Forge PR cannot meet, by the same rules as
     `effective_rule_problems`: required status contexts no installed PR workflow job reports, or
@@ -3151,11 +3195,14 @@ def remote_check_contexts(
     default_branch: str,
     platform_repository: str | None = None,
     load_callee: CalleeLoader | None = None,
-) -> tuple[set[str], tuple[str, ...], bool]:
+    inactive: frozenset[str] = frozenset(),
+) -> ProducedContexts:
     """`workflow_check_contexts` over a workflow set read from GitHub (`remote_workflow_files`):
-    the contexts PRs into `default_branch` can actually receive."""
+    the contexts PRs into `default_branch` (and merge groups) can actually receive."""
     with _materialized_workflows(files) as root:
-        return workflow_check_contexts(root, default_branch, platform_repository, load_callee)
+        return workflow_check_contexts(
+            root, default_branch, platform_repository, load_callee, inactive
+        )
 
 
 def fork_runner_exposure(
@@ -5000,7 +5047,9 @@ def doctor(
             if produced is not None
             else [r for r in rules if r.get("type") not in unverifiable]
         )
-        problems = effective_rule_problems(checked, produced or (set(), (), True))
+        problems = effective_rule_problems(
+            checked, produced or ProducedContexts(merge_group_declared=True)
+        )
         if produced is None and any(r.get("type") == "merge_queue" for r in rules):
             problems.append(
                 f"a merge queue is required, and whether a workflow on {effective_branch} runs on "
@@ -5076,7 +5125,7 @@ def doctor(
             legacy_contexts,
             legacy_protection_problems(
                 legacy if produced is not None else {**legacy, "required_status_checks": None},
-                produced or (set(), (), False),
+                produced or ProducedContexts(),
             ),
         )
         add(
