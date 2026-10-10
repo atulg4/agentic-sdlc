@@ -70,6 +70,9 @@ def _repo(tmp_path: Path) -> Path:
     return repo
 
 
+CONSUMER_WORKFLOW_STATES = "api repos/owner/comic/actions/workflows"
+
+
 class FakeGh:
     """Records gh invocations and answers from a canned table keyed by the first few args.
 
@@ -116,6 +119,27 @@ class FakeGh:
             if "/" in name or not path.is_file():
                 raise OnboardError("gh: Not Found (HTTP 404)")
             return _blob(path.read_bytes())
+        if key.startswith(CONSUMER_WORKFLOW_STATES):
+            for prefix, value in self.answers.items():
+                if prefix.startswith(CONSUMER_WORKFLOW_STATES) and key.startswith(prefix):
+                    if isinstance(value, Exception):
+                        raise value
+                    return value
+            # Every workflow file of the checkout and of an answered remote listing, active.
+            names = {p.name for p in (_CONSUMER["path"] / ".github/workflows").glob("*.y*ml")}
+            for prefix, value in self.answers.items():
+                if prefix.startswith(CONSUMER_CONTENTS + ".github/workflows?"):
+                    try:
+                        listing = json.loads(value) if isinstance(value, str) else []
+                    except json.JSONDecodeError:
+                        listing = []
+                    names |= {
+                        str(e.get("name"))
+                        for e in (listing if isinstance(listing, list) else [])
+                        if isinstance(e, dict)
+                    }
+            rows = [{"path": f".github/workflows/{n}", "state": "active"} for n in sorted(names)]
+            return json.dumps({"total_count": len(rows), "workflows": rows})
         for prefix, value in self.answers.items():
             if key.startswith(prefix):
                 if isinstance(value, Exception):
@@ -5838,3 +5862,120 @@ def test_merge_queue_requires_each_context_in_the_merge_group(tmp_path, ci_on, n
         assert len(problems) == 1 and "'test'" in problems[0] and "merge_group" in problems[0]
     # without a merge queue the PR contexts alone decide
     assert effective_rule_problems(_queue_rules("test")[1:], produced) == []
+
+
+# Codex 4238935460: a disabled workflow does not respond to its triggers. Managed workflows must
+# be `active`; a non-active workflow is no evidence for a required context; unreadable = TODO.
+def _states(gh: FakeGh, states: dict[str, str]) -> None:
+    rows = [{"path": f".github/workflows/{n}", "state": s} for n, s in sorted(states.items())]
+    gh.answers[CONSUMER_WORKFLOW_STATES] = json.dumps({"total_count": len(rows), "workflows": rows})
+
+
+def _doctor_checks(repo, gh) -> dict:
+    return {c.name: c for c in doctor(repo, "owner/comic", "owner/agentic-sdlc", gh).checks}
+
+
+def _all_active(repo) -> dict[str, str]:
+    return {p.name: "active" for p in (repo / ".github/workflows").glob("*.yml")}
+
+
+def test_doctor_requires_managed_workflows_to_be_active(tmp_path):
+    from agentic_sdlc.onboard import EFFECTIVE_RULES_CHECK, WORKFLOWS_ACTIVE_CHECK
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _healthy_gh()
+    _states(gh, _all_active(repo))
+    checks = _doctor_checks(repo, gh)
+    assert checks[WORKFLOWS_ACTIVE_CHECK].ok
+    # ci.yml disabled: its `test` (required by Forge's own ruleset) is no longer produced
+    gh = _healthy_gh()
+    _states(gh, {**_all_active(repo), "ci.yml": "disabled_manually"})
+    checks = _doctor_checks(repo, gh)
+    active = checks[WORKFLOWS_ACTIVE_CHECK]
+    assert not active.ok and active.manual and "ci.yml (disabled_manually)" in active.detail
+    rules = checks[EFFECTIVE_RULES_CHECK]
+    assert not rules.ok and "'test'" in rules.detail and "not active" in rules.detail
+    # a managed workflow GitHub has not registered at all is not proven to run either
+    gh = _healthy_gh()
+    _states(gh, {n: s for n, s in _all_active(repo).items() if n != "agent-auto-implement.yml"})
+    active = _doctor_checks(repo, gh)[WORKFLOWS_ACTIVE_CHECK]
+    assert not active.ok and "agent-auto-implement.yml (not registered" in active.detail
+
+
+def test_disabled_context_producing_workflow_is_no_evidence(tmp_path):
+    from agentic_sdlc.onboard import EFFECTIVE_RULES_CHECK, WORKFLOWS_ACTIVE_CHECK
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    _wf(repo, "scan.yml", "on: pull_request\njobs:\n  scan:\n    runs-on: ubuntu-latest\n")
+    rule = _org_rule("required_status_checks", required_status_checks=[{"context": "scan"}])
+    gh = _healthy_gh()
+    gh.answers["api repos/owner/comic/rules/branches/main"] = _effective_rules(rule)
+    assert _doctor_checks(repo, gh)[EFFECTIVE_RULES_CHECK].ok
+    gh = _healthy_gh()
+    gh.answers["api repos/owner/comic/rules/branches/main"] = _effective_rules(rule)
+    _states(gh, {**_all_active(repo), "scan.yml": "disabled_inactivity"})
+    checks = _doctor_checks(repo, gh)
+    assert checks[WORKFLOWS_ACTIVE_CHECK].ok  # not a managed workflow
+    rules = checks[EFFECTIVE_RULES_CHECK]
+    assert not rules.ok
+    assert "'scan', which no installed workflow job reports" in rules.detail
+    assert "not active in GitHub Actions (scan.yml) → enable it" in rules.detail
+    # a disabled workflow is no merge-group evidence either
+    rules = [
+        _org_rule("merge_queue"),
+        _org_rule("required_status_checks", required_status_checks=[{"context": "test"}]),
+    ]
+    ci = repo / ".github/workflows/ci.yml"
+    _wf(repo, "queue.yml", ci.read_text().replace("pull_request:", "merge_group:", 1))
+    gh = _healthy_gh()
+    gh.answers["api repos/owner/comic/rules/branches/main"] = _effective_rules(*rules)
+    assert _doctor_checks(repo, gh)[EFFECTIVE_RULES_CHECK].ok  # queue.yml serves the queue
+    gh = _healthy_gh()
+    gh.answers["api repos/owner/comic/rules/branches/main"] = _effective_rules(*rules)
+    _states(gh, {**_all_active(repo), "queue.yml": "disabled_manually"})
+    detail = _doctor_checks(repo, gh)[EFFECTIVE_RULES_CHECK].detail
+    assert "no installed workflow runs on merge_group" in detail
+
+
+def test_unreadable_workflow_states_are_a_manual_todo(tmp_path):
+    from agentic_sdlc.onboard import EFFECTIVE_RULES_CHECK, WORKFLOWS_ACTIVE_CHECK
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _healthy_gh()
+    gh.answers[CONSUMER_WORKFLOW_STATES] = OnboardError("gh: Forbidden (HTTP 403)")
+    checks = _doctor_checks(repo, gh)
+    active = checks[WORKFLOWS_ACTIVE_CHECK]
+    assert not active.ok and active.manual and "could not read" in active.detail
+    rules = checks[EFFECTIVE_RULES_CHECK]
+    assert not rules.ok and rules.manual and "workflow states unreadable" in rules.detail
+
+
+def test_remote_workflow_states_reads_every_page():
+    from agentic_sdlc.onboard import remote_workflow_states
+
+    rows = [{"path": f".github/workflows/w{i}.yml", "state": "active"} for i in range(150)]
+    rows[120]["state"] = "disabled_manually"
+    rows.append({"path": "dynamic/github-code-scanning/codeql", "state": "active"})
+    calls = []
+
+    def gh(args, input=None):
+        calls.append(args[1])
+        page = int(args[1].rsplit("page=", 1)[1])
+        assert "per_page=100" in args[1]
+        chunk = rows[(page - 1) * 100 : page * 100]
+        return json.dumps({"total_count": len(rows), "workflows": chunk})
+
+    states, why = remote_workflow_states(gh, "owner/comic")
+    assert why == "" and len(calls) == 2
+    assert len(states) == 150 and states["w120.yml"] == "disabled_manually"
+    assert states["w0.yml"] == "active" and "codeql" not in states
+
+    def broken(args, input=None):
+        if args[1].endswith("page=2"):
+            raise OnboardError("gh: HTTP 502")
+        return json.dumps({"total_count": len(rows), "workflows": rows[:100]})
+
+    assert remote_workflow_states(broken, "owner/comic")[0] is None
