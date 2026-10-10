@@ -442,6 +442,71 @@ def run_gh(args: Sequence[str], input: str | None = None) -> str:
     return proc.stdout
 
 
+@dataclass(frozen=True)
+class Unreadable:
+    """A GitHub API answer that could not be read: the call failed, or it answered something
+    that is not the documented shape. It is never "empty", "absent", "public" or "none
+    configured": only an explicit successful answer proves those. `not_found` is True when the
+    call failed with a 404 -- "absent" ONLY where that is the endpoint's documented meaning.
+    It has no truth value and cannot be iterated, so a caller that forgets to handle it fails
+    loudly instead of silently reading it as an empty answer."""
+
+    why: str
+    not_found: bool = False
+
+    def __bool__(self) -> bool:
+        raise TypeError(f"unhandled unreadable GitHub answer ({self.why})")
+
+    def __iter__(self):
+        raise TypeError(f"unhandled unreadable GitHub answer ({self.why})")
+
+
+def _safe_json(gh: GhRunner, args: Sequence[str]) -> object:
+    """The parsed JSON `gh` answers, or `Unreadable` (a failed call, an empty or non-JSON
+    answer). Callers decide what an unreadable answer means; it is never an empty one."""
+    where = " ".join(a for a in args if not a.startswith("-"))[:160]
+    try:
+        out = gh(args)
+    except OnboardError as exc:
+        return Unreadable(
+            f"{where}: {str(exc)[-160:]}", bool(re.search(r"\b404\b|Not Found", str(exc)))
+        )
+    if not out or not out.strip():
+        return Unreadable(f"{where}: empty answer")
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return Unreadable(f"{where}: not JSON")
+
+
+def _paged_items(gh: GhRunner, path: str, key: str | None = None) -> list[dict] | Unreadable:
+    """Every item of a paginated list endpoint, or `Unreadable`. --slurp wraps the pages in one
+    array; each page is a JSON array (key=None) or an object carrying the items under `key`.
+    Any page of another shape, or any item that is not an object, makes the whole list
+    unreadable: a partial or malformed inventory is never read as "nothing there"."""
+    pages = _safe_json(gh, ["api", path, "--paginate", "--slurp"])
+    if isinstance(pages, Unreadable):
+        return pages
+    if not isinstance(pages, list):
+        return Unreadable(f"{path}: not a list of pages")
+    items: list = []
+    for page in pages:
+        rows = page if key is None else page.get(key) if isinstance(page, dict) else None
+        if not isinstance(rows, list):
+            return Unreadable(f"{path}: a page is not a list" + (f" of {key!r}" if key else ""))
+        items += rows
+    if not all(isinstance(item, dict) for item in items):
+        return Unreadable(f"{path}: an item is not an object")
+    return items
+
+
+def _paged_names(gh: GhRunner, path: str, key: str) -> set[str] | Unreadable:
+    items = _paged_items(gh, path, key)
+    if isinstance(items, Unreadable):
+        return items
+    return {str(item.get("name")) for item in items}
+
+
 def resolve_platform_ref(platform_repository: str, ref: str, gh: GhRunner = run_gh) -> str:
     """Accept a SHA as-is; otherwise resolve a branch/tag on the platform repo to its commit SHA."""
     if _SHA.fullmatch(ref):
@@ -514,11 +579,13 @@ def _canonical_full_name(repo_info: object, project_id: str) -> str | None:
 def canonical_project_id(project_id: str, gh: GhRunner = run_gh) -> str:
     """`project_id` as GitHub spells it (`full_name`): every workflow run passes the canonical
     `$GITHUB_REPOSITORY` to `prepare-request`, which compares it EXACTLY with the policy's id, so
-    the policy must carry that spelling. Unreadable: the given spelling (doctor checks it)."""
-    try:
-        info = _safe_json(gh, ["api", f"repos/{project_id}"])
-    except Exception:  # noqa: BLE001 -- best effort; doctor reports a mismatch
-        return project_id
+    the policy must carry that spelling. A repository answering under another name (a rename):
+    the given spelling (doctor reports it). Unreadable: raises -- `--apply` writes this id into
+    the policy and configures the repository by it, so it never proceeds on a guess."""
+    info = _safe_json(gh, ["api", f"repos/{project_id}"])
+    if not isinstance(info, dict):
+        why = info.why if isinstance(info, Unreadable) else "not a repository object"
+        raise OnboardError(f"could not read {project_id} from GitHub ({why}); nothing was changed")
     return _canonical_full_name(info, project_id) or project_id
 
 
@@ -1463,6 +1530,25 @@ def apply_repo_settings(
 ) -> list[str]:
     """Idempotently create labels, the protect-main ruleset and repo variables. Returns a log."""
     log: list[str] = []
+    # Read every inventory a mutation depends on BEFORE the first mutation: an unreadable
+    # ruleset list is not "no `Protect main`" (creating one would duplicate it), and an
+    # unreadable ruleset is not an empty one (merging into it would drop its rules).
+    existing = _repo_rulesets(spec.project_id, gh)
+    if isinstance(existing, Unreadable):
+        raise OnboardError(
+            f"could not read the rulesets of {spec.project_id} ({existing.why}); nothing was "
+            "changed → retry --apply"
+        )
+    current = next((r for r in existing if r.get("name") == RULESET_NAME), None)
+    detail: object = None
+    if current is not None:
+        detail = _safe_json(gh, ["api", f"repos/{spec.project_id}/rulesets/{current.get('id')}"])
+        if not isinstance(detail, dict) or not isinstance(detail.get("rules"), list):
+            why = detail.why if isinstance(detail, Unreadable) else "not a ruleset object"
+            raise OnboardError(
+                f"could not read ruleset '{RULESET_NAME}' of {spec.project_id} ({why}); nothing "
+                "was changed → retry --apply"
+            )
     for name, (color, description) in spec.labels.items():
         gh(
             [
@@ -1479,12 +1565,8 @@ def apply_repo_settings(
             ]
         )
         log.append(f"label {name}")
-    existing = _repo_rulesets(spec.project_id, gh)
-    current = next((r for r in existing if r.get("name") == RULESET_NAME), None)
-    if current is not None:
-        detail = json.loads(
-            gh(["api", f"repos/{spec.project_id}/rulesets/{current.get('id')}"]) or "{}"
-        )
+    if isinstance(detail, dict):
+        assert current is not None
         problems = ruleset_mismatches(detail, spec)
         if problems:
             gh(
@@ -1572,13 +1654,6 @@ class DoctorReport:
             lines.append(f"[{mark}] {c.name}" + (f" — {c.detail}" if c.detail else ""))
         lines.append("READY" if self.ok else "NOT READY")
         return "\n".join(lines)
-
-
-def _safe_json(gh: GhRunner, args: Sequence[str]):
-    try:
-        return json.loads(gh(args) or "null")
-    except (OnboardError, json.JSONDecodeError):
-        return None
 
 
 def _remote_file_state(gh: GhRunner, args: Sequence[str]) -> str:
@@ -1707,23 +1782,6 @@ def platform_access_check(
         f"{platform_repository} (every caller fails before any job starts) → set {fix}",
         manual=True,
     )
-
-
-def _paged_items(gh: GhRunner, path: str, key: str | None = None) -> list[dict]:
-    """Every item of a paginated list endpoint. --slurp wraps the pages in one array; each page
-    is either a JSON array (key=None) or an object carrying the items under `key`."""
-    pages = _safe_json(gh, ["api", path, "--paginate", "--slurp"])
-    items: list = []
-    for page in pages if isinstance(pages, list) else []:
-        if key is None:
-            items += page if isinstance(page, list) else [page]
-        elif isinstance(page, dict):
-            items += page.get(key) or []
-    return [item for item in items if isinstance(item, dict)]
-
-
-def _paged_names(gh: GhRunner, path: str, key: str) -> set[str]:
-    return {str(item.get("name")) for item in _paged_items(gh, path, key)}
 
 
 ACTIONS_PERMISSIONS_CHECK = "repository Actions policy allows the generated workflows"
@@ -1995,10 +2053,13 @@ def _decoded_blob(blob: object) -> bytes | None:
         return None
 
 
-def _repo_rulesets(project_id: str, gh: GhRunner) -> list[dict]:
+def _repo_rulesets(project_id: str, gh: GhRunner) -> list[dict] | Unreadable:
     """Rulesets owned by the repository itself: every page, without inherited org rulesets
-    (a repository admin cannot update those through the repository endpoint)."""
+    (a repository admin cannot update those through the repository endpoint); `Unreadable`
+    when the inventory cannot be read in full."""
     rows = _paged_items(gh, f"repos/{project_id}/rulesets?includes_parents=false")
+    if isinstance(rows, Unreadable):
+        return rows
     return [r for r in rows if r.get("source_type", "Repository") == "Repository"]
 
 
@@ -2309,14 +2370,221 @@ def context_produced(context: str, produced: ProducedContexts) -> bool:
     return context in produced.pull_request
 
 
-def effective_rule_problems(rules: Sequence[dict], produced: ProducedContexts) -> list[str]:
+# Rule types a Forge PR always satisfies (no parameter of theirs can block it): deleting or
+# force-pushing the branch, creating it, linear history (Forge PRs merge like any other), PR
+# reviews (the draft PR waits for a human anyway), and tag names (the publisher pushes no tags).
+_COMPATIBLE_RULE_TYPES = frozenset(
+    {
+        "creation",
+        "deletion",
+        "non_fast_forward",
+        "required_linear_history",
+        "pull_request",
+        "tag_name_pattern",
+    }
+)
+# Metadata-pattern rules: which field of what the publisher pushes each one restricts.
+_PATTERN_RULE_FIELDS = {
+    "commit_message_pattern": ("messages", "commit message"),
+    "commit_author_email_pattern": ("author_emails", "commit author email"),
+    "committer_email_pattern": ("committer_emails", "committer email"),
+    "branch_name_pattern": ("branches", "branch name"),
+}
+
+
+@dataclass(frozen=True)
+class PublisherCommit:
+    """What the Actions publisher (`reusable-implement.yml` at the pin) pushes, with sample
+    values for its run-time variables: the commit message, its author and committer email, and
+    the branch name. Every sample must satisfy a metadata-pattern rule."""
+
+    messages: tuple[str, ...]
+    author_emails: tuple[str, ...]
+    committer_emails: tuple[str, ...]
+    branches: tuple[str, ...]
+
+
+# The run-time variables a publisher template may use, with sample values (short and long).
+_PUBLISHER_SAMPLES = {
+    "ISSUE_NUMBER": ("1", "42", "12345"),
+    "GITHUB_RUN_ID": ("1", "9876543210"),
+}
+_SHELL_VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+_GIT_IDENTITY_ENV = frozenset(
+    {
+        "GIT_AUTHOR_EMAIL",
+        "GIT_COMMITTER_EMAIL",
+        "EMAIL",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+    }
+)
+
+
+def _expand_samples(template: str) -> tuple[str, ...] | None:
+    """Every value of a shell word over `_PUBLISHER_SAMPLES`; None if it uses anything else (an
+    unknown variable, a substitution, an escape) that doctor cannot evaluate."""
+    parts = _SHELL_VAR.split(template)
+    # split() yields: literal, braced-name, bare-name, literal, ...
+    literals = parts[0::3]
+    names = [braced or bare for braced, bare in zip(parts[1::3], parts[2::3], strict=True)]
+    if any(ch in lit for lit in literals for ch in "$`\\") or any(
+        n not in _PUBLISHER_SAMPLES for n in names
+    ):
+        return None
+    out = [""]
+    for i, lit in enumerate(literals):
+        out = [o + lit for o in out]
+        if i < len(names):
+            out = [o + v for o in out for v in _PUBLISHER_SAMPLES[names[i]]]
+    return tuple(dict.fromkeys(out))
+
+
+def publisher_commit(doc: object) -> PublisherCommit | str:
+    """`PublisherCommit` read from the parsed `reusable-implement.yml`: the ONE step that runs
+    `git push`, its `git config user.email`, `git commit -m` and pushed ref. A str says why it
+    cannot be read exactly (doctor then leaves metadata-pattern rules a manual TODO)."""
+    jobs = doc.get("jobs") if isinstance(doc, dict) else None
+    if not isinstance(jobs, dict):
+        return "reusable-implement.yml declares no jobs"
+    pushing = []
+    for job_id, job in jobs.items():
+        for step in (job.get("steps") if isinstance(job, dict) else None) or []:
+            run = step.get("run") if isinstance(step, dict) else None
+            if isinstance(run, str):
+                commands = _shell_commands(run)
+                if any(c[:2] == ("git", "push") for c in commands):
+                    pushing.append((job_id, job, step, run, commands))
+    if len(pushing) != 1:
+        return f"expected one step that runs `git push`, found {len(pushing)}"
+    job_id, job, step, run, commands = pushing[0]
+    envs = [doc.get("env"), job.get("env"), step.get("env")]
+    if any(isinstance(env, dict) and _GIT_IDENTITY_ENV & set(env) for env in envs):
+        return f"job {job_id} sets the git identity through the environment"
+    emails = [c[3] for c in commands if c[:3] == ("git", "config", "user.email") and len(c) == 4]
+    commits = [c for c in commands if c[:2] == ("git", "commit")]
+    pushes = [c for c in commands if c[:2] == ("git", "push")]
+    if len(emails) != 1 or len(commits) != 1 or len(pushes) != 1:
+        return (
+            f"job {job_id}: expected one `git config user.email`, `git commit` and `git push`, "
+            f"found {len(emails)}, {len(commits)} and {len(pushes)}"
+        )
+    if len(commits[0]) != 4 or commits[0][2] != "-m":
+        return f"job {job_id}: the commit is not `git commit -m MESSAGE`"
+    if len(pushes[0]) != 4 or not pushes[0][3].startswith("HEAD:refs/heads/"):
+        return f"job {job_id}: the push is not `git push REMOTE HEAD:refs/heads/BRANCH`"
+    branch = pushes[0][3].removeprefix("HEAD:refs/heads/")
+    named = re.fullmatch(r"\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)", branch)
+    if named:
+        var = named.group(1) or named.group(2)
+        found = re.findall(rf"^\s*{var}=(\"[^\"]*\"|'[^']*'|\S*)\s*$", run, re.MULTILINE)
+        if len(found) != 1:
+            return f"job {job_id}: the pushed branch ${var} is not assigned exactly once"
+        branch = found[0][1:-1] if found[0][:1] in ("'", '"') else found[0]
+    messages = _expand_samples(commits[0][3])
+    author = _expand_samples(emails[0])
+    branches = _expand_samples(branch)
+    if messages is None or author is None or branches is None:
+        return (
+            f"job {job_id}: the commit message, email or branch uses a value doctor cannot expand"
+        )
+    return PublisherCommit(messages, author, author, branches)
+
+
+def _portable_regex(pattern: str) -> re.Pattern[str] | None:
+    """`pattern` compiled, when Python evaluates it as GitHub's ruleset engine does: literals,
+    `.`, classes, groups `(...)`/`(?:...)`, alternation, quantifiers, anchors `^`/`$` and the
+    escapes \\d \\D \\w \\W \\s \\S or an escaped punctuation character. Anything else
+    (lookaround, backreferences, inline flags, POSIX classes, \\A \\Z \\b ...) is None:
+    engines disagree there, so doctor does not guess."""
+    i = 0
+    while i < len(pattern):
+        char, nxt = pattern[i], pattern[i + 1 : i + 2]
+        if char == "\\":
+            if not nxt or (nxt.isalnum() and nxt not in "dDwWsS") or not nxt.isascii():
+                return None
+            i += 2
+            continue
+        if char == "(" and nxt == "?" and pattern[i + 2 : i + 3] != ":":
+            return None
+        i += 1
+    if any(t in pattern for t in ("[:", "[=", "[.", "{,", "&&", "~~", "--", "||")):
+        return None
+    try:
+        return re.compile(pattern)
+    except re.error:
+        return None
+
+
+def _pattern_verdict(params: dict, value: str) -> bool | None:
+    """Does `value` satisfy a metadata-pattern rule's parameters (`operator` starts_with /
+    ends_with / contains / regex, `pattern`, `negate`)? None: doctor cannot evaluate it."""
+    pattern, operator = params.get("pattern"), params.get("operator")
+    negate = params.get("negate", False)
+    if not isinstance(pattern, str) or not isinstance(negate, bool):
+        return None
+    if operator == "starts_with":
+        hit = value.startswith(pattern)
+    elif operator == "ends_with":
+        hit = value.endswith(pattern)
+    elif operator == "contains":
+        hit = pattern in value
+    elif operator == "regex":
+        compiled = _portable_regex(pattern)
+        if compiled is None:
+            return None
+        hit = compiled.search(value) is not None
+    else:
+        return None
+    return hit != negate
+
+
+def _pattern_rule_problem(
+    source: str, kind: str, params: dict, publisher: PublisherCommit | str
+) -> str | None:
+    attr, what = _PATTERN_RULE_FIELDS[kind]
+    shown = f"{params.get('operator')} {params.get('pattern')!r}" + (
+        " (negated)" if params.get("negate") is True else ""
+    )
+    if isinstance(publisher, str):
+        return (
+            f"{source}: restricts the {what} ({shown}), and the publisher's {what} could not be "
+            f"read ({publisher}) → verify Forge's commits satisfy it"
+        )
+    verdicts = {value: _pattern_verdict(params, value) for value in getattr(publisher, attr)}
+    rejected = [v for v, ok in verdicts.items() if ok is False]
+    if rejected:
+        scope = (
+            " (if the ruleset also targets the publisher's branches)"
+            if kind == "branch_name_pattern"
+            else ""
+        )
+        return (
+            f"{source}: requires the {what} to match {shown}; the publisher's {what} "
+            f"{rejected[0]!r} does not, so its push is rejected{scope}"
+        )
+    if any(ok is None for ok in verdicts.values()):
+        return (
+            f"{source}: restricts the {what} ({shown}) in a way doctor cannot evaluate exactly "
+            f"→ verify the publisher's {what} {next(iter(verdicts))!r} satisfies it"
+        )
+    return None
+
+
+def effective_rule_problems(
+    rules: Sequence[dict],
+    produced: ProducedContexts,
+    publisher: PublisherCommit | str = "the publisher's commit format was not read",
+) -> list[str]:
     """The requirements in the default branch's EFFECTIVE rules (`rules/branches/{branch}`:
     repository, organization and enterprise rulesets alike) that a Forge PR cannot meet, or that
     doctor cannot verify: required status contexts no installed workflow job reports (or bound to
     an app other than GitHub Actions, which those jobs report through), required deployments,
     required workflows, a merge queue no workflow serves -- or a required context no workflow
     reports in the merge group, where the queue waits for it -- required signatures, update
-    restrictions and code-scanning gates."""
+    restrictions and code-scanning gates. Commit-metadata and branch-name pattern rules are
+    evaluated against what the publisher pushes (`publisher`; a str: unreadable, so a TODO).
+    A rule type doctor does not know is never silently compatible: it is reported."""
     queued = any(str(rule.get("type") or "") == "merge_queue" for rule in rules)
     problems: list[str] = []
     for rule in rules:
@@ -2362,11 +2630,12 @@ def effective_rule_problems(rules: Sequence[dict], produced: ProducedContexts) -
                 f"{source}: requires workflows ({paths or '?'}) to pass; verify they run on "
                 "Forge PRs"
             )
-        elif kind == "merge_queue" and not produced.merge_group_declared:
-            problems.append(
-                f"{source}: requires a merge queue, but no installed workflow runs on "
-                "merge_group, so its required checks never report"
-            )
+        elif kind == "merge_queue":
+            if not produced.merge_group_declared:
+                problems.append(
+                    f"{source}: requires a merge queue, but no installed workflow runs on "
+                    "merge_group, so its required checks never report"
+                )
         elif kind == "required_signatures":
             problems.append(
                 f"{source}: requires signed commits; verify the Forge publisher's commits are "
@@ -2382,6 +2651,14 @@ def effective_rule_problems(rules: Sequence[dict], produced: ProducedContexts) -
                 f"{source}: requires code scanning results ({tools or '?'}); verify a scanner "
                 "reports on Forge PRs"
             )
+        elif kind in _PATTERN_RULE_FIELDS:
+            if found := _pattern_rule_problem(source, kind, params, publisher):
+                problems.append(found)
+        elif kind not in _COMPATIBLE_RULE_TYPES:
+            problems.append(
+                f"{source}: rule type {kind or '?'!r} is not one doctor understands → verify "
+                "Forge's pull requests and pushes satisfy it"
+            )
     return problems
 
 
@@ -2393,12 +2670,19 @@ def _enabled(value: object) -> bool:
     return isinstance(value, dict) and value.get("enabled") is True
 
 
-def legacy_protection_problems(protection: dict, produced: ProducedContexts) -> list[str]:
+def legacy_protection_problems(
+    protection: dict, produced: ProducedContexts, merge_queue: bool | None = False
+) -> list[str]:
     """What a CLASSIC branch-protection rule (`branches/{branch}/protection`, enforced alongside
     rulesets) requires that a Forge PR cannot meet, by the same rules as
     `effective_rule_problems`: required status contexts no installed PR workflow job reports, or
     bound to an app other than GitHub Actions; required signatures; push restrictions; a locked
-    branch. Linear history, reviews and conversation resolution are compatible."""
+    branch. Linear history, reviews and conversation resolution are compatible.
+
+    `merge_queue` is the EFFECTIVE queue state of the branch (a `merge_queue` rule in its
+    effective rules; None: unknown). A queued PR merges only once every required check --
+    classic ones too -- reports in the merge group, so with a queue each classic context must
+    also be produced on `merge_group`; with the state unknown, that cannot be verified."""
     problems: list[str] = []
     checks = protection.get("required_status_checks")
     if isinstance(checks, dict):
@@ -2413,6 +2697,18 @@ def legacy_protection_problems(protection: dict, produced: ProducedContexts) -> 
                 problems.append(
                     f"requires status check '{context}', which no installed pull-request "
                     "workflow job reports"
+                )
+            elif merge_queue and context not in produced.merge_group:
+                problems.append(
+                    f"requires status check '{context}' and the branch has a merge queue, but "
+                    "no installed workflow job reports it on merge_group, so the queue never "
+                    "receives it"
+                )
+            elif merge_queue is None and context not in produced.merge_group:
+                problems.append(
+                    f"requires status check '{context}', and whether a merge queue also waits "
+                    "for it cannot be verified (the effective rules are unreadable) and no "
+                    "installed workflow job reports it on merge_group"
                 )
             elif any(app not in (None, -1, GITHUB_ACTIONS_INTEGRATION_ID) for app in apps):
                 foreign = ", ".join(sorted(str(a) for a in apps if a not in (None, -1)))
@@ -4462,7 +4758,14 @@ def doctor(
         # carry the canonical `full_name`, not merely a spelling the API also answers to.
         canonical = _canonical_full_name(repo_info, project_id) or project_id
         same = policy.project_id == canonical
-        if same:
+        if remote and not isinstance(repo_info, dict):
+            same = False
+            detail = (
+                f"could not read GET repos/{project_id} ("
+                + (repo_info.why if isinstance(repo_info, Unreadable) else "not a repository")
+                + ") → GitHub's spelling of the repository is unverified; rerun doctor"
+            )
+        elif same:
             detail = ""
         elif policy.project_id.casefold() == canonical.casefold():
             detail = (
@@ -4471,7 +4774,14 @@ def doctor(
             )
         else:
             detail = f"policy names {policy.project_id}, not {canonical}"
-        add(Check("policy project id matches the repository", same, detail))
+        add(
+            Check(
+                "policy project id matches the repository",
+                same,
+                detail,
+                manual=remote and not isinstance(repo_info, dict),
+            )
+        )
 
     routed_secrets: set[str] = set()
     routed_vars: set[str] = set()
@@ -4786,7 +5096,8 @@ def doctor(
                     if found.group(2) not in probes:
                         probes.append(found.group(2))
         callees: dict[str, object] = {}
-        absent = []
+        absent: list[str] = []
+        unread_probes: list[str] = []
         for name in probes:
             blob = _safe_json(
                 gh,
@@ -4795,8 +5106,11 @@ def doctor(
                     f"repos/{platform_repository}/contents/.github/workflows/{name}?ref={ref}",
                 ],
             )
-            if not blob:
-                absent.append(name)
+            if isinstance(blob, Unreadable):
+                if blob.not_found:  # the contents API's documented "no such file"
+                    absent.append(name)
+                else:
+                    unread_probes.append(f"{name} ({blob.why})")
                 continue
             raw = _decoded_blob(blob)
             if raw is None:
@@ -4811,8 +5125,11 @@ def doctor(
         add(
             Check(
                 "platform ref reachable (reusable workflows exist at pin)",
-                not absent,
-                ref[:12] + (f": missing {', '.join(absent)}" if absent else ""),
+                not absent and not unread_probes,
+                ref[:12]
+                + (f": missing {', '.join(absent)}" if absent else "")
+                + (f"; could not read {', '.join(unread_probes)}" if unread_probes else ""),
+                manual=not absent and bool(unread_probes),
             )
         )
         for doc in callees.values():
@@ -4849,7 +5166,28 @@ def doctor(
     if repo_info is None:
         repo_info = _safe_json(gh, ["api", f"repos/{project_id}"])
     platform_private = _safe_json(gh, ["api", f"repos/{platform_repository}", "--jq", ".private"])
-    if platform_private is True:  # private or internal (both report private: true)
+    # Only `private: false` PROVES a public platform. Anything else -- unreadable, or not a
+    # boolean -- may be private or internal: the access check is an unmet manual requirement and
+    # PLATFORM_READ_TOKEN stays required (fail closed).
+    platform_public = platform_private is False
+    if not platform_public and platform_private is not True:
+        why = (
+            platform_private.why
+            if isinstance(platform_private, Unreadable)
+            else f"unexpected answer {platform_private!r}"
+        )
+        add(
+            Check(
+                PLATFORM_ACCESS_CHECK,
+                False,
+                f"could not read whether {platform_repository} is public ({why}): if it is "
+                f"private or internal, {project_id} must be admitted by its Actions access "
+                "setting and PLATFORM_READ_TOKEN is required → confirm its visibility and rerun "
+                "doctor",
+                manual=True,
+            )
+        )
+    elif platform_private is True:  # private or internal (both report private: true)
         platform_visibility = _safe_json(
             gh, ["api", f"repos/{platform_repository}", "--jq", "{visibility}"]
         )
@@ -4906,6 +5244,9 @@ def doctor(
         blob = _safe_json(
             gh, ["api", f"repos/{project_id}/contents/{relative}?ref={remote_branch or 'HEAD'}"]
         )
+        if isinstance(blob, Unreadable) and not blob.not_found:
+            unpushed.append(f"{relative} (unreadable: {blob.why})")
+            continue
         if isinstance(blob, list):
             unpushed.append(f"{relative} (a directory, not a file)")
             continue
@@ -4953,25 +5294,51 @@ def doctor(
     )
 
     # --- labels
-    names = {x.get("name") for x in _paged_items(gh, f"repos/{project_id}/labels?per_page=100")}
+    label_rows = _paged_items(gh, f"repos/{project_id}/labels?per_page=100")
     want = (
         {policy.ready_label, policy.human_review_label, policy.implementation_label}
         if policy
         else {"claude-ready", HUMAN_REVIEW_LABEL, IMPLEMENTATION_LABEL}
     ) | {IN_PROGRESS_LABEL}  # claim() adds it; a missing label fails every lease
-    lacking = sorted(want - names)
-    add(
-        Check(
-            "Forge labels exist",
-            not lacking,
-            ", ".join(lacking) if lacking else ", ".join(sorted(want)),
+    if isinstance(label_rows, Unreadable):
+        add(
+            Check(
+                "Forge labels exist",
+                False,
+                f"could not read the labels of {project_id} ({label_rows.why}) → confirm "
+                + ", ".join(sorted(want))
+                + " exist (onboard --apply creates them)",
+                manual=True,
+            )
         )
-    )
+    else:
+        lacking = sorted(want - {x.get("name") for x in label_rows})
+        add(
+            Check(
+                "Forge labels exist",
+                not lacking,
+                ", ".join(lacking) if lacking else ", ".join(sorted(want)),
+            )
+        )
 
     # --- ruleset
     rulesets = _repo_rulesets(project_id, gh)
-    protect = next((r for r in rulesets if r.get("name") == RULESET_NAME), None)
-    if protect is None:
+    protect = (
+        None
+        if isinstance(rulesets, Unreadable)
+        else next((r for r in rulesets if r.get("name") == RULESET_NAME), None)
+    )
+    if isinstance(rulesets, Unreadable):
+        add(
+            Check(
+                f"ruleset '{RULESET_NAME}' active on default branch",
+                False,
+                f"could not read the rulesets of {project_id} ({rulesets.why}) → confirm "
+                f"'{RULESET_NAME}' exists and is active",
+                manual=True,
+            )
+        )
+    elif protect is None:
         add(Check(f"ruleset '{RULESET_NAME}' active on default branch", False, "not found"))
     else:
         detail = _safe_json(gh, ["api", f"repos/{project_id}/rulesets/{protect.get('id')}"])
@@ -5117,6 +5484,21 @@ def doctor(
             "--slurp",
         ],
     )
+    effective_queue: bool | None = None  # unknown until the effective rules are read
+    # What the Actions publisher pushes (commit message, emails, branch), read from the pinned
+    # reusable-implement.yml: metadata-pattern rules are judged against it.
+    publisher: PublisherCommit | str
+    if cloud:
+        publisher = "the cloud routine commits as its owner's account, in its own format"
+    elif not ref:
+        publisher = "the platform pin is unknown"
+    else:
+        implement_doc = load_callee("reusable-implement.yml", ref)
+        publisher = (
+            publisher_commit(implement_doc)
+            if implement_doc is not None
+            else f"reusable-implement.yml is unreadable at {ref[:12]}"
+        )
     if not isinstance(pages, list) or not all(isinstance(page, list) for page in pages):
         add(
             Check(
@@ -5130,6 +5512,7 @@ def doctor(
         )
     else:
         rules = [rule for page in pages for rule in page if isinstance(rule, dict)]
+        effective_queue = any(r.get("type") == "merge_queue" for r in rules)
         required_contexts = [
             str((check or {}).get("context") or "")
             for rule in rules
@@ -5144,7 +5527,7 @@ def doctor(
             else [r for r in rules if r.get("type") not in unverifiable]
         )
         problems = effective_rule_problems(
-            checked, produced or ProducedContexts(merge_group_declared=True)
+            checked, produced or ProducedContexts(merge_group_declared=True), publisher
         )
         if produced is None and any(r.get("type") == "merge_queue" for r in rules):
             problems.append(
@@ -5222,6 +5605,7 @@ def doctor(
             legacy_protection_problems(
                 legacy if produced is not None else {**legacy, "required_status_checks": None},
                 produced or ProducedContexts(),
+                effective_queue,
             ),
         )
         add(
@@ -5236,16 +5620,19 @@ def doctor(
         )
 
     # --- variables & secrets (names only)
-    variable_values = {
-        str(v.get("name")): str(v.get("value") or "")
-        for v in _paged_items(gh, f"repos/{project_id}/actions/variables", "variables")
-    }
+    variable_rows = _paged_items(gh, f"repos/{project_id}/actions/variables", "variables")
+    variable_values = (
+        {}
+        if isinstance(variable_rows, Unreadable)
+        else {str(v.get("name")): str(v.get("value") or "") for v in variable_rows}
+    )
     variables = {name for name, value in variable_values.items() if value.strip()}
     empty_vars = sorted(name for name, value in variable_values.items() if not value.strip())
-    secrets = _paged_names(gh, f"repos/{project_id}/actions/secrets", "secrets")
+    secret_names = _paged_names(gh, f"repos/{project_id}/actions/secrets", "secrets")
+    secrets = set() if isinstance(secret_names, Unreadable) else secret_names
     need_vars = set() if cloud else {"PUBLISHER_APP_CLIENT_ID"}
     need_secrets = {"CLAUDE_CODE_OAUTH_TOKEN"} | (set() if cloud else {"PUBLISHER_APP_PRIVATE_KEY"})
-    if platform_private is True:  # GITHUB_TOKEN cannot check out another private repository
+    if not platform_public:  # GITHUB_TOKEN cannot check out another private repository
         need_secrets |= {"PLATFORM_READ_TOKEN"}
     # Whatever an installed implement caller's preflight insists on must exist too, or every run
     # stops there; and whatever the router may select must be configured.
@@ -5259,23 +5646,40 @@ def doctor(
         need_secrets |= {"OPENAI_API_KEY"}
     mv, ms = sorted(need_vars - variables), sorted(need_secrets - secrets)
     empty_required = [name for name in mv if name in empty_vars]
-    add(
-        Check(
-            "repo variables set (non-empty)",
-            not mv,
-            (
-                ", ".join(mv)
-                + (f" (empty value: {', '.join(empty_required)})" if empty_required else "")
+    if isinstance(variable_rows, Unreadable) and need_vars:
+        add(
+            Check(
+                "repo variables set (non-empty)",
+                False,
+                f"could not read the variables of {project_id} ({variable_rows.why}) → confirm "
+                + ", ".join(sorted(need_vars))
+                + " are set",
+                manual=True,
             )
-            if mv
-            else ", ".join(sorted(need_vars)),
         )
-    )
+    else:
+        add(
+            Check(
+                "repo variables set (non-empty)",
+                not mv,
+                (
+                    ", ".join(mv)
+                    + (f" (empty value: {', '.join(empty_required)})" if empty_required else "")
+                )
+                if mv
+                else ", ".join(sorted(need_vars)),
+            )
+        )
     add(
         Check(
             "repo secrets set (by name)",
             not ms,
-            ("missing: " + ", ".join(ms) + " → gh secret set NAME --repo " + project_id)
+            (
+                f"could not read the secret names of {project_id} ({secret_names.why}) → "
+                "confirm: " + ", ".join(ms)
+                if isinstance(secret_names, Unreadable)
+                else "missing: " + ", ".join(ms) + " → gh secret set NAME --repo " + project_id
+            )
             if ms
             else ", ".join(sorted(need_secrets)),
             manual=True,
@@ -5339,9 +5743,12 @@ def doctor(
     # Windows targets are reported above, not as a runner to register.
     targets = {w: lbls for w, lbls in label_targets.items() if w not in on_windows}
     need_runners = any(not _github_hosted(t) for t in [*targets.values(), ci_labels or set()])
-    runners = (
+    runner_rows = (
         _paged_items(gh, f"repos/{project_id}/actions/runners", "runners") if need_runners else []
     )
+    # Unreadable proves no runner: every self-hosted target stays stranded (fails closed).
+    runners_unread = runner_rows.why if isinstance(runner_rows, Unreadable) else ""
+    runners = [] if isinstance(runner_rows, Unreadable) else runner_rows
     stranded = {
         where: labels for where, labels in targets.items() if not _runner_available(labels, runners)
     }
@@ -5354,7 +5761,11 @@ def doctor(
                 "self-hosted runner online for this repo",
                 not stranded,
                 (
-                    "no online non-Windows runner for "
+                    f"could not read the runners of {project_id} ({runners_unread}) → confirm an "
+                    "online runner carries "
+                    + "; ".join(f"{w} {sorted(lbls)}" for w, lbls in sorted(stranded.items()))
+                    if runners_unread
+                    else "no online non-Windows runner for "
                     + "; ".join(f"{w} {sorted(lbls)}" for w, lbls in sorted(stranded.items()))
                     + f" ({len(online)} online / {len(runners)} registered)"
                     if runners
@@ -5385,6 +5796,9 @@ def doctor(
                 + (
                     "online runner found"
                     if ci_ok
+                    else f"the runner list is unreadable ({runners_unread}) → confirm an online "
+                    "runner carries all of them"
+                    if runners_unread
                     else "not a GitHub-hosted label and no online non-Windows runner carries "
                     "all of them"
                 ),
@@ -5437,6 +5851,17 @@ def doctor(
         )
         return rep
     installs = _paged_items(gh, "/user/installations", "installations")
+    if isinstance(installs, Unreadable):
+        add(
+            Check(
+                "Publisher GitHub App installed on this repo",
+                False,
+                f"could not read the app installations visible to this user ({installs.why}) → "
+                f"confirm the Agentic SDLC Publisher app is installed on {project_id}",
+                manual=True,
+            )
+        )
+        return rep
     apps = [i for i in installs if PUBLISHER_APP_SLUG_HINT in str(i.get("app_slug", "")).lower()]
     # create-github-app-token pairs PUBLISHER_APP_CLIENT_ID with the private key: only the App
     # that client ID belongs to counts, not any similarly named installation.
@@ -5474,18 +5899,23 @@ def doctor(
         )
     else:
         # The app may be installed on several accounts; the repo can be under any of them.
-        holding = [
-            app
-            for app in apps
-            if project_id
-            in {
-                str(r.get("full_name"))
-                for r in _paged_items(
-                    gh, f"/user/installations/{app['id']}/repositories", "repositories"
-                )
-            }
-        ]
-        if not holding:
+        holding = []
+        unread_installs = []
+        for app in apps:
+            repos = _paged_items(
+                gh, f"/user/installations/{app['id']}/repositories", "repositories"
+            )
+            if isinstance(repos, Unreadable):
+                unread_installs.append(f"installation {app['id']} ({repos.why})")
+            elif project_id in {str(r.get("full_name")) for r in repos}:
+                holding.append(app)
+        if not holding and unread_installs:
+            detail = (
+                "could not read the repositories of "
+                + ", ".join(unread_installs)
+                + f" → confirm {project_id} is among the app's repositories"
+            )
+        elif not holding:
             detail = f"add {project_id} under the app's 'Only select repositories'"
         else:
             shortfalls = [

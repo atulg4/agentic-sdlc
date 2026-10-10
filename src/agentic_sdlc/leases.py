@@ -255,10 +255,12 @@ def _cleanup_fields(body: str) -> dict[str, str] | None:
 
 
 def _paged(path: str, gh: GhRunner) -> list[dict]:
-    """Every item of a paginated list endpoint (--slurp wraps the pages in one outer array)."""
-    data = json.loads(gh(["api", path, "--paginate", "--slurp"]) or "[]")
+    """Every item of a paginated list endpoint (--slurp wraps the pages in one outer array).
+    An answer that is not that shape raises: an unreadable list (comments, events, claims) is
+    never read as an empty one -- no lease, no history -- which would let a claim proceed."""
+    data = json.loads(gh(["api", path, "--paginate", "--slurp"]) or "null")
     if not isinstance(data, list):
-        return []
+        raise LeaseError(f"unreadable answer from {path}: not a list of pages")
     items = [item for page in data for item in (page if isinstance(page, list) else [page])]
     return [item for item in items if isinstance(item, dict)]
 
