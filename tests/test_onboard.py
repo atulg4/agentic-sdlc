@@ -7432,3 +7432,435 @@ def test_a_classic_allowlist_must_admit_the_actor_that_actually_pushes(tmp_path)
     assert classic_publisher_branch_problems(answer, branch, GITHUB_ACTIONS_PUSHER) == []
     unknown = classic_publisher_branch_problems(answer, branch, "the checkout persists X")
     assert len(unknown) == 1 and "could not be determined (the checkout persists X)" in unknown[0]
+
+
+def test_commit_guard_pr_fallback_accepts_only_a_same_repository_head(tmp_path, monkeypatch):
+    """`gh pr list --head` filters by branch NAME: a fork PR from an identically named branch
+    is not this branch's claim, and a PR whose head repository cannot be read is not one
+    either."""
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    seen: list[list[str]] = []
+    answer: dict[str, object] = {}
+
+    def fake_run(args, **kwargs):
+        seen.append(list(args))
+
+        class Done:
+            stdout = json.dumps(answer["prs"])
+
+        return Done()
+
+    monkeypatch.setattr(guard.subprocess, "run", fake_run)
+    own = {
+        "number": 3,
+        "isCrossRepository": False,
+        "headRepository": {"id": "R1", "name": "comic"},
+        "headRepositoryOwner": {"id": "U1", "login": "Owner"},
+    }
+    fork = {
+        **own,
+        "isCrossRepository": True,
+        "headRepositoryOwner": {"id": "U2", "login": "mallory"},
+    }
+    answer["prs"] = [fork]
+    assert guard.open_pr_for("forge/issue-7") is False
+    fields = seen[-1][seen[-1].index("--json") + 1].split(",")
+    assert {"headRepository", "headRepositoryOwner", "isCrossRepository"} <= set(fields)
+    # A fork that claims to be same-repository but names another owner is still not the claim.
+    answer["prs"] = [{**fork, "isCrossRepository": False}]
+    assert guard.open_pr_for("forge/issue-7") is False
+    for broken in (
+        {k: v for k, v in own.items() if k != "isCrossRepository"},
+        {k: v for k, v in own.items() if k != "headRepository"},
+        {**own, "headRepositoryOwner": None},
+        {**own, "isCrossRepository": "false"},
+        {**own, "headRepository": {"name": ""}},
+    ):
+        answer["prs"] = [broken]
+        assert guard.open_pr_for("forge/issue-7") is False, broken
+    answer["prs"] = {"number": 3}
+    assert guard.open_pr_for("forge/issue-7") is None
+    answer["prs"] = [fork, own]
+    assert guard.open_pr_for("forge/issue-7") is True
+    commit = {"tool_name": "Bash", "session_id": "s1", "tool_input": {"command": "git commit"}}
+    answer["prs"] = [fork]
+    code, message = guard.decide(commit, "forge/issue-7", lambda n: None, guard.open_pr_for)
+    assert code == 2 and "no live lease exists" in message
+    answer["prs"] = [own]
+    assert guard.decide(commit, "forge/issue-7", lambda n: None, guard.open_pr_for) == (0, "")
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"test_command": "echo TEST_COMMAND"},
+        {"setup_command": "make SETUP_COMMAND=1 PLATFORM_REPOSITORY"},
+        {"quality_command": "echo AGENT IMPLEMENT_JOBS LABELER_AUTHORIZATION"},
+        {"project_id": "owner/AGENT"},
+        {"platform_repository": "owner/PLATFORM_REPOSITORY"},
+        {"ready_label": "AUTHORIZED_WORK"},
+    ],
+)
+def test_user_values_containing_placeholder_words_render_verbatim(overrides):
+    files = render_onboarding(spec(**overrides))
+    for key, value in overrides.items():
+        if key.endswith("_command"):
+            ci = yaml.safe_load(files[".github/workflows/ci.yml"])
+            runs = [step.get("run") for job in ci["jobs"].values() for step in job["steps"]]
+            assert value in runs
+            assert tomllib.loads(files["agentic-sdlc.toml"])["commands"][key[:-8]] == value
+        elif key == "project_id":
+            assert f'PROJECT = "{value}"' in files[".claude/hooks/forge_commit_guard.py"]
+            assert tomllib.loads(files["agentic-sdlc.toml"])["project"]["id"] == value
+        elif key == "ready_label":
+            assert value in files[".github/ISSUE_TEMPLATE/agent-work-request.md"]
+        else:
+            assert value in files[".github/workflows/agent-plan.yml"]
+
+
+def test_hook_placeholders_are_substituted_in_one_pass():
+    """A project id equal to the branch placeholder is not substituted a second time."""
+    files = render_onboarding(spec(project_id="DEFAULT_BRANCH_NAME/x", default_branch="trunk"))
+    start = files[".claude/hooks/forge_session_start.py"]
+    assert 'PROJECT = "DEFAULT_BRANCH_NAME/x"' in start and 'DEFAULT_BRANCH = "trunk"' in start
+
+
+def test_template_completeness_is_checked_on_the_source_template(monkeypatch):
+    import agentic_sdlc.onboard as onboard
+
+    real = onboard._resource
+
+    def broken(relative):
+        text = real(relative)
+        if relative == "github/forge/agent-plan.yml":
+            text += "# leftover: PREFLIGHT_EXTRA here\n"
+        return text
+
+    monkeypatch.setattr(onboard, "_resource", broken)
+    with pytest.raises(OnboardError, match="unrendered placeholder PREFLIGHT_EXTRA in template"):
+        render_onboarding(spec())
+
+    def no_project(relative):
+        text = real(relative)
+        if relative == "hooks/forge_commit_guard.py":
+            text = text.replace('"PROJECT_ID"', '"x"')
+        return text
+
+    monkeypatch.setattr(onboard, "_resource", no_project)
+    with pytest.raises(OnboardError, match="lacks its placeholder PROJECT_ID"):
+        render_onboarding(spec())
+
+    def branch_in_guard(relative):
+        text = real(relative)
+        if relative == "hooks/forge_commit_guard.py":
+            text += 'X = "DEFAULT_BRANCH_NAME"\n'
+        return text
+
+    monkeypatch.setattr(onboard, "_resource", branch_in_guard)
+    with pytest.raises(OnboardError, match="unrendered placeholder DEFAULT_BRANCH_NAME"):
+        render_onboarding(spec())
+
+
+# ---------------------------------------------------------------- Codex 4239598425
+# Active `target: push` rulesets reject pushes by their FILES, for every actor; doctor proves
+# a restriction harmless only when the Forge policy's forbidden_paths provably excludes it.
+def _push_ruleset(*rules: dict, enforcement: str = "active", source: str = "Organization"):
+    return {
+        "id": 88,
+        "name": "org push",
+        "source_type": source,
+        "source": "owner",
+        "target": "push",
+        "enforcement": enforcement,
+        "rules": list(rules),
+    }
+
+
+def _push_gh(detail: object, summary: dict | None = None) -> FakeGh:
+    gh = _healthy_gh()
+    ruleset = detail if isinstance(detail, dict) else _push_ruleset()
+    summary = summary or {
+        k: ruleset[k] for k in ("id", "name", "source_type", "source", "target", "enforcement")
+    }
+    gh.answers = {
+        "api repos/owner/comic/rulesets/88": (
+            json.dumps(detail) if isinstance(detail, dict) else detail
+        ),
+        "api repos/owner/comic/rulesets?includes_parents=true": json.dumps(
+            [[{"id": 11, "name": RULESET_NAME, "enforcement": "active"}, summary]]
+        ),
+        **gh.answers,
+    }
+    return gh
+
+
+@pytest.mark.parametrize(
+    ("ruleset", "ok", "needle"),
+    [
+        # covered by forbidden_paths (spec's "*.png", the baseline's "*.pem"/".env*")
+        (
+            _push_ruleset(
+                {
+                    "type": "file_path_restriction",
+                    "parameters": {"restricted_file_paths": ["*.png", ".env*"]},
+                }
+            ),
+            True,
+            "",
+        ),
+        (
+            _push_ruleset(
+                {
+                    "type": "file_extension_restriction",
+                    "parameters": {"restricted_file_extensions": ["*.pem", ".key"]},
+                }
+            ),
+            True,
+            "",
+        ),
+        (
+            _push_ruleset(
+                {
+                    "type": "file_path_restriction",
+                    "parameters": {"restricted_file_paths": ["src/**"]},
+                }
+            ),
+            False,
+            "restricts file paths 'src/**'",
+        ),
+        (
+            _push_ruleset(
+                {
+                    "type": "file_path_restriction",
+                    "parameters": {"restricted_file_paths": ["*.{png,exe}"]},
+                }
+            ),
+            False,
+            "restricts file paths",
+        ),
+        (
+            _push_ruleset(
+                {
+                    "type": "file_extension_restriction",
+                    "parameters": {"restricted_file_extensions": ["*.exe"]},
+                }
+            ),
+            False,
+            "restricts file extensions '*.exe'",
+        ),
+        (
+            _push_ruleset({"type": "max_file_size", "parameters": {"max_file_size": 100}}),
+            False,
+            "limits files to 100 MB",
+        ),
+        (
+            _push_ruleset(
+                {"type": "max_file_path_length", "parameters": {"max_file_path_length": 255}}
+            ),
+            False,
+            "limits file paths to 255",
+        ),
+        (_push_ruleset({"type": "something_new"}), False, "'something_new'"),
+        (
+            _push_ruleset(
+                {"type": "max_file_size", "parameters": {"max_file_size": 1}}, source="Repository"
+            ),
+            False,
+            "MB",
+        ),
+        (_push_ruleset({"type": "max_file_size"}, enforcement="evaluate"), True, ""),
+        (_push_ruleset({"type": "max_file_size"}, enforcement="disabled"), True, ""),
+    ],
+)
+def test_doctor_inspects_active_push_rulesets(tmp_path, ruleset, ok, needle):
+    from agentic_sdlc.onboard import PUSH_RULESETS_CHECK
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", _push_gh(ruleset))
+    if ok:
+        assert report.ok, report.render()
+    else:
+        check = _failed(report)[PUSH_RULESETS_CHECK]
+        assert check.manual and needle in check.detail and "'org push'" in check.detail
+        assert set(_failed(report)) == {PUSH_RULESETS_CHECK}
+
+
+def test_doctor_fails_closed_on_unreadable_push_rulesets(tmp_path):
+    from agentic_sdlc.onboard import PUSH_RULESETS_CHECK
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(implementer="cloud-routine"))  # every mode is checked
+    gh = _push_gh(
+        OnboardError("gh: boom (HTTP 500)"),
+        {"id": 88, "name": "org push", "target": "push", "enforcement": "active"},
+    )
+    check = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))[PUSH_RULESETS_CHECK]
+    assert check.manual and "could not be read" in check.detail
+    gh = _push_gh(_push_ruleset())
+    gh.answers["api repos/owner/comic/rulesets?includes_parents=true"] = OnboardError(
+        "gh: boom (HTTP 500)"
+    )
+    check = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))[PUSH_RULESETS_CHECK]
+    assert check.manual and "could not list the rulesets" in check.detail
+    gh = _push_gh({**_push_ruleset(), "rules": "nope"})
+    check = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))[PUSH_RULESETS_CHECK]
+    assert "push rules could not be read" in check.detail
+
+
+def test_push_ruleset_restrictions_are_unprovable_without_a_policy():
+    from agentic_sdlc.onboard import push_ruleset_problems
+
+    ruleset = _push_ruleset(
+        {"type": "file_path_restriction", "parameters": {"restricted_file_paths": ["*.png"]}}
+    )
+    assert push_ruleset_problems([(ruleset, ruleset)], ("*.png",)) == []
+    assert push_ruleset_problems([(ruleset, ruleset)], None)
+
+
+# ---------------------------------------------------------------- Codex 4239598427
+# A reusable-workflow chain can only keep or lose GITHUB_TOKEN permissions: every callee job is
+# compared with the ceiling its caller passes on, transitively.
+def _plan_nested_with_permissions(job_permissions: object = None) -> str:
+    doc = yaml.safe_load(_plan_calling_nested("nested.yml"))
+    if job_permissions is not None:
+        doc["jobs"]["nested"]["permissions"] = job_permissions
+    return yaml.safe_dump(doc)
+
+
+NESTED_PERMISSIONS_CALLEE = (
+    "on:\n  workflow_call:\njobs:\n  inner:\n    runs-on: ubuntu-latest\n"
+    "    permissions:\n      issues: write\n    steps:\n      - run: echo hi\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("nested_job_permissions", "callee", "needle"),
+    [
+        # the nested call inherits reusable-plan.yml's `permissions: {}`: nothing to pass on
+        (None, NESTED_PERMISSIONS_CALLEE, "requests issues: write but"),
+        # granted by the nested call, which the generated caller's `issues: write` covers
+        ({"issues": "write"}, NESTED_PERMISSIONS_CALLEE, None),
+        # the nested call itself asks for more than the generated caller grants
+        ({"issues": "write", "pull-requests": "write"}, NESTED_PERMISSIONS_CALLEE, "pull-requests"),
+        # the callee's workflow-level default applies to a job without its own
+        (
+            {"issues": "read"},
+            NESTED_PERMISSIONS_CALLEE.replace(
+                "    permissions:\n      issues: write\n", ""
+            ).replace("jobs:\n", "permissions: write-all\njobs:\n"),
+            "nested.yml@ffffffffffff:inner requests actions: write",
+        ),
+    ],
+)
+def test_doctor_compares_token_permissions_through_reusable_chains(
+    tmp_path, nested_job_permissions, callee, needle
+):
+    from agentic_sdlc.onboard import PLATFORM_CONTRACT_CHECK
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _nested_gh(_healthy_gh(), callee)
+    gh.answers[PLATFORM_CONTENTS + ".github/workflows/reusable-plan.yml"] = _blob(
+        _plan_nested_with_permissions(nested_job_permissions).encode()
+    )
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    if needle is None:
+        assert report.ok, report.render()
+    else:
+        check = _failed(report)[PLATFORM_CONTRACT_CHECK]
+        assert not check.manual and needle in check.detail, check.detail
+        assert "reusable-plan.yml@" in check.detail or "nested.yml@" in check.detail
+
+
+def _permission_graph(callee_doc: dict):
+    from agentic_sdlc.onboard import platform_callee_graph
+
+    return platform_callee_graph({"r.yml": callee_doc}, SHA, "owner/agentic-sdlc", lambda *a: None)
+
+
+def test_token_ceiling_falls_back_to_the_repository_default_and_fails_closed():
+    from agentic_sdlc.onboard import (
+        Unreadable,
+        default_token_permissions,
+        token_permission_problems,
+    )
+
+    callee = {
+        "on": {"workflow_call": None},
+        "jobs": {"j": {"runs-on": "x", "permissions": {"contents": "write"}, "steps": []}},
+    }
+    graph = _permission_graph(callee)
+    caller_job = {"uses": f"owner/agentic-sdlc/.github/workflows/r.yml@{SHA}"}
+    calls = [("caller.yml:call", caller_job, "r.yml")]
+
+    def check(caller_doc, default):
+        return token_permission_problems(
+            [("caller.yml", caller_doc)], calls, graph, SHA, "owner/agentic-sdlc", lambda: default
+        )
+
+    read = default_token_permissions({"default_workflow_permissions": "read"})
+    write = default_token_permissions({"default_workflow_permissions": "write"})
+    over, unknown = check({"jobs": {"call": caller_job}}, read)
+    assert (
+        unknown == []
+        and "requests contents: write but caller.yml:call grants at most contents: read" in over[0]
+    )
+    assert check({"jobs": {"call": caller_job}}, write) == ([], [])
+    # the caller's workflow-level permissions are its jobs' default: the repo default is unused
+    assert check({"permissions": {"contents": "write"}}, "never read") == ([], [])
+    over, unknown = check({"permissions": {"contents": "read"}}, "never read")
+    assert over and not unknown
+    # unreadable default, unreadable permissions, unreadable callee: unknown, never fine
+    unreadable = default_token_permissions(Unreadable("boom"))
+    assert isinstance(unreadable, str)
+    over, unknown = check({}, unreadable)
+    assert not over and "cannot be determined" in unknown[0]
+    assert isinstance(default_token_permissions({"default_workflow_permissions": "x"}), str)
+    over, unknown = check({"permissions": {"contents": "admin"}}, "never read")
+    assert unknown
+    over, unknown = token_permission_problems(
+        [("caller.yml", {"permissions": "write-all"})],
+        [("caller.yml:call", caller_job, "gone.yml")],
+        graph,
+        SHA,
+        "owner/agentic-sdlc",
+        lambda: "never read",
+    )
+    assert not over and "could not be read" in unknown[0]
+
+
+def test_doctor_reports_an_undeterminable_token_ceiling_as_manual(tmp_path):
+    from agentic_sdlc.onboard import PLATFORM_CONTRACT_CHECK, TOKEN_PERMISSIONS_CHECK
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    plan = repo / ".github/workflows/agent-plan.yml"
+    doc = yaml.safe_load(plan.read_text())
+    gh = _healthy_gh()
+    # an installed caller with no permissions on the calling job or the workflow inherits the
+    # repository default
+    doc.pop("permissions")
+    doc["jobs"]["plan"].pop("permissions")
+    plan.write_text(yaml.safe_dump(doc))
+    # before the healthy table's `actions/permissions` prefix
+    gh.answers = {
+        "api repos/owner/comic/actions/permissions/workflow": OnboardError("gh: boom (HTTP 500)"),
+        **gh.answers,
+    }
+    check = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)).get(
+        TOKEN_PERMISSIONS_CHECK
+    )
+    assert check is not None and check.manual and "cannot be determined" in check.detail
+    assert "agent-plan.yml:plan" in check.detail and "boom" in check.detail
+    # readable and restricted: the callee's `issues: write` is then over the ceiling
+    gh = _healthy_gh()
+    gh.answers = {
+        "api repos/owner/comic/actions/permissions/workflow": json.dumps(
+            {"default_workflow_permissions": "read"}
+        ),
+        **gh.answers,
+    }
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))
+    assert TOKEN_PERMISSIONS_CHECK not in failed
+    assert "grants at most issues: none" in failed[PLATFORM_CONTRACT_CHECK].detail
