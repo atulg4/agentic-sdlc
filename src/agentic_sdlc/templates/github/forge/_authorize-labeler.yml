@@ -13,12 +13,37 @@
           ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
+          # Only a DEFINITIVE answer decides: HTTP 200 with a permission field, or 404 (not a
+          # collaborator). Anything else (rate limit, 5xx, network) is retried, then FAILS the
+          # job: never read as "unauthorized", which would silently consume the label event.
           authorized=true
+          errors="$(mktemp)"
           for login in "$SENDER" "$ACTOR"; do
             encoded="$(jq -rn --arg login "$login" '$login | @uri')"
-            permission="$(gh api --method GET \
-              "repos/${GITHUB_REPOSITORY}/collaborators/${encoded}/permission" \
-              --jq '.permission' 2>/dev/null)" || permission=none
+            permission=""
+            for attempt in 1 2 3; do
+              if body="$(gh api --method GET \
+                "repos/${GITHUB_REPOSITORY}/collaborators/${encoded}/permission" 2>"$errors")"; then
+                permission="$(jq -r '.permission // empty | strings' <<<"$body" 2>/dev/null || true)"
+                if [ -n "$permission" ]; then
+                  break
+                fi
+                printf '::warning::attempt %s: no permission field in the answer for %s\n' "$attempt" "$login"
+              elif grep -q '(HTTP 404)' "$errors"; then
+                permission=none
+                break
+              else
+                printf '::warning::attempt %s: could not read the permission of %s: %s\n' \
+                  "$attempt" "$login" "$(head -c 300 "$errors" | tr '\n' ' ')"
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                sleep "$((attempt * 10))"
+              fi
+            done
+            if [ -z "$permission" ]; then
+              printf '::error::Could not read the repository permission of %s; failing instead of treating the labeler as unauthorized. Re-run this job or re-apply the label.\n' "$login"
+              exit 1
+            fi
             case "$permission" in
               admin|write) ;;
               *) authorized=false ;;

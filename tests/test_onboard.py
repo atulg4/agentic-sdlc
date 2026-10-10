@@ -494,6 +494,7 @@ def _healthy_gh() -> FakeGh:
                     "default_branch": "main",
                     "visibility": "private",
                     "allow_forking": False,
+                    "has_issues": True,
                 }
             ),
             "api /user/installations": _installs(7),
@@ -807,7 +808,12 @@ def test_doctor_flags_a_policy_branch_that_is_not_the_repo_default(tmp_path):
     write_onboarding(repo, spec())
     gh = _healthy_gh()
     gh.answers["api repos/owner/comic"] = json.dumps(
-        {"default_branch": "master", "visibility": "private", "allow_forking": False}
+        {
+            "default_branch": "master",
+            "visibility": "private",
+            "allow_forking": False,
+            "has_issues": True,
+        }
     )
     report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
     failed = {c.name: c for c in report.checks if not c.ok}
@@ -1161,6 +1167,8 @@ def test_rulesets_are_paginated_and_exclude_inherited_ones(tmp_path):
     healthy.answers = {
         "api repos/owner/comic/rulesets?includes_parents=false": json.dumps([filler, [page2]]),
         "api repos/owner/comic/rulesets/5": json.dumps({"id": 5, **ruleset_payload(spec())}),
+        # the inherited one is read too (does it target only some agent/** branches?)
+        "api repos/owner/comic/rulesets/99": json.dumps({**org_owned, **ruleset_payload(spec())}),
         **healthy.answers,
     }
     healthy.answers["api repos/owner/comic/rulesets"] = json.dumps([[org_owned]])
@@ -1914,7 +1922,7 @@ def test_doctor_accepts_a_public_repository_onboarded_with_hosted_ci(tmp_path):
     write_onboarding(repo, spec(fork_exposed=True))
     gh = _healthy_gh()
     gh.answers["api repos/owner/comic"] = json.dumps(
-        {"default_branch": "main", "visibility": "public", "private": False}
+        {"default_branch": "main", "visibility": "public", "private": False, "has_issues": True}
     )
     report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
     assert report.ok, report.render()
@@ -2044,7 +2052,12 @@ def test_doctor_accepts_self_hosted_pr_jobs_when_fork_workflows_are_proven_off(t
     key = "api repos/owner/comic/actions/permissions/fork-pr-workflows-private-repos"
     gh.answers = {key: '{"run_workflows_from_fork_pull_requests": false}', **gh.answers}
     gh.answers["api repos/owner/comic"] = json.dumps(
-        {"default_branch": "main", "visibility": "internal", "allow_forking": True}
+        {
+            "default_branch": "main",
+            "visibility": "internal",
+            "allow_forking": True,
+            "has_issues": True,
+        }
     )
     report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
     assert report.ok, report.render()
@@ -5296,7 +5309,9 @@ def test_platform_access_rejects_an_internal_caller_of_a_private_platform(tmp_pa
     [
         ("pull_request", True),
         ("[pull_request, schedule]", True),
-        ("{pull_request_target: {branches: [main]}}", True),
+        ("{pull_request_target: {branches: [main]}}", False),
+        ("pull_request_target", False),
+        ("[pull_request_target, push]", False),
         ("{pull_request: {branches: ['ma*']}}", True),
         ("{pull_request: {branches: ['**']}}", True),
         ("{schedule: [{cron: '0 0 * * *'}]}", False),
@@ -6167,10 +6182,14 @@ def test_publisher_commit_is_read_from_the_pinned_reusable_implement():
 
     found = _publisher()
     assert isinstance(found, PublisherCommit)
-    assert "Implement issue #42" in found.messages
-    assert found.author_emails == found.committer_emails
-    assert found.author_emails == ("agentic-sdlc[bot]@users.noreply.github.com",)
-    assert "agent/issue-42-9876543210" in found.branches
+    assert found.message.template == "Implement issue #${ISSUE_NUMBER}"
+    assert "Implement issue #42" in found.message.samples
+    assert found.author_email == found.committer_email
+    assert found.author_email.constant
+    assert found.author_email.example == "agentic-sdlc[bot]@users.noreply.github.com"
+    assert found.branch.template == "agent/issue-${ISSUE_NUMBER}-${GITHUB_RUN_ID}"
+    assert found.branch.example == "agent/issue-1-1"
+    assert "agent/issue-42-9876543210" in found.branch.samples
     # anything doctor cannot read exactly is a reason, never a guess
     doc = yaml.safe_load((PLATFORM_WORKFLOWS / "reusable-implement.yml").read_text())
     pushing = next(
@@ -6210,7 +6229,25 @@ def _pattern_rule(kind: str, operator: str, pattern: str, negate: bool = False) 
         ("commit_message_pattern", "starts_with", "JIRA-", False, "rejects"),
         ("commit_message_pattern", "contains", "WIP", True, "ok"),
         ("commit_message_pattern", "contains", "issue", True, "rejects"),
-        ("commit_message_pattern", "regex", r"^Implement issue #\d+$", False, "ok"),
+        # a regex over a numbered message is never proven for every number (Codex 4239269925)
+        ("commit_message_pattern", "regex", r"^Implement issue #\d+$", False, "todo"),
+        # issue #2 is a real value outside it: a proven rejection
+        ("commit_message_pattern", "regex", r"^Implement issue #(1|42|12345)$", False, "rejects"),
+        # passes every sample, rejects issue #3: never PASS on samples alone
+        ("commit_message_pattern", "regex", r"^Implement issue #(1|2|42|12345)$", False, "todo"),
+        ("commit_message_pattern", "starts_with", "Implement issue #1", False, "rejects"),
+        ("commit_message_pattern", "starts_with", "Implement issue #1", True, "rejects"),
+        ("commit_message_pattern", "starts_with", "Implement issue #x", False, "rejects"),
+        ("commit_message_pattern", "contains", "#4", False, "rejects"),  # issue #1 lacks it
+        ("commit_message_pattern", "contains", "#", False, "ok"),
+        ("commit_message_pattern", "contains", "ssue #", False, "ok"),
+        ("commit_message_pattern", "contains", "Implement issue #4", True, "rejects"),
+        ("commit_message_pattern", "contains", "#1", True, "rejects"),
+        ("commit_message_pattern", "contains", "JIRA", True, "ok"),
+        ("commit_message_pattern", "ends_with", "#", False, "rejects"),
+        ("commit_message_pattern", "ends_with", "#1", True, "rejects"),
+        ("commit_message_pattern", "ends_with", "x", True, "ok"),
+        ("commit_message_pattern", "contains", "9", True, "todo"),  # no sample has a 9
         ("commit_message_pattern", "regex", r"^[A-Z]+-\d+: ", False, "rejects"),
         ("commit_message_pattern", "regex", r"(?i)^implement", False, "todo"),
         ("commit_message_pattern", "regex", r"^(?=Impl)", False, "todo"),
@@ -6432,6 +6469,37 @@ def test_callee_graph_is_cycle_safe_bounded_and_fails_closed():
         assert graph.unfollowed and graph.uninspectable, target
 
 
+def test_callee_graph_depth_counts_the_generated_caller():
+    """Codex 4239269932: GitHub's ten-level nesting limit includes the generated top-level
+    caller, so nine called workflows (root + 8 nested) fit and a tenth is reported."""
+    from agentic_sdlc.onboard import platform_callee_graph
+
+    plat = "owner/agentic-sdlc/.github/workflows"
+
+    def chain(called: int) -> tuple[dict, dict]:
+        # root.yml -> w1.yml -> ... -> w{called-1}.yml: `called` workflows below the caller
+        def doc(nxt: str | None) -> dict:
+            jobs = {"j": {"uses": f"{plat}/{nxt}@{NESTED_SHA}"}} if nxt else {"j": {}}
+            return {"on": {"workflow_call": None}, "jobs": jobs}
+
+        names = ["root.yml", *[f"w{i}.yml" for i in range(1, called)]]
+        docs = {
+            (n, NESTED_SHA): doc(names[i + 1] if i + 1 < len(names) else None)
+            for i, n in enumerate(names)
+            if i
+        }
+        root = doc(names[1] if len(names) > 1 else None)
+        return {"root.yml": root}, docs
+
+    roots, docs = chain(9)
+    graph = platform_callee_graph(roots, SHA, "owner/agentic-sdlc", lambda n, s: docs.get((n, s)))
+    assert not graph.unfollowed and not graph.uninspectable
+    assert len(graph.docs) == 9
+    roots, docs = chain(10)
+    graph = platform_callee_graph(roots, SHA, "owner/agentic-sdlc", lambda n, s: docs.get((n, s)))
+    assert any("deeper than 10" in why for why in graph.unfollowed)
+
+
 def test_nested_reusable_calls_must_match_their_callee_contract(tmp_path):
     """Codex 4239194854: a nested pinned call that omits a required input is rejected by
     GitHub before its jobs start; doctor must not report READY."""
@@ -6514,3 +6582,225 @@ def test_publisher_branch_rules_compatible_or_unreadable(tmp_path):
     assert check.manual and "could not read the rules that apply to agent/issue-1-1" in (
         check.detail
     )
+
+
+# ---------------------------------------------------------------- Codex 4239269925
+# The publisher's branch is agent/issue-<N>-<RUN> for EVERY issue and run: the effective rules of
+# one sample branch speak for all of them only when no ruleset targets some and not others.
+@pytest.mark.parametrize(
+    ("pattern", "scope"),
+    [
+        ("~ALL", True),
+        ("~DEFAULT_BRANCH", False),
+        ("refs/heads/agent/**", True),
+        ("refs/heads/**", None),  # Ruby FNM_PATHNAME reads a bare `**` as `*`: unprovable
+        ("refs/heads/agent/*", True),
+        ("refs/heads/agent/issue-*", True),
+        ("refs/heads/agent/issue-*-*", True),
+        ("refs/heads/**/*", True),
+        ("refs/heads/*", False),
+        ("refs/heads/main", False),
+        ("refs/heads/release-1.*", False),
+        ("refs/heads/feature/**/*", False),
+        ("refs/heads/agent/issue-1*", None),
+        ("refs/heads/agent/issue-2-*", None),
+        ("refs/heads/agent/issue-*-1", None),
+        ("refs/heads/agent/issue-42-9876543210", None),
+        ("refs/heads/agent/issue-x*", False),
+        ("refs/heads/agent/issue-?-*", None),
+        ("refs/heads/agent/issue-[0-9]*", None),
+        ("refs/heads/Agent/*", None),  # case sensitivity unknown
+        ("agent/*", None),  # not a full ref: do not guess
+    ],
+)
+def test_ruleset_ref_patterns_are_judged_for_every_agent_branch(pattern, scope):
+    from agentic_sdlc.onboard import PublisherValue, _ref_pattern_scope
+
+    ref = PublisherValue(("refs/heads/agent/issue-", "-", ""), ("ISSUE_NUMBER", "GITHUB_RUN_ID"))
+    assert _ref_pattern_scope(pattern, ref, "main") is scope
+
+
+def _scoped_ruleset(include: list[str], exclude: list[str] | None = None, **extra) -> dict:
+    return {
+        "id": 77,
+        "name": "org agents",
+        "source_type": "Organization",
+        "source": "owner",
+        "target": "branch",
+        "enforcement": "active",
+        "conditions": {"ref_name": {"include": include, "exclude": exclude or []}},
+        **extra,
+    }
+
+
+@pytest.mark.parametrize(
+    ("ruleset", "ok"),
+    [
+        (_scoped_ruleset(["refs/heads/agent/issue-2*"]), False),  # issue-1-1 misses it
+        (_scoped_ruleset(["~ALL"], ["refs/heads/agent/issue-7-*"]), False),
+        (_scoped_ruleset(["refs/heads/agent/issue-*"]), True),  # every agent branch alike
+        (_scoped_ruleset(["refs/heads/release/*"]), True),  # none of them
+        (_scoped_ruleset(["~ALL"], ["refs/heads/agent/*"]), True),
+        (_scoped_ruleset(["refs/heads/agent/issue-2*"], enforcement="disabled"), True),
+        (_scoped_ruleset(["refs/heads/agent/issue-2*"], target="tag"), True),
+    ],
+)
+def test_doctor_requires_rulesets_to_treat_every_agent_branch_alike(tmp_path, ruleset, ok):
+    from agentic_sdlc.onboard import PUBLISHER_BRANCH_RULES_CHECK
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _healthy_gh()
+    summary = {k: ruleset[k] for k in ("id", "name", "source_type", "source", "target")}
+    summary["enforcement"] = ruleset["enforcement"]
+    gh.answers = {
+        "api repos/owner/comic/rulesets/77": json.dumps(ruleset),
+        "api repos/owner/comic/rulesets?includes_parents=true": json.dumps(
+            [[{"id": 11, "name": RULESET_NAME, "enforcement": "active"}, summary]]
+        ),
+        **gh.answers,
+    }
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    if ok:
+        assert report.ok, report.render()
+    else:
+        check = _failed(report)[PUBLISHER_BRANCH_RULES_CHECK]
+        assert check.manual and "'org agents'" in check.detail
+        assert "agent/issue-${ISSUE_NUMBER}-${GITHUB_RUN_ID}" in check.detail
+        assert set(_failed(report)) == {PUBLISHER_BRANCH_RULES_CHECK}
+
+
+def test_doctor_fails_closed_when_agent_branch_rulesets_are_unreadable(tmp_path):
+    from agentic_sdlc.onboard import PUBLISHER_BRANCH_RULES_CHECK
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _healthy_gh()
+    gh.answers = {
+        "api repos/owner/comic/rulesets?includes_parents=true": OnboardError("gh: boom (HTTP 500)"),
+        **gh.answers,
+    }
+    check = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))[
+        PUBLISHER_BRANCH_RULES_CHECK
+    ]
+    assert check.manual and "could not list the rulesets" in check.detail
+    gh = _healthy_gh()
+    gh.answers = {
+        "api repos/owner/comic/rulesets/77": OnboardError("gh: boom (HTTP 500)"),
+        "api repos/owner/comic/rulesets?includes_parents=true": json.dumps(
+            [[{"id": 11, "name": RULESET_NAME, "enforcement": "active"}, {"id": 77, "name": "x"}]]
+        ),
+        **gh.answers,
+    }
+    check = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))[
+        PUBLISHER_BRANCH_RULES_CHECK
+    ]
+    assert check.manual and "could not be read" in check.detail
+
+
+# ---------------------------------------------------------------- Codex 4239269950
+# Only a definitive answer (200 with a permission, or 404) may make the labeler unauthorized; an
+# API failure is retried and then FAILS the job instead of silently consuming the label event.
+def _run_authorize(tmp_path: Path, script: str, workflow: str = "agent-auto-plan.yml"):
+    import shutil
+    import subprocess
+
+    if not (shutil.which("bash") and shutil.which("jq")):
+        pytest.skip("bash and jq are needed to run the generated authorization step")
+    doc = yaml.safe_load(render_onboarding(spec())[f".github/workflows/{workflow}"])
+    step = next(
+        s
+        for job in doc["jobs"].values()
+        for s in job.get("steps") or []
+        if s.get("id") == "authorize"
+    )
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "gh").write_text("#!/usr/bin/env bash\n" + script)
+    (bin_dir / "sleep").write_text("#!/usr/bin/env bash\nexit 0\n")  # no real backoff in tests
+    for tool in ("gh", "sleep"):
+        (bin_dir / tool).chmod(0o755)
+    output = tmp_path / "output"
+    output.write_text("")
+    env = {
+        "PATH": f"{bin_dir}:/usr/bin:/bin",
+        "SENDER": "alice",
+        "ACTOR": "alice",
+        "GITHUB_REPOSITORY": "owner/comic",
+        "GITHUB_OUTPUT": str(output),
+        "GH_COUNT": str(tmp_path / "count"),
+    }
+    done = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", step["run"]],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return done, output.read_text()
+
+
+COUNT_CALLS = 'n=$(( $(cat "$GH_COUNT" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$GH_COUNT"\n'
+
+
+@pytest.mark.parametrize("workflow", ["agent-auto-plan.yml", "agent-auto-implement.yml"])
+@pytest.mark.parametrize(
+    ("script", "code", "authorized"),
+    [
+        ('echo \'{"permission": "write"}\'\n', 0, "true"),
+        ('echo \'{"permission": "admin"}\'\n', 0, "true"),
+        ('echo \'{"permission": "read"}\'\n', 0, "false"),
+        ('echo \'{"permission": "none"}\'\n', 0, "false"),
+        ('echo "gh: Not Found (HTTP 404)" >&2; exit 1\n', 0, "false"),
+        # transient failures and malformed answers: never "unauthorized"
+        ('echo "gh: API rate limit exceeded (HTTP 403)" >&2; exit 1\n', 1, None),
+        ('echo "gh: Server Error (HTTP 502)" >&2; exit 1\n', 1, None),
+        ('echo "connection reset" >&2; exit 1\n', 1, None),
+        ("echo '{}'\n", 1, None),
+        ("echo 'not json'\n", 1, None),
+        # a transient failure that clears on retry
+        (
+            COUNT_CALLS
+            + 'if [ "$n" -lt 3 ]; then echo "gh: (HTTP 500)" >&2; exit 1; fi\n'
+            + 'echo \'{"permission": "write"}\'\n',
+            0,
+            "true",
+        ),
+    ],
+)
+def test_labeler_authorization_fails_on_unreadable_permissions(
+    tmp_path, workflow, script, code, authorized
+):
+    done, output = _run_authorize(tmp_path, script, workflow)
+    assert done.returncode == code, (done.stdout, done.stderr)
+    if authorized is None:
+        assert "authorized=" not in output  # nothing is decided: the job fails
+        assert "::error::" in done.stdout
+    else:
+        assert output.strip() == f"authorized={authorized}"
+
+
+# ---------------------------------------------------------------- Codex 4239269954
+# Work requests, labels and leases are all issues: a repository with Issues disabled is never
+# READY; an answer that does not say they are enabled is a manual TODO.
+@pytest.mark.parametrize(
+    ("has_issues", "manual"),
+    [(False, False), (None, True), ("yes", True)],
+)
+def test_doctor_requires_github_issues_enabled(tmp_path, has_issues, manual):
+    from agentic_sdlc.onboard import ISSUES_ENABLED_CHECK
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _healthy_gh()
+    info = json.loads(gh.answers["api repos/owner/comic"])
+    info.pop("has_issues")
+    if has_issues is not None:
+        info["has_issues"] = has_issues
+    gh.answers["api repos/owner/comic"] = json.dumps(info)
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    failed = _failed(report)
+    assert set(failed) == {ISSUES_ENABLED_CHECK}, report.render()
+    assert failed[ISSUES_ENABLED_CHECK].manual is manual
+    assert "Issues" in failed[ISSUES_ENABLED_CHECK].detail
+    assert not report.ok

@@ -2084,6 +2084,7 @@ def _repo_rulesets(project_id: str, gh: GhRunner) -> list[dict] | Unreadable:
 
 
 EFFECTIVE_RULES_CHECK = "effective default-branch rules (org/enterprise rulesets too) fit Forge"
+ISSUES_ENABLED_CHECK = "GitHub Issues are enabled"
 
 
 _MATRIX_REF = re.compile(r"\$\{\{\s*matrix\.([A-Za-z_][A-Za-z0-9_-]*)\s*\}\}")
@@ -2230,13 +2231,16 @@ def _branch_glob_matches(pattern: str, branch: str) -> bool | None:
 
 def _reports_on_protected_pull_requests(doc: dict, default_branch: str) -> bool:
     """Whether a workflow runs for EVERY pull request into the protected branch: a
-    `pull_request` or `pull_request_target` trigger with no `paths`/`paths-ignore` filter (a PR
-    outside it never reports), no `branches-ignore` and no negated pattern (fail closed), a
-    `branches` filter only when one of its globs matches the default branch, and activity types
-    (if listed) covering every head update. Only such a workflow's jobs produce required contexts;
-    a schedule-, dispatch- or call-only workflow reports nothing on the PR."""
+    `pull_request` trigger with no `paths`/`paths-ignore` filter (a PR outside it never reports),
+    no `branches-ignore` and no negated pattern (fail closed), a `branches` filter only when one
+    of its globs matches the default branch, and activity types (if listed) covering every head
+    update. Only such a workflow's jobs produce required contexts; a schedule-, dispatch- or
+    call-only workflow reports nothing on the PR. `pull_request_target` does not count either:
+    it runs on the BASE branch's last commit (`GITHUB_SHA`), so its checks attach to that commit,
+    never to the PR head or test-merge commit a required check is evaluated on. Only
+    `pull_request` attaches to the revision being protected."""
     triggers = doc.get("on", doc.get(True))
-    for event in ("pull_request", "pull_request_target"):
+    for event in ("pull_request",):
         if event not in _triggers(doc):
             continue
         spec = triggers.get(event) if isinstance(triggers, dict) else None
@@ -2459,28 +2463,80 @@ _COMPATIBLE_RULE_TYPES = frozenset(
 )
 # Metadata-pattern rules: which field of what the publisher pushes each one restricts.
 _PATTERN_RULE_FIELDS = {
-    "commit_message_pattern": ("messages", "commit message"),
-    "commit_author_email_pattern": ("author_emails", "commit author email"),
-    "committer_email_pattern": ("committer_emails", "committer email"),
-    "branch_name_pattern": ("branches", "branch name"),
+    "commit_message_pattern": ("message", "commit message"),
+    "commit_author_email_pattern": ("author_email", "commit author email"),
+    "committer_email_pattern": ("committer_email", "committer email"),
+    "branch_name_pattern": ("branch", "branch name"),
 }
 
 
 @dataclass(frozen=True)
+class PublisherValue:
+    """One value the publisher pushes, as its shell template: `literals[0] $var[0] literals[1]
+    ... literals[-1]`, each variable a run-time number (`_PUBLISHER_VARIABLES`). Its domain is
+    every value of those variables -- infinitely many -- so a rule is judged for ALL of them,
+    never for a finite sample (`_value_verdict`). `samples` are real values of the domain: one
+    that a rule rejects is a counterexample, never a proof that the rest pass."""
+
+    literals: tuple[str, ...]
+    variables: tuple[str, ...] = ()
+
+    @property
+    def constant(self) -> bool:
+        return not self.variables
+
+    def render(self, fill: Callable[[str], str]) -> str:
+        out = self.literals[0]
+        for var, lit in zip(self.variables, self.literals[1:], strict=True):
+            out += fill(var) + lit
+        return out
+
+    @property
+    def template(self) -> str:
+        return self.render(lambda var: "${" + var + "}")
+
+    @property
+    def example(self) -> str:
+        """The value with every variable 1 (issue #1, run 1): a real value of the domain."""
+        return self.render(lambda var: "1")
+
+    @property
+    def samples(self) -> tuple[str, ...]:
+        out = [""]
+        for i, lit in enumerate(self.literals):
+            out = [o + lit for o in out]
+            if i < len(self.variables):
+                out = [o + v for o in out for v in _PUBLISHER_SAMPLES[self.variables[i]]]
+        return tuple(dict.fromkeys(out))
+
+    def loose_regex(self) -> str:
+        """A regex for a SUPERSET of the domain (each variable any non-empty digit run)."""
+        out = re.escape(self.literals[0])
+        for lit in self.literals[1:]:
+            out += "[0-9]+" + re.escape(lit)
+        return out
+
+    def __str__(self) -> str:
+        return self.template
+
+
+@dataclass(frozen=True)
 class PublisherCommit:
-    """What the Actions publisher (`reusable-implement.yml` at the pin) pushes, with sample
-    values for its run-time variables: the commit message, its author and committer email, and
-    the branch name. Every sample must satisfy a metadata-pattern rule."""
+    """What the Actions publisher (`reusable-implement.yml` at the pin) pushes, as templates
+    over its run-time variables: the commit message, its author and committer email, and the
+    branch name. A metadata-pattern rule must hold for EVERY value of each."""
 
-    messages: tuple[str, ...]
-    author_emails: tuple[str, ...]
-    committer_emails: tuple[str, ...]
-    branches: tuple[str, ...]
+    message: PublisherValue
+    author_email: PublisherValue
+    committer_email: PublisherValue
+    branch: PublisherValue
 
 
-# The run-time variables a publisher template may use, with sample values (short and long).
+# The run-time variables a publisher template may use. Each is a positive decimal number (an
+# issue number, a run id); the proofs below rely only on "a non-empty run of digits". The
+# samples are real values, used only to find counterexamples.
 _PUBLISHER_SAMPLES = {
-    "ISSUE_NUMBER": ("1", "42", "12345"),
+    "ISSUE_NUMBER": ("1", "2", "42", "12345"),
     "GITHUB_RUN_ID": ("1", "9876543210"),
 }
 _SHELL_VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
@@ -2495,23 +2551,18 @@ _GIT_IDENTITY_ENV = frozenset(
 )
 
 
-def _expand_samples(template: str) -> tuple[str, ...] | None:
-    """Every value of a shell word over `_PUBLISHER_SAMPLES`; None if it uses anything else (an
-    unknown variable, a substitution, an escape) that doctor cannot evaluate."""
+def _publisher_value(template: str) -> PublisherValue | None:
+    """A shell word as a `PublisherValue`; None if it uses anything else (an unknown variable,
+    a substitution, an escape) that doctor cannot evaluate."""
     parts = _SHELL_VAR.split(template)
     # split() yields: literal, braced-name, bare-name, literal, ...
-    literals = parts[0::3]
-    names = [braced or bare for braced, bare in zip(parts[1::3], parts[2::3], strict=True)]
+    literals = tuple(parts[0::3])
+    names = tuple(braced or bare for braced, bare in zip(parts[1::3], parts[2::3], strict=True))
     if any(ch in lit for lit in literals for ch in "$`\\") or any(
         n not in _PUBLISHER_SAMPLES for n in names
     ):
         return None
-    out = [""]
-    for i, lit in enumerate(literals):
-        out = [o + lit for o in out]
-        if i < len(names):
-            out = [o + v for o in out for v in _PUBLISHER_SAMPLES[names[i]]]
-    return tuple(dict.fromkeys(out))
+    return PublisherValue(literals, names)
 
 
 def publisher_commit(doc: object) -> PublisherCommit | str:
@@ -2555,14 +2606,14 @@ def publisher_commit(doc: object) -> PublisherCommit | str:
         if len(found) != 1:
             return f"job {job_id}: the pushed branch ${var} is not assigned exactly once"
         branch = found[0][1:-1] if found[0][:1] in ("'", '"') else found[0]
-    messages = _expand_samples(commits[0][3])
-    author = _expand_samples(emails[0])
-    branches = _expand_samples(branch)
-    if messages is None or author is None or branches is None:
+    message = _publisher_value(commits[0][3])
+    author = _publisher_value(emails[0])
+    pushed = _publisher_value(branch)
+    if message is None or author is None or pushed is None:
         return (
             f"job {job_id}: the commit message, email or branch uses a value doctor cannot expand"
         )
-    return PublisherCommit(messages, author, author, branches)
+    return PublisherCommit(message, author, author, pushed)
 
 
 def _portable_regex(pattern: str) -> re.Pattern[str] | None:
@@ -2613,6 +2664,60 @@ def _pattern_verdict(params: dict, value: str) -> bool | None:
     return hit != negate
 
 
+def _operator_hits_every_value(params: dict, value: PublisherValue) -> bool | None:
+    """Does the rule's operator (before `negate`) hit EVERY value of `value`'s domain (True),
+    NO value (False), or does that depend on the run-time numbers / is it unprovable (None)?
+    Each variable is a non-empty run of digits. A constant value is evaluated exactly; a
+    `regex` over a variable value is never proven (a manual TODO)."""
+    pattern, operator = params.get("pattern"), params.get("operator")
+    if not isinstance(pattern, str):
+        return None
+    if value.constant:
+        hit = _pattern_verdict({**params, "negate": False}, value.example)
+        return hit
+    head, tail = value.literals[0], value.literals[-1]
+    if operator == "starts_with":
+        if head.startswith(pattern):
+            return True
+        if not pattern.startswith(head):
+            return False  # differs inside the constant head
+        # the head is a proper prefix of the pattern: next comes a digit of the variable
+        return False if not pattern[len(head)].isdigit() else None
+    if operator == "ends_with":
+        if tail.endswith(pattern):
+            return True
+        if not pattern.endswith(tail):
+            return False
+        return False if not pattern[len(pattern) - len(tail) - 1].isdigit() else None
+    if operator == "contains":
+        if any(pattern in lit for lit in value.literals):
+            return True
+        # with no digit, an occurrence cannot overlap a variable's digits, so it would lie
+        # inside one constant part -- and it does not
+        return False if not any(ch.isdigit() for ch in pattern) else None
+    return None
+
+
+def _value_verdict(params: dict, value: PublisherValue) -> tuple[bool | None, str]:
+    """(verdict, witness) of a metadata-pattern rule over EVERY value of `value`: False with a
+    real value it rejects (a counterexample among the samples, or a proof that every value is
+    rejected); True only when proven for the whole domain; None: doctor cannot prove it (e.g.
+    `^Implement issue #(1|42)$` passes every sample yet rejects issue #2)."""
+    unknown = False
+    for sample in value.samples:
+        ok = _pattern_verdict(params, sample)
+        if ok is False:
+            return False, sample
+        unknown = unknown or ok is None
+    if unknown:
+        return None, value.template
+    negate = params.get("negate", False)
+    hits = _operator_hits_every_value(params, value)
+    if hits is None:
+        return None, value.template
+    return (hits != negate), value.example
+
+
 def _pattern_rule_problem(
     source: str, kind: str, params: dict, publisher: PublisherCommit | str
 ) -> str | None:
@@ -2625,9 +2730,9 @@ def _pattern_rule_problem(
             f"{source}: restricts the {what} ({shown}), and the publisher's {what} could not be "
             f"read ({publisher}) → verify Forge's commits satisfy it"
         )
-    verdicts = {value: _pattern_verdict(params, value) for value in getattr(publisher, attr)}
-    rejected = [v for v, ok in verdicts.items() if ok is False]
-    if rejected:
+    value: PublisherValue = getattr(publisher, attr)
+    verdict, witness = _value_verdict(params, value)
+    if verdict is False:
         scope = (
             " (if the ruleset also targets the publisher's branches)"
             if kind == "branch_name_pattern"
@@ -2635,12 +2740,14 @@ def _pattern_rule_problem(
         )
         return (
             f"{source}: requires the {what} to match {shown}; the publisher's {what} "
-            f"{rejected[0]!r} does not, so its push is rejected{scope}"
+            f"{witness!r} does not, so its push is rejected{scope}"
         )
-    if any(ok is None for ok in verdicts.values()):
+    if verdict is None:
+        over = ", ".join(dict.fromkeys(value.variables))
         return (
             f"{source}: restricts the {what} ({shown}) in a way doctor cannot evaluate exactly "
-            f"→ verify the publisher's {what} {next(iter(verdicts))!r} satisfies it"
+            f"for every value → verify the publisher's {what} {value.template!r} satisfies it"
+            + (f" for every {over}" if over else "")
         )
     return None
 
@@ -2743,14 +2850,164 @@ PUBLISHER_BRANCH_RULES_CHECK = "effective rules on the publisher's agent branche
 _PUBLISHER_PUSH_COMPATIBLE = frozenset(
     {"deletion", "non_fast_forward", "required_linear_history", "tag_name_pattern"}
 )
-#: At most this many sample branch names are queried for their effective rules.
-_PUBLISHER_BRANCH_SAMPLES = 8
+_REF_GLOB_UNSUPPORTED = frozenset("?[]{}\\!")
+_SENTINEL = "\x00"  # stands for a whole variable: only a wildcard can consume it
+
+
+def _ref_glob_regexes(pattern: str) -> list[str] | None:
+    """A ruleset ref pattern (fnmatch) as regexes under each reading doctor allows for `**`:
+    any characters (`.*`), or Ruby's FNM_PATHNAME reading (`**/` zero or more directories,
+    any other `**` like `*`). `*` never crosses `/`. None: syntax beyond literals, `*` and `**`
+    (`?`, classes, braces, escapes, `***`), which doctor does not evaluate."""
+    if any(ch in _REF_GLOB_UNSUPPORTED for ch in pattern) or "***" in pattern:
+        return None
+    readings = []
+    for recursive in (".*", None):
+        out, i = "", 0
+        while i < len(pattern):
+            if pattern.startswith("**", i):
+                if recursive:
+                    out, i = out + recursive, i + 2
+                elif pattern.startswith("**/", i):
+                    out, i = out + "(?:[^/]*/)*", i + 3
+                else:
+                    out, i = out + "[^/]*", i + 2
+            elif pattern[i] == "*":
+                out, i = out + "[^/]*", i + 1
+            else:
+                out, i = out + re.escape(pattern[i]), i + 1
+        readings.append(out)
+    return readings
+
+
+def _ref_pattern_scope(pattern: str, ref: PublisherValue, default_branch: str) -> bool | None:
+    """Does a ruleset ref pattern match EVERY ref of `ref`'s domain (True), NONE (False), or
+    some but not others / unprovable (None)? `ref` is `refs/heads/<branch template>`, each
+    variable a non-empty digit run. ALL: the pattern matches the template with each variable
+    replaced by a sentinel only a wildcard can consume (a wildcard that takes the sentinel
+    takes any digit run). NONE: a literal pattern outside the domain, a constant prefix or
+    suffix that disagrees, or a sentinel mismatch with no digit in the pattern (then every
+    digit run lies inside one wildcard's span and the sentinel would match too). Judged
+    case-sensitively and case-insensitively; a disagreement is None."""
+    verdicts = {
+        _ref_pattern_scope_case(pattern, ref, default_branch, fold) for fold in (False, True)
+    }
+    return verdicts.pop() if len(verdicts) == 1 else None
+
+
+def _ref_pattern_scope_case(
+    pattern: str, ref: PublisherValue, default_branch: str, fold: bool
+) -> bool | None:
+    low = (lambda x: x.lower()) if fold else (lambda x: x)
+    if pattern == "~ALL":
+        return True
+    if pattern == "~DEFAULT_BRANCH":
+        pattern = "refs/heads/" + default_branch  # git ref names hold no glob characters
+    pattern = low(pattern)
+    ref = PublisherValue(tuple(low(lit) for lit in ref.literals), ref.variables)
+    if not pattern.startswith("refs/"):
+        return None  # GitHub may read it relative to refs/heads/: do not guess
+    readings = _ref_glob_regexes(pattern)
+    if ref.constant:
+        if readings is None:
+            return None
+        matched = {re.fullmatch(r, ref.example, re.DOTALL) is not None for r in readings}
+        return matched.pop() if len(matched) == 1 else None
+    if "*" not in pattern and readings is not None:
+        # one literal ref: inside (a superset of) the domain it names ONE value of it
+        return None if re.fullmatch(ref.loose_regex(), pattern) else False
+    head, tail = ref.literals[0], ref.literals[-1]
+    fixed_head = re.split(r"[*?\[\]{}\\!]", pattern, maxsplit=1)[0]
+    fixed_tail = re.split(r"[*?\[\]{}\\!]", pattern)[-1]
+    k = min(len(fixed_head), len(head))
+    if fixed_head[:k] != head[:k]:
+        return False  # the constant prefixes disagree
+    if len(fixed_head) > len(head) and not fixed_head[len(head)].isdigit():
+        return False  # the pattern wants a non-digit where every ref has a digit
+    k = min(len(fixed_tail), len(tail))
+    if fixed_tail[len(fixed_tail) - k :] != tail[len(tail) - k :]:
+        return False
+    if len(fixed_tail) > len(tail) and not fixed_tail[len(fixed_tail) - len(tail) - 1].isdigit():
+        return False
+    if readings is None:
+        return None
+    abstract = ref.render(lambda var: _SENTINEL)
+    matched = {re.fullmatch(r, abstract, re.DOTALL) is not None for r in readings}
+    if matched == {True}:
+        return True
+    if matched == {False} and not any(ch.isdigit() for ch in pattern):
+        return False
+    return None
+
+
+def _ruleset_branch_scope(
+    conditions: object, ref: PublisherValue, default_branch: str
+) -> bool | None:
+    """Does a ruleset's `ref_name` condition cover every ref of the domain (True), none
+    (False), or depend on the run-time numbers (None)? Conditions on anything else
+    (repository name, id or property) are the same for every agent branch."""
+    ref_name = conditions.get("ref_name") if isinstance(conditions, dict) else None
+    if ref_name is None:
+        return True  # not branch-scoped: the same for every agent branch
+    if not isinstance(ref_name, dict):
+        return None
+
+    def any_of(key: str) -> bool | None:
+        listed = ref_name.get(key) or []
+        if not isinstance(listed, list) or not all(isinstance(p, str) for p in listed):
+            return None
+        scopes = [_ref_pattern_scope(p, ref, default_branch) for p in listed]
+        if True in scopes:
+            return True
+        return False if all(x is False for x in scopes) else None
+
+    include, exclude = any_of("include"), any_of("exclude")
+    if exclude is True or include is False:
+        return False
+    if include is True and exclude is False:
+        return True
+    return None
+
+
+def publisher_branch_scope_problems(
+    rulesets: Sequence[tuple[dict, object]], branch: PublisherValue, default_branch: str
+) -> list[str]:
+    """The rulesets (summary, detail) whose branch targeting matches SOME of the publisher's
+    branches but not others -- `agent/issue-<N>-<RUN>` for every issue and run -- or cannot be
+    proven either way. The effective rules of one sample branch speak for every branch only
+    when no such ruleset exists; each one is a manual TODO. A detail that could not be read
+    (not a dict) is one too."""
+    ref = PublisherValue(
+        ("refs/heads/" + branch.literals[0], *branch.literals[1:]), branch.variables
+    )
+    problems: list[str] = []
+    for summary, detail in rulesets:
+        name = (
+            f"{summary.get('source_type') or 'ruleset'} {summary.get('source') or ''} ruleset "
+            f"{summary.get('name')!r} ({summary.get('id', '?')})"
+        ).replace("  ", " ")
+        if summary.get("enforcement") == "disabled" or summary.get("target") in ("tag", "push"):
+            continue
+        if not isinstance(detail, dict):
+            problems.append(
+                f"{name}: could not be read → check whether it targets agent/** branches"
+            )
+            continue
+        if detail.get("enforcement") == "disabled" or detail.get("target") in ("tag", "push"):
+            continue
+        if _ruleset_branch_scope(detail.get("conditions"), ref, default_branch) is None:
+            problems.append(
+                f"{name}: targets some of the publisher's branches {branch.template!r} but "
+                "doctor cannot prove it targets all or none of them (it depends on the issue or "
+                "run number) → verify it does not block the publisher's push"
+            )
+    return problems
 
 
 def publisher_branch_rule_problems(
     rules: Sequence[dict], publisher: PublisherCommit, branch: str
 ) -> list[str]:
-    """What in the EFFECTIVE rules of `branch` (`rules/branches/{branch}`: a sample of the
+    """What in the EFFECTIVE rules of `branch` (`rules/branches/{branch}`: one value of the
     `agent/...` branch the Actions publisher creates and pushes) can reject that push: creating
     the branch, updating it, required status checks that are enforced on creation, signatures,
     pull requests, deployments, workflows, code scanning, a merge queue -- and the
@@ -3555,8 +3812,11 @@ def _pull_request_off_hosted(
 
 
 #: How deep doctor follows nested platform reusable workflows (GitHub itself allows ten levels
-#: of nesting, top-level caller included); a deeper graph fails closed.
+#: of nesting, top-level caller included); a deeper graph fails closed. The generated caller in
+#: the consumer repository is level 1 and is not part of the graph, so the roots (the platform
+#: workflows it calls) are level `_CALLEE_GRAPH_ROOT_LEVEL`: at most nine called levels pass.
 _CALLEE_GRAPH_MAX_DEPTH = 10
+_CALLEE_GRAPH_ROOT_LEVEL = 2
 
 
 @dataclass
@@ -3584,13 +3844,15 @@ def platform_callee_graph(
     `root_ref`) transitively: a job calling a platform workflow pinned to a full SHA is loaded
     at that SHA (`load_callee`) and walked in turn. A callee that cannot be read, a call doctor
     cannot follow (a branch/tag ref, another repository's workflow, a `./` call inside the
-    platform), a cycle, or a graph deeper than `max_depth` is recorded as uninspectable."""
+    platform), a cycle, or a graph deeper than `max_depth` is recorded as uninspectable. Depth
+    counts the generated top-level caller (outside the graph) as level 1, so roots are level 2:
+    GitHub's limit of ten levels includes that caller."""
     graph = CalleeGraph()
     stack: list[tuple[str, str, dict, int, tuple[tuple[str, str], ...]]] = []
     for name, doc in roots.items():
         if isinstance(doc, dict):
             graph.docs[(name, root_ref)] = doc
-            stack.append((name, root_ref, doc, 1, ((name, root_ref),)))
+            stack.append((name, root_ref, doc, _CALLEE_GRAPH_ROOT_LEVEL, ((name, root_ref),)))
         else:
             graph.uninspectable.append(f"{name} could not be read at {root_ref[:12]}")
 
@@ -4998,6 +5260,25 @@ def doctor(
             )
         )
 
+    if remote:
+        # Every work request, label event, lease and issue-number operation is an ISSUE: a
+        # repository with Issues disabled can be READY in every other respect and still unusable.
+        issues = repo_info.get("has_issues") if isinstance(repo_info, dict) else None
+        add(
+            Check(
+                ISSUES_ENABLED_CHECK,
+                issues is True,
+                "enabled"
+                if issues is True
+                else f"GitHub Issues are disabled on {project_id} → enable them (Settings → "
+                "General → Features → Issues): work requests, labels and leases are issues"
+                if issues is False
+                else f"could not read whether GitHub Issues are enabled on {project_id} "
+                f"(GET repos/{project_id}: has_issues) → confirm they are",
+                manual=issues is not False,
+            )
+        )
+
     routed_secrets: set[str] = set()
     routed_vars: set[str] = set()
     routing_files = (".forge/executors.json", ".forge/routing-policy.json")
@@ -5797,44 +6078,66 @@ def doctor(
                 )
             )
         else:
+            # The effective rules of ONE branch speak for every agent/issue-<N>-<RUN> only if
+            # no ruleset (repository, organization or enterprise) targets some of them and not
+            # others: each ruleset's ref_name targeting is judged over the whole domain first.
             branch_problems: list[str] = []
-            unread_branches: list[str] = []
-            for branch in publisher.branches[:_PUBLISHER_BRANCH_SAMPLES]:
-                branch_pages = _safe_json(
-                    gh,
-                    [
-                        "api",
-                        f"repos/{project_id}/rules/branches/{_q(branch)}",
-                        "--paginate",
-                        "--slurp",
-                    ],
+            listed = _paged_items(gh, f"repos/{project_id}/rulesets?includes_parents=true")
+            if isinstance(listed, Unreadable):
+                branch_problems.append(
+                    f"could not list the rulesets that apply to {project_id} ({listed.why}) → "
+                    "check that no org or enterprise ruleset targets only some agent/** branches"
                 )
-                if not isinstance(branch_pages, list) or not all(
-                    isinstance(page, list) for page in branch_pages
-                ):
-                    unread_branches.append(branch)
-                    continue
+            else:
+                details: list[tuple[dict, object]] = []
+                for summary in listed:
+                    skip = summary.get("enforcement") == "disabled" or summary.get("target") in (
+                        "tag",
+                        "push",
+                    )
+                    detail = (
+                        None
+                        if skip
+                        else _safe_json(
+                            gh, ["api", f"repos/{project_id}/rulesets/{summary.get('id')}"]
+                        )
+                    )
+                    details.append((summary, detail))
+                branch_problems += publisher_branch_scope_problems(
+                    details, publisher.branch, effective_branch
+                )
+            branch = publisher.branch.example
+            branch_pages = _safe_json(
+                gh,
+                [
+                    "api",
+                    f"repos/{project_id}/rules/branches/{_q(branch)}",
+                    "--paginate",
+                    "--slurp",
+                ],
+            )
+            if not isinstance(branch_pages, list) or not all(
+                isinstance(page, list) for page in branch_pages
+            ):
+                branch_problems.append(
+                    f"could not read the rules that apply to {branch} "
+                    f"(GET repos/{project_id}/rules/branches/{{branch}}) → check org and "
+                    "enterprise rulesets targeting agent/** by hand"
+                )
+            else:
                 branch_problems += publisher_branch_rule_problems(
                     [r for page in branch_pages for r in page if isinstance(r, dict)],
                     publisher,
                     branch,
                 )
             branch_problems = list(dict.fromkeys(branch_problems))
-            if unread_branches:
-                branch_problems.append(
-                    "could not read the rules that apply to "
-                    + ", ".join(unread_branches)
-                    + f" (GET repos/{project_id}/rules/branches/{{branch}}) → check org and "
-                    "enterprise rulesets targeting agent/** by hand"
-                )
             add(
                 Check(
                     PUBLISHER_BRANCH_RULES_CHECK,
                     not branch_problems,
                     "; ".join(branch_problems)
                     if branch_problems
-                    else "no rule blocks the publisher's push to "
-                    + ", ".join(publisher.branches[:_PUBLISHER_BRANCH_SAMPLES]),
+                    else "no rule blocks the publisher's push to any " + publisher.branch.template,
                     manual=True,
                 )
             )
