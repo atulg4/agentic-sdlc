@@ -275,6 +275,19 @@ something that runs differently.
   checkout's persisted `github.token`, i.e. as `github-actions[bot]` (the GitHub Actions app);
   the Publisher App's token only opens the pull request. `doctor` reads the pusher from the
   pinned workflow and reports a manual TODO when it cannot.
+- **Push rulesets** (`target: push`, repository, organization or enterprise) reject a push by
+  the files it carries, for every actor. `doctor` reads each active one (disabled and
+  evaluate-mode ones never block): a restricted path or extension passes only when the policy's
+  `forbidden_paths` provably excludes it (the same glob, or `*.<ext>`, is listed there); a
+  path-length or file-size limit, an unknown rule and an unreadable ruleset are a manual TODO.
+- **GITHUB_TOKEN across reusable calls**: a called workflow can only keep or lose
+  permissions. The calling job's `permissions` (else its workflow's, else the repository
+  default from `GET repos/{owner}/{repo}/actions/permissions/workflow`) is the ceiling for every
+  job of the callee and everything it calls in turn; a callee job asking for more fails the
+  contract check, and a ceiling doctor cannot determine is a manual TODO.
+- The commit guard's open-PR fallback counts only a PR whose head branch lives in this
+  repository: `gh pr list --head` matches the branch NAME, so a fork's PR from an identically
+  named branch is not this branch's claim.
 
 ## Required repository state
 

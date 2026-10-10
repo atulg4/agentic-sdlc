@@ -1659,9 +1659,25 @@ def lease_for(issue: int) -> dict | None:
         return UNAVAILABLE
 
 
+def _same_repository_pr(pr: object) -> bool:
+    """True only for a PR whose head branch lives in PROJECT itself. `gh pr list --head` filters
+    by branch NAME only, so a fork's PR from an identically named branch matches too: that is
+    not this branch's claim. A missing or malformed field proves nothing and is no claim."""
+    if not isinstance(pr, dict) or pr.get("isCrossRepository") is not False:
+        return False
+    repo, owner = pr.get("headRepository"), pr.get("headRepositoryOwner")
+    if not isinstance(repo, dict) or not isinstance(owner, dict):
+        return False
+    name, login = repo.get("name"), owner.get("login")
+    if not isinstance(name, str) or not isinstance(login, str) or not name or not login:
+        return False
+    return f"{login}/{name}".lower() == PROJECT.lower()
+
+
 def open_pr_for(branch: str) -> bool | None:
-    """An open PR from this branch is the durable claim once the lease is released. None when
-    the PR list could not be read."""
+    """An open PR from this branch OF THIS REPOSITORY is the durable claim once the lease is
+    released (a fork PR with the same head branch name is not). None when the PR list could
+    not be read."""
     try:
         out = subprocess.run(
             [
@@ -1675,15 +1691,18 @@ def open_pr_for(branch: str) -> bool | None:
                 "--state",
                 "open",
                 "--json",
-                "number",
+                "number,headRepository,headRepositoryOwner,isCrossRepository",
             ],
             capture_output=True,
             text=True,
             check=True,
         ).stdout
-        return bool(json.loads(out or "[]"))
+        prs = json.loads(out or "[]")
     except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
         return None
+    if not isinstance(prs, list):
+        return None
+    return any(_same_repository_pr(pr) for pr in prs)
 
 
 def decide(

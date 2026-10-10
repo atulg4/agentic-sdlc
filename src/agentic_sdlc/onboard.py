@@ -21,7 +21,7 @@ import stat
 import subprocess
 import tomllib
 import unicodedata
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import quote
@@ -1126,14 +1126,54 @@ def _render_workflow(name: str, spec: OnboardSpec, issue_expr: str | None = None
     }
     if set(replacements) != set(WORKFLOW_PLACEHOLDERS):
         raise OnboardError("workflow placeholders and their renderings disagree")
-    # One pass, whole words: a substituted value is never re-scanned for placeholder names.
-    pattern = re.compile(r"\b(" + "|".join(sorted(replacements, key=len, reverse=True)) + r")\b")
-    return pattern.sub(lambda m: replacements[m.group(1)], text)
+    # At this point `text` is template material only (the structural inserts are templates
+    # too): any structural marker still in it, or any placeholder without a value, is a
+    # template bug caught BEFORE user data goes in.
+    return _substitute_template(f"github/forge/{name}", text, replacements)
+
+
+#: Every placeholder word any template carries: the workflow values plus the structural
+#: markers `_render_workflow` expands from other templates.
+TEMPLATE_PLACEHOLDERS = (
+    *WORKFLOW_PLACEHOLDERS,
+    "IMPLEMENT_JOBS",
+    "PREFLIGHT_EXTRA",
+    "LABELER_AUTHORIZATION",
+    "AUTHORIZED_WORK",
+)
+
+
+def _substitute_template(
+    name: str,
+    template: str,
+    replacements: Mapping[str, str],
+    pattern: re.Pattern[str] | None = None,
+    required: Sequence[str] = (),
+) -> str:
+    """Fill `template` in ONE regex pass and prove it complete from the SOURCE, never the output.
+
+    Every placeholder `pattern` (default: the `TEMPLATE_PLACEHOLDERS` words) finds in the
+    template must have a value, and every `required` one must occur; otherwise the template is
+    broken and nothing is rendered. A substituted value is never re-scanned, so a user value
+    that merely contains a placeholder word (`echo TEST_COMMAND`) is rendered as given."""
+    if pattern is None:
+        pattern = re.compile(
+            r"\b(" + "|".join(sorted(TEMPLATE_PLACEHOLDERS, key=len, reverse=True)) + r")\b"
+        )
+    found = {m.group(1) for m in pattern.finditer(template)}
+    missing = sorted(found - set(replacements))
+    if missing:
+        raise OnboardError(f"unrendered placeholder {missing[0]} in template {name}")
+    absent = sorted(set(required) - found)
+    if absent:
+        raise OnboardError(f"template {name} lacks its placeholder {absent[0]}")
+    return pattern.sub(lambda m: replacements[m.group(1)], template)
 
 
 def render_work_request(spec: OnboardSpec) -> str:
     """The generic work-request template, labelled with this profile's ready label."""
-    text = _resource("work-request.md")
+    # No placeholder words belong in this template: prove it on the source, not the output.
+    text = _substitute_template("work-request.md", _resource("work-request.md"), {})
     rendered, count = re.subn(
         r"^labels: .*$",
         # A flow sequence of quoted scalars: a label's `:`, `#`, quotes or leading `-` stay text.
@@ -1158,14 +1198,26 @@ def render_hooks(spec: OnboardSpec) -> dict[str, str]:
         }
     }
     # The placeholders sit in Python string literals ("PROJECT_ID"): substitute the whole
-    # literal with a JSON string, which is a valid Python string literal.
-    guard = _resource("hooks/forge_commit_guard.py").replace(
-        '"PROJECT_ID"', json.dumps(spec.project_id)
+    # literal with a JSON string, which is a valid Python string literal. One pass, so a
+    # project id cannot be mistaken for the branch placeholder after it is substituted.
+    literal = re.compile(r'"(PROJECT_ID|DEFAULT_BRANCH_NAME)"')
+    values = {
+        "PROJECT_ID": json.dumps(spec.project_id),
+        "DEFAULT_BRANCH_NAME": json.dumps(spec.default_branch),
+    }
+    guard = _substitute_template(
+        "hooks/forge_commit_guard.py",
+        _resource("hooks/forge_commit_guard.py"),
+        {"PROJECT_ID": values["PROJECT_ID"]},
+        literal,
+        required=("PROJECT_ID",),
     )
-    start = (
-        _resource("hooks/forge_session_start.py")
-        .replace('"PROJECT_ID"', json.dumps(spec.project_id))
-        .replace('"DEFAULT_BRANCH_NAME"', json.dumps(spec.default_branch))
+    start = _substitute_template(
+        "hooks/forge_session_start.py",
+        _resource("hooks/forge_session_start.py"),
+        values,
+        literal,
+        required=tuple(values),
     )
     return {
         ".claude/settings.json": json.dumps(settings, indent=2) + "\n",
@@ -1201,29 +1253,8 @@ def render_onboarding(spec: OnboardSpec) -> dict[str, str]:
         files[".forge/routing-policy.json"] = (
             json.dumps(default_routing_policy(spec), indent=2) + "\n"
         )
-    common = (
-        r"\b(PLATFORM_REPOSITORY|PLATFORM_COMMIT_SHA|(?:CI_)?RUNS_ON_(?:JSON|YAML)|"
-        r"(?:SETUP|QUALITY|TEST)_COMMAND|ISSUE_NUMBER_EXPR|IMPLEMENT_JOBS|PREFLIGHT_EXTRA|"
-        r"LABELER_AUTHORIZATION|AUTHORIZED_WORK)\b"
-    )
-    workflow = re.compile(
-        r"\b("
-        + "|".join(
-            (
-                *WORKFLOW_PLACEHOLDERS,
-                "IMPLEMENT_JOBS",
-                "PREFLIGHT_EXTRA",
-                "LABELER_AUTHORIZATION",
-                "AUTHORIZED_WORK",
-            )
-        )
-        + r")\b"
-    )
-    for name, content in files.items():
-        pattern = workflow if name.startswith(".github/workflows/") else re.compile(common)
-        leftover = pattern.search(content)
-        if leftover:
-            raise OnboardError(f"unrendered placeholder {leftover.group(0)} in {name}")
+    # Completeness is proven per SOURCE template as each file renders (`_substitute_template`);
+    # the rendered files are never rescanned, since they carry user values verbatim.
     return files
 
 
@@ -2996,6 +3027,129 @@ def effective_rule_problems(
     return problems
 
 
+PUSH_RULESETS_CHECK = "push rulesets admit every patch the Forge policy allows"
+#: Enforcement values that never reject a push: off, or only reported (Enterprise "evaluate").
+_NON_BLOCKING_ENFORCEMENT = ("disabled", "evaluate")
+
+
+def _ruleset_name(summary: dict) -> str:
+    return (
+        f"{summary.get('source_type') or 'ruleset'} {summary.get('source') or ''} ruleset "
+        f"{summary.get('name')!r} ({summary.get('id', '?')})"
+    ).replace("  ", " ")
+
+
+def _push_ruleset_candidate(summary: dict) -> bool:
+    """A listed ruleset that may be an ACTIVE push ruleset (its detail decides when the summary
+    does not name a target)."""
+    return summary.get("enforcement") not in _NON_BLOCKING_ENFORCEMENT and summary.get(
+        "target"
+    ) in ("push", None)
+
+
+def _forge_forbids_glob(pattern: object, forbidden: Sequence[str]) -> bool:
+    """True only when a push ruleset's restricted path `pattern` is PROVABLY inside the Forge
+    policy's `forbidden_paths`, so no patch Forge accepts can touch a path it restricts.
+
+    Proof is textual: the same pattern is a forbidden path. Forge matches with fnmatch where `*`
+    crosses `/` and case is folded, a superset of what the same glob matches on GitHub. Braces,
+    classes and escapes are never proved (their syntax differs between the two matchers)."""
+    if not isinstance(pattern, str) or not pattern or set(pattern) & set("{}[]\\!"):
+        return False
+    return pattern.casefold() in {f.casefold() for f in forbidden}
+
+
+def push_ruleset_problems(
+    rulesets: Sequence[tuple[dict, object]], forbidden: Sequence[str] | None
+) -> list[str]:
+    """What the ACTIVE `target: push` rulesets (repository, organization, enterprise) among
+    `rulesets` (summary, detail) can do to a Forge patch. A push ruleset rejects any push --
+    the implementer's or the publisher's -- whose commits add a restricted path or extension,
+    a path over a length or a file over a size, whoever the actor (bypass lists are not
+    evaluated). Only a path or extension restriction the Forge policy's `forbidden_paths`
+    provably covers is safe; a length or size limit cannot be proved against the policy's
+    caps (a patch's size is not its files' sizes), so it is a manual TODO, as is any rule
+    doctor does not know and any ruleset that could not be read. `forbidden` None: the policy
+    could not be read, so nothing is provable. Disabled and evaluate-mode rulesets never
+    block."""
+    problems: list[str] = []
+    for summary, detail in rulesets:
+        if not _push_ruleset_candidate(summary):
+            continue
+        name = _ruleset_name(summary)
+        if not isinstance(detail, dict):
+            problems.append(
+                f"{name}: could not be read → check whether it is an active push ruleset "
+                "restricting paths, extensions, path length or file size"
+            )
+            continue
+        if detail.get("enforcement") in _NON_BLOCKING_ENFORCEMENT or detail.get("target") not in (
+            "push",
+        ):
+            continue
+        rules = detail.get("rules")
+        if not isinstance(rules, list) or not all(isinstance(r, dict) for r in rules):
+            problems.append(f"{name}: its push rules could not be read → verify them by hand")
+            continue
+        for rule in rules:
+            kind = rule.get("type")
+            params = rule.get("parameters") if isinstance(rule.get("parameters"), dict) else {}
+            if kind == "file_path_restriction":
+                paths = params.get("restricted_file_paths")
+                unproved = (
+                    [
+                        str(p)
+                        for p in paths
+                        if forbidden is None or not _forge_forbids_glob(p, forbidden)
+                    ]
+                    if isinstance(paths, list)
+                    else ["<unreadable>"]
+                )
+                if unproved:
+                    problems.append(
+                        f"{name}: restricts file paths {', '.join(map(repr, unproved))} that the "
+                        "Forge policy's forbidden_paths does not provably exclude → add them to "
+                        "forbidden_paths or verify no Forge patch touches them"
+                    )
+            elif kind == "file_extension_restriction":
+                exts = params.get("restricted_file_extensions")
+                unproved = []
+                for ext in exts if isinstance(exts, list) else ["<unreadable>"]:
+                    tail = ext.removeprefix("*") if isinstance(ext, str) else ""
+                    covered = (
+                        forbidden is not None
+                        and tail.startswith(".")
+                        and _forge_forbids_glob("*" + tail, forbidden)
+                    )
+                    if not covered:
+                        unproved.append(str(ext))
+                if unproved:
+                    problems.append(
+                        f"{name}: restricts file extensions {', '.join(map(repr, unproved))} "
+                        "that the Forge policy's forbidden_paths does not provably exclude "
+                        "(as `*<ext>`) → add them to forbidden_paths or verify no Forge patch "
+                        "adds such a file"
+                    )
+            elif kind == "max_file_path_length":
+                problems.append(
+                    f"{name}: limits file paths to {params.get('max_file_path_length')!r} "
+                    "characters, which the Forge policy does not cap → verify no Forge patch "
+                    "adds a longer path"
+                )
+            elif kind == "max_file_size":
+                problems.append(
+                    f"{name}: limits files to {params.get('max_file_size')!r} MB; the Forge "
+                    "policy caps patch size, not file size → verify no Forge patch pushes a "
+                    "larger file"
+                )
+            else:
+                problems.append(
+                    f"{name}: push rule {kind!r} is not one doctor can evaluate → verify it "
+                    "admits Forge's patches"
+                )
+    return problems
+
+
 PUBLISHER_BRANCH_RULES_CHECK = "effective rules on the publisher's agent branches allow its push"
 # Rule types that cannot reject the publisher's push of a NEW branch carrying one new commit:
 # deleting or force-pushing it (it does neither), linear history (one commit on top of the
@@ -4294,6 +4448,145 @@ def reusable_workflow_limit_problems(
                 f"GitHub runs at most {_REUSABLE_WORKFLOWS_PER_CALLER} from one workflow file"
             )
     return problems
+
+
+#: GITHUB_TOKEN permission scopes and levels (`none` < `read` < `write`). `metadata` is always
+#: read and never requested, so it is not compared.
+TOKEN_SCOPES = (
+    "actions",
+    "attestations",
+    "checks",
+    "contents",
+    "deployments",
+    "discussions",
+    "id-token",
+    "issues",
+    "models",
+    "packages",
+    "pages",
+    "pull-requests",
+    "repository-projects",
+    "security-events",
+    "statuses",
+)
+_TOKEN_LEVELS = {"none": 0, "read": 1, "write": 2}
+_TOKEN_LEVEL_NAMES = {v: k for k, v in _TOKEN_LEVELS.items()}
+TOKEN_PERMISSIONS_CHECK = "GITHUB_TOKEN permissions hold across reusable-workflow calls"
+#: The repository default for a workflow/job that sets no `permissions`
+#: (`actions/permissions/workflow`'s `default_workflow_permissions`).
+_DEFAULT_TOKEN_PERMISSIONS = {
+    "read": {"contents": 1, "packages": 1, "models": 1},
+    "write": {
+        **{scope: 2 for scope in TOKEN_SCOPES if scope not in ("id-token", "models")},
+        "models": 1,
+    },
+}
+TokenPermissions = dict[str, int]
+
+
+def token_permissions(value: object) -> TokenPermissions | str:
+    """A `permissions:` value as {scope: level} (a scope it does not name is `none`), or why it
+    cannot be read. `read-all`/`write-all` grant every scope; `{}` none of them."""
+    if value in ("read-all", "write-all"):
+        level = _TOKEN_LEVELS[str(value).split("-")[0]]
+        return dict.fromkeys(TOKEN_SCOPES, level)
+    if not isinstance(value, dict):
+        return f"unreadable permissions {value!r}"
+    out: TokenPermissions = {}
+    for scope, level in value.items():
+        if not isinstance(scope, str) or level not in _TOKEN_LEVELS:
+            return f"unreadable permission {scope!r}: {level!r}"
+        if scope != "metadata":
+            out[scope] = _TOKEN_LEVELS[level]
+    return out
+
+
+def default_token_permissions(answer: object) -> TokenPermissions | str:
+    """The repository's default GITHUB_TOKEN permissions from `GET
+    repos/{repo}/actions/permissions/workflow`, or why they are unknown."""
+    if isinstance(answer, Unreadable):
+        return f"the repository's default workflow permissions could not be read ({answer.why})"
+    default = answer.get("default_workflow_permissions") if isinstance(answer, dict) else None
+    if default not in _DEFAULT_TOKEN_PERMISSIONS:
+        return f"unrecognised default workflow permissions {default!r}"
+    return dict(_DEFAULT_TOKEN_PERMISSIONS[default])
+
+
+def token_permission_problems(
+    caller_docs: Sequence[tuple[str, object]],
+    calls: Sequence[tuple[str, dict, str]],
+    graph: CalleeGraph,
+    ref: str,
+    platform_repository: str,
+    repo_default: Callable[[], TokenPermissions | str],
+) -> tuple[list[str], list[str]]:
+    """(mismatches, unknowns) of GITHUB_TOKEN permissions through every reusable-call chain.
+
+    A called workflow's token can only keep or lose permissions: the calling job's
+    `permissions` (else its workflow's, else the repository default from `repo_default`) is the
+    CEILING of every job of the callee, and of everything that job calls in turn. A callee job
+    (or the callee's workflow-level default it inherits) requesting more than its ceiling is a
+    mismatch: GitHub refuses the run or the job's API calls fail on a downgraded token. A
+    ceiling or a request doctor cannot read, or a callee missing from `graph`, is an unknown
+    (fail closed). The walk follows `graph`'s pinned platform calls (the edges
+    `platform_callee_graph` resolved); calls it could not follow are already reported there."""
+    mismatches: list[str] = []
+    unknowns: list[str] = []
+    docs_by_label = dict(caller_docs)
+    seen: set[tuple[str, str, frozenset[tuple[str, int]]]] = set()
+
+    def walk(name: str, sha: str, ceiling: TokenPermissions, chain: str, path: tuple) -> None:
+        key = (name, sha, frozenset(ceiling.items()))
+        if key in seen or (name, sha) in path or len(path) >= _CALLEE_GRAPH_MAX_DEPTH:
+            return  # done, a cycle or too deep: the graph reports the last two
+        seen.add(key)
+        doc = graph.docs.get((name, sha))
+        if not isinstance(doc, dict):
+            unknowns.append(f"{chain} → {name}@{sha[:12]} could not be read")
+            return
+        jobs = doc.get("jobs")
+        if not isinstance(jobs, dict):
+            unknowns.append(f"{name}@{sha[:12]} has no readable jobs")
+            return
+        for job_name, job in jobs.items():
+            where = f"{name}@{sha[:12]}:{job_name}"
+            if not isinstance(job, dict):
+                unknowns.append(f"{where}: unreadable job")
+                continue
+            source = job if "permissions" in job else doc if "permissions" in doc else None
+            effective = ceiling
+            if source is not None:
+                requested = token_permissions(source["permissions"])
+                if isinstance(requested, str):
+                    unknowns.append(f"{where}: {requested}")
+                    continue
+                over = [s for s, level in requested.items() if level > ceiling.get(s, 0)]
+                for scope in sorted(over):
+                    mismatches.append(
+                        f"{where} requests {scope}: {_TOKEN_LEVEL_NAMES[requested[scope]]} but "
+                        f"{chain} grants at most "
+                        f"{scope}: {_TOKEN_LEVEL_NAMES[ceiling.get(scope, 0)]}"
+                    )
+                effective = {s: min(level, ceiling.get(s, 0)) for s, level in requested.items()}
+            found = _REMOTE_REUSABLE.fullmatch(str(job.get("uses") or "").strip())
+            if found and found.group(1) == platform_repository and _SHA.fullmatch(found.group(3)):
+                walk(found.group(2), found.group(3), effective, where, (*path, (name, sha)))
+
+    for where, job, callee in calls:
+        label = where.rsplit(":", 1)[0]
+        doc = docs_by_label.get(label)
+        doc = doc if isinstance(doc, dict) else {}
+        if "permissions" in job:
+            ceiling = token_permissions(job["permissions"])
+        elif "permissions" in doc:
+            ceiling = token_permissions(doc["permissions"])
+        else:
+            ceiling = repo_default()
+        if isinstance(ceiling, str):
+            unknowns.append(f"{where}: the token it passes on cannot be determined ({ceiling})")
+            continue
+        walk(callee, ref, ceiling, where, ())
+    return list(dict.fromkeys(mismatches)), list(dict.fromkeys(unknowns))
 
 
 _WORKFLOW_FILE = re.compile(r"^[A-Za-z0-9._-]+\.ya?ml$")
@@ -6052,7 +6345,39 @@ def doctor(
             mismatches += reusable_call_mismatches(where, job, callee, callee_doc)
         mismatches += [f"{why}: its call contract cannot be verified" for why in graph.unfollowed]
         mismatches += reusable_workflow_limit_problems(caller_docs, calls, graph, ref)
+        default_permissions: list[TokenPermissions | str] = []
+
+        def repo_default() -> TokenPermissions | str:
+            if not default_permissions:  # read once, and only when some caller inherits it
+                default_permissions.append(
+                    default_token_permissions(
+                        _safe_json(gh, ["api", f"repos/{project_id}/actions/permissions/workflow"])
+                    )
+                )
+            return default_permissions[0]
+
+        over_ceiling, unknown_ceiling = token_permission_problems(
+            caller_docs,
+            [c for c in calls if c[2] not in absent],
+            graph,
+            ref,
+            platform_repository,
+            repo_default,
+        )
+        mismatches += over_ceiling
         mismatches = list(dict.fromkeys(mismatches))
+        add(
+            Check(
+                TOKEN_PERMISSIONS_CHECK,
+                not unknown_ceiling,
+                "; ".join(unknown_ceiling) + " → verify the token each call passes on by hand"
+                if unknown_ceiling
+                else "every reusable-workflow job requests no more than its caller grants"
+                if not over_ceiling
+                else "see the reusable-workflow contract check",
+                manual=True,
+            )
+        )
         add(
             Check(
                 PLATFORM_CONTRACT_CHECK,
@@ -6454,6 +6779,40 @@ def doctor(
             )
         )
 
+    # Every ruleset that applies to the repository (org/enterprise ones included): listed once.
+    listed = _paged_items(gh, f"repos/{project_id}/rulesets?includes_parents=true")
+
+    # --- push rulesets reject a push by its FILES (path, extension, path length, size) for
+    # every actor and every branch, and none of them shows up in a branch's effective rules.
+    if isinstance(listed, Unreadable):
+        push_problems = [
+            f"could not list the rulesets that apply to {project_id} ({listed.why}) → check "
+            "for active push rulesets restricting paths, extensions, path length or file size"
+        ]
+    else:
+        forbidden = policy.forbidden_paths if policy is not None else None
+        push_problems = push_ruleset_problems(
+            [
+                (
+                    summary,
+                    _safe_json(gh, ["api", f"repos/{project_id}/rulesets/{summary.get('id')}"]),
+                )
+                for summary in listed
+                if _push_ruleset_candidate(summary)
+            ],
+            forbidden,
+        )
+    add(
+        Check(
+            PUSH_RULESETS_CHECK,
+            not push_problems,
+            "; ".join(dict.fromkeys(push_problems))
+            if push_problems
+            else "no active push ruleset restricts what a Forge patch may contain",
+            manual=True,
+        )
+    )
+
     # --- the publisher creates and pushes agent/... branches: rulesets targeting only that
     # namespace (org/enterprise ones included) are invisible in the default branch's rules.
     if not cloud:
@@ -6472,7 +6831,6 @@ def doctor(
             # no ruleset (repository, organization or enterprise) targets some of them and not
             # others: each ruleset's ref_name targeting is judged over the whole domain first.
             branch_problems: list[str] = []
-            listed = _paged_items(gh, f"repos/{project_id}/rulesets?includes_parents=true")
             if isinstance(listed, Unreadable):
                 branch_problems.append(
                     f"could not list the rulesets that apply to {project_id} ({listed.why}) → "
