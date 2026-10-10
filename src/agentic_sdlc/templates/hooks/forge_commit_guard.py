@@ -36,6 +36,12 @@ next to the letters of `git` then `commit` is unproven outright. Unparseable tex
 git is guarded too. Over-blocking (`echo "git merge"`) costs nothing on a leased branch or off
 issue branches; a missed history change costs the lease.
 
+A branch change earlier in the SAME command re-targets the git after it (`git switch X && git
+commit` is checked against X, see UNKNOWN_BRANCH); one whose destination cannot be known before
+the command runs (`git checkout "$B"`, an alias, bisect, `source`, `cd "$D"`, ...) blocks a later
+guarded git outright -- run the two as separate commands. A plain switch to an existing branch
+(`git switch main`) rewrites no history and needs no lease.
+
 Out of scope: programs that run git without naming it on the command line (a script file, a
 Makefile target) and direct writes into `.git/`.
 """
@@ -180,16 +186,23 @@ _LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
 
 def _segments(command: str) -> list[list[str]]:
     """Shell words of each simple command, split on `;`, `&&`, `||`, `|`, `&`, parentheses."""
+    return [seg for _, seg in _segments_with_ops(command)]
+
+
+def _segments_with_ops(command: str) -> list[tuple[tuple[str, ...], list[str]]]:
+    """Each simple command with the operators that precede it (`()` for the first one)."""
     lexer = shlex.shlex(command.replace("\n", ";"), posix=True, punctuation_chars=";&|()")
     lexer.whitespace_split = True
     lexer.commenters = ""
-    segments: list[list[str]] = [[]]
+    segments: list[tuple[list[str], list[str]]] = [([], [])]
     for token in lexer:
         if token in OPERATORS:
-            segments.append([])
+            if segments[-1][1]:
+                segments.append(([], []))
+            segments[-1][0].append(token)
         else:
-            segments[-1].append(token)
-    return [seg for seg in segments if seg]
+            segments[-1][1].append(token)
+    return [(tuple(ops), seg) for ops, seg in segments if seg]
 
 
 # A commit invocation: (directories to change into, in order, from the hook's cwd; the git
@@ -716,35 +729,295 @@ def _raw_unproven(command: str, depth: int = 0) -> bool:
     return False
 
 
+# ---- Branch changes inside one command (Codex 4238832970). Every target's branch is asked of git
+# BEFORE anything runs, so `git switch forge/issue-7 && git commit` would be judged on the branch
+# the hook started on. A segment that can move HEAD to another branch therefore re-targets every
+# guarded git invocation after it: to the branch it names when that is statically known
+# (`git switch X`, `git checkout X`, `git checkout -b X`, `git switch -c X`), and to
+# UNKNOWN_BRANCH -- blocked outright -- when it is not (`git checkout "$B"`, `git checkout -`,
+# bisect, symbolic-ref, an alias or unknown subcommand, git run indirectly, `source`/`eval`, a
+# script, `pushd`/`popd`, a `cd` to an expanded directory, an exported GIT_DIR/GIT_WORK_TREE).
+# The new branch REPLACES the old one only for an invocation in the same repository joined to the
+# switch by `&&` alone (the switch then certainly succeeded); otherwise both are checked.
+UNKNOWN_BRANCH = "\0unknown-branch"
+_BRANCH_KEY = "\0branch"  # a Target env entry carrying the branch HEAD was moved to
+# Git subcommands that never move HEAD to another branch (the read-only ones never do either).
+SWITCH_FREE = frozenset(
+    {
+        "commit", "merge", "cherry-pick", "revert", "am", "apply", "pull", "reset", "push",
+        "stash", "notes", "tag", "update-ref", "commit-tree", "fetch", "add", "rm", "mv",
+        "restore", "worktree", "clean", "gc", "fsck", "prune", "repack", "hash-object",
+        "update-index", "write-tree", "read-tree", "format-patch", "mktree", "mktag", "rerere",
+        "init", "clone", "submodule", "sparse-checkout", "lfs", "maintenance", "range-diff",
+        "rev-list", "show-ref", "ls-remote", "count-objects", "var", "diff-tree", "diff-index",
+        "diff-files", "whatchanged", "cherry", "archive", "bundle", "verify-commit",
+        "verify-tag", "check-ref-format", "interpret-trailers", "request-pull", "annotate",
+        "show-branch", "difftool", "mergetool", "pack-refs", "credential", "send-email",
+    }
+)  # fmt: skip
+QUIET_OPTS = frozenset({"-q", "--quiet"})
+CHECKOUT_CREATE_OPTS = frozenset({"-b", "-B", "--orphan"})
+SWITCH_CREATE_OPTS = frozenset({"-c", "-C", "--create", "--force-create", "--orphan"})
+REBASE_VALUE_OPTS = frozenset({"--onto", "-s", "--strategy", "-X", "--strategy-option", "-x"})
+REBASE_VALUE_OPTS |= {"--exec", "-S", "--gpg-sign"}
+# A program that mentions git AND one of these words may move HEAD through it.
+_MOVES_HEAD = re.compile(
+    r"(?<![\w-])(?:checkout|switch|rebase|bisect|symbolic-ref|branch)(?![\w-])"
+)
+SET_BUILTINS = frozenset({"export", "declare", "typeset", "local", "readonly", "unset"})
+_GIT_REPO_VAR = re.compile(r"^GIT_(?:DIR|WORK_TREE)(?:=|$)")
+
+
+def _git_sub_args(words: list[str]) -> tuple[str | None, list[str]]:
+    """`git [global options] SUB ARGS...` -> (SUB, ARGS)."""
+    rest = list(words[1:])
+    while rest:
+        word = rest.pop(0)
+        if word in GIT_VALUE_OPTS:
+            if rest:
+                rest.pop(0)
+            continue
+        if word.startswith("-"):
+            continue
+        return word, rest
+    return None, []
+
+
+def _branch_exists(branch: str, where: str, target: Target) -> bool:
+    """Is `branch` a local branch of the repository `target` acts on from `where`?"""
+    _, opts, env = target
+    try:
+        subprocess.run(
+            ["git", *opts, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+            cwd=where,
+            env={**os.environ, **dict(env)} if env else None,
+            capture_output=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return True
+
+
+def _switch_target(sub: str, args: list[str]) -> tuple[str, str | None]:
+    """How `git checkout|switch ARGS` moves HEAD: ("none", None) when it does not (a path
+    checkout), ("create", X) / ("detach", "HEAD") / ("branch", X) when the destination is a
+    literal, ("unknown", None) otherwise. ("branch", X) may still be a path (`git checkout
+    file`) or a remote branch to create; the caller tells a pure switch by X existing locally."""
+    if any(_dynamic_ref(a) for a in args):
+        return "unknown", None
+    create = CHECKOUT_CREATE_OPTS if sub == "checkout" else SWITCH_CREATE_OPTS
+    rest, positionals, detach = list(args), [], False
+    while rest:
+        arg = rest.pop(0)
+        if arg == "--":
+            if sub == "checkout" and rest:
+                return "none", None  # `git checkout [tree] -- paths`
+            break
+        option, eq, value = arg.partition("=")
+        if option in create:
+            value = value if eq else (rest.pop(0) if rest else "")
+            return ("create", value) if value else ("unknown", None)
+        if arg[:2] in create and not arg.startswith("--"):
+            return "create", arg[2:]  # `-bX`
+        if arg == "--detach" or (sub == "switch" and arg == "-d"):
+            detach = True
+        elif arg in ("-p", "--patch") or arg.startswith("--pathspec-from-file"):
+            return "none", None
+        elif not arg.startswith("-"):
+            positionals.append(arg)
+    if detach:
+        return "detach", "HEAD"
+    if sub == "checkout" and len(positionals) != 1:
+        return "none", None  # `git checkout` (no-op) or `git checkout TREE PATH...`
+    if not positionals:
+        return "none", None
+    return "branch", positionals[0]
+
+
+def _dynamic_ref(arg: str) -> bool:
+    """An argument whose branch only the shell or git knows: `$B`, `{a,b}`, `-`, `@{-1}`."""
+    return (
+        bool(_EXPANSION.search(arg) or _BRACE_EXPANSION.search(arg)) or arg == "-" or ("@{" in arg)
+    )
+
+
+def _rebase_branch(args: list[str]) -> str | None:
+    """The branch `git rebase [opts] UPSTREAM BRANCH` checks out first (None without one)."""
+    rest, positionals = list(args), []
+    while rest:
+        arg = rest.pop(0)
+        if arg in REBASE_VALUE_OPTS:
+            if rest:
+                rest.pop(0)
+        elif not arg.startswith("-"):
+            positionals.append(arg)
+    return positionals[1] if len(positionals) > 1 else None
+
+
+def _segment_switch(seg: list[str], depth: int) -> tuple[str, str | None]:
+    """How one simple command can move HEAD (see the block comment above): ("none", None),
+    ("unknown", None), or a checkout/switch/rebase/branch-rename shape for `_switch_target`'s
+    kinds plus ("maybe", X) for a destination X that may or may not be taken."""
+    if seg[0] in ("pushd", "popd"):
+        return "unknown", None
+    if seg[0] == "cd":
+        operands = [w for w in seg[1:] if not w.startswith("-") or w == "-"]
+        dynamic = any(w == "-" or _EXPANSION.search(w) for w in operands)
+        return ("unknown", None) if dynamic else ("none", None)
+    if seg[0] in SET_BUILTINS or all(_ASSIGNMENT.match(w) for w in seg):
+        if any(_GIT_REPO_VAR.match(w) for w in seg[1 if seg[0] in SET_BUILTINS else 0 :]):
+            return "unknown", None
+        return "none", None
+    words = _command_words(seg, [], [])
+    if not words:
+        return "none", None
+    program = os.path.basename(words[0])
+    if program in _EVAL_LIKE:
+        return "unknown", None
+    inner = _shell_command_string(words)
+    if inner is not None:
+        return "unknown" if depth >= MAX_SUBST_DEPTH or _changes_branch(inner, depth + 1) else (
+            "none"
+        ), None
+    if program in SHELLS:
+        return "unknown", None  # a script file or stdin: anything
+    if program not in GIT_PROGRAMS:
+        if program.startswith("git-"):
+            return "unknown", None  # `git-checkout`, `git-switch`
+        args = " ".join(_strip_substitutions(w) for w in words[1:])
+        if program in FANOUT and (_mentions_git(args) or any(w in SHELLS for w in words[1:])):
+            return "unknown", None  # `xargs git` / `xargs sh`: the subcommand comes from stdin
+        if _mentions_git(args) and _MOVES_HEAD.search(args):
+            return "unknown", None  # `python -c "...['git', 'checkout', b]..."`
+        return "none", None
+    sub, args = _git_sub_args(words)
+    if sub is None or sub in READ_ONLY_ANY or sub in SWITCH_FREE:
+        return "none", None
+    if sub in READ_ONLY_SHAPED and sub != "branch":
+        return "none", None
+    if sub in ("checkout", "switch"):
+        return _switch_target(sub, args)
+    if sub == "rebase":
+        if any(_EXPANSION.search(a) for a in args):
+            return "unknown", None
+        branch = _rebase_branch(args)
+        return ("maybe", branch) if branch else ("none", None)
+    if sub == "branch":
+        if not any(a in ("-m", "-M", "--move") for a in args):
+            return "none", None
+        positionals = [a for a in args if not a.startswith("-")]
+        if not positionals or any(_EXPANSION.search(a) for a in positionals):
+            return "unknown", None
+        return "maybe", positionals[-1]  # `git branch -m NEW` renames the current branch
+    return "unknown", None  # bisect, symbolic-ref, an alias, an unknown subcommand
+
+
+def _changes_branch(command: str, depth: int) -> bool:
+    """Could any simple command (or substitution body) in `command` move HEAD?"""
+    try:
+        for seg in _segments(command):
+            while seg and seg[0] in SHELL_KEYWORDS:
+                seg = seg[1:]
+            if not seg:
+                continue
+            if _segment_switch(seg, depth)[0] != "none":
+                return True
+            for body in _substitutions(" ".join(seg)):
+                if depth >= MAX_SUBST_DEPTH or _changes_branch(body, depth + 1):
+                    return True
+    except ValueError:
+        return _mentions_git(command)
+    return False
+
+
+def _with_branch(target: Target, branch: str) -> Target:
+    dirs, opts, env = target
+    env = tuple(item for item in env if item[0] != _BRANCH_KEY)
+    return (dirs, opts, (*env, (_BRANCH_KEY, branch)))
+
+
+def _retarget(targets: list[Target], state) -> list[Target]:
+    """`targets` after a branch change `state` = (location, branch, replace) or UNKNOWN_BRANCH."""
+    if state is None:
+        return targets
+    if state == UNKNOWN_BRANCH:
+        return [_with_branch(t, UNKNOWN_BRANCH) for t in targets]
+    location, branch, replace = state
+    out: list[Target] = []
+    for target in targets:
+        if not (replace and target == location):
+            out.append(target)
+        out.append(_with_branch(target, branch))
+    return out
+
+
 def commit_targets(command: str, depth: int = 0, cwd: str | None = None) -> list[Target]:
     """Every guarded git invocation in `command` (see the module docstring) with the repository
-    it acts on. `cd DIR` before it (`cd ../wt && git merge x`) counts too. Deny by default: any
+    it acts on. `cd DIR` before it (`cd ../wt && git merge x`) counts too, and so does a branch
+    change before it (`git switch X && git commit`, see UNKNOWN_BRANCH). Deny by default: any
     git invocation not proven read-only, and anything that runs git or a shell indirectly, is
     one; an assembled program or subcommand is one with an unknown repository."""
     found: list[Target] = []
     cds: list[str] = []
-    for seg in _segments(command):
+    state = None  # the branch change in effect: None, UNKNOWN_BRANCH or (location, X, replace)
+    for ops, seg in _segments_with_ops(command):
         while seg and seg[0] in SHELL_KEYWORDS:
             seg = seg[1:]
         if not seg:
             continue
+        if isinstance(state, tuple) and any(op != "&&" for op in ops):
+            state = (state[0], state[1], False)  # the switch may not have happened
         where = _where(cwd, cds)
         is_cd = seg[0] == "cd"
         if is_cd:  # changes where later commands run; its own substitutions run here
             operands = [w for w in seg[1:] if not w.startswith("-") or w == "-"]
             cds.append(operands[-1] if operands else "~")
-        targets = [] if is_cd else _commit_targets(seg, depth, where)
+        prefix = cds[:-1] if is_cd else cds
+        own = [] if is_cd else _commit_targets(seg, depth, where)
+        own = [((*prefix, *dirs), opts, env) for dirs, opts, env in own]
+        subst: list[Target] = []
         # over the joined words: shlex splits an unquoted `cd \`git commit\`` across words
         for body in _substitutions(" ".join(seg)):
             if depth >= MAX_SUBST_DEPTH:
-                targets += [((), (), ())] if _mentions_git(body) else []
+                subst += [((), (), ())] if _mentions_git(body) else []
+                if _mentions_git(body):
+                    state = UNKNOWN_BRANCH
                 continue
             try:  # a substitution runs where the command runs: same `cd`s
-                targets += commit_targets(body, depth + 1, where)
+                subst += commit_targets(body, depth + 1, where)
             except ValueError:
-                targets += [((), (), ())] if _mentions_git(body) else []
-        prefix = cds[:-1] if is_cd else cds
-        found += [((*prefix, *dirs), opts, env) for dirs, opts, env in targets]
+                subst += [((), (), ())] if _mentions_git(body) else []
+            if _changes_branch(body, depth + 1):
+                state = UNKNOWN_BRANCH  # it ran before this command did
+        found += _retarget([((*prefix, *dirs), o, e) for dirs, o, e in subst], state)
+        kind, branch = _segment_switch(seg, depth)
+        location = own[0] if own else (tuple(prefix), (), ())
+        if kind in ("branch", "create", "detach") and own and branch:
+            # `pure`: certainly lands on `branch` -- a creation, a detach, or a plain switch to a
+            # branch that exists (`git checkout NAME` may also be a path, or a DWIM create)
+            pure = kind != "branch" or (
+                {a for a in seg if a.startswith("-")} <= QUIET_OPTS
+                and _branch_exists(branch, _where(cwd, location[0]), location)
+            )
+            if kind == "branch" and pure:
+                own = []  # a pure switch to an existing branch rewrites no history
+            elif kind == "create":
+                own = [_with_branch(t, branch) for t in own]  # it creates `branch`
+            elif kind == "branch":
+                own = own + [_with_branch(t, branch) for t in own]  # path, or DWIM create
+            found += _retarget(own, state)
+            if state != UNKNOWN_BRANCH:
+                state = (location, branch, pure)
+            continue
+        if kind == "maybe" and branch:
+            found += _retarget(own + [_with_branch(t, branch) for t in own], state)
+            if state != UNKNOWN_BRANCH:
+                state = (location, branch, False)
+            continue
+        found += _retarget(own, state)
+        if kind != "none":
+            state = UNKNOWN_BRANCH
     if depth == 0 and (
         _raw_unproven(command)
         or (_mentions_git(command) and _ENV_TAINT.search(re.sub(r"[\"'\\]", "", command)))
@@ -769,6 +1042,9 @@ def is_git_commit(command: str, depth: int = 0, cwd: str | None = None) -> bool:
 def target_branch(target: Target, cwd: str | None) -> str:
     """The branch `git <repo options> ...` acts on, asked of git itself."""
     chdirs, opts, env = target
+    moved = dict(env).pop(_BRANCH_KEY, None)
+    if moved is not None:
+        return moved  # a branch change earlier in the command put HEAD there
     return current_branch(_where(cwd, chdirs), opts, dict(env))
 
 
@@ -1006,6 +1282,14 @@ def decide(
 
 
 def _decide_branch(payload: dict, branch: str, lease_lookup, pr_lookup) -> tuple[int, str]:
+    if branch == UNKNOWN_BRANCH:
+        return 2, (
+            "Forge guard: this command can move HEAD to a branch that cannot be known before it "
+            "runs (a branch change with a computed name, `-`, an alias, bisect, a sourced or "
+            "piped script, a `cd` to an expanded path, ...) and then runs git that needs the "
+            "issue lease. Run the branch change and the git command as SEPARATE commands so the "
+            "guard can check the branch the second one acts on."
+        )
     m = ISSUE_BRANCH.search(branch or "")
     if not m:
         return 0, ""

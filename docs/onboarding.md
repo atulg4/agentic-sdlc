@@ -208,7 +208,12 @@ something that runs differently.
   listing forms of `branch`/`tag`/`remote`/`config`/`stash`, `fetch` without a refspec or
   `--update-head-ok`, help, version, cat-file, for-each-ref, name-rev, merge-base, check-ignore,
   check-attr). Aliases, `git-<name>` programs, `-c`/`--config-env`, and anything that runs git or
-  a shell indirectly (`xargs git`, `find -exec git`, `... | sh`) need the lease too.
+  a shell indirectly (`xargs git`, `find -exec git`, `... | sh`) need the lease too. A branch
+  change earlier in the same command re-targets the git after it: `git switch forge/issue-7 &&
+  git commit` is checked against issue 7, `git switch main && git commit` against main (a plain
+  switch to an existing branch needs no lease); a change whose destination is not literal
+  (`git checkout "$B"`, `git checkout -`, an alias, bisect, `source`, `cd "$D"`) blocks any
+  later guarded git in that command -- run the two as separate commands.
 - **Publisher App** permissions must be exactly Contents read, Issues write, Pull requests write
   (plus GitHub's mandatory Metadata read); any other grant fails.
 - **Rulesets**: every parameter Forge's ruleset sets is compared (iterated from the payload, not
