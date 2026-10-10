@@ -1580,6 +1580,7 @@ def platform_access_check(
     project_id: str,
     platform_repository: str,
     consumer_info: dict | None = None,
+    platform_visibility: str | None = None,
 ) -> Check:
     """A private (or internal) platform repository's reusable workflows can be called only from
     the repositories its Actions access setting admits: `user` (repositories of the same user),
@@ -1589,7 +1590,9 @@ def platform_access_check(
     `PLATFORM_READ_TOKEN` is used after a called workflow starts and cannot resolve the caller's
     `uses:`. Unreadable (403/404: it needs admin on the platform) or unverifiable is an unmet
     MANUAL requirement, never READY. `consumer_info` is `GET repos/{project_id}` (read when
-    omitted)."""
+    omitted). `platform_visibility` is the platform's own (private or internal; None: unknown):
+    an INTERNAL caller can use only internal (or public) reusable workflows, never a private
+    platform's, so that pairing fails and an unknown platform visibility leaves it unverified."""
     if consumer_info is None:
         consumer_info = _safe_json(gh, ["api", f"repos/{project_id}"])
     visibility = _visibility(consumer_info)
@@ -1601,6 +1604,15 @@ def platform_access_check(
             "repository call only PUBLIC reusable workflows, so every platform call is rejected "
             "before any job starts, whatever the access setting → make the platform public, or "
             f"make {project_id} private",
+        )
+    if visibility == "internal" and platform_visibility == "private":
+        return Check(
+            PLATFORM_ACCESS_CHECK,
+            False,
+            f"{project_id} is internal and {platform_repository} is private: GitHub lets an "
+            "internal repository call only INTERNAL or public reusable workflows, so every "
+            "platform call is rejected before any job starts, whatever the access setting → "
+            f"make the platform internal, or make {project_id} private",
         )
     consumer_owner = project_id.split("/")[0]
     platform_owner = platform_repository.split("/")[0]
@@ -1632,6 +1644,16 @@ def platform_access_check(
                 f"access_level {level}, but the visibility of {project_id} could not be read: a "
                 "PUBLIC caller cannot use a private platform's reusable workflows → confirm "
                 f"{project_id} is private or internal",
+                manual=True,
+            )
+        if visibility == "internal" and platform_visibility != "internal":
+            return Check(
+                PLATFORM_ACCESS_CHECK,
+                False,
+                f"access_level {level}, but the visibility of {platform_repository} could not "
+                f"be read: an internal caller ({project_id}) can use only an INTERNAL "
+                "platform's reusable workflows, never a private one's → confirm "
+                f"{platform_repository} is internal",
                 manual=True,
             )
         return Check(PLATFORM_ACCESS_CHECK, True, f"access_level {level} ({visibility} caller)")
@@ -2021,12 +2043,70 @@ def _matrix_job_names(name: str, strategy: object) -> list[str] | None:
     return sorted(names)
 
 
-def workflow_check_contexts(base: Path) -> tuple[set[str], tuple[str, ...], bool]:
-    """What the installed workflows can report as status-check contexts: exact job names (`name:`
-    else the job id), prefixes for the contexts GitHub derives (`caller / callee` for a reusable
-    call, `name (...)` for a matrix), the evaluated names of a job named with `matrix.*` over a
-    finite literal matrix (any other expression in a name contributes nothing), and whether any
-    workflow runs on `merge_group` (a merge queue's checks)."""
+def _branch_glob_matches(pattern: str, branch: str) -> bool:
+    """GitHub's branch filter glob: `**` any characters, `*` any but `/`, `?` one character."""
+    regex = ""
+    i = 0
+    while i < len(pattern):
+        if pattern.startswith("**", i):
+            regex, i = regex + ".*", i + 2
+        elif pattern[i] == "*":
+            regex, i = regex + "[^/]*", i + 1
+        elif pattern[i] == "?":
+            regex, i = regex + "[^/]", i + 1
+        else:
+            regex, i = regex + re.escape(pattern[i]), i + 1
+    return re.fullmatch(regex, branch) is not None
+
+
+def _reports_on_protected_pull_requests(doc: dict, default_branch: str) -> bool:
+    """Whether a workflow runs for EVERY pull request into the protected branch: a
+    `pull_request` or `pull_request_target` trigger with no `paths`/`paths-ignore` filter (a PR
+    outside it never reports), no `branches-ignore` and no negated pattern (fail closed), a
+    `branches` filter only when one of its globs matches the default branch, and activity types
+    (if listed) covering every head update. Only such a workflow's jobs produce required contexts;
+    a schedule-, dispatch- or call-only workflow reports nothing on the PR."""
+    triggers = doc.get("on", doc.get(True))
+    for event in ("pull_request", "pull_request_target"):
+        if event not in _triggers(doc):
+            continue
+        spec = triggers.get(event) if isinstance(triggers, dict) else None
+        if spec is None:
+            return True
+        if not isinstance(spec, dict):
+            continue
+        if any(key in spec for key in ("paths", "paths-ignore", "branches-ignore")):
+            continue
+        if "branches" in spec:
+            branches = spec["branches"]
+            listed = [branches] if isinstance(branches, str) else branches
+            if not isinstance(listed, list):
+                continue
+            patterns = [str(b) for b in listed]
+            if any(p.startswith("!") for p in patterns) or not any(
+                _branch_glob_matches(p, default_branch) for p in patterns
+            ):
+                continue
+        if "types" in spec:
+            types = spec["types"]
+            listed = [types] if isinstance(types, str) else types
+            if not isinstance(listed, list) or not all(
+                t in [str(x) for x in listed] for t in PULL_REQUEST_REQUIRED_TYPES
+            ):
+                continue
+        return True
+    return False
+
+
+def workflow_check_contexts(
+    base: Path, default_branch: str = "main"
+) -> tuple[set[str], tuple[str, ...], bool]:
+    """What the installed workflows can report as status-check contexts ON A PULL REQUEST INTO
+    `default_branch` (only workflows `_reports_on_protected_pull_requests` admits count): exact
+    job names (`name:` else the job id), prefixes for the contexts GitHub derives (`caller /
+    callee` for a reusable call, `name (...)` for a matrix), the evaluated names of a job named
+    with `matrix.*` over a finite literal matrix (any other expression in a name contributes
+    nothing), and whether any workflow runs on `merge_group` (a merge queue's checks)."""
     exact: set[str] = set()
     prefixes: list[str] = []
     merge_group = False
@@ -2039,6 +2119,8 @@ def workflow_check_contexts(base: Path) -> tuple[set[str], tuple[str, ...], bool
             isinstance(triggers, (list, dict)) and "merge_group" in triggers
         ):
             merge_group = True
+        if not _reports_on_protected_pull_requests(doc, default_branch):
+            continue
         for job_id, job in _workflow_jobs(path).items():
             name = str(job.get("name") or job_id)
             if "${{" in name:
@@ -2129,6 +2211,59 @@ def effective_rule_problems(
                 f"{source}: requires code scanning results ({tools or '?'}); verify a scanner "
                 "reports on Forge PRs"
             )
+    return problems
+
+
+LEGACY_PROTECTION_CHECK = "classic branch protection on the default branch fits Forge"
+
+
+def _enabled(value: object) -> bool:
+    """A classic-protection toggle (`{"enabled": true}`) is on."""
+    return isinstance(value, dict) and value.get("enabled") is True
+
+
+def legacy_protection_problems(
+    protection: dict, produced: tuple[set[str], tuple[str, ...], bool]
+) -> list[str]:
+    """What a CLASSIC branch-protection rule (`branches/{branch}/protection`, enforced alongside
+    rulesets) requires that a Forge PR cannot meet, by the same rules as
+    `effective_rule_problems`: required status contexts no installed PR workflow job reports, or
+    bound to an app other than GitHub Actions; required signatures; push restrictions; a locked
+    branch. Linear history, reviews and conversation resolution are compatible."""
+    exact, prefixes, _ = produced
+    prefixes = tuple(p for p in prefixes if p.strip())
+    problems: list[str] = []
+    checks = protection.get("required_status_checks")
+    if isinstance(checks, dict):
+        bound: dict[str, set[object]] = {}
+        for item in checks.get("checks") or []:
+            if isinstance(item, dict) and item.get("context"):
+                bound.setdefault(str(item["context"]), set()).add(item.get("app_id"))
+        for context in checks.get("contexts") or []:
+            bound.setdefault(str(context), set())
+        for context, apps in sorted(bound.items()):
+            if context not in exact and not context.startswith(prefixes):
+                problems.append(
+                    f"requires status check '{context}', which no installed pull-request "
+                    "workflow job reports"
+                )
+            elif any(app not in (None, -1, GITHUB_ACTIONS_INTEGRATION_ID) for app in apps):
+                foreign = ", ".join(sorted(str(a) for a in apps if a not in (None, -1)))
+                problems.append(
+                    f"requires status check '{context}' from app {foreign}, not GitHub Actions "
+                    f"({GITHUB_ACTIONS_INTEGRATION_ID}): the installed workflow job can never "
+                    "satisfy it"
+                )
+    if _enabled(protection.get("required_signatures")):
+        problems.append(
+            "requires signed commits; verify the Forge publisher's commits are verified (manual)"
+        )
+    if isinstance(protection.get("restrictions"), dict):
+        problems.append(
+            "restricts who can push; merging a Forge PR needs the publisher app in the allow list"
+        )
+    if _enabled(protection.get("lock_branch")):
+        problems.append("locks the branch (read-only): no Forge PR can merge")
     return problems
 
 
@@ -2527,23 +2662,6 @@ def _triggers(doc: dict) -> set[str]:
     return set()
 
 
-#: Platform reusable workflows whose EVERY job runs on `${{ fromJSON(inputs.runs_on) }}`
-#: (tests/test_onboard.py pins this against the files): called from the platform repository at a
-#: pinned SHA with an explicit `with.runs_on`, they run exactly there.
-PLATFORM_RUNS_ON_WORKFLOWS = frozenset(
-    {
-        "reusable-ci-repair.yml",
-        "reusable-implement.yml",
-        "reusable-orchestrate.yml",
-        "reusable-plan.yml",
-        "reusable-pre-review.yml",
-        "reusable-protected-merge.yml",
-        "reusable-repair.yml",
-        "reusable-review.yml",
-        "reusable-spec.yml",
-        "reusable-transient-retry.yml",
-    }
-)
 _INPUT_REF = re.compile(r"^\$\{\{\s*inputs\.([A-Za-z0-9_-]+)\s*\}\}$")
 _FROMJSON_INPUT_REF = re.compile(
     r"^\$\{\{\s*fromJSON\(\s*inputs\.([A-Za-z0-9_-]+)\s*\)\s*\}\}$", re.IGNORECASE
@@ -2552,6 +2670,9 @@ _REMOTE_REUSABLE = re.compile(r"([^/\s]+/[^/\s]+)/\.github/workflows/([^@\s/]+)@
 
 #: A job's runner target: its labels, or why they cannot be determined (a str).
 RunnerTarget = set[str] | str
+#: (callee file name, pinned SHA) -> the platform's reusable workflow parsed at that SHA (None:
+#: unreadable). Runner diagnosis reads the PINNED callee, never a list of trusted file names.
+CalleeLoader = Callable[[str, str], object]
 
 
 def _input_text(value: object) -> str | None:
@@ -2635,13 +2756,85 @@ def _call_inputs(
     return out
 
 
+def _pinned_callee_targets(
+    where: str,
+    name: str,
+    called: dict,
+    call_inputs: dict[str, str | None],
+    platform_repository: str,
+    load_callee: CalleeLoader | None,
+    seen: tuple[object, ...],
+) -> dict[str, RunnerTarget]:
+    """Where each job of a platform reusable workflow, as fetched at its pinned SHA, runs: its
+    `runs-on` with the call's inputs substituted (the caller's `with:` over the callee's
+    defaults). A nested pinned platform call is followed the same way; anything else is a str."""
+    jobs = called.get("jobs")
+    if not isinstance(jobs, dict) or not jobs:
+        return {where: f"{name} at its pin has no readable jobs"}
+    targets: dict[str, RunnerTarget] = {}
+    for job_name, job in jobs.items():
+        at = f"{where} > {name}:{job_name}"
+        if not isinstance(job, dict):
+            targets[at] = "unreadable job"
+        elif "uses" in job:
+            targets.update(
+                _remote_call_targets(at, job, platform_repository, call_inputs, load_callee, seen)
+            )
+        elif "runs-on" in job:
+            labels = _resolved_labels(job["runs-on"], call_inputs)
+            targets[at] = (
+                labels if labels is not None else _unresolved_target(job["runs-on"], "runs-on")
+            )
+        else:
+            targets[at] = "no runs-on"
+    return targets
+
+
+def _remote_call_targets(
+    where: str,
+    job: dict,
+    platform_repository: str,
+    inputs: dict[str, str | None] | None,
+    load_callee: CalleeLoader | None,
+    seen: tuple[object, ...],
+) -> dict[str, RunnerTarget]:
+    """Runner targets of a job that calls a REMOTE reusable workflow: a Forge platform workflow
+    pinned to a full SHA is read at that SHA (`load_callee`) and its jobs analyzed; anything
+    else -- a third-party workflow, a branch/tag ref, a callee that cannot be fetched -- fails
+    closed as a str."""
+    uses = str(job.get("uses", "")).strip()
+    passed = job.get("with") if isinstance(job.get("with"), dict) else {}
+    found = _REMOTE_REUSABLE.fullmatch(uses)
+    if not (found and found.group(1) == platform_repository and _SHA.fullmatch(found.group(3))):
+        return {where: f"calls {uses}: its runners cannot be verified from this repository"}
+    name, sha = found.group(2), found.group(3)
+    if (name, sha) in seen:
+        return {where: f"reusable workflow cycle through {name}@{sha[:12]}"}
+    called = load_callee(name, sha) if load_callee is not None else None
+    if not isinstance(called, dict):
+        return {
+            where: f"calls {name}@{sha[:12]}, which could not be read at that pin: its runners "
+            "cannot be verified"
+        }
+    return _pinned_callee_targets(
+        where,
+        name,
+        called,
+        _call_inputs(called, passed, inputs),
+        platform_repository,
+        load_callee,
+        (*seen, (name, sha)),
+    )
+
+
 def _reusable_call_targets(
     base: Path,
     where: str,
     job: dict,
     platform_repository: str,
     inputs: dict[str, str | None] | None,
-    seen: tuple[Path, ...],
+    seen: tuple[object, ...],
+    load_callee: CalleeLoader | None = None,
 ) -> dict[str, RunnerTarget]:
     """Runner targets of a job that `uses:` a reusable workflow."""
     uses = str(job.get("uses", "")).strip()
@@ -2667,30 +2860,44 @@ def _reusable_call_targets(
             platform_repository,
             _call_inputs(called, passed, inputs),
             seen,
+            load_callee,
         )
         return {f"{where} > {k}": v for k, v in nested.items()}
-    found = _REMOTE_REUSABLE.fullmatch(uses)
-    if (
-        found
-        and found.group(1) == platform_repository
-        and found.group(2) in PLATFORM_RUNS_ON_WORKFLOWS
-        and _SHA.fullmatch(found.group(3))
-    ):
-        key = f"{where} (runs_on)"
-        if "runs_on" not in passed:
-            return {key: f"calls {found.group(2)} without an explicit runs_on"}
-        raw, ok = _resolve_input(passed["runs_on"], inputs)
-        value: object = passed["runs_on"]
-        labels = None
-        if ok and isinstance(raw, str):
-            try:
-                value = json.loads(raw)
-            except json.JSONDecodeError:
-                value = raw
-            else:
-                labels = _resolved_labels(value, None)
-        return {key: labels if labels is not None else _unresolved_target(value, "runs_on")}
-    return {where: f"calls {uses}: its runners cannot be verified from this repository"}
+    return _remote_call_targets(where, job, platform_repository, inputs, load_callee, seen)
+
+
+def platform_callee_loader(
+    gh: GhRunner, platform_repository: str, prefetched: dict[tuple[str, str], object]
+) -> CalleeLoader:
+    """A cached `CalleeLoader` over the platform's contents API: a callee doctor already fetched
+    at a pin is reused; any other (file, SHA) is read once. Unreadable -> None (fails closed)."""
+    cache = dict(prefetched)
+
+    def load(name: str, sha: str) -> object:
+        if (name, sha) not in cache:
+            doc = None
+            if _WORKFLOW_FILE.fullmatch(name):
+                raw = _decoded_blob(
+                    _safe_json(
+                        gh,
+                        [
+                            "api",
+                            f"repos/{platform_repository}/contents/.github/workflows/"
+                            f"{name}?ref={sha}",
+                        ],
+                    )
+                )
+                if raw is not None:
+                    import yaml  # deferred: the CLI must import without site dependencies
+
+                    try:
+                        doc = yaml.safe_load(raw.decode("utf-8", "replace"))
+                    except yaml.YAMLError:
+                        doc = None
+            cache[(name, sha)] = doc
+        return cache[(name, sha)]
+
+    return load
 
 
 def _job_runner_targets(
@@ -2698,13 +2905,15 @@ def _job_runner_targets(
     path: Path,
     platform_repository: str,
     inputs: dict[str, str | None] | None = None,
-    seen: tuple[Path, ...] = (),
+    seen: tuple[object, ...] = (),
+    load_callee: CalleeLoader | None = None,
 ) -> dict[str, RunnerTarget]:
     """`file:job` -> where each job of a workflow runs, following local reusable workflows
     (`./.github/workflows/x.yml`) recursively with their `with:` inputs substituted, and Forge
-    platform reusable workflows through their `runs_on` input. Anything else -- a third-party
-    reusable workflow, an expression that is not a resolvable input, a runner group, a cycle --
-    is a str saying why it cannot be proven."""
+    platform reusable workflows pinned to a SHA through the jobs of the callee AS FETCHED at
+    that SHA (`load_callee`), inputs substituted likewise. Anything else -- a third-party
+    reusable workflow, a callee that cannot be fetched, an expression that is not a resolvable
+    input, a runner group, a cycle -- is a str saying why it cannot be proven."""
     seen = (*seen, path.resolve())
     doc = _workflow_doc(path)
     jobs = doc.get("jobs") if doc is not None else None
@@ -2717,7 +2926,9 @@ def _job_runner_targets(
             targets[where] = "unreadable job"
         elif "uses" in job:
             targets.update(
-                _reusable_call_targets(base, where, job, platform_repository, inputs, seen)
+                _reusable_call_targets(
+                    base, where, job, platform_repository, inputs, seen, load_callee
+                )
             )
         elif "runs-on" in job:
             labels = _resolved_labels(job["runs-on"], inputs)
@@ -2729,7 +2940,9 @@ def _job_runner_targets(
     return targets
 
 
-def _pull_request_off_hosted(base: Path, platform_repository: str) -> list[str]:
+def _pull_request_off_hosted(
+    base: Path, platform_repository: str, load_callee: CalleeLoader | None = None
+) -> list[str]:
     """Every job a pull_request-triggered workflow (any `pull_request*` event) runs that is not
     PROVEN to run on a single GitHub-hosted label -- including the jobs of the reusable workflows
     it calls (`_job_runner_targets`). On a fork-exposed repository those jobs run fork code, so an
@@ -2741,7 +2954,8 @@ def _pull_request_off_hosted(base: Path, platform_repository: str) -> list[str]:
         doc = _workflow_doc(path)
         if doc is None or not any(t.startswith("pull_request") for t in _triggers(doc)):
             continue
-        for where, target in _job_runner_targets(base, path, platform_repository).items():
+        targets = _job_runner_targets(base, path, platform_repository, load_callee=load_callee)
+        for where, target in targets.items():
             if isinstance(target, str):
                 found.append(f"{where} ({target})")
             elif not _github_hosted(target):
@@ -2785,7 +2999,9 @@ def remote_workflow_files(
     return files, ""
 
 
-def _remote_pull_request_off_hosted(files: dict[str, bytes], platform_repository: str) -> list[str]:
+def _remote_pull_request_off_hosted(
+    files: dict[str, bytes], platform_repository: str, load_callee: CalleeLoader | None = None
+) -> list[str]:
     """`_pull_request_off_hosted` over a workflow set read from GitHub (`remote_workflow_files`),
     materialized in a scratch checkout so local reusable calls resolve within that same set."""
     import tempfile
@@ -2796,7 +3012,7 @@ def _remote_pull_request_off_hosted(files: dict[str, bytes], platform_repository
         workflows.mkdir(parents=True)
         for name, content in files.items():
             (workflows / name).write_bytes(content)
-        return _pull_request_off_hosted(root, platform_repository)
+        return _pull_request_off_hosted(root, platform_repository, load_callee)
 
 
 def fork_runner_exposure(
@@ -2805,6 +3021,7 @@ def fork_runner_exposure(
     project_id: str,
     platform_repository: str,
     ref: str | None,
+    load_callee: CalleeLoader | None = None,
 ) -> list[str]:
     """Every pull_request-triggered job of a fork-exposed repository not proven GitHub-hosted. The
     authority is the default branch's workflow set as GitHub serves it (a stale or partial
@@ -2813,10 +3030,10 @@ def fork_runner_exposure(
     files, why = remote_workflow_files(gh, project_id, ref)
     if files is None:
         return [f"default-branch workflows unverifiable ({why}); doctor fails closed"]
-    exposed = _remote_pull_request_off_hosted(files, platform_repository)
+    exposed = _remote_pull_request_off_hosted(files, platform_repository, load_callee)
     exposed += [
         f"local checkout: {item}"
-        for item in _pull_request_off_hosted(base, platform_repository)
+        for item in _pull_request_off_hosted(base, platform_repository, load_callee)
         if item not in exposed
     ]
     return exposed
@@ -4390,17 +4607,28 @@ def doctor(
             )
         )
 
+    # The platform reusable workflows as fetched at the pin: runner diagnosis reads their jobs.
+    load_callee = platform_callee_loader(
+        gh,
+        platform_repository,
+        {(name, ref): doc for name, doc in callees.items()} if ref else {},
+    )
+
     # --- a private platform must also admit this repository as a caller (Actions access)
     if repo_info is None:
         repo_info = _safe_json(gh, ["api", f"repos/{project_id}"])
     platform_private = _safe_json(gh, ["api", f"repos/{platform_repository}", "--jq", ".private"])
-    if platform_private is True:
+    if platform_private is True:  # private or internal (both report private: true)
+        platform_visibility = _safe_json(
+            gh, ["api", f"repos/{platform_repository}", "--jq", "{visibility}"]
+        )
         add(
             platform_access_check(
                 gh,
                 project_id,
                 platform_repository,
                 repo_info if isinstance(repo_info, dict) else {},
+                _visibility(platform_visibility),
             )
         )
 
@@ -4565,7 +4793,7 @@ def doctor(
         )
     else:
         rules = [rule for page in pages for rule in page if isinstance(rule, dict)]
-        problems = effective_rule_problems(rules, workflow_check_contexts(base))
+        problems = effective_rule_problems(rules, workflow_check_contexts(base, effective_branch))
         inherited = sorted(
             {
                 f"{r.get('ruleset_source_type')} {r.get('ruleset_source')}"
@@ -4581,6 +4809,55 @@ def doctor(
                 if problems
                 else f"{len(rules)} rules on {effective_branch}"
                 + (f", inherited from {', '.join(inherited)}" if inherited else ""),
+                manual=True,
+            )
+        )
+
+    # --- classic branch protection is enforced alongside rulesets and is NOT in rules/branches
+    try:
+        legacy = json.loads(
+            gh(
+                [
+                    "api",
+                    f"repos/{project_id}/branches/{quote(effective_branch, safe='')}/protection",
+                ]
+            )
+            or "null"
+        )
+        legacy_why = "" if isinstance(legacy, dict) else "unreadable answer"
+    except OnboardError as exc:
+        legacy = None
+        legacy_why = "absent" if re.search(r"\b404\b|Not Found", str(exc)) else str(exc)[:120]
+    except json.JSONDecodeError:
+        legacy, legacy_why = None, "unreadable answer"
+    if legacy_why == "absent":
+        add(
+            Check(
+                LEGACY_PROTECTION_CHECK, True, f"no classic protection rule on {effective_branch}"
+            )
+        )
+    elif not isinstance(legacy, dict):
+        add(
+            Check(
+                LEGACY_PROTECTION_CHECK,
+                False,
+                f"cannot read branch protection of {effective_branch} ({legacy_why}; needs admin: "
+                f"GET repos/{project_id}/branches/{effective_branch}/protection) → check its "
+                "required checks, signatures and push restrictions by hand",
+                manual=True,
+            )
+        )
+    else:
+        legacy_problems = legacy_protection_problems(
+            legacy, workflow_check_contexts(base, effective_branch)
+        )
+        add(
+            Check(
+                LEGACY_PROTECTION_CHECK,
+                not legacy_problems,
+                "; ".join(legacy_problems)
+                if legacy_problems
+                else f"classic protection on {effective_branch} is compatible",
                 manual=True,
             )
         )
@@ -4635,11 +4912,14 @@ def doctor(
     # --- runners: every job of every active caller, and ci.yml's `test` job, must run somewhere
     # that exists, or the run (or every PR's required check) sits queued forever.
     # The same resolver as the fork-exposure check: local reusable workflows are followed
-    # into their own jobs, platform calls through their `runs_on` input; anything it cannot
-    # prove (a runner group, an expression, a third-party workflow) is a str reason.
+    # into their own jobs, pinned platform calls through the callee fetched at that SHA;
+    # anything it cannot prove (a runner group, an expression, a third-party workflow, an
+    # unreadable callee) is a str reason.
     all_targets: dict[str, RunnerTarget] = {}
     for caller in callers:
-        all_targets.update(_job_runner_targets(base, caller, platform_repository))
+        all_targets.update(
+            _job_runner_targets(base, caller, platform_repository, load_callee=load_callee)
+        )
     ci_target = _ci_runs_on(base)
     ci_labels = ci_target if isinstance(ci_target, set) else None
     unprovable = {w: why for w, why in all_targets.items() if isinstance(why, str)}
@@ -4746,7 +5026,9 @@ def doctor(
     if fork_state == "safe":
         add(Check(FORK_RUNNER_CHECK, True, f"{fork_why}: fork pull requests run no workflows"))
     else:
-        exposed = fork_runner_exposure(base, gh, project_id, platform_repository, actual_branch)
+        exposed = fork_runner_exposure(
+            base, gh, project_id, platform_repository, actual_branch, load_callee
+        )
         add(
             Check(
                 FORK_RUNNER_CHECK,
