@@ -1812,3 +1812,50 @@ def test_a_session_retracts_its_own_queued_claim_without_touching_the_live_holde
     assert claim(PROJECT, 7, agent="a", session="A2", branch="b", gh=gh, now=NOW).ok
     with pytest.raises(LeaseError):
         release(PROJECT, 7, session="C", gh=gh, now=NOW)
+
+
+@pytest.mark.parametrize(
+    "slurped",
+    [
+        [None],  # a page that is not a list
+        [{"message": "unexpected response"}],  # an error object where a page should be
+        [[], {"message": "unexpected response"}],  # one good page, one malformed
+        [["not an object"]],  # a page whose item is not a comment object
+        [[None]],
+        {"message": "unexpected response"},  # not even a list of pages
+    ],
+)
+def test_a_malformed_paginated_comment_answer_is_unreadable_not_empty(slurped):
+    """A successful but malformed --slurp answer is an unreadable lease history: reading it as
+    an empty one would let a rival claim over a live lease it merely could not see."""
+    fake = FakeGh().issue(7)
+
+    def gh(args, input=None):
+        args = tuple(args)
+        if args[0] == "api" and args[1].split("?")[0].endswith("/comments") and "-X" not in args:
+            return json.dumps(slurped)
+        return fake(args, input)
+
+    with pytest.raises(LeaseError, match="unreadable"):
+        current_lease(PROJECT, 7, gh, now=NOW)
+    with pytest.raises(LeaseError):
+        claim(PROJECT, 7, agent="me", session="s1", branch="b", ttl_minutes=60, gh=gh, now=NOW)
+    assert not any(c[:3] == ("api", "-X", "POST") for c in fake.calls)  # no marker posted
+
+
+@pytest.mark.parametrize(
+    "slurped", [[None], [{"message": "x"}], [[], {"message": "x"}], [["s"]], [[None]], {}, None]
+)
+def test_the_commit_guard_reads_a_malformed_comment_answer_as_unavailable(
+    slurped, monkeypatch, tmp_path
+):
+    import subprocess
+
+    guard = _guard()
+    out = "" if slurped is None else json.dumps(slurped)
+
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(guard.subprocess, "run", fake_run)
+    assert guard.lease_unavailable(guard.lease_for(7))

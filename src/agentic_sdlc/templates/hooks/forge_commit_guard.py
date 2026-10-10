@@ -1643,12 +1643,16 @@ def lease_for(issue: int) -> dict | None:
             text=True,
             check=True,
         ).stdout
-        pages = json.loads(out or "[]")
+        pages = json.loads(out or "null")
     except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
         return UNAVAILABLE
-    if not isinstance(pages, list):
+    # --slurp wraps the pages in one outer array. Any other shape -- a page that is not a list,
+    # an item that is not an object -- is an unreadable lease history, never an empty one.
+    if not isinstance(pages, list) or not all(isinstance(page, list) for page in pages):
         return UNAVAILABLE
-    comments = [c for page in pages if isinstance(page, list) for c in page if isinstance(c, dict)]
+    comments = [c for page in pages for c in page]
+    if not all(isinstance(c, dict) for c in comments):
+        return UNAVAILABLE
     try:
         return lease_from_comments(comments, repo_permission)
     except LeaseUnavailable:

@@ -264,9 +264,17 @@ something that runs differently.
   TODO, and leaves the required contexts unverifiable.
 - **`onboard --apply`** merges Forge's rules into an existing `Protect main` ruleset: existing
   rules and stricter parameters (more approvals, extra status checks, signatures) are kept.
-  The one exception is Forge's own `test` check: a binding (`integration_id`) to an app other
-  than GitHub Actions (15368) could never be satisfied by `ci.yml`, so the merge drops it and
-  `doctor` fails a ruleset that has one.
+  The one exception is Forge's own `test` check, which is always bound to GitHub Actions
+  (`integration_id` 15368): unbound, any app or credential with commit-status access could
+  report `test` and satisfy the gate without `ci.yml` running; bound to another app, `ci.yml`
+  could never satisfy it. The merge rebinds it to GitHub Actions, and `doctor` fails a `test`
+  requirement that is unbound or bound elsewhere -- in `Protect main`, in inherited
+  org/enterprise rulesets and in classic branch protection (`checks[].app_id`) alike.
+- A push allowlist (classic protection) or ruleset over `agent/**` must admit the actor that
+  actually pushes the publisher's branch. The pinned `reusable-implement.yml` pushes with the
+  checkout's persisted `github.token`, i.e. as `github-actions[bot]` (the GitHub Actions app);
+  the Publisher App's token only opens the pull request. `doctor` reads the pusher from the
+  pinned workflow and reports a manual TODO when it cannot.
 
 ## Required repository state
 
