@@ -86,6 +86,12 @@ _FIXED_LABEL_KEYS = frozenset(name.casefold() for name in LABELS if name != "cla
 assert len(_FIXED_LABEL_KEYS) == len(LABELS) - 1, "Forge's fixed labels collide case-insensitively"
 assert IN_PROGRESS_LABEL.casefold() in _FIXED_LABEL_KEYS
 
+#: Binary media the default policy forbids: images, video, audio.
+MEDIA_EXTENSIONS = (
+    *("png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tif", "tiff", "heic", "avif"),
+    *("mp4", "mov", "avi", "mkv", "webm", "m4v", "wmv", "flv"),
+    *("mp3", "wav", "flac", "ogg", "m4a", "aac", "opus", "wma", "aiff"),
+)
 BASE_FORBIDDEN = (
     ".github/**",
     ".github/workflows/**",
@@ -112,6 +118,10 @@ BASE_FORBIDDEN = (
     "**/*.sqlite",
     "*.sqlite3",
     "**/*.sqlite3",
+    # Media (Codex 4239397981): AGENTS.md says it is never committed and that `forbidden_paths`
+    # rejects it, so the default policy has to. evaluate_diff matches forbidden paths
+    # case-insensitively (`LOGO.PNG`). SVG is text source, reviewed like code: not listed.
+    *(pattern for ext in MEDIA_EXTENSIONS for pattern in (f"*.{ext}", f"**/*.{ext}")),
 )
 BASE_FORBIDDEN_TASKS = (
     r"\bdeploy\b.{0,40}\bprod",
@@ -374,6 +384,9 @@ class OnboardSpec:
             raise OnboardError(f"{WINDOWS_UNSUPPORTED} (got {', '.join(windows)})")
         if not _linux_labels(self.runs_on):
             raise OnboardError(f"{LINUX_RUNNER_REQUIRED} (got --runs-on {','.join(self.runs_on)})")
+        short = _short_job_labels((*self.runs_on, *self.ci_runs_on))
+        if short:
+            raise OnboardError(f"{SHORT_JOB_UNSUPPORTED} (got {', '.join(short)})")
         if self.fork_exposed and not _github_hosted(set(self.ci_labels)):
             raise OnboardError(
                 "a fork-exposed (public, or forkable private/internal) repository's CI runs fork "
@@ -796,7 +809,9 @@ Codex is the primary architect, planner, and independent reviewer. The routed im
 ## Product Invariants
 
 - Verification must not call production systems, paid AI providers, or deployment targets.
-- Never commit media, user data, credentials, or `.env*` files; `forbidden_paths` rejects them.
+- Never commit media, user data, credentials, or `.env*` files. `forbidden_paths` rejects
+  image, video and audio files (SVG is source, reviewed like code), key files, SQLite
+  databases and `.env*`; other user data is on you.
 - Touching a `protected_paths` entry adds an architect/security review gate.
 
 ## Verification
@@ -3046,6 +3061,118 @@ def publisher_branch_rule_problems(
     return problems
 
 
+#: Classic branch-protection rules of the repository, with what each one requires (GraphQL:
+#: `rules/branches` and `branches/{b}/protection` show only rulesets / one existing branch, so a
+#: wildcard rule over agent/** that does not exist yet is visible only here).
+CLASSIC_PROTECTION_QUERY = """
+query($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    branchProtectionRules(first: 100) {
+      pageInfo { hasNextPage }
+      nodes {
+        pattern
+        requiresStatusChecks
+        requiredStatusCheckContexts
+        requiresCommitSignatures
+        requiresApprovingReviews
+        requiresCodeOwnerReviews
+        requiresDeployments
+        restrictsPushes
+        blocksCreations
+        lockBranch
+        pushAllowances(first: 100) {
+          pageInfo { hasNextPage }
+          nodes { actor { __typename ... on App { slug } } }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def classic_publisher_branch_problems(answer: object, branch: PublisherValue) -> list[str]:
+    """What the repository's CLASSIC branch-protection rules do to the publisher's push of a
+    new `agent/issue-<N>-<RUN>` branch (Codex 4239397979). A rule's pattern (fnmatch with
+    FNM_PATHNAME, relative to refs/heads/) is judged over the whole branch domain, like a
+    ruleset's: one matching every agent branch is reported for each requirement the push cannot
+    meet (required checks or reviews, signatures, deployments, a push allowlist without the
+    publisher App, a lock); one matching some of them, or one doctor cannot evaluate, is a
+    manual TODO; one matching none is ignored. An unreadable answer is a manual TODO."""
+    data = answer.get("data") if isinstance(answer, dict) else None
+    repo = data.get("repository") if isinstance(data, dict) else None
+    rules = repo.get("branchProtectionRules") if isinstance(repo, dict) else None
+    nodes = rules.get("nodes") if isinstance(rules, dict) else None
+    if not isinstance(nodes, list) or (isinstance(answer, dict) and answer.get("errors")):
+        why = answer.why if isinstance(answer, Unreadable) else "unreadable answer"
+        return [
+            f"could not read the classic branch-protection rules ({why}; GraphQL "
+            "repository.branchProtectionRules) → check that no rule pattern matches agent/** "
+            "branches"
+        ]
+    problems: list[str] = []
+    if (rules.get("pageInfo") or {}).get("hasNextPage"):
+        problems.append(
+            "more than 100 classic branch-protection rules: the rest were not inspected → check "
+            "that none matches agent/** branches"
+        )
+    ref = PublisherValue(
+        ("refs/heads/" + branch.literals[0], *branch.literals[1:]), branch.variables
+    )
+    for node in nodes:
+        if not isinstance(node, dict) or not isinstance(node.get("pattern"), str):
+            problems.append("a classic branch-protection rule could not be read → check it")
+            continue
+        pattern = node["pattern"]
+        name = f"classic branch protection {pattern!r}"
+        scope = _ref_pattern_scope("refs/heads/" + pattern, ref, "")
+        if scope is False:
+            continue
+        needs = []
+        if node.get("requiresStatusChecks"):
+            contexts = ", ".join(str(c) for c in node.get("requiredStatusCheckContexts") or [])
+            needs.append(f"status checks{f' ({contexts})' if contexts else ''}")
+        if node.get("requiresApprovingReviews") or node.get("requiresCodeOwnerReviews"):
+            needs.append("pull-request reviews (no direct push)")
+        if node.get("requiresCommitSignatures"):
+            needs.append("signed commits")
+        if node.get("requiresDeployments"):
+            needs.append("successful deployments")
+        if node.get("lockBranch"):
+            needs.append("a locked branch")
+        if node.get("restrictsPushes") or node.get("blocksCreations"):
+            allowances = node.get("pushAllowances")
+            actors = allowances.get("nodes") if isinstance(allowances, dict) else None
+            readable = isinstance(actors, list) and not (
+                (allowances.get("pageInfo") or {}).get("hasNextPage")
+            )
+            publisher_allowed = readable and any(
+                isinstance(a, dict)
+                and isinstance(a.get("actor"), dict)
+                and a["actor"].get("__typename") == "App"
+                and PUBLISHER_APP_SLUG_HINT in str(a["actor"].get("slug") or "").lower()
+                for a in actors
+            )
+            if not publisher_allowed:
+                needs.append(
+                    "a push/creation allowlist "
+                    + ("without the publisher App" if readable else "that could not be read")
+                )
+        if scope is None:
+            problems.append(
+                f"{name}: matches some of the publisher's branches {branch.template!r} or "
+                "cannot be evaluated → verify it does not block the publisher's push"
+                + (f" (it requires {'; '.join(needs)})" if needs else "")
+            )
+        elif needs:
+            problems.append(
+                f"{name}: matches every publisher branch {branch.template!r} and requires "
+                f"{'; '.join(needs)}, which the publisher's push cannot meet → exempt agent/** "
+                "from the rule or narrow its pattern"
+            )
+    return problems
+
+
 LEGACY_PROTECTION_CHECK = "classic branch protection on the default branch fits Forge"
 
 
@@ -3145,8 +3272,10 @@ GITHUB_HOSTED_LABELS: dict[str, str] = {
     **dict.fromkeys(
         (
             "ubuntu-latest",
+            "ubuntu-26.04",
             "ubuntu-24.04",
             "ubuntu-22.04",
+            "ubuntu-26.04-arm",
             "ubuntu-24.04-arm",
             "ubuntu-22.04-arm",
             "ubuntu-slim",
@@ -3175,6 +3304,18 @@ GITHUB_HOSTED_LABELS: dict[str, str] = {
         "windows",
     ),
 }
+#: Hosted labels that are LARGER runners, not standard images (Codex 4239397961): they need an
+#: eligible Team/Enterprise plan with the runner made available to the repository, so a label
+#: alone proves nothing. Doctor passes one only when a registered online runner of the
+#: repository carries it; otherwise it is an owner TODO, never an automatic pass.
+GITHUB_LARGER_RUNNER_LABELS = frozenset(
+    label for label in GITHUB_HOSTED_LABELS if label.endswith(("-large", "-xlarge"))
+)
+#: Hosted labels with a hard per-job time limit, in minutes (Codex 4239397966): `ubuntu-slim`
+#: stops every job at 15 minutes. Every Forge workload may run longer -- ci.yml's test job
+#: allows 30 minutes, reusable-implement.yml 60 and 120 -- so such a label is rejected for
+#: `--runs-on` and `--ci-runs-on` alike, and doctor fails a workflow that targets one.
+SHORT_JOB_LIMIT_LABELS: dict[str, int] = {"ubuntu-slim": 15}
 
 #: Providers reusable-implement.yml can generate a patch with once routed: Codex, Claude Code and
 #: every provider the OpenAI-compatible adapter configures. Anything else stops at "needs an
@@ -3412,8 +3553,33 @@ def _unforwarded_secrets(caller: Path, needed: set[str]) -> list[str]:
 
 
 def _github_hosted(labels: set[str]) -> bool:
-    """Exactly one label, and one GitHub actually hosts (any OS: a fresh VM either way)."""
+    """Exactly one label, and one GitHub actually hosts (any OS: a fresh VM either way). Says
+    nothing about AVAILABILITY: a larger runner may not be provisioned (`_standard_hosted`)."""
     return len(labels) == 1 and next(iter(labels)) in GITHUB_HOSTED_LABELS
+
+
+def _standard_hosted(labels) -> bool:
+    """One standard GitHub-hosted label: available to every repository with no setup. Not a
+    larger runner (plan and provisioning dependent) and not a label whose hard job-time limit is
+    below the Forge workloads' timeouts."""
+    names = {str(x) for x in labels}
+    return (
+        _github_hosted(names)
+        and not names & GITHUB_LARGER_RUNNER_LABELS
+        and not names & set(SHORT_JOB_LIMIT_LABELS)
+    )
+
+
+def _short_job_labels(labels) -> list[str]:
+    """Labels whose hard job-time limit is below what the Forge workflows allow a job."""
+    return sorted(str(x) for x in labels if str(x) in SHORT_JOB_LIMIT_LABELS)
+
+
+SHORT_JOB_UNSUPPORTED = (
+    "ubuntu-slim stops every job after 15 minutes, below the Forge workflows' own timeouts "
+    "(ci.yml test 30 min, reusable-implement.yml 60/120 min): use ubuntu-latest or another "
+    "standard label"
+)
 
 
 def _windows_labels(labels) -> list[str]:
@@ -3464,13 +3630,15 @@ def _runner_on_windows(runner: dict) -> bool:
 
 def _runner_available(labels: set[str], runners: Sequence[dict]) -> bool:
     """A standard GitHub-hosted label, or an online NON-Windows runner carrying every label.
-    Anything else -- self-hosted, a typo, an unresolved expression -- would queue forever. A
+    Anything else -- self-hosted, a larger runner not proven provisioned, a typo, an unresolved
+    expression -- may queue forever; a short-limit label (`ubuntu-slim`) kills the job. A
     Windows target, or a match only on a Windows runner, is never available: the generated jobs
     run bash with Unix paths."""
-    if _windows_labels(labels):
+    if _windows_labels(labels) or _short_job_labels(labels):
         return False
-    if _github_hosted(labels):
+    if _standard_hosted(labels):
         return True
+    # A larger hosted runner (or self-hosted labels): only a registered online runner proves it.
     return bool(labels) and any(
         r.get("status") == "online"
         and not _runner_on_windows(r)
@@ -3831,6 +3999,24 @@ class CalleeGraph:
     calls: list[tuple[str, dict, str, object]] = field(default_factory=list)
     uninspectable: list[str] = field(default_factory=list)
     unfollowed: list[str] = field(default_factory=list)
+    #: (file, sha) -> the pinned platform workflows it calls: what `reachable` walks.
+    edges: dict[tuple[str, str], set[tuple[str, str]]] = field(default_factory=dict)
+
+    def reachable(self, roots) -> set[tuple[str, str]]:
+        """Every workflow (file, sha) in the trees of `roots`, the roots included."""
+        seen: set[tuple[str, str]] = set()
+        todo = list(roots)
+        while todo:
+            node = todo.pop()
+            if node not in seen:
+                seen.add(node)
+                todo += self.edges.get(node, ())
+        return seen
+
+
+#: GitHub runs at most 50 unique reusable workflows from one top-level workflow file, nested
+#: trees included; a larger tree is rejected when the caller runs (Codex 4239397986).
+_REUSABLE_WORKFLOWS_PER_CALLER = 50
 
 
 def platform_callee_graph(
@@ -3849,6 +4035,14 @@ def platform_callee_graph(
     GitHub's limit of ten levels includes that caller."""
     graph = CalleeGraph()
     stack: list[tuple[str, str, dict, int, tuple[tuple[str, str], ...]]] = []
+    # The deepest level each workflow has been expanded at. A workflow reached again along a
+    # DEEPER path is expanded again (Codex 4239397976): GitHub's nesting limit applies to every
+    # path, and one shared callee met shallow first used to hide an edge past level ten behind
+    # it. Documents are loaded once (`graph.docs`); a re-expansion at a depth no deeper than one
+    # already done can find nothing new and is skipped, so the walk stays bounded by
+    # files x max_depth.
+    expanded: dict[tuple[str, str], int] = {}
+    seen_calls: set[tuple[str, tuple[str, str]]] = set()
     for name, doc in roots.items():
         if isinstance(doc, dict):
             graph.docs[(name, root_ref)] = doc
@@ -3862,6 +4056,10 @@ def platform_callee_graph(
 
     while stack:
         name, sha, doc, depth, path = stack.pop()
+        if expanded.get((name, sha), 0) >= depth:
+            continue
+        expanded[(name, sha)] = depth
+        edges = graph.edges.setdefault((name, sha), set())
         jobs = doc.get("jobs")
         for job_name, job in jobs.items() if isinstance(jobs, dict) else ():
             if not isinstance(job, dict) or "uses" not in job:
@@ -3878,6 +4076,7 @@ def platform_callee_graph(
                 )
                 continue
             target = (found.group(2), found.group(3))
+            edges.add(target)
             if target in path:
                 unfollowed(f"{where}: reusable workflow cycle through {target[0]}@{target[1][:12]}")
                 continue
@@ -3885,21 +4084,52 @@ def platform_callee_graph(
                 unfollowed(f"{where}: calls nested deeper than {max_depth} levels")
                 continue
             called = graph.docs.get(target)
-            if called is None:
+            if called is None and target not in graph.edges:
                 loaded = load_callee(*target)
                 called = loaded if isinstance(loaded, dict) else None
-            graph.calls.append((where, job, target[0], called))
+                if called is None:
+                    graph.edges[target] = set()  # unreadable: never loaded again
+            if (where, target) not in seen_calls:
+                seen_calls.add((where, target))
+                graph.calls.append((where, job, target[0], called))
             if called is None:
                 graph.uninspectable.append(
                     f"{where}: {target[0]} could not be read at {target[1][:12]}"
                 )
                 continue
-            if target not in graph.docs:
-                graph.docs[target] = called
-                stack.append((*target, called, depth + 1, (*path, target)))
+            graph.docs[target] = called
+            stack.append((*target, called, depth + 1, (*path, target)))
     graph.uninspectable = list(dict.fromkeys(graph.uninspectable))
     graph.unfollowed = list(dict.fromkeys(graph.unfollowed))
     return graph
+
+
+def reusable_workflow_limit_problems(
+    caller_docs: Sequence[tuple[str, object]],
+    calls: Sequence[tuple[str, dict, str]],
+    graph: CalleeGraph,
+    ref: str,
+) -> list[str]:
+    """Each top-level caller whose tree holds more than `_REUSABLE_WORKFLOWS_PER_CALLER` unique
+    reusable workflows (Codex 4239397986): its platform callees (walked at `ref`) with
+    everything they reach, plus every other reusable workflow it calls directly. Counted per
+    caller: GitHub's limit is per top-level workflow file, not per repository."""
+    problems = []
+    for label, doc in caller_docs:
+        roots = {(callee, ref) for where, _, callee in calls if where.startswith(f"{label}:")}
+        others: set[str] = set()
+        jobs = doc.get("jobs") if isinstance(doc, dict) else None
+        for job in jobs.values() if isinstance(jobs, dict) else ():
+            uses = str((job or {}).get("uses", "") if isinstance(job, dict) else "").strip()
+            if uses and not any(uses.split("@")[0].endswith(f"/{c}") for c, _ in roots):
+                others.add(uses)
+        count = len(graph.reachable(roots)) + len(others)
+        if count > _REUSABLE_WORKFLOWS_PER_CALLER:
+            problems.append(
+                f"{label} reaches {count} unique reusable workflows (nested trees included); "
+                f"GitHub runs at most {_REUSABLE_WORKFLOWS_PER_CALLER} from one workflow file"
+            )
+    return problems
 
 
 _WORKFLOW_FILE = re.compile(r"^[A-Za-z0-9._-]+\.ya?ml$")
@@ -5657,6 +5887,7 @@ def doctor(
                 continue
             mismatches += reusable_call_mismatches(where, job, callee, callee_doc)
         mismatches += [f"{why}: its call contract cannot be verified" for why in graph.unfollowed]
+        mismatches += reusable_workflow_limit_problems(caller_docs, calls, graph, ref)
         mismatches = list(dict.fromkeys(mismatches))
         add(
             Check(
@@ -6106,6 +6337,23 @@ def doctor(
                 branch_problems += publisher_branch_scope_problems(
                     details, publisher.branch, effective_branch
                 )
+            owner, _, name = project_id.partition("/")
+            branch_problems += classic_publisher_branch_problems(
+                _safe_json(
+                    gh,
+                    [
+                        "api",
+                        "graphql",
+                        "-f",
+                        f"query={CLASSIC_PROTECTION_QUERY}",
+                        "-F",
+                        f"owner={owner}",
+                        "-F",
+                        f"name={name}",
+                    ],
+                ),
+                publisher.branch,
+            )
             branch = publisher.branch.example
             branch_pages = _safe_json(
                 gh,
@@ -6330,7 +6578,21 @@ def doctor(
         )
     # Windows targets are reported above, not as a runner to register.
     targets = {w: lbls for w, lbls in label_targets.items() if w not in on_windows}
-    need_runners = any(not _github_hosted(t) for t in [*targets.values(), ci_labels or set()])
+    # ubuntu-slim kills a job at 15 minutes (Codex 4239397966): a failure, not a runner to
+    # register. ci.yml's own check below reports its test job.
+    too_short = {w: lbls for w, lbls in targets.items() if _short_job_labels(lbls)}
+    if too_short:
+        add(
+            Check(
+                "runners allow the workflows' job timeouts",
+                False,
+                SHORT_JOB_UNSUPPORTED
+                + ": "
+                + "; ".join(f"{w} {sorted(lbls)}" for w, lbls in sorted(too_short.items())),
+            )
+        )
+    targets = {w: lbls for w, lbls in targets.items() if w not in too_short}
+    need_runners = any(not _standard_hosted(t) for t in [*targets.values(), ci_labels or set()])
     runner_rows = (
         _paged_items(gh, f"repos/{project_id}/actions/runners", "runners") if need_runners else []
     )
@@ -6340,7 +6602,7 @@ def doctor(
     stranded = {
         where: labels for where, labels in targets.items() if not _runner_available(labels, runners)
     }
-    if targets and all(_github_hosted(t) for t in targets.values()):
+    if targets and all(_standard_hosted(t) for t in targets.values()):
         add(Check("runner", True, "GitHub-hosted runners (billed minutes on private repos)"))
     elif targets:
         online = [r for r in runners if r.get("status") == "online"]
@@ -6372,14 +6634,28 @@ def doctor(
     elif ci_labels is not None:
         ci_ok = _runner_available(ci_labels, runners)
         ci_windows = bool(_windows_labels(ci_labels))
+        ci_short = bool(_short_job_labels(ci_labels))
+        ci_larger = sorted(ci_labels & GITHUB_LARGER_RUNNER_LABELS)
         add(
             Check(
                 "ci.yml test job runs on an available runner",
                 ci_ok,
                 f"labels {sorted(ci_labels)}: {WINDOWS_UNSUPPORTED}"
                 if ci_windows
+                else f"labels {sorted(ci_labels)}: {SHORT_JOB_UNSUPPORTED}"
+                if ci_short
                 else ", ".join(sorted(ci_labels))
-                if _github_hosted(ci_labels)
+                if _standard_hosted(ci_labels)
+                else f"{', '.join(ci_larger)} is a larger GitHub-hosted runner: "
+                + (
+                    "an online runner of the repository carries it"
+                    if ci_ok
+                    else "it needs an eligible GitHub Team/Enterprise plan with the runner made "
+                    f"available to {project_id}, which doctor cannot verify"
+                    + (f" (runner list unreadable: {runners_unread})" if runners_unread else "")
+                    + " → confirm, or use a standard label such as macos-latest"
+                )
+                if ci_larger
                 else f"labels {sorted(ci_labels)}: "
                 + (
                     "online runner found"
@@ -6390,7 +6666,7 @@ def doctor(
                     else "not a GitHub-hosted label and no online non-Windows runner carries "
                     "all of them"
                 ),
-                manual=not ci_ok and not ci_windows,
+                manual=not ci_ok and not ci_windows and not ci_short,
             )
         )
 

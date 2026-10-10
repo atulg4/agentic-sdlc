@@ -2,8 +2,9 @@
 """Claude Code PreToolUse hook: guard git on an issue branch without this session's lease.
 
 Installed by `sdlcctl onboard`. Reads the hook payload on stdin; exit 2 blocks the tool call and
-shows the message to the agent. Only an issue branch (`*/issue-N*`) this session does not lease
-is ever blocked; everything else passes.
+shows the message to the agent. Only git that acts on an issue branch (`*/issue-N*`) this session
+does not lease -- the checked-out one, or one the command names as a destination -- is blocked,
+plus git whose destinations cannot be known before it runs; everything else passes.
 
 Posture: DENY BY DEFAULT for git. On an issue branch, EVERY git invocation needs the lease except
 a short allowlist of read-only subcommands proven by plain literal tokens (`_read_only`):
@@ -41,6 +42,14 @@ commit` is checked against X, see UNKNOWN_BRANCH); one whose destination cannot 
 the command runs (`git checkout "$B"`, an alias, bisect, `source`, `cd "$D"`, ...) blocks a later
 guarded git outright -- run the two as separate commands. A plain switch to an existing branch
 (`git switch main`) rewrites no history and needs no lease.
+
+A guarded command is checked against every ref it NAMES as a destination too, not only the
+checked-out branch: `git push origin HEAD:forge/issue-7`, `git push origin :forge/issue-7`,
+`git branch -f forge/issue-7 HEAD` or `git update-ref refs/heads/forge/issue-7 X` run from main
+need issue 7's lease (see `_named_refs`). One whose destinations cannot be known before it runs
+(`git push --all`, a glob refspec, a push driven by `remote.*.push` or `push.default`
+upstream/matching, an alias to a shell command, `rebase --update-refs`, ...) is blocked on any
+branch: name the destinations explicitly.
 
 Out of scope: programs that run git without naming it on the command line (a script file, a
 Makefile target) and direct writes into `.git/`.
@@ -176,7 +185,8 @@ MAX_TTL_MINUTES = 7 * 24 * 60  # leases.MAX_TTL_MINUTES
 # Who may post lease markers -- the SAME rule as leases.trusted_marker_author (a test holds the
 # two to identical decisions): a user with write/maintain/admin on the repository, read from the
 # collaborator permission API (author_association is no authority: a read-only member is MEMBER),
-# `github-actions[bot]`, or the Forge Publisher App's bot. Unreadable permission = untrusted.
+# `github-actions[bot]`, or the Forge Publisher App's bot. A 404 = no access (untrusted); any
+# other unreadable permission refuses the lease read (LeaseUnavailable), never drops the marker.
 WRITE_PERMISSIONS = frozenset({"admin", "maintain", "write"})  # leases.WRITE_PERMISSIONS
 GITHUB_ACTIONS_BOT = "github-actions[bot]"  # leases.GITHUB_ACTIONS_BOT
 PUBLISHER_APP_SLUG_HINT = "agentic-sdlc"  # leases.PUBLISHER_APP_SLUG_HINT
@@ -295,8 +305,10 @@ def _read_only(sub: str, args: list[str]) -> bool:
         return reads and not any(a in CONFIG_WRITE for a in options)
     if sub == "fetch":
         for arg in options:
-            if arg.startswith(("--update-head-ok", "--upload-pack", "--exec")):
-                return False
+            if arg.startswith(("--update-head-ok", "--upload-pack", "--exec", "--refmap")):
+                return False  # --refmap maps fetched refs onto local ones (refs/heads/* too)
+            if arg == "--stdin":
+                return False  # refspecs from stdin
             if "u" in _short_cluster(arg):
                 return False
         # `git fetch REMOTE SRC:DST` writes DST; an `ext::` remote runs a command
@@ -467,16 +479,23 @@ def _commit_targets(argv: list[str], depth: int = 0, cwd: str | None = None) -> 
             for inner_dirs, opts, inner_env in commit_targets(inner, depth + 1, _where(cwd, chdirs))
         ]
     args = [_strip_substitutions(word) for word in words[1:]]
+    named = _mentioned_refs(unknown[0], " ".join(words[1:]))
     if program in SHELLS:  # `| sh`, `bash <<< ...`: the program arrives on stdin
         reads_stdin = _shell_reads_stdin(words)
-        return unknown if reads_stdin or any(_mentions_git(a) for a in args) else []
-    if program.startswith("git-"):
-        return unknown  # `git-commit`, `git-merge`: a git subcommand run directly
+        return unknown + named if reads_stdin or any(_mentions_git(a) for a in args) else []
+    if program.startswith("git-"):  # `git-commit`, `git-push`: a git subcommand run directly
+        refs = _named_refs(program[4:], words[1:], _where(cwd, chdirs), unknown[0], False)
+        return unknown + [_with_ref(unknown[0], ref) for ref in refs]
     if program not in GIT_PROGRAMS:
         if any(_mentions_git(a) for a in args):
-            return unknown  # `xargs git`, `find -exec git`, `eval git ...`, `python -c '...git'`
+            # `xargs git`, `find -exec git`, `eval git ...`: git's arguments (and so the refs
+            # it updates) arrive from stdin or are assembled -- no destination can be known.
+            # `python -c '...git'`: every issue ref the text names is a destination.
+            if (program in FANOUT or program in _EVAL_LIKE) and not _ref_free_fanout(words):
+                return [*unknown, *named, _with_ref(unknown[0], UNKNOWN_REF)]
+            return unknown + named
         if program in FANOUT and any(os.path.basename(a) in SHELLS for a in args):
-            return unknown  # `xargs sh`, `find -exec bash -c ...`
+            return unknown + named  # `xargs sh`, `find -exec bash -c ...`
         return []
     unsafe = any(
         key not in SAFE_GIT_ENV and not key.startswith("LC_") for key in keys
@@ -507,7 +526,10 @@ def _commit_targets(argv: list[str], depth: int = 0, cwd: str | None = None) -> 
             continue  # --no-pager, --bare, ...
         target = [(tuple(chdirs), tuple(repo_opts), tuple(env))]
         if unsafe or not _read_only(word, rest):
-            return target
+            # Codex 4239397967: the refs the command names are destinations too, not only the
+            # checked-out branch (`git push origin HEAD:forge/issue-7` from main).
+            refs = _named_refs(word, rest, _where(cwd, chdirs), target[0], unsafe)
+            return target + [_with_ref(target[0], ref) for ref in refs]
         return []
     return []  # `git`, `git --version`: no subcommand
 
@@ -768,6 +790,392 @@ SET_BUILTINS = frozenset({"export", "declare", "typeset", "local", "readonly", "
 _GIT_REPO_VAR = re.compile(r"^GIT_(?:DIR|WORK_TREE)(?:=|$)")
 
 
+# ---- Named destination refs (Codex 4239397967). A guarded git command updates the checked-out
+# branch AND every ref it names: `git push origin HEAD:forge/issue-7`, `git push origin
+# :forge/issue-7`, `git branch -f forge/issue-7 HEAD`, `git update-ref refs/heads/forge/issue-7 X`
+# run from main touch issue 7 all the same. Each named ref rides its Target as `_REF_KEY` and is
+# checked against ITS issue's lease. When the destinations cannot be known before the command
+# runs -- `--all`/`--mirror`/`--prune`, a glob or `:` refspec, a push whose refspecs come from
+# configuration that may map elsewhere (`remote.*.push`, `push.default` upstream/matching), an
+# alias to a shell command or an external `git-<name>` program, `rebase --exec/--update-refs`,
+# `update-ref --stdin`, a computed name -- the target carries UNKNOWN_REF and the command is
+# blocked outright, issue branch or not.
+UNKNOWN_REF = "\0unknown-ref"
+_REF_KEY = "\0ref"  # a Target env entry carrying a ref the command names as a destination
+_ISSUE_REF_TEXT = re.compile(r"[A-Za-z0-9_./-]*issue-\d+[A-Za-z0-9_./-]*")
+# Subcommands that update no ref but the checked-out branch (or none at all). A branch CHANGE
+# (`checkout -b X`, `switch -c X`, `rebase U X`) is `_segment_switch`'s and re-targets already.
+NO_NAMED_REFS = (
+    READ_ONLY_ANY
+    | {"grep", "reflog", "remote", "config", "tag", "checkout", "switch"}
+    | (SWITCH_FREE - {"push", "update-ref", "fetch", "pull", "worktree", "stash", "submodule"})
+    | {"merge-tree", "merge-file", "patch-id", "column", "stripspace", "mailsplit", "mailinfo"}
+    | {"commit-graph", "multi-pack-index", "pack-objects", "index-pack", "verify-pack"}
+    | {"unpack-objects", "prune-packed", "update-server-info", "show-index", "check-mailmap"}
+    | {"fmt-merge-msg", "get-tar-commit-id", "bugreport", "diagnose", "quiltimport", "replace"}
+)
+UNKNOWN_REF_SUBCOMMANDS = frozenset({"filter-branch", "fast-import", "replay", "filter-repo"})
+PUSH_VALUE_OPTS = frozenset({"-o", "--push-option", "--repo", "--receive-pack", "--exec"})
+PUSH_ALL_OPTS = frozenset({"--all", "--branches", "--mirror", "--prune"})
+PUSH_LONG_FLAGS = frozenset(
+    {
+        "--tags", "--follow-tags", "--no-follow-tags", "--atomic", "--no-atomic", "--dry-run",
+        "--porcelain", "--force", "--set-upstream", "--thin", "--no-thin", "--progress",
+        "--no-progress", "--no-verify", "--verify", "--ipv4", "--ipv6", "--quiet", "--verbose",
+        "--signed", "--no-signed", "--force-with-lease", "--no-force-with-lease",
+        "--force-if-includes", "--no-force-if-includes", "--recurse-submodules",
+        "--no-recurse-submodules",
+    }
+)  # fmt: skip
+PUSH_SHORT_FLAGS = frozenset("fnqvu46")
+BRANCH_VALUE_OPTS = frozenset(
+    {"-u", "--set-upstream-to", "--contains", "--no-contains", "--merged", "--no-merged"}
+    | {"--points-at", "--sort", "--format"}
+)
+# Long `git branch` options -> the short letter of their mode ("" = no bearing on the mode).
+BRANCH_LONG_MODES = {
+    "--delete": "d", "--move": "m", "--copy": "c", "--list": "l", "--all": "a",
+    "--remotes": "r", "--show-current": "l", "--unset-upstream": "U",
+    "--edit-description": "U", "--force": "f", "--verbose": "", "--quiet": "", "--track": "",
+    "--no-track": "", "--ignore-case": "", "--create-reflog": "", "--no-create-reflog": "",
+    "--recurse-submodules": "", "--no-recurse-submodules": "", "--omit-empty": "",
+    "--color": "", "--no-color": "", "--column": "", "--no-column": "", "--abbrev": "",
+    "--no-abbrev": "",
+}  # fmt: skip
+BRANCH_SHORT_FLAGS = frozenset("dDmMcCflarvqti")
+
+
+def _with_ref(target: Target, ref: str) -> Target:
+    dirs, opts, env = target
+    return (dirs, opts, (*env, (_REF_KEY, ref)))
+
+
+def _branch_name(ref: str) -> str:
+    """`refs/heads/X` -> `X`; any other spelling as given."""
+    return ref[len("refs/heads/") :] if ref.startswith("refs/heads/") else ref
+
+
+def _mentioned_refs(target: Target, text: str) -> list[Target]:
+    """A destination Target for every issue ref `text` names (`HEAD:forge/issue-7` inside a
+    `python -c` string): what an indirect git run can update is at least what it spells out."""
+    names = dict.fromkeys(_branch_name(m) for m in _ISSUE_REF_TEXT.findall(text))
+    return [_with_ref(target, name) for name in names]
+
+
+def _ref_free_fanout(words: list[str]) -> bool:
+    """`xargs git log`, `find -exec git status {} ;`: the git subcommand is a literal on the
+    command line and updates no named ref, so only its trailing arguments come from elsewhere."""
+    for index, word in enumerate(words):
+        if os.path.basename(word) in GIT_PROGRAMS:
+            sub, _ = _git_sub_args(words[index:])
+            return sub is not None and sub in NO_NAMED_REFS
+    return False
+
+
+def _git_config(where: str, target: Target, *args: str) -> tuple[int, str]:
+    """`git config ARGS` in the repository `target` acts on: (exit code, stdout); 128 when git
+    could not be run at all. Exit 1 is git's "no such key"."""
+    _, opts, env = target
+    clean = {key: value for key, value in env if not key.startswith("\0")}
+    try:
+        proc = subprocess.run(
+            ["git", *opts, "config", *args],
+            cwd=where,
+            env={**os.environ, **clean} if clean else None,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return 128, ""
+    return proc.returncode, proc.stdout
+
+
+def _named_refs(
+    sub: str, args: list[str], where: str, target: Target, unsafe: bool, depth: int = 0
+) -> list[str]:
+    """The refs `git SUB ARGS` updates besides the checked-out branch, as branch names, with
+    UNKNOWN_REF when they cannot be known (see the block comment above). `unsafe`: git runs
+    under configuration given on the command line (`-c`, GIT_CONFIG_*), which the repository's
+    configuration read here does not show."""
+    if sub in NO_NAMED_REFS:
+        return []
+    if sub in UNKNOWN_REF_SUBCOMMANDS or any(_dynamic_ref(a) for a in args):
+        return [UNKNOWN_REF]
+    if sub == "push":
+        return _push_refs(args, where, target, unsafe)
+    if sub == "branch":
+        return _branch_refs(args)
+    if sub == "update-ref":
+        return _update_ref_refs(args)
+    if sub == "symbolic-ref":
+        return _symbolic_ref_refs(args)
+    if sub in ("fetch", "pull"):
+        refs = _fetch_refs(args)
+        if sub == "pull" and UNKNOWN_REF not in refs and "--no-rebase" not in args:
+            refs += _rebase_update_refs(where, target, unsafe)
+        return refs
+    if sub == "rebase":
+        return _rebase_refs(args, where, target, unsafe)
+    if sub == "worktree":
+        return _worktree_refs(args)
+    if sub == "stash":
+        rest = [a for a in args if not a.startswith("-")]
+        return [_branch_name(rest[1])] if len(rest) > 1 and rest[0] == "branch" else []
+    if sub == "bisect":
+        return [UNKNOWN_REF] if args[:1] == ["run"] else []
+    if sub == "submodule":
+        return [UNKNOWN_REF] if "foreach" in args else []
+    return _alias_refs(sub, args, where, target, unsafe, depth)
+
+
+def _alias_refs(
+    sub: str, args: list[str], where: str, target: Target, unsafe: bool, depth: int
+) -> list[str]:
+    """What an alias updates: a git alias is followed (`push-wip = push origin HEAD:x`); a
+    shell alias (`!...`), an external `git-<name>` program or an unreadable one is unknown."""
+    if unsafe or depth >= MAX_SUBST_DEPTH:
+        return [UNKNOWN_REF]
+    code, out = _git_config(where, target, "--get", f"alias.{sub}")
+    value = out.strip()
+    if code != 0 or not value or value.startswith("!"):
+        return [UNKNOWN_REF]
+    try:
+        words = shlex.split(value)
+    except ValueError:
+        return [UNKNOWN_REF]
+    if not words or words[0].startswith("-"):
+        return [UNKNOWN_REF]  # global options inside the alias (`-c`, `-C`)
+    return _named_refs(words[0], [*words[1:], *args], where, target, unsafe, depth + 1)
+
+
+def _push_refs(args: list[str], where: str, target: Target, unsafe: bool) -> list[str]:
+    """`git push [options] [REPOSITORY [REFSPEC...]]`: each refspec's destination; an option
+    this parser does not know is unknown (it may take a value that shifts the refspecs)."""
+    positionals: list[str] = []
+    delete = False
+    rest = list(args)
+    while rest:
+        arg = rest.pop(0)
+        if arg == "--":
+            positionals += rest
+            break
+        if not arg.startswith("-") or arg == "-":
+            positionals.append(arg)
+            continue
+        option, eq, _ = arg.partition("=")
+        if option in PUSH_ALL_OPTS:
+            return [UNKNOWN_REF]
+        if option in PUSH_VALUE_OPTS:
+            if not eq and rest:
+                rest.pop(0)
+            continue
+        if option in ("-d", "--delete"):
+            delete = True
+            continue
+        if arg.startswith("--"):
+            if option in PUSH_LONG_FLAGS:
+                continue
+            return [UNKNOWN_REF]
+        letters = arg[1:]
+        for index, letter in enumerate(letters):
+            if letter == "o":  # `-o VALUE` / `-oVALUE`
+                if not letters[index + 1 :] and rest:
+                    rest.pop(0)
+                break
+            if letter == "d":
+                delete = True
+            elif letter not in PUSH_SHORT_FLAGS:
+                return [UNKNOWN_REF]
+    if len(positionals) < 2:
+        return _configured_push_refs(where, target, unsafe)
+    refs: list[str] = []
+    for spec in positionals[1:]:
+        ref = _push_destination(spec, delete)
+        if ref and ref not in refs:
+            refs.append(ref)
+    return refs
+
+
+def _push_destination(spec: str, delete: bool) -> str | None:
+    """The branch one push refspec updates; None for the checked-out branch (its own target)."""
+    spec = spec[1:] if spec.startswith("+") else spec
+    if "*" in spec or spec == ":":
+        return UNKNOWN_REF  # a glob, or `:` (every matching branch)
+    if delete:
+        return _branch_name(spec)
+    src, colon, dst = spec.partition(":")
+    if not colon or not dst:
+        return None if src in ("HEAD", "@") else _branch_name(src)
+    if dst in ("HEAD", "@"):
+        return UNKNOWN_REF
+    return _branch_name(dst)
+
+
+def _configured_push_refs(where: str, target: Target, unsafe: bool) -> list[str]:
+    """A push without refspecs pushes what configuration says. Only `push.default` simple,
+    current or nothing with no `remote.*.push` provably lands on the checked-out branch's own
+    name (which its own target checks); anything else, or unreadable configuration, is unknown."""
+    if unsafe:
+        return [UNKNOWN_REF]
+    code, out = _git_config(where, target, "--get-regexp", r"^remote\..*\.push$")
+    if code not in (0, 1) or (code == 0 and out.strip()):
+        return [UNKNOWN_REF]
+    code, out = _git_config(where, target, "--get", "push.default")
+    if code not in (0, 1):
+        return [UNKNOWN_REF]
+    mode = out.strip().lower() if code == 0 else "simple"
+    return [] if mode in ("simple", "current", "nothing") else [UNKNOWN_REF]
+
+
+def _branch_refs(args: list[str]) -> list[str]:
+    """`git branch`: the names it deletes, renames, copies, configures or (re)creates."""
+    positionals: list[str] = []
+    modes: set[str] = set()
+    rest = list(args)
+    while rest:
+        arg = rest.pop(0)
+        if arg == "--":
+            positionals += rest
+            break
+        if not arg.startswith("-") or arg == "-":
+            positionals.append(arg)
+            continue
+        option, eq, _ = arg.partition("=")
+        if option in BRANCH_VALUE_OPTS:
+            if not eq and rest:
+                rest.pop(0)
+            modes.add("U" if option in ("-u", "--set-upstream-to") else "l")
+            continue
+        if arg.startswith("--"):
+            if option not in BRANCH_LONG_MODES:
+                return [UNKNOWN_REF]
+            modes.update(BRANCH_LONG_MODES[option])
+            continue
+        letters = arg[1:]
+        for index, letter in enumerate(letters):
+            if letter == "u":  # `-u UPSTREAM` / `-uUPSTREAM`
+                if not letters[index + 1 :] and rest:
+                    rest.pop(0)
+                modes.add("U")
+                break
+            if letter not in BRANCH_SHORT_FLAGS:
+                return [UNKNOWN_REF]
+            modes.add(letter)
+    if modes & set("dDmMcCU"):
+        chosen = positionals  # every name is deleted, renamed/copied or configured
+    elif modes & set("lar") or not positionals:
+        return []  # a listing: the positionals are patterns
+    else:
+        chosen = positionals[:1]  # `git branch [-f] NAME [START]`
+    if any("*" in name or "?" in name or "[" in name for name in chosen):
+        return [UNKNOWN_REF]
+    return [_branch_name(name) for name in chosen]
+
+
+def _update_ref_refs(args: list[str]) -> list[str]:
+    """`git update-ref [-m MSG] [-d] REF ...`: REF (`--stdin` reads its refs from stdin)."""
+    rest, positionals = list(args), []
+    while rest:
+        arg = rest.pop(0)
+        if arg == "--stdin":
+            return [UNKNOWN_REF]
+        if arg == "-m":
+            if rest:
+                rest.pop(0)
+            continue
+        if arg.startswith("-") and arg != "-":
+            continue
+        positionals.append(arg)
+    if not positionals or positionals[0] in ("HEAD", "@"):
+        return []  # HEAD: the checked-out branch, its own target
+    return [_branch_name(positionals[0])]
+
+
+def _symbolic_ref_refs(args: list[str]) -> list[str]:
+    """`git symbolic-ref NAME REF` / `-d NAME` writes NAME; one operand only reads it."""
+    rest, positionals, delete = list(args), [], False
+    while rest:
+        arg = rest.pop(0)
+        if arg == "-m":
+            if rest:
+                rest.pop(0)
+        elif arg in ("-d", "--delete"):
+            delete = True
+        elif not arg.startswith("-"):
+            positionals.append(arg)
+    if not positionals or (len(positionals) < 2 and not delete) or positionals[0] == "HEAD":
+        return []
+    return [_branch_name(positionals[0])]
+
+
+def _fetch_refs(args: list[str]) -> list[str]:
+    """`git fetch|pull REMOTE SRC:DST`: each DST. Any word with a `:` counts (an scp-style
+    remote only adds a harmless non-issue name); `--stdin`/`--refmap` refspecs are unknown."""
+    refs: list[str] = []
+    for arg in args:
+        if arg.partition("=")[0] in ("--stdin", "--refmap"):
+            return [UNKNOWN_REF]
+        if arg.startswith("-") or ":" not in arg or "://" in arg:
+            continue
+        dst = (arg[1:] if arg.startswith("+") else arg).partition(":")[2]
+        if "*" in dst:
+            return [UNKNOWN_REF]
+        if dst and _branch_name(dst) not in refs:
+            refs.append(_branch_name(dst))
+    return refs
+
+
+def _rebase_refs(args: list[str], where: str, target: Target, unsafe: bool) -> list[str]:
+    """A rebase rewrites the branch it is on, plus every branch stacked on the rebased commits
+    when it updates refs (`--update-refs`, `rebase.updateRefs`); `--exec` runs commands."""
+    for arg in args:
+        if arg.startswith(("--exec", "--update-refs")) or "x" in _short_cluster(arg):
+            return [UNKNOWN_REF]
+    if "--no-update-refs" in args:
+        return []
+    return _rebase_update_refs(where, target, unsafe)
+
+
+def _rebase_update_refs(where: str, target: Target, unsafe: bool) -> list[str]:
+    if unsafe:
+        return [UNKNOWN_REF]
+    code, out = _git_config(where, target, "--type=bool", "--get", "rebase.updateRefs")
+    if code == 1 or (code == 0 and out.strip() == "false"):
+        return []
+    return [UNKNOWN_REF]
+
+
+def _worktree_refs(args: list[str]) -> list[str]:
+    """`git worktree add [-b|-B NEW] PATH [COMMIT]`: NEW, else the branch it checks out or
+    DWIM-creates (PATH's basename, or COMMIT)."""
+    if not args or args[0] != "add":
+        return []
+    rest, positionals, refs, detach = list(args[1:]), [], [], False
+    while rest:
+        arg = rest.pop(0)
+        if arg == "--":
+            positionals += rest
+            break
+        option, eq, value = arg.partition("=")
+        if option in ("-b", "-B"):
+            refs.append(value if eq else (rest.pop(0) if rest else ""))
+        elif arg[:2] in ("-b", "-B") and len(arg) > 2:
+            refs.append(arg[2:])
+        elif option == "--reason":
+            if not eq and rest:
+                rest.pop(0)
+        elif arg in ("--detach", "-d"):
+            detach = True
+        elif not arg.startswith("-"):
+            positionals.append(arg)
+    if not refs and not detach:
+        if len(positionals) == 1:
+            refs.append(os.path.basename(positionals[0].rstrip("/")))
+        elif len(positionals) > 1:
+            refs.append(positionals[1])
+    return [_branch_name(ref) for ref in refs if ref]
+
+
 def _git_sub_args(words: list[str]) -> tuple[str | None, list[str]]:
     """`git [global options] SUB ARGS...` -> (SUB, ARGS)."""
     rest = list(words[1:])
@@ -790,7 +1198,7 @@ def _branch_exists(branch: str, where: str, target: Target) -> bool:
         subprocess.run(
             ["git", *opts, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
             cwd=where,
-            env={**os.environ, **dict(env)} if env else None,
+            env={**os.environ, **_real_env(dict(env))} if env else None,
             capture_output=True,
             check=True,
         )
@@ -1025,6 +1433,7 @@ def commit_targets(command: str, depth: int = 0, cwd: str | None = None) -> list
         # An assembled program/subcommand, or git run under an exported GIT_*/PAGER/EDITOR
         # setting: unknown repository, so every `cd` prefix.
         found += [(tuple(cds[:count]), (), ()) for count in range(len(cds) + 1)]
+        found += _mentioned_refs(((), (), ()), command)  # every issue ref it names, too
     return found
 
 
@@ -1042,6 +1451,9 @@ def is_git_commit(command: str, depth: int = 0, cwd: str | None = None) -> bool:
 def target_branch(target: Target, cwd: str | None) -> str:
     """The branch `git <repo options> ...` acts on, asked of git itself."""
     chdirs, opts, env = target
+    named = dict(env).get(_REF_KEY)
+    if named is not None:
+        return named  # a ref the command names as a destination (Codex 4239397967)
     moved = dict(env).pop(_BRANCH_KEY, None)
     if moved is not None:
         return moved  # a branch change earlier in the command put HEAD there
@@ -1067,6 +1479,11 @@ def commit_branches(command: str, cwd: str | None) -> list[str]:
     return branches
 
 
+def _real_env(env: dict[str, str]) -> dict[str, str]:
+    """`env` without the guard's own bookkeeping entries (`\0branch`, `\0ref`)."""
+    return {key: value for key, value in env.items() if not key.startswith("\0")}
+
+
 def current_branch(
     cwd: str | None, git_opts: tuple[str, ...] = (), env: dict[str, str] | None = None
 ) -> str:
@@ -1074,7 +1491,7 @@ def current_branch(
         return subprocess.run(
             ["git", *git_opts, "rev-parse", "--abbrev-ref", "HEAD"],
             cwd=cwd,
-            env={**os.environ, **env} if env else None,
+            env={**os.environ, **_real_env(env)} if env else None,
             capture_output=True,
             text=True,
             check=True,
@@ -1153,6 +1570,8 @@ def repo_permission(login: str) -> str | None:
             data = json.loads(proc.stdout or "{}")
         except json.JSONDecodeError as exc:
             raise LeaseUnavailable("unparseable permission response") from exc
+        if not isinstance(data, dict) or not (data.get("permission") or data.get("role_name")):
+            raise LeaseUnavailable("permission response carries no permission")
     if isinstance(data, dict):
         for key in ("role_name", "permission"):
             value = login_key(data.get(key))
@@ -1274,7 +1693,9 @@ def decide(
     command = str((payload.get("tool_input") or {}).get("command", ""))
     if not is_git_commit(command, cwd=payload.get("cwd")):
         return 0, ""
-    for candidate in [branch] if isinstance(branch, str) else branch:
+    candidates = [branch] if isinstance(branch, str) else list(branch)
+    # the "run them separately" advice first: it is the one that unblocks a mixed command
+    for candidate in sorted(candidates, key=lambda b: b != UNKNOWN_BRANCH):
         verdict = _decide_branch(payload, candidate, lease_lookup, pr_lookup)
         if verdict[0]:
             return verdict
@@ -1282,6 +1703,16 @@ def decide(
 
 
 def _decide_branch(payload: dict, branch: str, lease_lookup, pr_lookup) -> tuple[int, str]:
+    if branch == UNKNOWN_REF:
+        return 2, (
+            "Forge guard: this git command can update refs that cannot be known before it runs "
+            "(--all/--mirror/--prune, a glob or `:` refspec, a push whose destinations come from "
+            "configuration -- remote.*.push, push.default upstream/matching --, an alias to a "
+            "shell command or an external git-<name> program, rebase --exec/--update-refs, "
+            "update-ref --stdin, xargs/eval feeding git its arguments, a computed ref name, ...). "
+            "Name every destination explicitly (git push origin HEAD:<branch>) so the guard can "
+            "check the lease of each issue branch it touches."
+        )
     if branch == UNKNOWN_BRANCH:
         return 2, (
             "Forge guard: this command can move HEAD to a branch that cannot be known before it "

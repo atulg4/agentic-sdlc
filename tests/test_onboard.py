@@ -426,6 +426,13 @@ def _effective_rules(*extra: dict) -> str:
 
 
 AGENT_BRANCH_RULES = "api repos/owner/comic/rules/branches/agent%2F"
+CLASSIC_RULES = "api graphql"
+
+
+def _classic_rules(*nodes: dict, more: bool = False) -> str:
+    """The GraphQL answer listing the repository's classic branch-protection rules."""
+    rules = {"pageInfo": {"hasNextPage": more}, "nodes": list(nodes)}
+    return json.dumps({"data": {"repository": {"branchProtectionRules": rules}}})
 
 
 def _healthy_gh() -> FakeGh:
@@ -438,6 +445,8 @@ def _healthy_gh() -> FakeGh:
             "api repos/owner/comic/rules/branches/main": _effective_rules(),
             # the publisher's agent/... branches: no ruleset targets them
             AGENT_BRANCH_RULES: json.dumps([[]]),
+            # ... and no classic branch-protection pattern either
+            CLASSIC_RULES: _classic_rules(),
             "api repos/owner/comic/rulesets/11": json.dumps({"id": 11, **ruleset_payload(spec())}),
             "api repos/owner/comic/labels": json.dumps(
                 [
@@ -1619,7 +1628,7 @@ def test_doctor_rejects_unknown_hosted_runner_labels(tmp_path, runs_on):
 
 
 @pytest.mark.parametrize(
-    "runs_on", ["ubuntu-latest", "ubuntu-24.04-arm", "macos-15", "macos-15-xlarge"]
+    "runs_on", ["ubuntu-latest", "ubuntu-24.04-arm", "ubuntu-26.04", "ubuntu-26.04-arm", "macos-15"]
 )
 def test_doctor_accepts_github_hosted_runner_labels(tmp_path, runs_on):
     repo = _repo(tmp_path)
@@ -6804,3 +6813,378 @@ def test_doctor_requires_github_issues_enabled(tmp_path, has_issues, manual):
     assert failed[ISSUES_ENABLED_CHECK].manual is manual
     assert "Issues" in failed[ISSUES_ENABLED_CHECK].detail
     assert not report.ok
+
+
+# ---------------------------------------------------------------- review regressions (PR 139, 7)
+# Codex review 5481000688.
+
+
+# Codex 4239397967: a git command is checked against every ref it NAMES as a destination, not
+# only the checked-out branch.
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git push origin HEAD:forge/issue-7",
+        "git push origin :forge/issue-7",
+        "git push origin forge/issue-7",
+        "git push --delete origin forge/issue-7",
+        "git push -d origin forge/issue-7",
+        "git push origin +main:refs/heads/forge/issue-7",
+        "git push -f origin main:forge/issue-7",
+        "git push -o ci.skip origin HEAD:forge/issue-7",
+        "git push --force-with-lease=forge/issue-7 origin HEAD:forge/issue-7",
+        "git branch -f forge/issue-7 HEAD",
+        "git branch --force forge/issue-7 main",
+        "git branch -D forge/issue-7",
+        "git branch --delete forge/issue-7",
+        "git branch -m forge/issue-7 renamed",
+        "git branch -c main forge/issue-7",
+        "git branch forge/issue-7",
+        "git branch -u origin/main forge/issue-7",
+        "git update-ref refs/heads/forge/issue-7 HEAD",
+        "git update-ref -d refs/heads/forge/issue-7",
+        "git update-ref -m msg refs/heads/forge/issue-7 HEAD",
+        "git symbolic-ref refs/heads/forge/issue-7 refs/heads/main",
+        "git fetch origin main:forge/issue-7",
+        "git pull origin main:forge/issue-7",
+        "git worktree add -b forge/issue-7 ../wt7",
+        "git worktree add ../issue-7",
+        "git stash branch forge/issue-7",
+        "git push-wip",  # a git alias: followed
+        "python3 -c \"import subprocess as s; s.run(['git','push','o','HEAD:forge/issue-7'])\"",
+        "git commit -m x && git push origin HEAD:forge/issue-7",
+    ],
+)
+def test_commit_guard_checks_the_refs_a_command_names(tmp_path, command):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    repo = _branch_flow_repo(tmp_path)
+    _git(repo, "config", "alias.push-wip", "push origin HEAD:forge/issue-7")
+    code, message = _flow_code(guard, command, repo)
+    assert code == 2 and "issue #7" in message, command
+    assert _flow_code(guard, command, repo, leased=(7,))[0] == 0, command
+
+
+@pytest.mark.parametrize(
+    ("command", "config"),
+    [
+        ("git push --all", ()),
+        ("git push --all origin", ()),
+        ("git push --branches origin", ()),
+        ("git push --mirror origin", ()),
+        ("git push --prune origin main", ()),
+        ("git push origin 'refs/heads/*:refs/heads/*'", ()),
+        ("git push origin :", ()),
+        ("git push origin main:HEAD", ()),
+        ('git push origin "$B"', ()),
+        ("git push origin HEAD:forge/issue-$N", ()),
+        ("git push --weird-option origin main", ()),
+        ("git push", (("remote.origin.push", "refs/heads/main:refs/heads/forge/issue-7"),)),
+        ("git push origin", (("remote.origin.push", "HEAD:refs/heads/forge/issue-7"),)),
+        ("git push", (("push.default", "upstream"),)),
+        ("git push", (("push.default", "matching"),)),
+        ("git -c push.default=matching push", ()),
+        ("git rebase --update-refs main", ()),
+        ("git rebase main", (("rebase.updateRefs", "true"),)),
+        ("git rebase -x 'git push origin HEAD:forge/issue-7' main", ()),
+        ("git update-ref --stdin < refs.txt", ()),
+        ("git shellpush", (("alias.shellpush", "!git push origin HEAD:forge/issue-7"),)),
+        ("git no-such-subcommand", ()),
+        ("git-push origin --all", ()),
+        ("xargs git push origin < refs.txt", ()),
+        ("echo HEAD:x | xargs git push origin", ()),
+        ("eval git push origin HEAD:x", ()),
+        ("git filter-branch --all", ()),
+        ("git fetch --refmap='+refs/heads/*:refs/heads/*' origin main", ()),
+        ("git branch -D 'forge/*'", ()),
+        ("git bisect run make", ()),
+        ("git submodule foreach git push", ()),
+    ],
+)
+def test_commit_guard_blocks_unknowable_destinations_on_any_branch(tmp_path, command, config):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    repo = _branch_flow_repo(tmp_path)
+    for key, value in config:
+        _git(repo, "config", key, value)
+    code, message = _flow_code(guard, command, repo, leased=(7, 9))  # every lease held
+    assert code == 2 and "cannot be known before it runs" in message, command
+
+
+def test_commit_guard_named_refs_leave_ordinary_commands_alone(tmp_path):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    repo = _branch_flow_repo(tmp_path)
+    _git(repo, "config", "alias.pm", "push origin main")
+    for allowed in (
+        "git push",
+        "git push origin",
+        "git push origin main",
+        "git push -u origin HEAD",
+        "git push origin HEAD",
+        "git push --tags origin",
+        "git push origin --force-with-lease main",
+        "git branch feature",
+        "git branch -d feature",
+        "git branch -a",
+        "git branch --list 'forge/*'",
+        "git fetch origin main:main",
+        "git rebase main",
+        "git rebase --no-update-refs main",
+        "git pm",
+        "git commit -m x && git push",
+        "xargs git log",
+        "find . -name '*.py' -exec git log -- {} ;",
+        "git update-ref HEAD main",
+        "git worktree add --detach ../wt-x",
+    ):
+        assert _flow_code(guard, allowed, repo)[0] == 0, allowed
+    _git(repo, "config", "push.default", "current")
+    assert _flow_code(guard, "git push", repo)[0] == 0
+
+
+def test_commit_guard_named_refs_checked_from_an_issue_branch_too(tmp_path):
+    """On a leased issue branch, a push into ANOTHER issue's branch needs that issue's lease."""
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    repo = _branch_flow_repo(tmp_path)
+    wt = tmp_path / "wt"  # on forge/issue-9
+    assert _flow_code(guard, "git push origin HEAD:forge/issue-7", wt, leased=(9,))[0] == 2
+    assert _flow_code(guard, "git push origin HEAD:forge/issue-7", wt, leased=(7, 9))[0] == 0
+    assert _flow_code(guard, "git push origin HEAD", wt, leased=(9,))[0] == 0
+    assert repo.is_dir()
+
+
+# Codex 4239397963 / 4239397966 / 4239397961: hosted runner labels.
+@pytest.mark.parametrize("label", ["ubuntu-26.04", "ubuntu-26.04-arm"])
+def test_ubuntu_26_04_labels_are_standard_hosted_linux(label):
+    from agentic_sdlc.onboard import _linux_labels, _runner_available, _standard_hosted
+
+    assert _linux_labels({label}) and _standard_hosted({label})
+    assert _runner_available({label}, [])
+    assert spec(runs_on=(label,)).runs_on == (label,)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"runs_on": ("ubuntu-slim",)},
+        {"runs_on": ("ubuntu-latest",), "ci_runs_on": ("ubuntu-slim",)},
+    ],
+)
+def test_onboard_rejects_ubuntu_slim_for_forge_workloads(overrides):
+    with pytest.raises(OnboardError, match="15 minutes"):
+        spec(**overrides)
+
+
+def test_doctor_fails_ubuntu_slim_workloads(tmp_path):
+    from agentic_sdlc.onboard import _runner_available
+
+    assert not _runner_available({"ubuntu-slim"}, [])
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(runs_on=("ubuntu-latest",)))
+    ci = repo / ".github/workflows/ci.yml"
+    doc = yaml.safe_load(ci.read_text())
+    doc["jobs"]["test"]["runs-on"] = "ubuntu-slim"
+    ci.write_text(yaml.safe_dump(doc, sort_keys=False))
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh()))
+    check = failed["ci.yml test job runs on an available runner"]
+    assert not check.manual and "15 minutes" in check.detail
+    # the plan/implement callers, too
+    repo = _repo(tmp_path / "second")
+    write_onboarding(repo, spec(runs_on=("ubuntu-latest",)))
+    plan = repo / ".github/workflows/agent-plan.yml"
+    plan.write_text(plan.read_text().replace('["ubuntu-latest"]', '["ubuntu-slim"]'))
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh()))
+    assert "15 minutes" in failed["runners allow the workflows' job timeouts"].detail
+
+
+@pytest.mark.parametrize("label", ["macos-15-xlarge", "macos-latest-large", "macos-14-large"])
+def test_doctor_never_auto_passes_a_larger_macos_runner(tmp_path, label):
+    from agentic_sdlc.onboard import _github_hosted, _runner_available, _standard_hosted
+
+    assert _github_hosted({label}) and not _standard_hosted({label})
+    assert not _runner_available({label}, [])
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    ci = repo / ".github/workflows/ci.yml"
+    doc = yaml.safe_load(ci.read_text())
+    doc["jobs"]["test"]["runs-on"] = label
+    ci.write_text(yaml.safe_dump(doc, sort_keys=False))
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh())
+    check = _failed(report)["ci.yml test job runs on an available runner"]
+    assert check.manual and "larger GitHub-hosted runner" in check.detail
+    assert not report.ok
+    # proven only by a runner of the repository that carries the label
+    gh = _healthy_gh()
+    gh.answers["api repos/owner/comic/actions/runners"] = _pages(
+        "runners",
+        [
+            {"status": "online", "labels": [{"name": n} for n in ("self-hosted", "linux", "x64")]},
+            {"status": "online", "os": "macOS", "labels": [{"name": label}]},
+        ],
+    )
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    assert report.ok, report.render()
+
+
+# Codex 4239397981: the default policy forbids the media AGENTS.md says it rejects.
+def test_default_policy_rejects_media_case_insensitively(tmp_path):
+    from agentic_sdlc.policy import evaluate_diff
+
+    files = render_onboarding(spec(forbidden_paths=()))
+    path = tmp_path / "agentic-sdlc.toml"
+    path.write_text(files["agentic-sdlc.toml"])
+    policy = load_policy(path)
+    for media in (
+        "logo.png",
+        "assets/img/photo.JPG",
+        "docs/shot.jpeg",
+        "a/b/anim.gif",
+        "x.webp",
+        "favicon.ico",
+        "clip.mp4",
+        "media/Movie.MOV",
+        "song.mp3",
+        "voice.wav",
+        "track.flac",
+        "sound.ogg",
+        "rec.m4a",
+    ):
+        decision = evaluate_diff((media,), 1, 0, policy)
+        assert any("forbidden paths changed" in r for r in decision.reasons), media
+    for allowed in ("icons/logo.svg", "src/app.py", "README.md", "src/png.py"):
+        decision = evaluate_diff((allowed,), 1, 0, policy)
+        assert not any("forbidden" in r for r in decision.reasons), allowed
+    agents = files["AGENTS.md"]
+    assert "image, video and audio files" in agents and "SVG is source" in agents
+
+
+# Codex 4239397976: a shared callee reached shallow first is walked again along a deeper path.
+@pytest.mark.parametrize("direct_first", [True, False])
+def test_callee_graph_checks_every_path_of_a_shared_callee(direct_first):
+    from agentic_sdlc.onboard import platform_callee_graph
+
+    plat = "owner/agentic-sdlc/.github/workflows"
+
+    def doc(*targets: str) -> dict:
+        jobs = {f"j{i}": {"uses": f"{plat}/{t}@{NESTED_SHA}"} for i, t in enumerate(targets)}
+        return {"on": {"workflow_call": None}, "jobs": jobs or {"leaf": {"runs-on": "x"}}}
+
+    # caller (1) -> root (2) -> w1 (3) ... w7 (9) -> x (10) -> y (11): one edge too deep;
+    # root also calls x directly (x at 3, y at 4: fine)
+    chain = [f"w{i}.yml" for i in range(1, 8)]
+    docs = {(n, NESTED_SHA): doc(nxt) for n, nxt in zip(chain, [*chain[1:], "x.yml"], strict=True)}
+    docs[("x.yml", NESTED_SHA)] = doc("y.yml")
+    docs[("y.yml", NESTED_SHA)] = doc()
+    loads: list[tuple[str, str]] = []
+
+    def load(name: str, sha: str) -> object:
+        loads.append((name, sha))
+        return docs.get((name, sha))
+
+    order = ("x.yml", "w1.yml") if direct_first else ("w1.yml", "x.yml")
+    graph = platform_callee_graph({"root.yml": doc(*order)}, SHA, "owner/agentic-sdlc", load)
+    assert any("x.yml" in why and "deeper than 10" in why for why in graph.unfollowed), (
+        graph.unfollowed
+    )
+    assert len(loads) == len(set(loads))  # each document loaded once
+    # nine levels along every path: nothing reported
+    docs[("w7.yml", NESTED_SHA)] = doc("y.yml")
+    loads.clear()
+    graph = platform_callee_graph({"root.yml": doc(*order)}, SHA, "owner/agentic-sdlc", load)
+    assert not graph.unfollowed and not graph.uninspectable
+
+
+# Codex 4239397986: at most 50 unique reusable workflows per top-level caller, nested included.
+def test_reusable_workflow_count_is_limited_per_top_level_caller():
+    from agentic_sdlc.onboard import platform_callee_graph, reusable_workflow_limit_problems
+
+    plat = "owner/agentic-sdlc/.github/workflows"
+
+    def doc(*targets: str) -> dict:
+        jobs = {f"j{i}": {"uses": f"{plat}/{t}@{NESTED_SHA}"} for i, t in enumerate(targets)}
+        return {"on": {"workflow_call": None}, "jobs": jobs or {"leaf": {"runs-on": "x"}}}
+
+    def problems(width: int, roots: dict) -> list[str]:
+        leaves = [f"c{i}.yml" for i in range(width)]
+        docs = {(n, NESTED_SHA): doc() for n in leaves}
+        callee_docs = {name: doc(*leaves) if name == "a.yml" else doc() for name in roots}
+        graph = platform_callee_graph(
+            callee_docs, SHA, "owner/agentic-sdlc", lambda n, s: docs.get((n, s))
+        )
+        caller_docs, calls = [], []
+        for caller, callees in roots.items():
+            jobs = {f"k{i}": {"uses": f"{plat}/{c}@{SHA}"} for i, c in enumerate(callees)}
+            caller_docs.append((caller, {"jobs": jobs}))
+            calls += [(f"{caller}:k{i}", jobs[f"k{i}"], c) for i, c in enumerate(callees)]
+        return reusable_workflow_limit_problems(caller_docs, calls, graph, SHA)
+
+    # a.yml + 49 nested = 50: allowed; + 50 nested = 51: rejected
+    assert problems(49, {"a.yml": ["a.yml"]}) == []
+    found = problems(50, {"a.yml": ["a.yml"]})
+    assert len(found) == 1 and "51 unique reusable workflows" in found[0]
+    # counted per caller: one caller reaching a.yml's tree, another only b.yml
+    found = problems(50, {"a.yml": ["a.yml"], "b.yml": ["b.yml"]})
+    assert len(found) == 1 and found[0].startswith("a.yml ")
+
+
+# Codex 4239397979: classic branch-protection patterns over the publisher's agent branches.
+def _bpr(pattern: str, **flags) -> dict:
+    return {"pattern": pattern, **flags}
+
+
+@pytest.mark.parametrize(
+    ("rule", "needle"),
+    [
+        (
+            _bpr("agent/**", restrictsPushes=True, pushAllowances={"nodes": []}),
+            "allowlist without the publisher App",
+        ),
+        (_bpr("agent/**", blocksCreations=True, restrictsPushes=True), "could not be read"),
+        (_bpr("agent/*", requiresCommitSignatures=True), "signed commits"),
+        (_bpr("agent/issue-*", requiresStatusChecks=True), "status checks"),
+        (_bpr("**/issue-*", requiresApprovingReviews=True), "pull-request reviews"),
+        (_bpr("agent/**", lockBranch=True), "locked branch"),
+        (_bpr("agent/issue-1*", restrictsPushes=True), "matches some of the publisher"),
+        (_bpr("agent/issue-[0-9]*", requiresCommitSignatures=True), "cannot be evaluated"),
+    ],
+)
+def test_doctor_reads_classic_protection_patterns_on_agent_branches(tmp_path, rule, needle):
+    from agentic_sdlc.onboard import PUBLISHER_BRANCH_RULES_CHECK
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _healthy_gh()
+    gh.answers[CLASSIC_RULES] = _classic_rules(rule)
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    failed = _failed(report)
+    assert set(failed) == {PUBLISHER_BRANCH_RULES_CHECK}, report.render()
+    assert needle in failed[PUBLISHER_BRANCH_RULES_CHECK].detail
+    assert "classic branch protection" in failed[PUBLISHER_BRANCH_RULES_CHECK].detail
+
+
+def test_classic_protection_patterns_that_spare_agent_branches_pass(tmp_path):
+    from agentic_sdlc.onboard import PUBLISHER_BRANCH_RULES_CHECK
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    publisher = {"actor": {"__typename": "App", "slug": "agentic-sdlc-publisher"}}
+    for rules in (
+        [_bpr("main", requiresStatusChecks=True, restrictsPushes=True)],
+        [_bpr("*", requiresCommitSignatures=True)],  # `*` does not cross `/`
+        [_bpr("release/**", lockBranch=True)],
+        [_bpr("agent/**", restrictsPushes=True, pushAllowances={"nodes": [publisher]})],
+        [_bpr("agent/**", allowsForcePushes=False, requiresLinearHistory=True)],
+    ):
+        gh = _healthy_gh()
+        gh.answers[CLASSIC_RULES] = _classic_rules(*rules)
+        report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+        assert report.ok, (rules, report.render())
+    for answer, needle in (
+        (OnboardError("gh: GraphQL: Resource not accessible (HTTP 403)"), "could not read"),
+        (json.dumps({"errors": [{"message": "nope"}]}), "could not read"),
+        (_classic_rules(more=True), "more than 100"),
+    ):
+        gh = _healthy_gh()
+        gh.answers[CLASSIC_RULES] = answer
+        check = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))[
+            PUBLISHER_BRANCH_RULES_CHECK
+        ]
+        assert check.manual and needle in check.detail
