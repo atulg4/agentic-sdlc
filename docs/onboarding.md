@@ -105,13 +105,22 @@ The only tunable knobs, each validated by its own check instead:
 
 | Knob | Validated by |
 |---|---|
-| every job's `runs-on`, and a reusable call's `with.runs_on` | the runner checks (hosted label or an online runner; Linux for implementation) |
+| every job's `runs-on` (except `agent-auto-plan.yml:preflight`, below), and a reusable call's `with.runs_on` | the runner checks (hosted label or an online runner; Linux for implementation) |
 | `with.route_budget_usd` on a reusable call (may be added) | "implement callers pass a readable route_budget_usd" |
-| the `if:` of `agent-auto-plan.yml:plan` and `agent-auto-implement.yml:preflight` | must be exactly the generated condition for the POLICY's labels |
+| the `if:` of `agent-auto-plan.yml:preflight` and `agent-auto-implement.yml:preflight` | must be exactly the generated condition for the POLICY's labels |
 | the platform pin (`uses: ...@<sha>`, `with.platform_ref`) | the template is rendered at the caller's own pin; "workflows pin the platform to a commit SHA" requires one SHA on the platform repository |
 
 Everything else in those files is the template. To change it, change the policy and re-run
 `onboard --force`.
+
+`agent-auto-plan.yml` authorizes before it schedules anything on your runners. Anyone who can open
+an issue can use the work-request template, and the template applies the planning labels itself;
+so its `preflight` job runs on `ubuntu-latest` (GitHub-hosted, NOT tunable), asks
+`GET repos/{owner}/{repo}/collaborators/{login}/permission` with `GITHUB_TOKEN` whether the
+labeler (`github.event.sender`) and `github.actor` have write, maintain or admin, and the reusable
+`plan` call runs only `if: needs.preflight.outputs.authorized == 'true'`. An outsider's issue
+therefore never occupies a self-hosted runner; a maintainer who re-applies the ready label starts
+planning. (`agent-plan.yml` is `workflow_dispatch` only, which already requires write access.)
 
 ### Other managed files
 

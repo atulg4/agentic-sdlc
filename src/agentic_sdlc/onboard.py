@@ -595,7 +595,7 @@ def _expr_str(value: str) -> str:
 
 
 def auto_plan_condition(ready: str, human_review: str, implementation: str) -> str:
-    """The `if:` of agent-auto-plan.yml's `plan` job. Only the ready label triggers: an issue
+    """The `if:` of agent-auto-plan.yml's `preflight` job. Only the ready label triggers: an issue
     opened with both labels fires one `labeled` run per label, and both would plan."""
     return (
         f"github.event.label.name == {_expr_str(ready)} &&\n"
@@ -3852,7 +3852,8 @@ POLICY_IMPLEMENTERS = {"router": "route", "claude": "claude", "codex": "codex"}
 _TUNED = "<tunable>"
 #: The ONLY parts of a managed workflow that may differ from the generated template; each is
 #: validated by its own check instead. Documented in docs/onboarding.md ("Managed workflows").
-#:   - every job's `runs-on`, and a reusable call's `with.runs_on` (the runner checks);
+#:   - every job's `runs-on` (except `_HOSTED_JOBS`), and a reusable call's `with.runs_on` (the
+#:     runner checks);
 #:   - a reusable-implement call's `with.route_budget_usd` (absent or present; the budget check);
 #: ci.yml's `test` job `steps` are NOT tunable: the template is rendered from the policy's own
 #: `[commands]` and `[ci] python_version`, so the steps must equal it exactly (customize them only
@@ -3865,11 +3866,17 @@ TUNABLE_KNOBS = (
     "jobs.*.runs-on",
     "jobs.*.with.runs_on",
     "jobs.*.with.route_budget_usd",
-    "agent-auto-plan.yml: jobs.plan.if",
+    "agent-auto-plan.yml: jobs.preflight.if",
     "agent-auto-implement.yml: jobs.preflight.if",
     "platform ref pin",
 )
-_LABEL_CONDITION_JOBS = {"agent-auto-plan.yml": "plan", "agent-auto-implement.yml": "preflight"}
+_LABEL_CONDITION_JOBS = {
+    "agent-auto-plan.yml": "preflight",
+    "agent-auto-implement.yml": "preflight",
+}
+#: Jobs whose `runs-on` is NOT tunable: agent-auto-plan.yml authorizes the labeler on a
+#: GitHub-hosted runner before anything is scheduled on the (self-hosted) RUNS_ON labels.
+_HOSTED_JOBS = {"agent-auto-plan.yml": "preflight"}
 
 
 def _mask_tunables(name: str, doc: object) -> object:
@@ -3882,7 +3889,7 @@ def _mask_tunables(name: str, doc: object) -> object:
     for job_name, job in jobs.items():
         if not isinstance(job, dict):
             continue
-        if "runs-on" in job:
+        if "runs-on" in job and _HOSTED_JOBS.get(name) != job_name:
             job["runs-on"] = _TUNED
         passed = job.get("with")
         if isinstance(passed, dict):
@@ -4568,7 +4575,7 @@ def doctor(
             # require every approval label, so a ready label alone could start credentialed work.
             mismatched = []
             for file, job_name, expected in (
-                ("agent-auto-plan.yml", "plan", auto_plan_condition(*labels)),
+                ("agent-auto-plan.yml", "preflight", auto_plan_condition(*labels)),
                 ("agent-auto-implement.yml", "preflight", auto_implement_condition(*labels)),
             ):
                 path = base / ".github/workflows" / file

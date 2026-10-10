@@ -11,10 +11,49 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  plan:
+  # Anyone may open the work-request issue template, which applies the planning labels itself.
+  # The labeler's write authority is therefore checked HERE, on a GitHub-hosted runner, before
+  # any job is scheduled on RUNS_ON: an outsider's issue must not occupy a self-hosted runner
+  # (the reusable workflow checks again; this check only keeps unauthorized runs off it).
+  # Not tunable: doctor requires this job, its runner and the `plan` gate exactly as generated.
+  preflight:
     # Only the ready label triggers. An issue opened with both labels fires one `labeled` run per
     # label, and both would see both labels and plan twice; the other is required, not a trigger.
     if: AUTO_PLAN_IF
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      authorized: ${{ steps.authorize.outputs.authorized }}
+    steps:
+      - name: Require repository write authority from the labeler
+        id: authorize
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SENDER: ${{ github.event.sender.login }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          authorized=true
+          for login in "$SENDER" "$ACTOR"; do
+            encoded="$(jq -rn --arg login "$login" '$login | @uri')"
+            permission="$(gh api --method GET \
+              "repos/${GITHUB_REPOSITORY}/collaborators/${encoded}/permission" \
+              --jq '.permission' 2>/dev/null)" || permission=none
+            case "$permission" in
+              admin|write) ;;
+              *) authorized=false ;;
+            esac
+          done
+          printf 'authorized=%s\n' "$authorized" >> "$GITHUB_OUTPUT"
+          if [ "$authorized" != true ]; then
+            printf '::notice::Planning not scheduled: the labeler lacks repository write authority.\n'
+          fi
+
+  plan:
+    needs: preflight
+    if: needs.preflight.outputs.authorized == 'true'
     permissions:
       contents: read
       issues: write
