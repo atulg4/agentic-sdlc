@@ -1,5 +1,232 @@
 # Project Onboarding
 
+## Fast path
+
+```bash
+pip install -e /path/to/agentic-sdlc          # provides `sdlcctl`
+sdlcctl onboard --destination . --project-id owner/repo --test "pytest -q" \
+  --implementer cloud-routine --runs-on ubuntu-latest --apply
+sdlcctl doctor --destination .
+```
+
+`onboard --apply` writes the policy, guides, issue template, CI and Forge workflows, creates the
+labels/ruleset/variables, and runs `doctor`. `doctor` lists the owner-only steps that remain:
+setting the credentials below, installing the Publisher GitHub App, and registering a self-hosted
+runner when `--runs-on` is `self-hosted,...`. Everything below is the manual procedure `onboard`
+automates.
+
+### Credentials `doctor` requires
+
+Secrets are set with `gh secret set NAME --repo owner/repo`; variables with
+`gh variable set NAME --repo owner/repo --body VALUE` (or `onboard --apply --var NAME=VALUE`, or
+`--copy-vars-from owner/onboarded-repo`). `doctor` derives the list from the installed workflows
+and the routed registry, and `tests/test_onboard.py` checks that every name it can demand appears
+here.
+
+| `--implementer` | Secrets | Variables |
+|---|---|---|
+| every mode | `CLAUDE_CODE_OAUTH_TOKEN` (planning) | |
+| `route`, `claude`, `codex` (Actions implementers) | `PUBLISHER_APP_PRIVATE_KEY` | `PUBLISHER_APP_CLIENT_ID` |
+| `route` (default) | `DEEPSEEK_API_KEY`, `ZAI_API_KEY`, `KIMI_API_KEY` | `DEEPSEEK_MODEL_FLASH`, `DEEPSEEK_MODEL_PRO`, `ZAI_MODEL_GLM`, `KIMI_MODEL_K3` |
+| `codex` | `OPENAI_API_KEY` | |
+| `cloud-routine` | nothing beyond the planning token | |
+| any, with a private platform repository | `PLATFORM_READ_TOKEN` | |
+
+The `route` row is the generated `.forge/executors.json`: every executor the router can select for
+an implementation run needs its provider key and its `configured-by-NAME` model variable, because
+the router falls back across them after a recoverable failure (the preflight also insists on both
+DeepSeek model variables). Trimming executors from the registry, or providers from
+`.forge/routing-policy.json`, drops their rows; an executor with `authMode: "api-key"` on the
+`anthropic` provider needs `ANTHROPIC_API_KEY` instead of the OAuth token.
+
+### Fork-exposed repositories and self-hosted runners
+
+GitHub runs every fork pull request's code in `ci.yml`, so a persistent self-hosted runner on a
+repository that fork pull requests can reach would execute untrusted code with whatever the host
+holds. That is every public repository, and also a private or internal one whose repository,
+organization or enterprise policy allows forking AND runs workflows from fork pull requests: an
+enterprise member or read collaborator can then fork it and run PR code on the runner.
+
+A repository counts as **fork-safe** only when GitHub proves one of the two is off: the repository
+is private or internal and `GET repos/{owner}/{repo}` reports `allow_forking: false`, or `GET
+repos/{owner}/{repo}/actions/permissions/fork-pr-workflows-private-repos` reports
+`run_workflows_from_fork_pull_requests: false`. Anything unread (a 403/404 on that endpoint, a
+missing field, an unknown visibility) is not proof. Everything else is **fork-exposed**.
+
+`onboard` reads this (`--visibility auto`, the default; pass `public`/`private` when offline --
+`private` asserts fork-safe, and `doctor` verifies it) and, for a fork-exposed repository, renders
+`ci.yml` on `ubuntu-latest` while the issue-triggered agent workflows keep `--runs-on`.
+`--ci-runs-on` overrides the CI runner, but only with GitHub-hosted labels on a fork-exposed
+repository: there is no opt-in for self-hosted pull-request CI. To keep `ci.yml` self-hosted on a
+private repository, disable forking (or fork pull-request workflows) for it first.
+
+`doctor` checks "fork pull requests cannot reach self-hosted runners". A fork-safe repository
+passes. Otherwise it fails when any `pull_request*`-triggered job (in any workflow
+file on the default branch, read through the contents API -- the set GitHub runs, not this
+checkout's, which is checked in addition; an unreadable remote set fails closed) targets anything
+but a single GitHub-hosted label, following the jobs of every local
+reusable workflow it calls (`./.github/workflows/x.yml`, with `with:` inputs substituted). A call
+to a third-party reusable workflow, a runner expression that is not a resolvable input, or a
+Forge platform reusable workflow called without an explicit `runs_on` cannot be proven hosted and
+fails. When the fork policy is merely unknown, that failure is an owner TODO (never `READY`):
+disable forking or fork pull-request workflows, or move those jobs to GitHub-hosted runners.
+
+### Runner labels
+
+The generated workflows are bash with Unix paths, so `--runs-on`/`--ci-runs-on` accept Linux and
+macOS targets only: a GitHub-hosted `ubuntu-*`/`macos-*` label from GitHub's documented list
+(`GITHUB_HOSTED_LABELS` in `onboard.py`; a version-shaped label GitHub does not provide is
+rejected), or a self-hosted runner's labels. Windows labels are refused by `onboard` and failed by
+`doctor`.
+
+Every Forge plan and implementation workflow is Linux-only, whatever the implementer and in both
+implementation modes: `reusable-implement.yml` installs bubblewrap for Claude Code with `apt-get`,
+and `reusable-plan.yml` hashes the checkout with GNU `sha256sum`, neither of which macOS has. A
+`cloud-routine` profile still runs the plan callers, so it is no exception. `--runs-on` must
+therefore be a GitHub-hosted `ubuntu-*` label or a self-hosted label set that includes `linux` (the
+OS label every self-hosted Linux runner carries); `onboard` refuses anything else, and `doctor`
+fails ("Forge workflows run on Linux runners") any job of a plan or implement caller, or any
+`runs_on` it hands a platform workflow, that is not Linux. macOS remains fine for `ci.yml` only
+(`--ci-runs-on macos-15`).
+
+### Managed workflows
+
+`agent-plan.yml`, `agent-auto-plan.yml`, `ci.yml` and, in Actions mode, `agent-implement.yml` and
+`agent-auto-implement.yml` are Forge-managed. `doctor` rebuilds each from the repository's own
+policy (`[agents] implementer` and `implementation_mode`, `[project] default_branch`, the platform
+repository and the caller's pinned SHA) exactly as `onboard` renders it, parses both, and
+requires them to be equal. Triggers and their filters, job `if:`, `needs`, every `with:` input
+(`issue_number`, `trigger_actor`, `config_path`, `agent`, the registry paths, ...), `secrets:`,
+permissions, concurrency, extra or missing jobs: any difference fails with
+`managed workflow X differs from the generated template at <path>; re-run sdlcctl onboard --force`.
+Comments and formatting do not count; only the parsed document does.
+
+The only tunable knobs, each validated by its own check instead:
+
+| Knob | Validated by |
+|---|---|
+| every job's `runs-on`, and a reusable call's `with.runs_on` | the runner checks (hosted label or an online runner; Linux for implementation) |
+| `with.route_budget_usd` on a reusable call (may be added) | "implement callers pass a readable route_budget_usd" |
+| the `if:` of `agent-auto-plan.yml:plan` and `agent-auto-implement.yml:preflight` | must be exactly the generated condition for the POLICY's labels |
+| the platform pin (`uses: ...@<sha>`, `with.platform_ref`) | the template is rendered at the caller's own pin; "workflows pin the platform to a commit SHA" requires one SHA on the platform repository |
+
+Everything else in those files is the template. To change it, change the policy and re-run
+`onboard --force`.
+
+### Other managed files
+
+Every other file `onboard` writes is compared with what it renders for the repository's policy,
+both in the checkout and on the default branch:
+
+| File | Compared |
+|---|---|
+| `.claude/hooks/forge_commit_guard.py`, `.claude/hooks/forge_session_start.py` | byte for byte |
+| `.github/ISSUE_TEMPLATE/agent-work-request.md` | byte for byte |
+| `docs/forge/cloud-implementer.md` (cloud-routine mode) | byte for byte apart from the CI runner it names |
+| `AGENTS.md`, `CLAUDE.md` | must contain the generated text verbatim (notes may be added around it) |
+| `.claude/settings.json` | structurally: the Forge hooks must be configured (other settings are yours) |
+| `.forge/executors.json`, `.forge/routing-policy.json` | semantically: loaded and routed on |
+| `agentic-sdlc.toml` | the policy itself: loaded and checked against the repository |
+
+Every policy field `onboard` writes from its options -- `[project] id`/`default_branch`,
+`[automation] ready_label`, `[commands]` `setup`/`quality`/`test`, `[ci] python_version`,
+`[policy] forbidden_paths`/`protected_paths`/`max_changed_files`/`max_diff_lines` -- is checked by
+ONE validator (`POLICY_FIELDS` in `onboard.py`) on both sides: `onboard` refuses a value it
+rejects, and `doctor` fails a policy holding one ("policy values are ones onboard accepts"). So
+`--setup ""` is refused up front instead of writing a profile doctor then calls not ready.
+
+A difference fails "managed files match the generated files" (or, on the default branch,
+"managed files are on the default branch"); re-run `sdlcctl onboard --force`.
+
+### The CI test job is fully managed
+
+`ci.yml`'s `test` job is NOT a tunable knob. Its steps are exactly what `onboard` renders from
+the policy, and `doctor` requires the installed steps to equal them (parsed, not textually):
+
+1. `actions/checkout` at a pinned SHA with `persist-credentials: false` and no `ref` or
+   `repository` input, so the pull request's own revision is what is tested;
+2. `actions/setup-python` at a pinned SHA, `python-version` from `[ci] python_version` in
+   `agentic-sdlc.toml` (default `3.12`; `onboard --python-version`);
+3. `Setup`, `Quality` and `Test`, each running the policy's `[commands]` `setup`, `quality` and
+   `test` verbatim as one quoted YAML scalar.
+
+Customize CI only through the policy: edit `[commands]` (or `[ci] python_version`) and re-run
+`sdlcctl onboard --force`. Any hand edit to the steps -- an extra action, an extra flag on a
+gate, a cache step -- fails "ci.yml runs the policy gates as 'test'" and "managed workflows match
+the generated templates". Each gate command must be a single line (join several with `&&`) and
+must not contain `${{` (GitHub would evaluate it before the shell runs the command); `onboard`
+refuses such a command and `doctor` fails a policy holding one, rather than normalizing it into
+something that runs differently.
+
+### What `doctor` verifies exactly
+
+- **Implementation mode** is `[agents] implementation_mode` in `agentic-sdlc.toml` (`actions` or
+  `cloud-routine`), never inferred from which files exist. A policy written before the field
+  existed still passes while its Actions implement callers are installed; without them, add
+  `implementation_mode = "cloud-routine"` (or re-run `onboard --force`).
+- **CI gates**: the `test` job's steps must equal the template rendered from `[commands]`
+  (above); that equality is the guarantee. The checks that follow are defense in depth behind
+  it. Each gate must be invoked exactly as `[commands]` states. Only output and fail-fast extras
+  may be appended (`-q`, `-v`, `-x`, `--maxfail=N`, `--tb=…`, `--durations=N`, `-r…`, `--color=…`);
+  anything else (`--help`, `--collect-only`, `-k`, `--ignore`, ...) fails the check.
+  A gate counts only as a top-level command: commands inside a shell function body never count,
+  whether or not the function is called. Nothing in the `test` job may change what a gate does
+  without being a visible argument: a `*ADDOPTS*`, `<TOOL>_*` (for the gate tools: `PYTEST_*`,
+  `RUFF_*`, `PIP_*`, ...) or interpreter/shell startup variable (`PYTHONPATH`, `BASH_ENV`, ...)
+  set by workflow/job/step `env:` or by a script; any mention of `$GITHUB_ENV` or `$GITHUB_PATH`
+  (a directory added to the path can shadow a gate tool); an `exit`, `exec` or `return` anywhere
+  before a gate (it is then not proven to run); an `actions/checkout` with a `ref` or
+  `repository` input; a function or alias
+  named like a gate tool; `eval` or a sourced file other than a virtualenv's `bin/activate`; an
+  action other than `actions/checkout`, `actions/setup-python`, `actions/cache` or
+  `astral-sh/setup-uv`. The setup command itself runs repository code by design; doctor proves
+  the workflow, not what that code does. The `pull_request` trigger must reach the `test` job
+  for every pull request into the protected branch: no `paths`, `paths-ignore` or
+  `branches-ignore` filter, a `branches` filter only when it lists the default branch by its
+  exact name, and `types` (if given) including `opened`, `synchronize` and `reopened`.
+- **Automatic callers** must trigger on `issues: types: [labeled]`, and their `if:` must be
+  exactly the generated label condition (after whitespace normalization) for the policy's labels.
+- **Implement calls** are read from the parsed `with:`/`secrets:` of each job calling
+  `reusable-implement.yml`: `agent` (default `codex`) must be a literal the workflow accepts,
+  `route_budget_usd` a finite non-negative number, and every routed secret must be forwarded by
+  that job itself (or `secrets: inherit` on it). Route mode comes from the parsed policy
+  (`[routing]`), the registry files, or an implement call's `agent: route`.
+- **Runners** are resolved with the same resolver as the public-repository check (local reusable
+  workflows followed). A matching self-hosted runner whose `os` is Windows does not count; a
+  `runs-on: {group: ...}` target fails, because runner-group membership cannot be verified
+  through the repository API.
+- **Claude Code hooks** are read from the parsed `.claude/settings.json`: a `SessionStart` group
+  firing on startup that runs `python3 .claude/hooks/forge_session_start.py`, and a `PreToolUse`
+  group whose matcher covers `Bash` running `python3 .claude/hooks/forge_commit_guard.py`. Each
+  Forge handler must be exactly the one `onboard` writes (`{"type": "command", "command": ...}`,
+  only the command's spelling may vary: `python`, a `$CLAUDE_PROJECT_DIR` prefix); a handler
+  with any other field -- `"async": true` above all, which runs it in the background where its
+  exit 2 can no longer block the commit, or a `timeout` -- fails, wherever it sits. Unrelated
+  hooks may sit beside them. The commit guard is deny-by-default for git: on an issue branch without the
+  session's lease, every git invocation is blocked except literal read-only subcommands (status,
+  log, diff, show, blame, grep, ls-files, ls-tree, rev-parse, describe, shortlog, `reflog show`,
+  listing forms of `branch`/`tag`/`remote`/`config`/`stash`, `fetch` without a refspec or
+  `--update-head-ok`, help, version, cat-file, for-each-ref, name-rev, merge-base, check-ignore,
+  check-attr). Aliases, `git-<name>` programs, `-c`/`--config-env`, and anything that runs git or
+  a shell indirectly (`xargs git`, `find -exec git`, `... | sh`) need the lease too.
+- **Publisher App** permissions must be exactly Contents read, Issues write, Pull requests write
+  (plus GitHub's mandatory Metadata read); any other grant fails.
+- **Rulesets**: every parameter Forge's ruleset sets is compared (iterated from the payload, not
+  hand-listed): a boolean Forge sets true -- `dismiss_stale_reviews_on_push`,
+  `required_review_thread_resolution`, `strict_required_status_checks_policy` -- must be true, a
+  count at least Forge's, a list a superset of Forge's.
+- **Effective rules**: `doctor` also reads the rules that actually apply to the default branch
+  (`GET repos/{owner}/{repo}/rules/branches/{branch}`), so organization and enterprise rulesets
+  count. A required status context no installed workflow job reports, required deployments,
+  required workflows, a merge queue no workflow runs on `merge_group` for, required signatures,
+  update restrictions and code-scanning gates are reported as a manual TODO, as is an
+  unreadable answer. `onboard --apply` still changes only the repository's own ruleset.
+- **`onboard --apply`** merges Forge's rules into an existing `Protect main` ruleset: existing
+  rules and stricter parameters (more approvals, extra status checks, signatures) are kept.
+  The one exception is Forge's own `test` check: a binding (`integration_id`) to an app other
+  than GitHub Actions (15368) could never be satisfied by `ci.yml`, so the merge drops it and
+  `doctor` fails a ruleset that has one.
+
 ## Required repository state
 
 - protected default branch;
@@ -15,7 +242,10 @@
 ## GitHub
 
 1. For a public platform repository, no platform credential is needed. For a
-   private platform, allow the consumer to call its reusable workflows and
+   private platform, allow the consumer to call its reusable workflows (on the
+   platform: Settings → Actions → General → Access, "Accessible from
+   repositories owned by" its user or organization; `sdlcctl doctor` reads this
+   setting and reports it as a manual TODO when it cannot) and
    create a fine-grained token that has Contents: Read for only the platform
    repository. Store it as `PLATFORM_READ_TOKEN`; never use a broad PAT.
 2. Copy the thin caller workflows from `examples/marketmaestro`.
