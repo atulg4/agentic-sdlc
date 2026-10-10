@@ -92,6 +92,8 @@ class FakeGh:
         if key.startswith(CONSUMER_CONTENTS):
             for prefix, value in self.answers.items():
                 if prefix.startswith(CONSUMER_CONTENTS) and key.startswith(prefix):
+                    if isinstance(value, Exception):
+                        raise value
                     return value
             path = _CONSUMER["path"] / key[len(CONSUMER_CONTENTS) :].split("?")[0]
             if path.is_dir():  # a directory listing, as the contents API returns it
@@ -111,6 +113,8 @@ class FakeGh:
         if key.startswith(PLATFORM_CONTENTS):
             for prefix, value in self.answers.items():
                 if prefix.startswith(PLATFORM_CONTENTS) and key.startswith(prefix):
+                    if isinstance(value, Exception):
+                        raise value
                     return value
             if any(key.startswith(prefix) for prefix in self.fail):
                 raise OnboardError("gh: Not Found (HTTP 404)")
@@ -119,6 +123,10 @@ class FakeGh:
             if "/" in name or not path.is_file():
                 raise OnboardError("gh: Not Found (HTTP 404)")
             return _blob(path.read_bytes())
+        if key == "api repos/owner/agentic-sdlc --jq .private" and not any(
+            key.startswith(prefix) for prefix in self.answers
+        ):
+            return "false\n"  # a public platform unless the test answers otherwise
         if key.startswith(CONSUMER_WORKFLOW_STATES):
             for prefix, value in self.answers.items():
                 if prefix.startswith(CONSUMER_WORKFLOW_STATES) and key.startswith(prefix):
@@ -338,7 +346,7 @@ def test_apply_repo_settings_creates_labels_ruleset_and_variables_idempotently()
     gh2 = FakeGh(
         {
             "api repos/owner/comic/rulesets/5": json.dumps({"id": 5, **ruleset_payload(spec())}),
-            "api repos/owner/comic/rulesets": json.dumps([{"id": 5, "name": RULESET_NAME}]),
+            "api repos/owner/comic/rulesets": json.dumps([[{"id": 5, "name": RULESET_NAME}]]),
         }
     )
     log2 = apply_repo_settings(spec(), gh2)
@@ -440,7 +448,7 @@ def _healthy_gh() -> FakeGh:
                 ]
             ),
             "api repos/owner/comic/rulesets": json.dumps(
-                [{"id": 11, "name": RULESET_NAME, "enforcement": "active"}]
+                [[{"id": 11, "name": RULESET_NAME, "enforcement": "active"}]]
             ),
             # the generated registry routes to deepseek, zai and kimi: every fallback configured
             "api repos/owner/comic/actions/variables": _var_pages(
@@ -738,7 +746,7 @@ def test_incomplete_same_name_ruleset_is_updated_and_fails_doctor(tmp_path):
     gh = FakeGh(
         {
             "api repos/owner/comic/rulesets/5": json.dumps(stale),
-            "api repos/owner/comic/rulesets": json.dumps([stale]),
+            "api repos/owner/comic/rulesets": json.dumps([[stale]]),
         }
     )
     log = apply_repo_settings(spec(), gh)
@@ -1133,7 +1141,7 @@ def test_rulesets_are_paginated_and_exclude_inherited_ones(tmp_path):
         {
             "api repos/owner/comic/rulesets/5": json.dumps({"id": 5, **ruleset_payload(spec())}),
             "api repos/owner/comic/rulesets?includes_parents=false": json.dumps([filler, [page2]]),
-            "api repos/owner/comic/rulesets": json.dumps([org_owned]),
+            "api repos/owner/comic/rulesets": json.dumps([[org_owned]]),
         }
     )
     log = apply_repo_settings(spec(), gh)
@@ -1150,7 +1158,7 @@ def test_rulesets_are_paginated_and_exclude_inherited_ones(tmp_path):
         "api repos/owner/comic/rulesets/5": json.dumps({"id": 5, **ruleset_payload(spec())}),
         **healthy.answers,
     }
-    healthy.answers["api repos/owner/comic/rulesets"] = json.dumps([org_owned])
+    healthy.answers["api repos/owner/comic/rulesets"] = json.dumps([[org_owned]])
     report = doctor(repo, "owner/comic", "owner/agentic-sdlc", healthy)
     assert report.ok, report.render()
 
@@ -1799,7 +1807,7 @@ def test_doctor_requires_the_managed_files_on_the_remote_default_branch(tmp_path
     repo = _repo(tmp_path)
     write_onboarding(repo, spec())
     gh = _healthy_gh()
-    gh.answers[CONSUMER_CONTENTS] = ""  # nothing pushed yet
+    gh.answers[CONSUMER_CONTENTS] = OnboardError("gh: Not Found (HTTP 404)")  # nothing pushed
     failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))
     # with no workflows on the default branch, its required `test` context is unverifiable too
     rules = "effective default-branch rules (org/enterprise rulesets too) fit Forge"
@@ -2331,7 +2339,7 @@ def test_ruleset_update_merges_forge_rules_without_weakening_existing_ones():
     gh = FakeGh(
         {
             "api repos/owner/comic/rulesets/5": json.dumps(strong),
-            "api repos/owner/comic/rulesets": json.dumps([strong]),
+            "api repos/owner/comic/rulesets": json.dumps([[strong]]),
         }
     )
     apply_repo_settings(spec(), gh)
@@ -5193,8 +5201,10 @@ def test_canonical_project_id_takes_githubs_spelling_of_the_same_repository():
     assert canonical_project_id("OWNER/Comic", gh) == "owner/comic"
     renamed = FakeGh({"api repos/owner/old": json.dumps({"full_name": "owner/new"})})
     assert canonical_project_id("owner/old", renamed) == "owner/old"  # doctor reports it
-    unreadable = FakeGh({"api repos/owner/comic": "not json"})
-    assert canonical_project_id("owner/comic", unreadable) == "owner/comic"
+    # Unreadable is never a guess: --apply would write the id into the policy and configure by it.
+    for answer in ("not json", "", OnboardError("gh: HTTP 502"), "[]"):
+        with pytest.raises(OnboardError, match="could not read owner/comic"):
+            canonical_project_id("owner/comic", FakeGh({"api repos/owner/comic": answer}))
 
 
 def test_cli_onboard_apply_writes_the_canonical_project_id(tmp_path, monkeypatch):
@@ -5979,3 +5989,286 @@ def test_remote_workflow_states_reads_every_page():
         return json.dumps({"total_count": len(rows), "workflows": rows[:100]})
 
     assert remote_workflow_states(broken, "owner/comic")[0] is None
+
+
+# ---------------------------------------------------------------- unreadable is never empty
+# Codex 4239080218 / 4239080211 (root cause): an API answer that cannot be read -- a failed call,
+# an empty or non-JSON body, a malformed page -- was read as "empty", "absent" or "public".
+# Now it is `Unreadable`: doctor never reports READY on it, and --apply aborts before mutating.
+_UNREADABLE_ANSWERS = [
+    pytest.param(OnboardError("gh: HTTP 502 Bad Gateway"), id="failed"),
+    pytest.param("not json", id="not-json"),
+    pytest.param("", id="empty"),
+]
+
+# (the gh answer key doctor reads at that call site, the check that must not pass)
+_ACTIONS_POLICY = "repository Actions policy allows the generated workflows"
+_PLATFORM_REF = "platform ref reachable (reusable workflows exist at pin)"
+_EFFECTIVE = "effective default-branch rules (org/enterprise rulesets too) fit Forge"
+_CLASSIC = "classic branch protection on the default branch fits Forge"
+_DOCTOR_READ_SITES = [
+    ("api repos/owner/comic", "policy project id matches the repository"),
+    ("api repos/owner/agentic-sdlc --jq .private", PLATFORM_ACCESS),
+    ("api repos/owner/comic/actions/permissions", _ACTIONS_POLICY),
+    (PLATFORM_CONTENTS + ".github/workflows/reusable-implement.yml", _PLATFORM_REF),
+    (CONSUMER_CONTENTS + "agentic-sdlc.toml", "managed files are on the default branch"),
+    ("api repos/owner/comic/labels", "Forge labels exist"),
+    ("api repos/owner/comic/rulesets/11", f"ruleset '{RULESET_NAME}' active on default branch"),
+    ("api repos/owner/comic/rulesets", f"ruleset '{RULESET_NAME}' active on default branch"),
+    (CONSUMER_WORKFLOW_STATES, "Forge workflows are active in GitHub Actions"),
+    ("api repos/owner/comic/rules/branches/main", _EFFECTIVE),
+    ("api repos/owner/comic/branches/main/protection", _CLASSIC),
+    ("api repos/owner/comic/actions/variables", "repo variables set (non-empty)"),
+    ("api repos/owner/comic/actions/secrets", "repo secrets set (by name)"),
+    ("api repos/owner/comic/actions/runners", "self-hosted runner online for this repo"),
+    ("api /user/installations/", "Publisher GitHub App installed on this repo"),
+    ("api /user/installations", "Publisher GitHub App installed on this repo"),
+    ("api apps/agentic-sdlc-publisher", "Publisher GitHub App installed on this repo"),
+]
+
+
+@pytest.mark.parametrize("answer", _UNREADABLE_ANSWERS)
+@pytest.mark.parametrize(("key", "check"), _DOCTOR_READ_SITES)
+def test_an_unreadable_answer_never_yields_ready(tmp_path, key, check, answer):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _healthy_gh()  # READY as is (test_doctor_is_green_for_a_fully_configured_repo)
+    gh.answers[key] = answer  # replaces in place: prefix order is kept
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    assert not report.ok and "NOT READY" in report.render()
+    assert check in _failed(report), report.render()
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        *_UNREADABLE_ANSWERS,
+        pytest.param(json.dumps({"id": 5}), id="not-a-list"),
+        pytest.param(json.dumps([{"id": 5, "name": RULESET_NAME}]), id="page-not-a-list"),
+        pytest.param(json.dumps([["junk"]]), id="item-not-an-object"),
+    ],
+)
+def test_apply_aborts_before_any_mutation_when_the_ruleset_inventory_is_unreadable(answer):
+    gh = FakeGh({"api repos/owner/comic/rulesets": answer})
+    with pytest.raises(OnboardError, match="could not read the rulesets.*nothing was changed"):
+        apply_repo_settings(spec(), gh, variables={"PUBLISHER_APP_CLIENT_ID": "Iv1"})
+    # only reads: no label, no ruleset POST/PUT (a duplicate 'Protect main'), no variable
+    assert all(c[0] == "api" and "-X" not in c for c, _ in gh.calls), gh.calls
+
+
+@pytest.mark.parametrize(
+    "answer", [*_UNREADABLE_ANSWERS, pytest.param(json.dumps({"id": 5}), id="no-rules")]
+)
+def test_apply_aborts_before_any_mutation_when_the_existing_ruleset_is_unreadable(answer):
+    gh = FakeGh(
+        {
+            "api repos/owner/comic/rulesets/5": answer,
+            "api repos/owner/comic/rulesets": json.dumps([[{"id": 5, "name": RULESET_NAME}]]),
+        }
+    )
+    with pytest.raises(OnboardError, match=f"could not read ruleset '{RULESET_NAME}'"):
+        apply_repo_settings(spec(), gh)
+    assert all(c[0] == "api" and "-X" not in c for c, _ in gh.calls), gh.calls
+
+
+def test_apply_reads_an_explicit_empty_inventory_as_empty():
+    gh = FakeGh({"api repos/owner/comic/rulesets": json.dumps([[]])})
+    assert any("created" in line for line in apply_repo_settings(spec(), gh))
+    assert sum(c[:3] == ("api", "-X", "POST") for c, _ in gh.calls) == 1
+
+
+def test_paged_items_distinguishes_unreadable_from_empty():
+    from agentic_sdlc.onboard import Unreadable, _paged_items
+
+    def answering(text):
+        return FakeGh({"api x": text})
+
+    assert _paged_items(answering("[[]]"), "x") == []
+    assert _paged_items(answering("[]"), "x") == []
+    assert _paged_items(answering(_pages("runners", [])), "x", "runners") == []
+    for text in ("", "nope", "{}", '[{"a": 1}]', '[["a"]]', '[{"total_count": 1}]'):
+        key = "runners" if text.startswith('[{"total') else None
+        found = _paged_items(answering(text), "x", key)
+        assert isinstance(found, Unreadable), text
+        with pytest.raises(TypeError):
+            bool(found)  # an unhandled Unreadable fails loudly, never reads as empty
+    not_found = _paged_items(FakeGh({"api x": OnboardError("gh: Not Found (HTTP 404)")}), "x")
+    assert isinstance(not_found, Unreadable) and not_found.not_found
+
+
+@pytest.mark.parametrize("answer", [*_UNREADABLE_ANSWERS, pytest.param('"yes"', id="not-bool")])
+def test_doctor_fails_closed_on_an_unreadable_platform_visibility(tmp_path, answer):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _healthy_gh()
+    gh.answers["api repos/owner/agentic-sdlc --jq .private"] = answer
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))
+    access = failed[PLATFORM_ACCESS]
+    assert access.manual and "could not read whether owner/agentic-sdlc is public" in access.detail
+    # an unknown platform may be private: its checkout token stays required
+    assert "PLATFORM_READ_TOKEN" in failed["repo secrets set (by name)"].detail
+    # only a proven-public platform skips both
+    gh.answers["api repos/owner/agentic-sdlc --jq .private"] = "false\n"
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    assert report.ok and PLATFORM_ACCESS not in {c.name for c in report.checks}
+
+
+# Codex 4239080209: with a merge queue, a CLASSIC required context must reach the merge group too.
+def test_classic_required_contexts_must_also_report_in_the_merge_group():
+    from agentic_sdlc.onboard import ProducedContexts, legacy_protection_problems
+
+    produced = ProducedContexts(
+        frozenset({"test", "security-scan"}), frozenset({"test"}), merge_group_declared=True
+    )
+    protection = {"required_status_checks": {"contexts": ["test", "security-scan"]}}
+    assert legacy_protection_problems(protection, produced) == []
+    assert legacy_protection_problems(protection, produced, merge_queue=False) == []
+    queued = legacy_protection_problems(protection, produced, merge_queue=True)
+    assert len(queued) == 1 and "'security-scan'" in queued[0] and "merge_group" in queued[0]
+    unknown = legacy_protection_problems(protection, produced, merge_queue=None)
+    assert (
+        len(unknown) == 1 and "'security-scan'" in unknown[0] and "cannot be verified" in unknown[0]
+    )
+    both = ProducedContexts(frozenset({"test", "security-scan"}), produced.pull_request, True)
+    assert legacy_protection_problems(protection, both, merge_queue=True) == []
+
+
+def test_doctor_passes_the_effective_merge_queue_to_the_classic_check(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    legacy = "classic branch protection on the default branch fits Forge"
+    protection = json.dumps({"required_status_checks": {"contexts": ["test"]}})
+    gh = _healthy_gh()
+    gh.answers["api repos/owner/comic/branches/main/protection"] = protection
+    assert doctor(repo, "owner/comic", "owner/agentic-sdlc", gh).ok  # no queue: PR runs suffice
+    gh.answers["api repos/owner/comic/rules/branches/main"] = _effective_rules(
+        {"type": "merge_queue", "parameters": {}, "ruleset_source_type": "Organization"}
+    )
+    check = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))[legacy]
+    assert "merge queue" in check.detail and "merge_group" in check.detail
+
+
+# Codex 4239080214: commit-metadata and branch-name pattern rules are judged against what the
+# pinned publisher pushes; a rule type doctor does not know is never silently compatible.
+def _publisher():
+    from agentic_sdlc.onboard import publisher_commit
+
+    doc = yaml.safe_load((PLATFORM_WORKFLOWS / "reusable-implement.yml").read_text())
+    return publisher_commit(doc)
+
+
+def test_publisher_commit_is_read_from_the_pinned_reusable_implement():
+    from agentic_sdlc.onboard import PublisherCommit, publisher_commit
+
+    found = _publisher()
+    assert isinstance(found, PublisherCommit)
+    assert "Implement issue #42" in found.messages
+    assert found.author_emails == found.committer_emails
+    assert found.author_emails == ("agentic-sdlc[bot]@users.noreply.github.com",)
+    assert "agent/issue-42-9876543210" in found.branches
+    # anything doctor cannot read exactly is a reason, never a guess
+    doc = yaml.safe_load((PLATFORM_WORKFLOWS / "reusable-implement.yml").read_text())
+    pushing = next(
+        step
+        for job in doc["jobs"].values()
+        for step in job.get("steps") or []
+        if "git push" in str(step.get("run"))
+    )
+    run = pushing["run"]
+    for broken in (
+        run.replace('git commit -m "Implement', 'git commit -F msg.txt -m "Implement'),
+        run.replace("Implement issue #", "Implement $(date) #"),
+        run.replace("git config user.email", "git config user.mail"),
+        run.replace("${ISSUE_NUMBER}-${GITHUB_RUN_ID}", "${ISSUE_NUMBER}-${UNKNOWN}"),
+    ):
+        pushing["run"] = broken
+        assert isinstance(publisher_commit(doc), str), broken
+    pushing["run"] = run
+    pushing["env"] = {**pushing.get("env", {}), "GIT_AUTHOR_EMAIL": "x@y"}
+    assert isinstance(publisher_commit(doc), str)
+    assert isinstance(publisher_commit({}), str)
+
+
+def _pattern_rule(kind: str, operator: str, pattern: str, negate: bool = False) -> dict:
+    return {
+        "type": kind,
+        "parameters": {"operator": operator, "pattern": pattern, "negate": negate},
+        "ruleset_source_type": "Organization",
+        "ruleset_source": "owner",
+    }
+
+
+@pytest.mark.parametrize(
+    ("kind", "operator", "pattern", "negate", "verdict"),
+    [
+        ("commit_message_pattern", "starts_with", "Implement issue #", False, "ok"),
+        ("commit_message_pattern", "starts_with", "JIRA-", False, "rejects"),
+        ("commit_message_pattern", "contains", "WIP", True, "ok"),
+        ("commit_message_pattern", "contains", "issue", True, "rejects"),
+        ("commit_message_pattern", "regex", r"^Implement issue #\d+$", False, "ok"),
+        ("commit_message_pattern", "regex", r"^[A-Z]+-\d+: ", False, "rejects"),
+        ("commit_message_pattern", "regex", r"(?i)^implement", False, "todo"),
+        ("commit_message_pattern", "regex", r"^(?=Impl)", False, "todo"),
+        ("commit_message_pattern", "regex", r"\bissue\b", False, "todo"),
+        ("commit_message_pattern", "glob", "Implement*", False, "todo"),
+        ("commit_author_email_pattern", "ends_with", "@users.noreply.github.com", False, "ok"),
+        ("commit_author_email_pattern", "ends_with", "@example.com", False, "rejects"),
+        ("committer_email_pattern", "regex", r"@corp\.example$", False, "rejects"),
+        ("committer_email_pattern", "regex", r"^agentic-sdlc\[bot\]@", False, "ok"),
+        ("branch_name_pattern", "starts_with", "agent/", False, "ok"),
+        ("branch_name_pattern", "regex", r"^feature/", False, "rejects"),
+        ("branch_name_pattern", "regex", r"^agent/issue-\d{1,3}-", False, "rejects"),
+        ("tag_name_pattern", "starts_with", "v", False, "ok"),  # the publisher pushes no tags
+    ],
+)
+def test_effective_metadata_pattern_rules_are_evaluated(kind, operator, pattern, negate, verdict):
+    from agentic_sdlc.onboard import ProducedContexts, effective_rule_problems
+
+    rules = [_pattern_rule(kind, operator, pattern, negate)]
+    problems = effective_rule_problems(rules, ProducedContexts(), _publisher())
+    if verdict == "ok":
+        assert problems == []
+    elif verdict == "rejects":
+        assert len(problems) == 1 and "does not" in problems[0], problems
+    else:
+        assert len(problems) == 1 and "cannot evaluate" in problems[0], problems
+    if kind != "tag_name_pattern":  # an unread publisher leaves every such rule a TODO
+        unread = effective_rule_problems(rules, ProducedContexts(), "reusable-implement unread")
+        assert len(unread) == 1 and "could not be read" in unread[0]
+
+
+def test_unknown_effective_rule_types_are_never_silently_compatible():
+    from agentic_sdlc.onboard import ProducedContexts, effective_rule_problems
+
+    compatible = [
+        {"type": t} for t in ("creation", "deletion", "non_fast_forward", "required_linear_history")
+    ] + [{"type": "pull_request", "parameters": {"required_approving_review_count": 1}}]
+    assert effective_rule_problems(compatible, ProducedContexts()) == []
+    for kind in ("file_path_restriction", "max_file_size", "copilot_code_review", "", "brand_new"):
+        problems = effective_rule_problems([{"type": kind}], ProducedContexts())
+        assert len(problems) == 1 and "not one doctor understands" in problems[0], kind
+    # a merge queue a workflow serves is understood (not reported as an unknown type)
+    served = ProducedContexts(merge_group_declared=True)
+    assert effective_rule_problems([{"type": "merge_queue", "parameters": {}}], served) == []
+
+
+@pytest.mark.parametrize(
+    ("rule", "ok"),
+    [
+        (_pattern_rule("commit_message_pattern", "starts_with", "Implement issue"), True),
+        (_pattern_rule("commit_message_pattern", "starts_with", "JIRA-"), False),
+        (_pattern_rule("commit_author_email_pattern", "ends_with", "@corp.example"), False),
+        ({"type": "file_path_restriction", "parameters": {"restricted_file_paths": ["x"]}}, False),
+    ],
+)
+def test_doctor_judges_effective_metadata_rules_against_the_pinned_publisher(tmp_path, rule, ok):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _healthy_gh()
+    gh.answers["api repos/owner/comic/rules/branches/main"] = _effective_rules(rule)
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    assert report.ok is ok, report.render()
+    if not ok:
+        assert set(_failed(report)) == {
+            "effective default-branch rules (org/enterprise rulesets too) fit Forge"
+        }
