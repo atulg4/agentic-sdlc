@@ -1776,7 +1776,10 @@ def test_doctor_requires_the_managed_files_on_the_remote_default_branch(tmp_path
     gh = _healthy_gh()
     gh.answers[CONSUMER_CONTENTS] = ""  # nothing pushed yet
     failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))
-    assert set(failed) == {"managed files are on the default branch"}
+    # with no workflows on the default branch, its required `test` context is unverifiable too
+    rules = "effective default-branch rules (org/enterprise rulesets too) fit Forge"
+    assert set(failed) == {"managed files are on the default branch", rules}
+    assert failed[rules].manual and "cannot be verified" in failed[rules].detail
     detail = failed["managed files are on the default branch"].detail
     assert ".github/workflows/ci.yml (missing)" in detail and "push these files first" in detail
     gh = _healthy_gh()
@@ -5287,7 +5290,7 @@ LEGACY = "classic branch protection on the default branch fits Forge"
 def test_legacy_protection_problems():
     from agentic_sdlc.onboard import legacy_protection_problems
 
-    produced = ({"test", "lint"}, ("call / ",), False)
+    produced = ({"test", "lint", "call / plan"}, (), False)
     assert legacy_protection_problems({}, produced) == []
     fine = {
         "required_status_checks": {
@@ -5441,3 +5444,125 @@ def test_commit_guard_branch_flow_keeps_existing_cd_and_plain_commands(tmp_path)
         "git checkout -b feature && git commit -m x",
     ):
         assert _flow_code(guard, allowed, repo)[0] == 0, allowed
+
+
+# Codex 4238832967: a reusable call reports `caller / callee-job` for the callee's REAL jobs only.
+def test_reusable_call_contexts_come_from_the_callees_jobs(tmp_path):
+    from agentic_sdlc.onboard import effective_rule_problems, workflow_check_contexts
+
+    workflows = tmp_path / ".github/workflows"
+    workflows.mkdir(parents=True)
+    pin = "a" * 40
+    (workflows / "pr.yml").write_text(
+        "on: pull_request\n"
+        "jobs:\n"
+        "  plan:\n"
+        "    uses: ./.github/workflows/reuse.yml\n"
+        "  remote:\n"
+        "    name: Remote\n"
+        f"    uses: owner/agentic-sdlc/.github/workflows/reusable-plan.yml@{pin}\n"
+        "  third:\n"
+        "    uses: someone/else/.github/workflows/x.yml@v1\n"
+    )
+    (workflows / "reuse.yml").write_text(
+        "on: workflow_call\n"
+        "jobs:\n"
+        "  build:\n"
+        "    name: Build it\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps: [{run: 'true'}]\n"
+        "  lint:\n"
+        "    strategy: {matrix: {py: ['3.11']}}\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps: [{run: 'true'}]\n"
+        "  label:\n"
+        "    name: ${{ inputs.label }}\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps: [{run: 'true'}]\n"
+        "  nested:\n"
+        "    uses: ./.github/workflows/leaf.yml\n"
+    )
+    (workflows / "leaf.yml").write_text(
+        "on: workflow_call\njobs:\n  leaf:\n    runs-on: ubuntu-latest\n"
+        "    steps: [{run: 'true'}]\n"
+    )
+    callee = {"on": {"workflow_call": {}}, "jobs": {"prepare": {"runs-on": "x"}}}
+
+    def load(name, sha):
+        return callee if (name, sha) == ("reusable-plan.yml", pin) else None
+
+    produced = workflow_check_contexts(tmp_path, "main", "owner/agentic-sdlc", load)
+    exact, prefixes, _ = produced
+    assert {"plan / Build it", "plan / nested / leaf", "Remote / prepare"} <= exact
+    assert "plan / lint (" in prefixes and not any(p.endswith(" / ") for p in prefixes)
+
+    def required(*contexts):
+        checks = [{"context": c} for c in contexts]
+        return [
+            {"type": "required_status_checks", "parameters": {"required_status_checks": checks}}
+        ]
+
+    fine = ("plan / Build it", "plan / lint (3.11)", "plan / nested / leaf", "Remote / prepare")
+    assert effective_rule_problems(required(*fine), produced) == []
+    for bogus in (
+        "plan / nonexistent",
+        "plan / lint (3.11) / x",
+        "plan / ",
+        "Remote / nonexistent",
+        "third / anything",
+        "plan / build",  # the job id: GitHub reports its `name:`
+    ):
+        assert effective_rule_problems(required(bogus), produced), bogus
+    # without the pinned callee readable, the remote call reports nothing
+    assert "Remote / prepare" not in workflow_check_contexts(tmp_path, "main")[0]
+
+
+# Codex 4238832973: required contexts are judged on the DEFAULT BRANCH's workflows.
+def test_doctor_judges_required_contexts_on_the_default_branchs_workflows(tmp_path):
+    from agentic_sdlc.onboard import EFFECTIVE_RULES_CHECK
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    pushed = {p.name: p.read_text() for p in (repo / ".github/workflows").glob("*.yml")}
+    scan = "on: pull_request\njobs:\n  security-scan:\n    runs-on: ubuntu-latest\n"
+    scan += "    steps: [{run: 'true'}]\n"
+    rule = _org_rule(
+        "required_status_checks", required_status_checks=[{"context": "security-scan"}]
+    )
+
+    # only in the checkout (not pushed): not produced, and reported as drift
+    _wf(repo, "scan.yml", scan)
+    gh = _healthy_gh()
+    gh.answers["api repos/owner/comic/rules/branches/main"] = _effective_rules(rule)
+    _remote_workflows(gh, pushed)
+    check = next(
+        c
+        for c in doctor(repo, "owner/comic", "owner/agentic-sdlc", gh).checks
+        if c.name == EFFECTIVE_RULES_CHECK
+    )
+    assert not check.ok and "'security-scan', which no installed" in check.detail
+    assert "local checkout: 'security-scan'" in check.detail
+
+    # on the default branch (even if not in the checkout): produced
+    (repo / ".github/workflows/scan.yml").unlink()
+    gh = _healthy_gh()
+    gh.answers["api repos/owner/comic/rules/branches/main"] = _effective_rules(rule)
+    _remote_workflows(gh, {**pushed, "scan.yml": scan})
+    check = next(
+        c
+        for c in doctor(repo, "owner/comic", "owner/agentic-sdlc", gh).checks
+        if c.name == EFFECTIVE_RULES_CHECK
+    )
+    assert check.ok, check.detail
+
+    # the default branch's set unreadable: a manual TODO, never the checkout's answer
+    _wf(repo, "scan.yml", scan)
+    gh = _healthy_gh()
+    gh.answers["api repos/owner/comic/rules/branches/main"] = _effective_rules(rule)
+    gh.answers[CONSUMER_CONTENTS + ".github/workflows?ref=main"] = "not json"
+    check = next(
+        c
+        for c in doctor(repo, "owner/comic", "owner/agentic-sdlc", gh).checks
+        if c.name == EFFECTIVE_RULES_CHECK
+    )
+    assert not check.ok and check.manual and "cannot be verified" in check.detail

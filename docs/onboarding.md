@@ -225,7 +225,13 @@ something that runs differently.
   count. A required status context no installed workflow job reports, required deployments,
   required workflows, a merge queue no workflow runs on `merge_group` for, required signatures,
   update restrictions and code-scanning gates are reported as a manual TODO, as is an
-  unreadable answer. `onboard --apply` still changes only the repository's own ruleset.
+  unreadable answer. The contexts a PR can receive are computed from the default branch's
+  workflow set as GitHub serves it (the checkout only adds a drift note for a workflow not yet
+  pushed; an unreadable set is a manual TODO): job names, evaluated `matrix.*` names, and for a
+  reusable call `caller / callee-job` for each job of the callee as fetched (a local callee, or
+  a platform callee at its pinned SHA, recursively); an unresolvable callee reports nothing, so
+  `plan / anything` is never assumed. `onboard --apply` still changes only the repository's own
+  ruleset.
 - **`onboard --apply`** merges Forge's rules into an existing `Protect main` ruleset: existing
   rules and stricter parameters (more approvals, extra status checks, signatures) are kept.
   The one exception is Forge's own `test` check: a binding (`integration_id`) to an app other
