@@ -255,6 +255,13 @@ something that runs differently.
   a platform callee at its pinned SHA, recursively); an unresolvable callee reports nothing, so
   `plan / anything` is never assumed. `onboard --apply` still changes only the repository's own
   ruleset.
+- **Workflow state**: a workflow disabled in GitHub Actions (`disabled_manually`,
+  `disabled_inactivity`, ...) does not respond to its triggers. `doctor` reads every page of
+  `GET repos/{owner}/{repo}/actions/workflows` and requires each Forge-managed workflow
+  (`agent-*.yml`, `ci.yml`) to be `active` ("Forge workflows are active in GitHub Actions"); a
+  non-active workflow is no evidence for any required context (a context only it would report
+  is flagged "enable it", including on `merge_group`). An unreadable state list is a manual
+  TODO, and leaves the required contexts unverifiable.
 - **`onboard --apply`** merges Forge's rules into an existing `Protect main` ruleset: existing
   rules and stricter parameters (more approvals, extra status checks, signatures) are kept.
   The one exception is Forge's own `test` check: a binding (`integration_id`) to an app other

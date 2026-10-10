@@ -3167,6 +3167,38 @@ def remote_workflow_files(
     return files, ""
 
 
+WORKFLOW_ACTIVE = "active"
+WORKFLOWS_ACTIVE_CHECK = "Forge workflows are active in GitHub Actions"
+_WORKFLOW_STATE_PAGE = 100
+_WORKFLOW_STATE_MAX_PAGES = 50
+
+
+def remote_workflow_states(gh: GhRunner, project_id: str) -> tuple[dict[str, str] | None, str]:
+    """({file name: state}, '') of every workflow file under `.github/workflows` that GitHub
+    Actions knows (`GET repos/{owner}/{repo}/actions/workflows`, every page), or (None, why)
+    when the list cannot be read in full. Only `active` responds to its triggers: a
+    `disabled_manually`, `disabled_inactivity`, `disabled_fork` ... workflow runs nothing, so it
+    reports no context and occupies no runner."""
+    states: dict[str, str] = {}
+    endpoint = f"repos/{project_id}/actions/workflows"
+    for page in range(1, _WORKFLOW_STATE_MAX_PAGES + 1):
+        answer = _safe_json(gh, ["api", f"{endpoint}?per_page={_WORKFLOW_STATE_PAGE}&page={page}"])
+        rows = answer.get("workflows") if isinstance(answer, dict) else None
+        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+            return None, f"could not read GET {endpoint} (page {page})"
+        for row in rows:
+            path = str(row.get("path") or "")
+            name = path.removeprefix(".github/workflows/")
+            if name != path and _WORKFLOW_FILE.fullmatch(name):
+                states[name] = str(row.get("state") or "unknown")
+        total = answer.get("total_count")
+        if len(rows) < _WORKFLOW_STATE_PAGE or (
+            isinstance(total, int) and page * _WORKFLOW_STATE_PAGE >= total
+        ):
+            return states, ""
+    return None, f"GET {endpoint} has more than {_WORKFLOW_STATE_MAX_PAGES} pages"
+
+
 @contextlib.contextmanager
 def _materialized_workflows(files: dict[str, bytes]) -> Iterator[Path]:
     """A scratch checkout holding a workflow set read from GitHub (`remote_workflow_files`), so
@@ -4981,14 +5013,68 @@ def doctor(
         return remote_sets[ref or ""]
 
     rules_files, rules_why = remote_set(effective_branch)
+    # A disabled workflow does not respond to its triggers: it reports no context. Only ACTIVE
+    # workflows are evidence; an unreadable state list leaves the contexts a manual TODO.
+    states, states_why = remote_workflow_states(gh, project_id)
+    if rules_files is not None and states is None:
+        rules_files, rules_why = None, f"workflow states unreadable: {states_why}"
+    inactive = frozenset(
+        name
+        for name in (rules_files or {})
+        if states is not None and states.get(name) != WORKFLOW_ACTIVE
+    )
     produced = (
-        remote_check_contexts(rules_files, effective_branch, platform_repository, load_callee)
+        remote_check_contexts(
+            rules_files, effective_branch, platform_repository, load_callee, inactive
+        )
         if rules_files is not None
         else None
     )
-    local_produced = workflow_check_contexts(
-        base, effective_branch, platform_repository, load_callee
+    # The same set with its non-active workflows counted: which required context a disabled
+    # workflow would report (enable it), as opposed to one nothing reports.
+    produced_if_enabled = (
+        remote_check_contexts(rules_files, effective_branch, platform_repository, load_callee)
+        if rules_files is not None and inactive
+        else produced
     )
+    local_produced = workflow_check_contexts(
+        base, effective_branch, platform_repository, load_callee, inactive
+    )
+    managed_names = [
+        name
+        for name in (*MANAGED_WORKFLOWS, *MANAGED_IMPLEMENT_WORKFLOWS)
+        if (base / ".github/workflows" / name).exists() or name in (rules_files or {})
+    ]
+    if states is None:
+        add(
+            Check(
+                WORKFLOWS_ACTIVE_CHECK,
+                False,
+                f"{states_why} → confirm in the Actions tab that "
+                + ", ".join(managed_names)
+                + " are enabled",
+                manual=True,
+            )
+        )
+    else:
+        not_active = [
+            f"{name} ({states.get(name, 'not registered in Actions')})"
+            for name in managed_names
+            if states.get(name) != WORKFLOW_ACTIVE
+        ]
+        add(
+            Check(
+                WORKFLOWS_ACTIVE_CHECK,
+                not not_active,
+                "not active: "
+                + ", ".join(not_active)
+                + f" → gh workflow enable <file> -R {project_id} (a workflow not registered yet "
+                "appears once it is on the default branch)"
+                if not_active
+                else ", ".join(managed_names) + " active",
+                manual=bool(not_active),
+            )
+        )
 
     def context_problems(required_contexts: list[str], problems: list[str]) -> list[str]:
         """`problems` for the required contexts, judged on the default branch's workflows; a
@@ -5010,7 +5096,17 @@ def doctor(
             for c in sorted(set(required_contexts))
             if c and not context_produced(c, produced) and context_produced(c, local_produced)
         ]
-        return problems + drift
+        disabled = [
+            f"'{c}' is reported only by a workflow that is not active in GitHub Actions ("
+            + ", ".join(sorted(inactive))
+            + ") → enable it"
+            for c in sorted(set(required_contexts))
+            if c
+            and not context_produced(c, produced)
+            and produced_if_enabled is not None
+            and context_produced(c, produced_if_enabled)
+        ]
+        return problems + drift + disabled
 
     pages = _safe_json(
         gh,
