@@ -19,6 +19,7 @@ from agentic_sdlc.onboard import (
     RULESET_NAME,
     OnboardError,
     OnboardSpec,
+    ProducedContexts,
     apply_repo_settings,
     copy_variables,
     doctor,
@@ -4896,10 +4897,10 @@ def test_expression_job_names_do_not_satisfy_every_required_check(tmp_path):
         "    steps: [{run: 'true'}]\n"
     )
     produced = workflow_check_contexts(tmp_path)
-    exact, prefixes, _ = produced
+    exact = produced.pull_request
     assert {"ruff", "pyright", "test-3.11-true", "test-3.12-true"} <= exact
     assert "mypy" not in exact
-    assert not [p for p in prefixes if not p.strip()]
+    assert not [c for c in exact if not c.strip()]
 
     def required(*contexts):
         checks = [{"context": c, "integration_id": 15368} for c in contexts]
@@ -4910,8 +4911,10 @@ def test_expression_job_names_do_not_satisfy_every_required_check(tmp_path):
     assert effective_rule_problems(required("ruff", "pyright", "test-3.12-true"), produced) == []
     problems = effective_rule_problems(required("mypy", "deploy", "anything"), produced)
     assert len(problems) == 3 and all("no installed workflow job reports" in p for p in problems)
-    # Even a hand-built empty prefix cannot prove a context.
-    assert effective_rule_problems(required("anything"), (set(), ("", " "), False))
+    # Nothing proves a context but the exact name.
+    assert effective_rule_problems(
+        required("anything"), ProducedContexts(frozenset({"", " ", "any"}))
+    )
 
 
 # Codex 4206173667 / 4206173686: the guard is deny-by-default for git. On an issue branch every
@@ -5279,7 +5282,7 @@ def test_required_contexts_come_only_from_workflows_running_on_protected_prs(tmp
         "    steps: [{run: 'true'}]\n"
     )
     produced = workflow_check_contexts(tmp_path, "main")
-    assert ("security-scan" in produced[0]) is counts
+    assert ("security-scan" in produced.pull_request) is counts
     rules = [
         {
             "type": "required_status_checks",
@@ -5298,7 +5301,7 @@ LEGACY = "classic branch protection on the default branch fits Forge"
 def test_legacy_protection_problems():
     from agentic_sdlc.onboard import legacy_protection_problems
 
-    produced = ({"test", "lint", "call / plan"}, (), False)
+    produced = ProducedContexts(frozenset({"test", "lint", "call / plan"}))
     assert legacy_protection_problems({}, produced) == []
     fine = {
         "required_status_checks": {
@@ -5500,9 +5503,9 @@ def test_reusable_call_contexts_come_from_the_callees_jobs(tmp_path):
         return callee if (name, sha) == ("reusable-plan.yml", pin) else None
 
     produced = workflow_check_contexts(tmp_path, "main", "owner/agentic-sdlc", load)
-    exact, prefixes, _ = produced
+    exact = produced.pull_request
     assert {"plan / Build it", "plan / nested / leaf", "Remote / prepare"} <= exact
-    assert "plan / lint (" in prefixes and not any(p.endswith(" / ") for p in prefixes)
+    assert "plan / lint (3.11)" in exact and not any(c.endswith(" / ") for c in exact)
 
     def required(*contexts):
         checks = [{"context": c} for c in contexts]
@@ -5519,10 +5522,12 @@ def test_reusable_call_contexts_come_from_the_callees_jobs(tmp_path):
         "Remote / nonexistent",
         "third / anything",
         "plan / build",  # the job id: GitHub reports its `name:`
+        "plan / lint (3.12)",  # not a combination of the matrix
+        "plan / lint",  # a matrix job reports only its combinations
     ):
         assert effective_rule_problems(required(bogus), produced), bogus
     # without the pinned callee readable, the remote call reports nothing
-    assert "Remote / prepare" not in workflow_check_contexts(tmp_path, "main")[0]
+    assert "Remote / prepare" not in workflow_check_contexts(tmp_path, "main").pull_request
 
 
 # Codex 4238832973: required contexts are judged on the DEFAULT BRANCH's workflows.
@@ -5693,3 +5698,143 @@ def test_retired_macos_13_labels_are_not_github_hosted(tmp_path, label):
     ci.write_text(yaml.safe_dump(doc, sort_keys=False))
     failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh()))
     assert "ci.yml test job runs on an available runner" in failed
+
+
+# Codex 4238935452: a matrix job reports one context per concrete combination, `name (v1, ...)`;
+# no prefix is accepted, so a combination the matrix never produces is never "reported".
+def _contexts_of(tmp_path, workflow: str) -> frozenset[str]:
+    from agentic_sdlc.onboard import workflow_check_contexts
+
+    workflows = tmp_path / ".github/workflows"
+    workflows.mkdir(parents=True, exist_ok=True)
+    (workflows / "ci.yml").write_text(workflow)
+    return workflow_check_contexts(tmp_path, "main").pull_request
+
+
+def test_matrix_jobs_report_only_their_concrete_combinations(tmp_path):
+    produced = _contexts_of(
+        tmp_path,
+        "on: pull_request\n"
+        "jobs:\n"
+        "  test:\n"
+        "    strategy: {matrix: {os: [ubuntu-latest]}}\n"
+        "    runs-on: ${{ matrix.os }}\n"
+        "    steps: [{run: 'true'}]\n",
+    )
+    assert produced == {"test (ubuntu-latest)"}
+    assert "test (windows-latest)" not in produced and "test" not in produced
+    from agentic_sdlc.onboard import effective_rule_problems
+
+    rules = _queue_rules("test (windows-latest)", "test")[1:]
+    problems = effective_rule_problems(rules, ProducedContexts(produced))
+    assert len(problems) == 2 and all("no installed workflow job reports" in p for p in problems)
+
+
+def test_matrix_contexts_follow_axes_exclude_and_include(tmp_path):
+    produced = _contexts_of(
+        tmp_path,
+        "on: pull_request\n"
+        "jobs:\n"
+        "  test:\n"
+        "    name: Unit\n"
+        "    strategy:\n"
+        "      matrix:\n"
+        "        os: [ubuntu-latest, macos-15]\n"
+        "        py: ['3.11', '3.12']\n"
+        "        exclude: [{os: macos-15, py: '3.11'}]\n"
+        "        include:\n"
+        "          - {os: ubuntu-latest, py: '3.12', experimental: true}\n"
+        "          - {os: ubuntu-24.04-arm, py: '3.13'}\n"
+        "    runs-on: ${{ matrix.os }}\n"
+        "    steps: [{run: 'true'}]\n"
+        "  lint:\n"
+        "    strategy: {matrix: {tool: [ruff]}}\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps: [{run: 'true'}]\n"
+        "  named:\n"
+        "    name: Check ${{ matrix.tool }}\n"
+        "    strategy: {matrix: {tool: [ruff, mypy]}}\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps: [{run: 'true'}]\n",
+    )
+    assert produced == {
+        # a static name gets the values appended, axes in order, include's extra key last
+        "Unit (ubuntu-latest, 3.11)",
+        "Unit (ubuntu-latest, 3.12, true)",
+        "Unit (macos-15, 3.12)",
+        "Unit (ubuntu-24.04-arm, 3.13)",
+        # an unnamed job: its id, values appended
+        "lint (ruff)",
+        # a name holding a matrix expression: exactly the expanded name, nothing appended
+        "Check ruff",
+        "Check mypy",
+    }
+
+
+@pytest.mark.parametrize(
+    "matrix",
+    [
+        "'${{ fromJSON(inputs.oses) }}'",
+        "{os: '${{ fromJSON(inputs.oses) }}'}",
+        "{os: [{name: ubuntu}]}",
+        "{os: [ubuntu-latest], exclude: [{os: ubuntu-latest}]}",
+    ],
+)
+def test_unresolvable_or_empty_matrices_report_nothing(tmp_path, matrix):
+    produced = _contexts_of(
+        tmp_path,
+        "on: pull_request\n"
+        "jobs:\n"
+        "  test:\n"
+        f"    strategy: {{matrix: {matrix}}}\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps: [{run: 'true'}]\n",
+    )
+    assert not produced
+
+
+# Codex 4238935454: with a merge queue, every required context must ALSO be reported in the merge
+# group: a workflow that declares `merge_group` but does not produce `test` does not serve it.
+def _queue_rules(*contexts):
+    return [
+        {"type": "merge_queue", "parameters": {}},
+        {
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [{"context": c} for c in contexts]},
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    ("ci_on", "noop_on", "ok"),
+    [
+        ("[pull_request, merge_group]", None, True),
+        ("{pull_request: {}, merge_group: {types: [checks_requested]}}", None, True),
+        ("{pull_request: {}, merge_group: {branches: [main]}}", None, True),
+        ("pull_request", "merge_group", False),  # an unrelated no-op serves the queue only
+        ("{pull_request: {}, merge_group: {branches: [develop]}}", None, False),
+        ("{pull_request: {}, merge_group: {branches-ignore: [develop]}}", None, False),
+    ],
+)
+def test_merge_queue_requires_each_context_in_the_merge_group(tmp_path, ci_on, noop_on, ok):
+    from agentic_sdlc.onboard import effective_rule_problems, workflow_check_contexts
+
+    workflows = tmp_path / ".github/workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "ci.yml").write_text(
+        f"on: {ci_on}\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps: [{{run: 'true'}}]\n"
+    )
+    if noop_on:
+        (workflows / "noop.yml").write_text(
+            f"on: {noop_on}\njobs:\n  noop:\n    runs-on: ubuntu-latest\n"
+            "    steps: [{run: 'true'}]\n"
+        )
+    produced = workflow_check_contexts(tmp_path, "main")
+    assert "test" in produced.pull_request and produced.merge_group_declared
+    problems = effective_rule_problems(_queue_rules("test"), produced)
+    if ok:
+        assert problems == []
+    else:
+        assert len(problems) == 1 and "'test'" in problems[0] and "merge_group" in problems[0]
+    # without a merge queue the PR contexts alone decide
+    assert effective_rule_problems(_queue_rules("test")[1:], produced) == []
