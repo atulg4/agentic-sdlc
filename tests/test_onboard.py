@@ -5674,3 +5674,22 @@ def test_doctor_requires_the_auto_implement_authorization(tmp_path, change):
     _edit_workflow(repo, "agent-auto-implement.yml", change)
     drift = _drift(repo)
     assert drift is not None and "agent-auto-implement.yml" in drift
+
+
+# Codex 4238935465: GitHub retired the macOS 13 images on 2025-12-04; their labels never start.
+@pytest.mark.parametrize("label", ["macos-13", "macos-13-large", "macos-13-xlarge"])
+def test_retired_macos_13_labels_are_not_github_hosted(tmp_path, label):
+    from agentic_sdlc.onboard import GITHUB_HOSTED_LABELS, _github_hosted
+
+    assert label not in GITHUB_HOSTED_LABELS
+    assert not _github_hosted({label})
+    with pytest.raises(OnboardError, match="fork-exposed"):
+        spec(fork_exposed=True, ci_runs_on=(label,))
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    ci = repo / ".github/workflows/ci.yml"
+    doc = yaml.safe_load(ci.read_text())
+    doc["jobs"]["test"]["runs-on"] = label
+    ci.write_text(yaml.safe_dump(doc, sort_keys=False))
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh()))
+    assert "ci.yml test job runs on an available runner" in failed
