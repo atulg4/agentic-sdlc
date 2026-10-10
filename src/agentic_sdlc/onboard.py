@@ -9,6 +9,7 @@ variables). `doctor` verifies a repository and lists the remaining manual steps.
 from __future__ import annotations
 
 import base64
+import contextlib
 import importlib.resources
 import json
 import math
@@ -20,7 +21,7 @@ import stat
 import subprocess
 import tomllib
 import unicodedata
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import quote
@@ -2098,15 +2099,103 @@ def _reports_on_protected_pull_requests(doc: dict, default_branch: str) -> bool:
     return False
 
 
+def _job_context_names(job_id: str, job: dict) -> tuple[list[str], list[str]]:
+    """(exact names, matrix prefixes) one job reports under: its `name:` (else its id), the
+    evaluated names of a `matrix.*`-named job over a finite literal matrix (any other expression
+    contributes nothing: an empty literal prefix would match every context), and `name (` for a
+    matrix job GitHub suffixes with its values."""
+    name = str(job.get("name") or job_id)
+    if "${{" in name:
+        rendered = _matrix_job_names(name, job.get("strategy")) or ()
+        return [r for r in rendered if r.strip()], []
+    strategy = job.get("strategy")
+    if isinstance(strategy, dict) and strategy.get("matrix"):
+        return [name], [f"{name} ("]
+    return [name], []
+
+
+def _callee_doc(
+    base: Path,
+    uses: str,
+    platform_repository: str | None,
+    load_callee: CalleeLoader | None,
+    seen: tuple[object, ...],
+) -> tuple[dict | None, object]:
+    """The reusable workflow a `uses:` names, as GitHub would run it -- a local
+    `./.github/workflows/x.yml` from the same workflow set, or a platform workflow pinned to a
+    full SHA as fetched at that SHA -- with its cycle key; (None, None) for anything else."""
+    if uses.startswith("./"):
+        workflows = (base / ".github/workflows").resolve()
+        target = (base / uses[2:]).resolve()
+        if "@" in uses or target.parent != workflows or target in seen or not target.is_file():
+            return None, None
+        return _workflow_doc(target), target
+    found = _REMOTE_REUSABLE.fullmatch(uses)
+    if not (
+        found
+        and platform_repository
+        and found.group(1) == platform_repository
+        and _SHA.fullmatch(found.group(3))
+        and load_callee is not None
+    ):
+        return None, None
+    key = (found.group(2), found.group(3))
+    if key in seen:
+        return None, None
+    called = load_callee(*key)
+    return (called if isinstance(called, dict) else None), key
+
+
+def _workflow_job_contexts(
+    base: Path,
+    doc: dict,
+    platform_repository: str | None,
+    load_callee: CalleeLoader | None,
+    seen: tuple[object, ...],
+) -> tuple[set[str], list[str]]:
+    """(exact contexts, matrix prefixes) the jobs of one workflow report. A job that calls a
+    reusable workflow reports `caller / callee-job` for each job of the callee as GitHub would
+    run it (`_callee_doc`), recursively; an unresolvable callee contributes nothing (fail
+    closed), and so does a matrix caller (its `name (...) / ...` contexts are not enumerated)."""
+    exact: set[str] = set()
+    prefixes: list[str] = []
+    jobs = doc.get("jobs")
+    for job_id, job in (jobs if isinstance(jobs, dict) else {}).items():
+        if not isinstance(job, dict):
+            continue
+        names, matrix = _job_context_names(str(job_id), job)
+        if not job.get("uses"):
+            exact.update(names)
+            prefixes += matrix
+            continue
+        if matrix:
+            continue
+        called, key = _callee_doc(
+            base, str(job["uses"]).strip(), platform_repository, load_callee, seen
+        )
+        if called is None:
+            continue
+        inner_exact, inner_prefixes = _workflow_job_contexts(
+            base, called, platform_repository, load_callee, (*seen, key)
+        )
+        for name in names:
+            exact.update(f"{name} / {inner}" for inner in inner_exact)
+            prefixes += [f"{name} / {inner}" for inner in inner_prefixes]
+    return exact, prefixes
+
+
 def workflow_check_contexts(
-    base: Path, default_branch: str = "main"
+    base: Path,
+    default_branch: str = "main",
+    platform_repository: str | None = None,
+    load_callee: CalleeLoader | None = None,
 ) -> tuple[set[str], tuple[str, ...], bool]:
-    """What the installed workflows can report as status-check contexts ON A PULL REQUEST INTO
+    """What the workflows under `base` can report as status-check contexts ON A PULL REQUEST INTO
     `default_branch` (only workflows `_reports_on_protected_pull_requests` admits count): exact
-    job names (`name:` else the job id), prefixes for the contexts GitHub derives (`caller /
-    callee` for a reusable call, `name (...)` for a matrix), the evaluated names of a job named
-    with `matrix.*` over a finite literal matrix (any other expression in a name contributes
-    nothing), and whether any workflow runs on `merge_group` (a merge queue's checks)."""
+    contexts (`_workflow_job_contexts`: job names, evaluated matrix names, and `caller /
+    callee-job` for every job of a resolvable reusable workflow), `name (` prefixes for the
+    contexts GitHub derives for a matrix job, and whether any workflow runs on `merge_group` (a
+    merge queue's checks). Doctor passes the DEFAULT BRANCH's workflow set, not the checkout."""
     exact: set[str] = set()
     prefixes: list[str] = []
     merge_group = False
@@ -2121,25 +2210,29 @@ def workflow_check_contexts(
             merge_group = True
         if not _reports_on_protected_pull_requests(doc, default_branch):
             continue
-        for job_id, job in _workflow_jobs(path).items():
-            name = str(job.get("name") or job_id)
-            if "${{" in name:
-                # GitHub reports the evaluated name (with no `(...)` matrix suffix). Doctor
-                # can evaluate only `matrix.*` over a finite literal matrix; any other
-                # expression proves nothing (an empty literal prefix would match every context).
-                for rendered in _matrix_job_names(name, job.get("strategy")) or ():
-                    if rendered.strip():
-                        exact.add(rendered)
-                        if job.get("uses"):
-                            prefixes.append(f"{rendered} / ")
-                continue
-            exact.add(name)
-            if job.get("uses"):
-                prefixes.append(f"{name} / ")
-            strategy = job.get("strategy")
-            if isinstance(strategy, dict) and strategy.get("matrix"):
-                prefixes.append(f"{name} (")
+        found, matrix = _workflow_job_contexts(
+            base, doc, platform_repository, load_callee, (path.resolve(),)
+        )
+        exact |= found
+        prefixes += matrix
     return exact, tuple(prefixes), merge_group
+
+
+def context_produced(context: str, produced: tuple[set[str], tuple[str, ...], bool]) -> bool:
+    """Does `produced` (`workflow_check_contexts`) report `context`? Exactly, or as the values of
+    a matrix job: `name (` + values + `)`, nothing after the parenthesis (so a matrix prefix never
+    admits `name (x) / anything`). Any other prefix -- an empty one above all -- proves nothing."""
+    exact, prefixes, _ = produced
+    if context in exact:
+        return True
+    return any(
+        prefix.strip()
+        and prefix.endswith(" (")
+        and context.startswith(prefix)
+        and context.endswith(")")
+        and " / " not in context[len(prefix) :]
+        for prefix in prefixes
+    )
 
 
 def effective_rule_problems(
@@ -2151,8 +2244,7 @@ def effective_rule_problems(
     an app other than GitHub Actions, which those jobs report through), required deployments,
     required workflows, a merge queue no workflow serves, required signatures, update
     restrictions and code-scanning gates."""
-    exact, prefixes, merge_group = produced
-    prefixes = tuple(p for p in prefixes if p.strip())  # an empty prefix proves every context
+    merge_group = produced[2]
     problems: list[str] = []
     for rule in rules:
         kind = str(rule.get("type") or "")
@@ -2164,7 +2256,7 @@ def effective_rule_problems(
         if kind == "required_status_checks":
             for check in params.get("required_status_checks") or []:
                 context = str((check or {}).get("context") or "")
-                if context and context not in exact and not context.startswith(prefixes):
+                if context and not context_produced(context, produced):
                     problems.append(
                         f"{source}: requires status check '{context}', which no installed "
                         "workflow job reports"
@@ -2230,8 +2322,6 @@ def legacy_protection_problems(
     `effective_rule_problems`: required status contexts no installed PR workflow job reports, or
     bound to an app other than GitHub Actions; required signatures; push restrictions; a locked
     branch. Linear history, reviews and conversation resolution are compatible."""
-    exact, prefixes, _ = produced
-    prefixes = tuple(p for p in prefixes if p.strip())
     problems: list[str] = []
     checks = protection.get("required_status_checks")
     if isinstance(checks, dict):
@@ -2242,7 +2332,7 @@ def legacy_protection_problems(
         for context in checks.get("contexts") or []:
             bound.setdefault(str(context), set())
         for context, apps in sorted(bound.items()):
-            if context not in exact and not context.startswith(prefixes):
+            if not context_produced(context, produced):
                 problems.append(
                     f"requires status check '{context}', which no installed pull-request "
                     "workflow job reports"
@@ -2999,11 +3089,10 @@ def remote_workflow_files(
     return files, ""
 
 
-def _remote_pull_request_off_hosted(
-    files: dict[str, bytes], platform_repository: str, load_callee: CalleeLoader | None = None
-) -> list[str]:
-    """`_pull_request_off_hosted` over a workflow set read from GitHub (`remote_workflow_files`),
-    materialized in a scratch checkout so local reusable calls resolve within that same set."""
+@contextlib.contextmanager
+def _materialized_workflows(files: dict[str, bytes]) -> Iterator[Path]:
+    """A scratch checkout holding a workflow set read from GitHub (`remote_workflow_files`), so
+    local reusable calls resolve within that same set."""
     import tempfile
 
     with tempfile.TemporaryDirectory(prefix="forge-remote-workflows-") as scratch:
@@ -3012,7 +3101,27 @@ def _remote_pull_request_off_hosted(
         workflows.mkdir(parents=True)
         for name, content in files.items():
             (workflows / name).write_bytes(content)
+        yield root
+
+
+def _remote_pull_request_off_hosted(
+    files: dict[str, bytes], platform_repository: str, load_callee: CalleeLoader | None = None
+) -> list[str]:
+    """`_pull_request_off_hosted` over a workflow set read from GitHub (`remote_workflow_files`)."""
+    with _materialized_workflows(files) as root:
         return _pull_request_off_hosted(root, platform_repository, load_callee)
+
+
+def remote_check_contexts(
+    files: dict[str, bytes],
+    default_branch: str,
+    platform_repository: str | None = None,
+    load_callee: CalleeLoader | None = None,
+) -> tuple[set[str], tuple[str, ...], bool]:
+    """`workflow_check_contexts` over a workflow set read from GitHub (`remote_workflow_files`):
+    the contexts PRs into `default_branch` can actually receive."""
+    with _materialized_workflows(files) as root:
+        return workflow_check_contexts(root, default_branch, platform_repository, load_callee)
 
 
 def fork_runner_exposure(
@@ -3022,12 +3131,14 @@ def fork_runner_exposure(
     platform_repository: str,
     ref: str | None,
     load_callee: CalleeLoader | None = None,
+    remote: tuple[dict[str, bytes] | None, str] | None = None,
 ) -> list[str]:
     """Every pull_request-triggered job of a fork-exposed repository not proven GitHub-hosted. The
     authority is the default branch's workflow set as GitHub serves it (a stale or partial
-    checkout must not hide a workflow that is live there); the local checkout's workflows are
-    checked IN ADDITION, never instead. An unreadable remote set fails closed."""
-    files, why = remote_workflow_files(gh, project_id, ref)
+    checkout must not hide a workflow that is live there; `remote` is that set when the caller
+    already read it); the local checkout's workflows are checked IN ADDITION, never instead. An
+    unreadable remote set fails closed."""
+    files, why = remote if remote is not None else remote_workflow_files(gh, project_id, ref)
     if files is None:
         return [f"default-branch workflows unverifiable ({why}); doctor fails closed"]
     exposed = _remote_pull_request_off_hosted(files, platform_repository, load_callee)
@@ -4771,6 +4882,48 @@ def doctor(
     # enterprise apply too, and a requirement no Forge PR can meet leaves every PR unmergeable
     # however correct `Protect main` is. Diagnosis only: `--apply` manages the repository's own.
     effective_branch = policy.default_branch if policy else "main"
+    # Required contexts come from the workflows GitHub runs -- the default branch's set, read
+    # once here and reused by the fork check -- never from this checkout, whose unpushed
+    # workflows are reported only as drift. An unreadable set leaves them a manual TODO.
+    remote_sets: dict[str, tuple[dict[str, bytes] | None, str]] = {}
+
+    def remote_set(ref: str | None) -> tuple[dict[str, bytes] | None, str]:
+        if (ref or "") not in remote_sets:
+            remote_sets[ref or ""] = remote_workflow_files(gh, project_id, ref)
+        return remote_sets[ref or ""]
+
+    rules_files, rules_why = remote_set(effective_branch)
+    produced = (
+        remote_check_contexts(rules_files, effective_branch, platform_repository, load_callee)
+        if rules_files is not None
+        else None
+    )
+    local_produced = workflow_check_contexts(
+        base, effective_branch, platform_repository, load_callee
+    )
+
+    def context_problems(required_contexts: list[str], problems: list[str]) -> list[str]:
+        """`problems` for the required contexts, judged on the default branch's workflows; a
+        context only this checkout reports is drift (push it); an unreadable set, a TODO."""
+        if produced is None:
+            missing = sorted(c for c in required_contexts if c)
+            return (
+                [
+                    f"required status checks {', '.join(repr(c) for c in missing)} cannot be "
+                    f"verified: default-branch workflows unreadable ({rules_why}) → confirm a "
+                    f"workflow on {effective_branch} reports each on pull requests"
+                ]
+                if missing
+                else []
+            ) + problems
+        drift = [
+            f"local checkout: '{c}' is reported only by a workflow not on {effective_branch}"
+            " → push it"
+            for c in sorted(set(required_contexts))
+            if c and not context_produced(c, produced) and context_produced(c, local_produced)
+        ]
+        return problems + drift
+
     pages = _safe_json(
         gh,
         [
@@ -4793,7 +4946,26 @@ def doctor(
         )
     else:
         rules = [rule for page in pages for rule in page if isinstance(rule, dict)]
-        problems = effective_rule_problems(rules, workflow_check_contexts(base, effective_branch))
+        required_contexts = [
+            str((check or {}).get("context") or "")
+            for rule in rules
+            if rule.get("type") == "required_status_checks"
+            for check in ((rule.get("parameters") or {}).get("required_status_checks") or [])
+            if isinstance(check, dict)
+        ]
+        unverifiable = ("required_status_checks", "merge_queue")
+        checked = (
+            rules
+            if produced is not None
+            else [r for r in rules if r.get("type") not in unverifiable]
+        )
+        problems = effective_rule_problems(checked, produced or (set(), (), True))
+        if produced is None and any(r.get("type") == "merge_queue" for r in rules):
+            problems.append(
+                f"a merge queue is required, and whether a workflow on {effective_branch} runs on "
+                f"merge_group cannot be verified ({rules_why})"
+            )
+        problems = context_problems(required_contexts, problems)
         inherited = sorted(
             {
                 f"{r.get('ruleset_source_type')} {r.get('ruleset_source')}"
@@ -4848,8 +5020,23 @@ def doctor(
             )
         )
     else:
-        legacy_problems = legacy_protection_problems(
-            legacy, workflow_check_contexts(base, effective_branch)
+        legacy_checks = legacy.get("required_status_checks")
+        legacy_contexts = (
+            [str(c) for c in legacy_checks.get("contexts") or []]
+            + [
+                str(item.get("context"))
+                for item in legacy_checks.get("checks") or []
+                if isinstance(item, dict) and item.get("context")
+            ]
+            if isinstance(legacy_checks, dict)
+            else []
+        )
+        legacy_problems = context_problems(
+            legacy_contexts,
+            legacy_protection_problems(
+                legacy if produced is not None else {**legacy, "required_status_checks": None},
+                produced or (set(), (), False),
+            ),
         )
         add(
             Check(
@@ -5027,7 +5214,13 @@ def doctor(
         add(Check(FORK_RUNNER_CHECK, True, f"{fork_why}: fork pull requests run no workflows"))
     else:
         exposed = fork_runner_exposure(
-            base, gh, project_id, platform_repository, actual_branch, load_callee
+            base,
+            gh,
+            project_id,
+            platform_repository,
+            actual_branch,
+            load_callee,
+            remote=remote_set(actual_branch),
         )
         add(
             Check(
