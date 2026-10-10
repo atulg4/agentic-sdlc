@@ -607,7 +607,7 @@ def auto_plan_condition(ready: str, human_review: str, implementation: str) -> s
 
 
 def auto_implement_condition(ready: str, human_review: str, implementation: str) -> str:
-    """The `if:` of agent-auto-implement.yml's `preflight` job: any approval label triggers, and
+    """The `if:` of agent-auto-implement.yml's `authorize` job: any approval label triggers, and
     every one of them must be on the issue, so a ready label alone never starts implementation."""
     return (
         f"(github.event.label.name == {_expr_str(implementation)} ||\n"
@@ -984,8 +984,30 @@ def _render_workflow(name: str, spec: OnboardSpec, issue_expr: str | None = None
             extra = '          test -n "$OPENAI_API_KEY"\n'
         jobs = jobs.replace("PREFLIGHT_EXTRA\n", extra)
         if name == "agent-auto-implement.yml":
-            jobs = jobs.replace("  preflight:\n", "  preflight:\n    if: AUTO_IMPLEMENT_IF\n", 1)
+            # Every job that can reach the configured runner waits on the hosted `authorize`.
+            gate = "    if: needs.authorize.outputs.authorized == 'true'\n"
+            for old, new in (
+                ("  preflight:\n", "  preflight:\n    needs: authorize\n" + gate),
+                ("    needs: preflight\n", "    needs: [authorize, preflight]\n" + gate),
+                (
+                    "    needs: [preflight, implement]\n",
+                    "    needs: [authorize, preflight, implement]\n",
+                ),
+                (
+                    "      ${{ always() &&\n",
+                    "      ${{ always() && needs.authorize.outputs.authorized == 'true' &&\n",
+                ),
+            ):
+                if jobs.count(old) != 1:
+                    raise OnboardError(f"implement jobs template: expected one {old.strip()!r}")
+                jobs = jobs.replace(old, new)
         text = text.replace("IMPLEMENT_JOBS\n", jobs)
+    if "LABELER_AUTHORIZATION" in text:
+        work = "Planning" if name == "agent-auto-plan.yml" else "Implementation"
+        authorization = _resource("github/forge/_authorize-labeler.yml").replace(
+            "AUTHORIZED_WORK", work
+        )
+        text = text.replace("LABELER_AUTHORIZATION\n", authorization)
     labels = (spec.ready_label, HUMAN_REVIEW_LABEL, IMPLEMENTATION_LABEL)
     platform = spec.platform_repository
     # Every placeholder is a WHOLE YAML value: strings go through `_yaml_str`, label lists
@@ -1093,10 +1115,21 @@ def render_onboarding(spec: OnboardSpec) -> dict[str, str]:
         )
     common = (
         r"\b(PLATFORM_REPOSITORY|PLATFORM_COMMIT_SHA|(?:CI_)?RUNS_ON_(?:JSON|YAML)|"
-        r"(?:SETUP|QUALITY|TEST)_COMMAND|ISSUE_NUMBER_EXPR|IMPLEMENT_JOBS|PREFLIGHT_EXTRA)\b"
+        r"(?:SETUP|QUALITY|TEST)_COMMAND|ISSUE_NUMBER_EXPR|IMPLEMENT_JOBS|PREFLIGHT_EXTRA|"
+        r"LABELER_AUTHORIZATION|AUTHORIZED_WORK)\b"
     )
     workflow = re.compile(
-        r"\b(" + "|".join((*WORKFLOW_PLACEHOLDERS, "IMPLEMENT_JOBS", "PREFLIGHT_EXTRA")) + r")\b"
+        r"\b("
+        + "|".join(
+            (
+                *WORKFLOW_PLACEHOLDERS,
+                "IMPLEMENT_JOBS",
+                "PREFLIGHT_EXTRA",
+                "LABELER_AUTHORIZATION",
+                "AUTHORIZED_WORK",
+            )
+        )
+        + r")\b"
     )
     for name, content in files.items():
         pattern = workflow if name.startswith(".github/workflows/") else re.compile(common)
@@ -3867,16 +3900,16 @@ TUNABLE_KNOBS = (
     "jobs.*.with.runs_on",
     "jobs.*.with.route_budget_usd",
     "agent-auto-plan.yml: jobs.preflight.if",
-    "agent-auto-implement.yml: jobs.preflight.if",
+    "agent-auto-implement.yml: jobs.authorize.if",
     "platform ref pin",
 )
 _LABEL_CONDITION_JOBS = {
     "agent-auto-plan.yml": "preflight",
-    "agent-auto-implement.yml": "preflight",
+    "agent-auto-implement.yml": "authorize",
 }
-#: Jobs whose `runs-on` is NOT tunable: agent-auto-plan.yml authorizes the labeler on a
+#: Jobs whose `runs-on` is NOT tunable: the automatic callers authorize the labeler on a
 #: GitHub-hosted runner before anything is scheduled on the (self-hosted) RUNS_ON labels.
-_HOSTED_JOBS = {"agent-auto-plan.yml": "preflight"}
+_HOSTED_JOBS = {"agent-auto-plan.yml": "preflight", "agent-auto-implement.yml": "authorize"}
 
 
 def _mask_tunables(name: str, doc: object) -> object:
@@ -4576,7 +4609,7 @@ def doctor(
             mismatched = []
             for file, job_name, expected in (
                 ("agent-auto-plan.yml", "preflight", auto_plan_condition(*labels)),
-                ("agent-auto-implement.yml", "preflight", auto_implement_condition(*labels)),
+                ("agent-auto-implement.yml", "authorize", auto_implement_condition(*labels)),
             ):
                 path = base / ".github/workflows" / file
                 if not path.exists():

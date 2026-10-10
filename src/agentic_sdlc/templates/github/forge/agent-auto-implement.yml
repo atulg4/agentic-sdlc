@@ -11,4 +11,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # A Triage user can apply the approval labels without write access, so the labeler's write
+  # authority is checked HERE, on a GitHub-hosted runner, before any job is scheduled on RUNS_ON:
+  # toggling a label must not occupy a self-hosted runner (the reusable workflow checks again;
+  # this check only keeps unauthorized runs off it). Not tunable: doctor requires this job, its
+  # runner and every job's `authorize` gate exactly as generated.
+  authorize:
+    # Any approval label triggers; every one of them must be on the issue.
+    if: AUTO_IMPLEMENT_IF
+LABELER_AUTHORIZATION
+
 IMPLEMENT_JOBS
