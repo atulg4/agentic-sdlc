@@ -858,7 +858,10 @@ def test_maintainers_and_writers_markers_count_and_permissions_are_read_once():
     assert len(reads) == 1  # cached for the run
 
 
-def test_an_unreadable_permission_makes_the_marker_untrusted():
+def test_an_unreadable_permission_refuses_the_lease_read():
+    """Codex 4239397972: a failed permission read of a marker author is not "no marker". It used
+    to drop the holder's claim, so a rival whose own read worked (or the Actions bot, which needs
+    none) posted a marker and won while the holder kept working: two agents on one issue."""
     gh = FakeGh().issue(7)
     real = gh.__call__
 
@@ -869,10 +872,39 @@ def test_an_unreadable_permission_makes_the_marker_untrusted():
 
     marker = format_claim_marker(Lease(7, "me", "s1", "b", NOW + timedelta(hours=1)))
     gh.issues[7]["comments"].append(_comment_row(95, marker, "2026-09-30T01:00:00Z"))
-    assert current_lease(PROJECT, 7, broken, now=NOW) is None
-    # Our own claim cannot be proven authoritative either: the claim fails closed.
-    result = claim(PROJECT, 7, agent="me", session="s9", branch="b", gh=broken, now=NOW)
-    assert not result.ok
+    before = len(gh.issues[7]["comments"])
+    with pytest.raises(LeaseError, match="cannot read the repository permission"):
+        current_lease(PROJECT, 7, broken, now=NOW)
+    with pytest.raises(LeaseError):
+        claim(PROJECT, 7, agent="me", session="s9", branch="b", gh=broken, now=NOW)
+    assert len(gh.issues[7]["comments"]) == before  # refused before posting any marker
+
+    # A bot rival needs no permission read, but the holder's marker still has to be classified.
+    bot = format_claim_marker(Lease(7, "bot", "s2", "b", NOW + timedelta(hours=1)))
+    gh.issues[7]["comments"].append(
+        _comment_row(96, bot, "2026-09-30T01:05:00Z", "github-actions[bot]", "Bot", "NONE")
+    )
+    with pytest.raises(LeaseError):
+        current_lease(PROJECT, 7, broken, now=NOW)
+
+    # Only a definitive answer classifies: a 404 is "no access" (untrusted, marker ignored) ...
+    gone = FakeGh().issue(7)
+    gone.issues[7]["comments"].append(
+        _comment_row(95, marker, "2026-09-30T01:00:00Z", "stranger", "User", "NONE")
+    )
+    assert current_lease(PROJECT, 7, gone, now=NOW) is None
+    # ... and a 200 that carries no permission is as unreadable as a failure.
+    blank = FakeGh().issue(7)
+    blank.issues[7]["comments"].append(_comment_row(95, marker, "2026-09-30T01:00:00Z"))
+    blank_real = blank.__call__
+
+    def shapeless(args, input=None):
+        if "/collaborators/" in args[1]:
+            return "{}"
+        return blank_real(args, input=input)
+
+    with pytest.raises(LeaseError, match="no permission"):
+        current_lease(PROJECT, 7, shapeless, now=NOW)
 
 
 @pytest.mark.parametrize(

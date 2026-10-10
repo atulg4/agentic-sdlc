@@ -168,8 +168,14 @@ def load_policy_bytes(raw: bytes) -> ProjectPolicy:
     )
 
 
-def _matches(path: str, patterns: tuple[str, ...]) -> bool:
+def _matches(path: str, patterns: tuple[str, ...], *, casefold: bool = False) -> bool:
+    """`path` matches one of `patterns` (fnmatch: `*` crosses `/`). `casefold` for the paths a
+    change must NOT touch: `LOGO.PNG` is the `*.png` media a forbidden list names, on every
+    filesystem that ignores case and in every reviewer's eyes."""
     normalized = path.removeprefix("./")
+    if casefold:
+        normalized = normalized.casefold()
+        return any(fnmatch.fnmatchcase(normalized, pattern.casefold()) for pattern in patterns)
     return any(fnmatch.fnmatch(normalized, pattern) for pattern in patterns)
 
 
@@ -227,11 +233,15 @@ def evaluate_diff(
     if patch_bytes > policy.max_patch_bytes:
         reasons.append(f"patch-byte cap exceeded: {patch_bytes} > {policy.max_patch_bytes}")
 
-    forbidden = sorted(path for path in paths if _matches(path, policy.forbidden_paths))
+    forbidden = sorted(
+        path for path in paths if _matches(path, policy.forbidden_paths, casefold=True)
+    )
     if forbidden:
         reasons.append("forbidden paths changed: " + ", ".join(forbidden))
 
-    protected = sorted(path for path in paths if _matches(path, policy.protected_paths))
+    protected = sorted(
+        path for path in paths if _matches(path, policy.protected_paths, casefold=True)
+    )
     if protected:
         gates.append("architect-security-review")
 

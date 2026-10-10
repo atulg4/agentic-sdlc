@@ -300,7 +300,8 @@ def trusted_marker_author(
 ) -> bool:
     """May this comment's author post lease markers? A bot by `trusted_bot`; a user only with
     write/maintain/admin on the repository (`permission(login)` -> the permission API's
-    `permission`/`role_name`, None when it could not be read: untrusted). Never by
+    `permission`/`role_name`, None when the account has none; a permission that cannot be read
+    raises LeaseError out of `permission` and refuses the whole read). Never by
     `author_association`, which a read-only member or collaborator also carries."""
     user = comment.get("user") or {}
     login = str(user.get("login") or "")
@@ -316,29 +317,49 @@ def trusted_marker_author(
 
 class PermissionCache:
     """Repository permission per login, read once per run (`GET .../collaborators/{u}/permission`).
-    A failed read is None (untrusted) and is not retried within the run. Keyed by `login_key`:
-    `Alice` and `alice` are one read."""
+    Keyed by `login_key`: `Alice` and `alice` are one read.
+
+    Only a definitive answer classifies an author: a 200 carrying the permission, or a 404 (the
+    account has no access: None, untrusted). Any other failure -- network, auth, 5xx, an answer
+    that is not the documented shape -- raises LeaseError, every time it is asked within the
+    run (Codex 4239397972): dropping that author's markers would read an existing lease as
+    absent and let a rival claim the issue. The commit-guard hook refuses the same way."""
 
     def __init__(self, project: str, gh: GhRunner):
         self.project = project
         self.gh = gh
-        self._known: dict[str, str | None] = {}
+        self._known: dict[str, str | None | LeaseError] = {}
 
     def __call__(self, login: str) -> str | None:
         key = login_key(login)
         if key not in self._known:
-            self._known[key] = self._read(login)
-        return self._known[key]
+            try:
+                self._known[key] = self._read(login)
+            except LeaseError as exc:
+                self._known[key] = exc
+        known = self._known[key]
+        if isinstance(known, LeaseError):
+            raise LeaseError(str(known))
+        return known
 
     def _read(self, login: str) -> str | None:
+        path = f"repos/{self.project}/collaborators/{login}/permission"
         try:
-            data = json.loads(
-                self.gh(["api", f"repos/{self.project}/collaborators/{login}/permission"]) or "{}"
-            )
-        except Exception:  # noqa: BLE001 -- unreadable means untrusted (fail closed)
-            return None
-        if not isinstance(data, dict):
-            return None
+            raw = self.gh(["api", path])
+        except Exception as exc:  # noqa: BLE001 -- only a 404 is an answer
+            if "HTTP 404" in str(exc):
+                return None  # GitHub: the account has no access to the repository
+            raise LeaseError(
+                f"cannot read the repository permission of marker author {login!r} "
+                f"({str(exc).strip()[:200] or type(exc).__name__}); lease state unknown, "
+                "refusing the lease operation -- retry once GitHub answers"
+            ) from exc
+        try:
+            data = json.loads(raw or "null")
+        except ValueError as exc:
+            raise LeaseError(f"unreadable answer from {path}: not JSON") from exc
+        if not isinstance(data, dict) or not (data.get("permission") or data.get("role_name")):
+            raise LeaseError(f"unreadable answer from {path}: no permission in it")
         # role_name distinguishes maintain (permission reads "write") and custom roles.
         for key in ("role_name", "permission"):
             value = login_key(data.get(key))
