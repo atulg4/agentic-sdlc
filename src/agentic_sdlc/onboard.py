@@ -2413,6 +2413,10 @@ ANTHROPIC_AUTH_SECRETS = {
 #: runners reference" (standard and larger macOS labels), NOT a version-shaped pattern -- a label
 #: GitHub does not provide (`ubuntu-99.04`, `macos-99`) queues forever. Windows labels are listed
 #: only to be recognised and rejected (`_windows_labels`): the generated workflows are bash/Unix.
+#: This list MUST track GitHub's CURRENT hosted-runner labels: a retired image's label (e.g.
+#: `macos-13`, `macos-13-large`, `macos-13-xlarge`, retired 2025-12-04) is accepted by onboard and
+#: counted as available by doctor, yet its job never starts. Remove labels as GitHub retires them
+#: (github.blog changelog, "... runner image is closing down"). Last reviewed: 2026-10-10.
 GITHUB_HOSTED_LABELS: dict[str, str] = {
     **dict.fromkeys(
         (
@@ -2431,17 +2435,14 @@ GITHUB_HOSTED_LABELS: dict[str, str] = {
             "macos-26",
             "macos-15",
             "macos-14",
-            "macos-13",
             "macos-15-intel",
             "macos-latest-large",
             "macos-15-large",
             "macos-14-large",
-            "macos-13-large",
             "macos-latest-xlarge",
             "macos-26-xlarge",
             "macos-15-xlarge",
             "macos-14-xlarge",
-            "macos-13-xlarge",
         ),
         "macos",
     ),
