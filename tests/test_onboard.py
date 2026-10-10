@@ -425,6 +425,9 @@ def _effective_rules(*extra: dict) -> str:
     return json.dumps([[*own, *extra]])
 
 
+AGENT_BRANCH_RULES = "api repos/owner/comic/rules/branches/agent%2F"
+
+
 def _healthy_gh() -> FakeGh:
     return FakeGh(
         {
@@ -433,6 +436,8 @@ def _healthy_gh() -> FakeGh:
                 "gh: Branch not protected (HTTP 404)"
             ),
             "api repos/owner/comic/rules/branches/main": _effective_rules(),
+            # the publisher's agent/... branches: no ruleset targets them
+            AGENT_BRANCH_RULES: json.dumps([[]]),
             "api repos/owner/comic/rulesets/11": json.dumps({"id": 11, **ruleset_payload(spec())}),
             "api repos/owner/comic/labels": json.dumps(
                 [
@@ -6272,3 +6277,240 @@ def test_doctor_judges_effective_metadata_rules_against_the_pinned_publisher(tmp
         assert set(_failed(report)) == {
             "effective default-branch rules (org/enterprise rulesets too) fit Forge"
         }
+
+
+# ---------------------------------------------------------------- Codex review 5480794212
+
+
+def test_platform_refs_are_encoded_as_one_path_component():
+    """Codex 4239194843: a ref with `/` or `%` must not split the REST path."""
+    from agentic_sdlc.onboard import remote_workflow_files
+
+    gh = FakeGh({"api repos/owner/agentic-sdlc/commits/feature%2Fonboarding": SHA + "\n"})
+    assert resolve_platform_ref("owner/agentic-sdlc", "feature/onboarding", gh) == SHA
+    assert gh.calls[0][0][1] == "repos/owner/agentic-sdlc/commits/feature%2Fonboarding"
+    gh = FakeGh({"api repos/owner/agentic-sdlc/commits/50%25off": SHA + "\n"})
+    assert resolve_platform_ref("owner/agentic-sdlc", "50%off", gh) == SHA
+    # a branch read through the contents API is one query value too
+    gh = FakeGh({"api repos/owner/comic/contents/.github/workflows?ref=release%2F1.0": "[]"})
+    assert remote_workflow_files(gh, "owner/comic", "release/1.0") == ({}, "")
+    assert gh.calls[0][0][1].endswith("?ref=release%2F1.0")
+
+
+@pytest.mark.parametrize(
+    ("pattern", "branch", "expected"),
+    [
+        ("ma?n", "main", False),  # `?` is zero or one of the PRECEDING character
+        ("ma?n", "man", True),
+        ("ma?n", "mn", True),
+        ("mai?n", "main", True),
+        ("mai+n", "maiiin", True),
+        ("mai+n", "man", False),
+        ("[mx]ain", "main", True),
+        ("[a-z]ain", "main", True),
+        ("[0-9]ain", "main", False),
+        ("*", "main", True),
+        ("*", "a/b", False),
+        ("**", "a/b", True),
+        ("releases/**", "releases/1/2", True),
+        ("releases/*", "releases/1/2", False),
+        ("ma\\*n", "ma*n", True),
+        ("ma\\*n", "main", False),
+        ("feature!", "feature!", True),  # `!` is special only first
+        # unsupported or ambiguous: fail closed (None)
+        ("!main", "main", None),
+        ("?main", "main", None),
+        ("*?", "main", None),
+        ("[mx]?ain", "main", None),
+        ("[!m]ain", "main", None),
+        ("[a-Z]ain", "main", None),
+        ("[ab", "main", None),
+        ("ma]n", "main", None),
+        ("***", "main", None),
+        ("ma\\n", "main", None),
+    ],
+)
+def test_branch_filters_follow_githubs_cheat_sheet(pattern, branch, expected):
+    """Codex 4239194847: GitHub's filter-pattern semantics, or None (not provably matching)."""
+    from agentic_sdlc.onboard import _branch_glob_matches
+
+    assert _branch_glob_matches(pattern, branch) is expected
+
+
+def test_a_question_mark_filter_does_not_prove_a_workflow_reports_on_main():
+    from agentic_sdlc.onboard import _reports_on_protected_pull_requests
+
+    def doc(branches):
+        return {"on": {"pull_request": {"branches": branches}}, "jobs": {}}
+
+    assert not _reports_on_protected_pull_requests(doc(["ma?n"]), "main")
+    assert not _reports_on_protected_pull_requests(doc(["[!x]ain"]), "main")
+    assert _reports_on_protected_pull_requests(doc(["mai?n"]), "main")
+    assert _reports_on_protected_pull_requests(doc(["[!x]ain", "ma*"]), "main")
+
+
+NESTED_SHA = "f" * 40
+
+
+def _plan_calling_nested(nested: str, *, with_: dict | None = None) -> str:
+    """reusable-plan.yml with one more job that calls the platform's `nested.yml` pinned."""
+    doc = yaml.safe_load((PLATFORM_WORKFLOWS / "reusable-plan.yml").read_text())
+    job = {"uses": f"owner/agentic-sdlc/.github/workflows/{nested}@{NESTED_SHA}"}
+    if with_:
+        job["with"] = with_
+    doc["jobs"]["nested"] = job
+    return yaml.safe_dump(doc)
+
+
+NESTED_CALLEE = (
+    "on:\n  workflow_call:\n{inputs}jobs:\n  inner:\n    runs-on: ubuntu-latest\n"
+    "    steps:\n      - uses: evil/action@" + "a" * 40 + "\n"
+)
+
+
+def _nested_gh(gh: FakeGh, nested: str | Exception, **kwargs) -> FakeGh:
+    gh.answers[PLATFORM_CONTENTS + ".github/workflows/reusable-plan.yml"] = _blob(
+        _plan_calling_nested("nested.yml", **kwargs).encode()
+    )
+    gh.answers[PLATFORM_CONTENTS + ".github/workflows/nested.yml"] = (
+        nested if isinstance(nested, Exception) else _blob(nested.encode())
+    )
+    return gh
+
+
+def test_actions_allowlist_covers_nested_platform_callees(tmp_path):
+    """Codex 4239194850: an action used only by a nested pinned platform workflow must be
+    admitted too; a nested callee that cannot be read is a manual TODO, never READY."""
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _nested_gh(_actions_policy_gh(SELECTED, ALLOWLIST), NESTED_CALLEE.format(inputs=""))
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    check = next(c for c in report.checks if c.name == ACTIONS_POLICY)
+    assert not check.ok and not check.manual and "evil/action@" in check.detail
+    assert not report.ok
+    # allowed: READY again (the nested call itself is the consumer owner's own workflow)
+    allow = {**ALLOWLIST, "patterns_allowed": [*ALLOWLIST["patterns_allowed"], "evil/*"]}
+    gh = _nested_gh(_actions_policy_gh(SELECTED, allow), NESTED_CALLEE.format(inputs=""))
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    assert report.ok, report.render()
+    # unreadable nested callee: fail closed
+    gh = _nested_gh(_actions_policy_gh(SELECTED, allow), OnboardError("gh: boom (HTTP 500)"))
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    check = next(c for c in report.checks if c.name == ACTIONS_POLICY)
+    assert not check.ok and check.manual and "nested.yml could not be read" in check.detail
+    assert not report.ok
+
+
+def test_callee_graph_is_cycle_safe_bounded_and_fails_closed():
+    from agentic_sdlc.onboard import platform_callee_graph
+
+    def calls(target: str) -> dict:
+        return {"on": {"workflow_call": None}, "jobs": {"j": {"uses": target}}}
+
+    plat = "owner/agentic-sdlc/.github/workflows"
+    docs = {
+        ("a.yml", NESTED_SHA): calls(f"{plat}/b.yml@{NESTED_SHA}"),
+        ("b.yml", NESTED_SHA): calls(f"{plat}/a.yml@{NESTED_SHA}"),
+    }
+    loads: list[tuple[str, str]] = []
+
+    def load(name: str, sha: str) -> object:
+        loads.append((name, sha))
+        return docs.get((name, sha))
+
+    roots = {"root.yml": calls(f"{plat}/a.yml@{NESTED_SHA}")}
+    graph = platform_callee_graph(roots, SHA, "owner/agentic-sdlc", load)
+    assert set(graph.docs) == {("root.yml", SHA), *docs}
+    assert any("cycle through a.yml" in why for why in graph.unfollowed)
+    assert loads == [("a.yml", NESTED_SHA), ("b.yml", NESTED_SHA)]  # each read once
+    # depth bound
+    graph = platform_callee_graph(roots, SHA, "owner/agentic-sdlc", load, max_depth=2)
+    assert any("deeper than 2" in why for why in graph.unfollowed)
+    # a branch ref, another repository, a `./` call: not followed, fail closed
+    for target in (f"{plat}/a.yml@main", "other/repo/.github/workflows/x.yml@" + SHA, "./x.yml"):
+        graph = platform_callee_graph({"r.yml": calls(target)}, SHA, "owner/agentic-sdlc", load)
+        assert graph.unfollowed and graph.uninspectable, target
+
+
+def test_nested_reusable_calls_must_match_their_callee_contract(tmp_path):
+    """Codex 4239194854: a nested pinned call that omits a required input is rejected by
+    GitHub before its jobs start; doctor must not report READY."""
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    required = "    inputs:\n      mode:\n        type: string\n        required: true\n"
+    gh = _nested_gh(_healthy_gh(), NESTED_CALLEE.format(inputs=required))
+    gh.answers["api repos/owner/comic/actions/permissions"] = json.dumps(
+        {"enabled": True, "allowed_actions": "all"}
+    )
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))
+    detail = failed[CONTRACT].detail
+    assert "reusable-plan.yml@" in detail and "nested.yml" in detail and "'mode'" in detail
+    # passing it satisfies the nested contract
+    gh = _nested_gh(_healthy_gh(), NESTED_CALLEE.format(inputs=required), with_={"mode": "x"})
+    gh.answers["api repos/owner/comic/actions/permissions"] = json.dumps(
+        {"enabled": True, "allowed_actions": "all"}
+    )
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    assert report.ok, report.render()
+
+
+@pytest.mark.parametrize(
+    ("rule", "needle"),
+    [
+        (_org_rule("creation"), "restricts creating agent/issue-1-1"),
+        (_org_rule("update"), "restricts updates to agent/issue-1-1"),
+        (_org_rule("required_signatures"), "'required_signatures' applies to agent/issue-1-1"),
+        (
+            _org_rule("required_status_checks", required_status_checks=[{"context": "x"}]),
+            "'required_status_checks' applies",
+        ),
+        (
+            _pattern_rule("commit_message_pattern", "starts_with", "JIRA-"),
+            "the publisher's commit message",
+        ),
+    ],
+)
+def test_doctor_reads_the_rules_on_the_publishers_agent_branches(tmp_path, rule, needle):
+    """Codex 4239194838: a ruleset targeting only agent/** is invisible in the default branch's
+    rules but rejects the publisher's push."""
+    from agentic_sdlc.onboard import PUBLISHER_BRANCH_RULES_CHECK
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _healthy_gh()
+    gh.answers[AGENT_BRANCH_RULES] = json.dumps([[rule]])
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    failed = _failed(report)
+    assert set(failed) == {PUBLISHER_BRANCH_RULES_CHECK}, report.render()
+    assert needle in failed[PUBLISHER_BRANCH_RULES_CHECK].detail
+    paths = [c[1] for c, _ in gh.calls if "/rules/branches/agent" in c[1]]
+    assert "repos/owner/comic/rules/branches/agent%2Fissue-1-1" in paths  # one encoded component
+
+
+def test_publisher_branch_rules_compatible_or_unreadable(tmp_path):
+    from agentic_sdlc.onboard import PUBLISHER_BRANCH_RULES_CHECK
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _healthy_gh()
+    compatible = [
+        _org_rule("deletion"),
+        _org_rule("non_fast_forward"),
+        _org_rule(
+            "required_status_checks",
+            required_status_checks=[{"context": "x"}],
+            do_not_enforce_on_create=True,
+        ),
+        _pattern_rule("branch_name_pattern", "starts_with", "agent/"),
+    ]
+    gh.answers[AGENT_BRANCH_RULES] = json.dumps([compatible])
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    assert report.ok, report.render()
+    gh = _healthy_gh()
+    gh.answers[AGENT_BRANCH_RULES] = OnboardError("gh: Forbidden (HTTP 403)")
+    check = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))[
+        PUBLISHER_BRANCH_RULES_CHECK
+    ]
+    assert check.manual and "could not read the rules that apply to agent/issue-1-1" in (
+        check.detail
+    )
