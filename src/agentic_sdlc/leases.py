@@ -261,8 +261,12 @@ def _paged(path: str, gh: GhRunner) -> list[dict]:
     data = json.loads(gh(["api", path, "--paginate", "--slurp"]) or "null")
     if not isinstance(data, list):
         raise LeaseError(f"unreadable answer from {path}: not a list of pages")
-    items = [item for page in data for item in (page if isinstance(page, list) else [page])]
-    return [item for item in items if isinstance(item, dict)]
+    if not all(isinstance(page, list) for page in data):
+        raise LeaseError(f"unreadable answer from {path}: a page is not a list")
+    items = [item for page in data for item in page]
+    if not all(isinstance(item, dict) for item in items):
+        raise LeaseError(f"unreadable answer from {path}: an item is not an object")
+    return items
 
 
 def _comments(project: str, issue: int, gh: GhRunner) -> list[dict]:

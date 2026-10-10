@@ -13,6 +13,7 @@ import yaml
 from agentic_sdlc.executors import load_executors, load_routing_policy
 from agentic_sdlc.onboard import (
     FORK_RUNNER_CHECK,
+    GITHUB_ACTIONS_INTEGRATION_ID,
     IMPLEMENTATION_LABEL,
     REUSABLE_IMPLEMENT_AGENTS,
     REUSABLE_IMPLEMENT_DEFAULT_AGENT,
@@ -330,7 +331,7 @@ def test_apply_repo_settings_creates_labels_ruleset_and_variables_idempotently()
     rules = {r["type"]: r for r in payload["rules"]}
     assert rules["pull_request"]["parameters"]["required_review_thread_resolution"] is True
     assert rules["required_status_checks"]["parameters"]["required_status_checks"] == [
-        {"context": "test"}
+        {"context": "test", "integration_id": GITHUB_ACTIONS_INTEGRATION_ID}
     ]
     assert (
         "variable",
@@ -2397,9 +2398,10 @@ def test_ruleset_update_merges_forge_rules_without_weakening_existing_ones():
     assert merged_ruleset(body, spec()) == body
 
 
-def test_ruleset_rejects_and_unbinds_a_foreign_integration_on_the_test_check():
+def test_ruleset_rejects_and_rebinds_a_foreign_integration_on_the_test_check():
     """A `test` context pinned to another app's integration_id can never be satisfied by ci.yml
-    (Codex review 4204434963): doctor reports it, and the merge drops the binding."""
+    (Codex review 4204434963): doctor reports it, and the merge rebinds it to GitHub Actions --
+    never to an unbound check any integration could satisfy (Codex review 4239510554)."""
     payload = ruleset_payload(spec())
     foreign = json.loads(json.dumps(payload))
     checks = foreign["rules"][3]["parameters"]["required_status_checks"]
@@ -2413,7 +2415,7 @@ def test_ruleset_rejects_and_unbinds_a_foreign_integration_on_the_test_check():
     merged = merged_ruleset(foreign, spec())
     kept = next(r for r in merged["rules"] if r["type"] == "required_status_checks")
     assert kept["parameters"]["required_status_checks"] == [
-        {"context": "test"},
+        {"context": "test", "integration_id": GITHUB_ACTIONS_INTEGRATION_ID},
         {"context": "lint", "integration_id": 4242},  # not Forge's context: untouched
     ]
     assert ruleset_mismatches(merged, spec()) == []
@@ -5128,12 +5130,30 @@ def test_doctor_flags_an_inherited_required_check_no_workflow_reports(tmp_path):
 def test_doctor_accepts_an_inherited_required_check_an_installed_job_reports(tmp_path):
     gh = _healthy_gh()
     gh.answers["api repos/owner/comic/rules/branches/main"] = _effective_rules(
-        _org_rule("required_status_checks", required_status_checks=[{"context": "test"}]),
+        _org_rule(
+            "required_status_checks",
+            required_status_checks=[
+                {"context": "test", "integration_id": GITHUB_ACTIONS_INTEGRATION_ID}
+            ],
+        ),
         _org_rule("pull_request", required_approving_review_count=2),
     )
     report, check = _effective_check(gh, tmp_path)
     assert report.ok, report.render()
     assert check.ok and "inherited from Organization owner" in check.detail
+
+
+def test_doctor_rejects_an_inherited_test_check_not_bound_to_github_actions(tmp_path):
+    """Forge's `test` gate, required with no integration, accepts a `test` status from ANY app
+    or credential with commit-status access (Codex review 4239510554): never READY."""
+    gh = _healthy_gh()
+    gh.answers["api repos/owner/comic/rules/branches/main"] = _effective_rules(
+        _org_rule("required_status_checks", required_status_checks=[{"context": "test"}]),
+    )
+    report, check = _effective_check(gh, tmp_path)
+    assert not report.ok and not check.ok and check.manual
+    assert "'test' is not bound to GitHub Actions" in check.detail
+    assert "Organization owner" in check.detail
 
 
 def test_doctor_rejects_an_inherited_check_bound_to_a_foreign_integration(tmp_path):
@@ -5393,6 +5413,65 @@ def test_legacy_protection_problems():
     assert any("signed commits" in p for p in problems)
     assert any("restricts who can push" in p for p in problems)
     assert any("locks the branch" in p for p in problems)
+
+
+@pytest.mark.parametrize(
+    "required",
+    [
+        {"contexts": ["test"]},  # a bare context: its binding cannot be read
+        {"contexts": ["test"], "checks": [{"context": "test", "app_id": None}]},  # any source
+        {"contexts": ["test"], "checks": [{"context": "test", "app_id": -1}]},  # any source
+        {
+            "contexts": ["test"],
+            "checks": [
+                {"context": "test", "app_id": GITHUB_ACTIONS_INTEGRATION_ID},
+                {"context": "test", "app_id": None},
+            ],
+        },
+    ],
+)
+def test_classic_test_check_must_be_bound_to_github_actions(required):
+    """Codex review 4239510554: a classic `test` requirement any app may satisfy (no app, or an
+    unreadable binding) lets a `test` status from another integration pass Forge's gate."""
+    from agentic_sdlc.onboard import legacy_protection_problems
+
+    produced = ProducedContexts(frozenset({"test"}))
+    problems = legacy_protection_problems({"required_status_checks": required}, produced)
+    assert len(problems) == 1 and "'test' is not bound to GitHub Actions" in problems[0]
+    bound = {
+        "contexts": ["test"],
+        "checks": [{"context": "test", "app_id": GITHUB_ACTIONS_INTEGRATION_ID}],
+    }
+    assert legacy_protection_problems({"required_status_checks": bound}, produced) == []
+
+
+def test_ruleset_requires_the_test_check_bound_to_github_actions():
+    """Codex review 4239510554: an unbound `test` in `Protect main` accepts the status from any
+    integration. The payload binds it; doctor rejects an unbound one; the merge binds it while
+    keeping every other rule and check."""
+    payload = ruleset_payload(spec())
+    gate = next(r for r in payload["rules"] if r["type"] == "required_status_checks")
+    assert gate["parameters"]["required_status_checks"] == [
+        {"context": "test", "integration_id": GITHUB_ACTIONS_INTEGRATION_ID}
+    ]
+    assert ruleset_mismatches(payload, spec()) == []
+    unbound = json.loads(json.dumps(payload))
+    unbound["rules"].append({"type": "required_linear_history"})
+    checks = next(r for r in unbound["rules"] if r["type"] == "required_status_checks")
+    checks["parameters"]["required_status_checks"] = [
+        {"context": "test"},
+        {"context": "lint"},
+    ]
+    problems = ruleset_mismatches(unbound, spec())
+    assert any("'test' is not bound to GitHub Actions" in p for p in problems), problems
+    merged = merged_ruleset(unbound, spec())
+    assert ruleset_mismatches(merged, spec()) == []
+    assert {"type": "required_linear_history"} in merged["rules"]
+    gate = next(r for r in merged["rules"] if r["type"] == "required_status_checks")
+    assert gate["parameters"]["required_status_checks"] == [
+        {"context": "test", "integration_id": GITHUB_ACTIONS_INTEGRATION_ID},
+        {"context": "lint"},  # not Forge's context: left as the owner set it
+    ]
 
 
 def test_doctor_checks_classic_branch_protection(tmp_path):
@@ -5863,7 +5942,12 @@ def _queue_rules(*contexts):
         {"type": "merge_queue", "parameters": {}},
         {
             "type": "required_status_checks",
-            "parameters": {"required_status_checks": [{"context": c} for c in contexts]},
+            "parameters": {
+                "required_status_checks": [
+                    {"context": c, "integration_id": GITHUB_ACTIONS_INTEGRATION_ID}
+                    for c in contexts
+                ]
+            },
         },
     ]
 
@@ -5964,7 +6048,12 @@ def test_disabled_context_producing_workflow_is_no_evidence(tmp_path):
     # a disabled workflow is no merge-group evidence either
     rules = [
         _org_rule("merge_queue"),
-        _org_rule("required_status_checks", required_status_checks=[{"context": "test"}]),
+        _org_rule(
+            "required_status_checks",
+            required_status_checks=[
+                {"context": "test", "integration_id": GITHUB_ACTIONS_INTEGRATION_ID}
+            ],
+        ),
     ]
     ci = repo / ".github/workflows/ci.yml"
     _wf(repo, "queue.yml", ci.read_text().replace("pull_request:", "merge_group:", 1))
@@ -6149,7 +6238,12 @@ def test_classic_required_contexts_must_also_report_in_the_merge_group():
     produced = ProducedContexts(
         frozenset({"test", "security-scan"}), frozenset({"test"}), merge_group_declared=True
     )
-    protection = {"required_status_checks": {"contexts": ["test", "security-scan"]}}
+    protection = {
+        "required_status_checks": {
+            "contexts": ["test", "security-scan"],
+            "checks": [{"context": "test", "app_id": GITHUB_ACTIONS_INTEGRATION_ID}],
+        }
+    }
     assert legacy_protection_problems(protection, produced) == []
     assert legacy_protection_problems(protection, produced, merge_queue=False) == []
     queued = legacy_protection_problems(protection, produced, merge_queue=True)
@@ -6166,7 +6260,14 @@ def test_doctor_passes_the_effective_merge_queue_to_the_classic_check(tmp_path):
     repo = _repo(tmp_path)
     write_onboarding(repo, spec())
     legacy = "classic branch protection on the default branch fits Forge"
-    protection = json.dumps({"required_status_checks": {"contexts": ["test"]}})
+    protection = json.dumps(
+        {
+            "required_status_checks": {
+                "contexts": ["test"],
+                "checks": [{"context": "test", "app_id": GITHUB_ACTIONS_INTEGRATION_ID}],
+            }
+        }
+    )
     gh = _healthy_gh()
     gh.answers["api repos/owner/comic/branches/main/protection"] = protection
     assert doctor(repo, "owner/comic", "owner/agentic-sdlc", gh).ok  # no queue: PR runs suffice
@@ -7135,7 +7236,7 @@ def _bpr(pattern: str, **flags) -> dict:
     [
         (
             _bpr("agent/**", restrictsPushes=True, pushAllowances={"nodes": []}),
-            "allowlist without the publisher App",
+            "allowlist without the pushing actor github-actions[bot]",
         ),
         (_bpr("agent/**", blocksCreations=True, restrictsPushes=True), "could not be read"),
         (_bpr("agent/*", requiresCommitSignatures=True), "signed commits"),
@@ -7165,12 +7266,12 @@ def test_classic_protection_patterns_that_spare_agent_branches_pass(tmp_path):
 
     repo = _repo(tmp_path)
     write_onboarding(repo, spec())
-    publisher = {"actor": {"__typename": "App", "slug": "agentic-sdlc-publisher"}}
+    pusher = {"actor": {"__typename": "App", "slug": "github-actions"}}
     for rules in (
         [_bpr("main", requiresStatusChecks=True, restrictsPushes=True)],
         [_bpr("*", requiresCommitSignatures=True)],  # `*` does not cross `/`
         [_bpr("release/**", lockBranch=True)],
-        [_bpr("agent/**", restrictsPushes=True, pushAllowances={"nodes": [publisher]})],
+        [_bpr("agent/**", restrictsPushes=True, pushAllowances={"nodes": [pusher]})],
         [_bpr("agent/**", allowsForcePushes=False, requiresLinearHistory=True)],
     ):
         gh = _healthy_gh()
@@ -7188,3 +7289,146 @@ def test_classic_protection_patterns_that_spare_agent_branches_pass(tmp_path):
             PUBLISHER_BRANCH_RULES_CHECK
         ]
         assert check.manual and needle in check.detail
+
+
+@pytest.mark.parametrize("junk", ["a rule", None, 7, ["nested"]])
+def test_effective_rules_with_a_malformed_item_are_unreadable_not_partial(tmp_path, junk):
+    """--slurp pages of rules must hold only rule objects: an item of another shape makes the
+    rules unreadable (a manual TODO), never a shorter list read as complete (Codex review
+    4239510547, applied to every --slurp consumer)."""
+    from agentic_sdlc.onboard import EFFECTIVE_RULES_CHECK, PUBLISHER_BRANCH_RULES_CHECK
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _healthy_gh()
+    own = json.loads(_effective_rules())
+    gh.answers["api repos/owner/comic/rules/branches/main"] = json.dumps([[*own[0], junk]])
+    check = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))[EFFECTIVE_RULES_CHECK]
+    assert check.manual and "could not read the rules that apply to main" in check.detail
+    gh = _healthy_gh()
+    gh.answers[AGENT_BRANCH_RULES] = json.dumps([[junk]])
+    check = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))[
+        PUBLISHER_BRANCH_RULES_CHECK
+    ]
+    assert check.manual and "could not read the rules that apply to agent/issue-1-1" in (
+        check.detail
+    )
+
+
+# ---------------------------------------------------------------- Codex 4239510543
+# The pinned publisher checks out with github.token (persisted by actions/checkout) and pushes
+# with it: the push is made by the GitHub Actions app, not the Publisher App, whose token only
+# opens the pull request. A push allowlist must admit the actor that actually pushes.
+def _implement_doc() -> dict:
+    return yaml.safe_load((PLATFORM_WORKFLOWS / "reusable-implement.yml").read_text())
+
+
+def _publishing_steps(doc: dict) -> list:
+    return next(
+        job["steps"]
+        for job in doc["jobs"].values()
+        if any("git push" in str(step.get("run")) for step in job.get("steps") or [])
+    )
+
+
+def _checkout(steps: list) -> dict:
+    return next(s for s in steps if str(s.get("uses", "")).startswith("actions/checkout@"))
+
+
+def test_the_pinned_publisher_pushes_as_github_actions():
+    from agentic_sdlc.onboard import GITHUB_ACTIONS_PUSHER, publisher_push_actor
+
+    assert publisher_push_actor(_implement_doc()) == GITHUB_ACTIONS_PUSHER
+    # the token spelled as the secret, or the checkout's default token, is the same actor
+    doc = _implement_doc()
+    _checkout(_publishing_steps(doc))["with"]["token"] = "${{ secrets.GITHUB_TOKEN }}"
+    assert publisher_push_actor(doc) == GITHUB_ACTIONS_PUSHER
+    doc = _implement_doc()
+    del _checkout(_publishing_steps(doc))["with"]["token"]
+    assert publisher_push_actor(doc) == GITHUB_ACTIONS_PUSHER
+
+
+def _mutated(change) -> object:
+    from agentic_sdlc.onboard import publisher_push_actor
+
+    doc = _implement_doc()
+    change(doc, _publishing_steps(doc))
+    return publisher_push_actor(doc)
+
+
+def _push_step(steps: list) -> dict:
+    return next(s for s in steps if "git push" in str(s.get("run")))
+
+
+@pytest.mark.parametrize(
+    ("change", "needle"),
+    [
+        (
+            lambda d, s: _checkout(s)["with"].update(token="${{ steps.app.outputs.token }}"),
+            "not github.token",
+        ),
+        (
+            lambda d, s: _checkout(s)["with"].update({"persist-credentials": False}),
+            "does not persist",
+        ),
+        (lambda d, s: _checkout(s)["with"].update({"ssh-key": "x"}), "SSH key"),
+        (
+            lambda d, s: s.insert(
+                s.index(_push_step(s)), {"name": "auth", "uses": "some/creds-action@v1"}
+            ),
+            "may change git's credentials",
+        ),
+        (
+            lambda d, s: _push_step(s).update(
+                run="git config http.extraheader x\n" + _push_step(s)["run"]
+            ),
+            "git config http.extraheader",
+        ),
+        (
+            lambda d, s: _push_step(s).update(
+                run="git remote set-url origin x\n" + _push_step(s)["run"]
+            ),
+            "git remote",
+        ),
+        (lambda d, s: _push_step(s).update(env={"GIT_ASKPASS": "/x"}), "GIT_ASKPASS"),
+        (lambda d, s: s.insert(0, {"uses": "actions/checkout@v4"}), "found 2"),
+    ],
+)
+def test_an_unrecognised_push_credential_leaves_the_pusher_unknown(change, needle):
+    found = _mutated(change)
+    assert isinstance(found, str) and needle in found, found
+
+
+def test_a_classic_allowlist_must_admit_the_actor_that_actually_pushes(tmp_path):
+    """Allowing only the Publisher App does not let `github-actions[bot]` push agent/**: doctor
+    must not report READY for it (it did, judging the Publisher App)."""
+    from agentic_sdlc.onboard import PUBLISHER_BRANCH_RULES_CHECK
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    app = {"actor": {"__typename": "App", "slug": "agentic-sdlc-publisher"}}
+    gh = _healthy_gh()
+    gh.answers[CLASSIC_RULES] = _classic_rules(
+        _bpr("agent/**", restrictsPushes=True, pushAllowances={"nodes": [app]})
+    )
+    check = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))[
+        PUBLISHER_BRANCH_RULES_CHECK
+    ]
+    assert check.manual and "without the pushing actor github-actions[bot]" in check.detail
+    # an unknown pusher never passes an allowlist, whoever is on it
+    from agentic_sdlc.onboard import (
+        GITHUB_ACTIONS_PUSHER,
+        PublisherValue,
+        classic_publisher_branch_problems,
+    )
+
+    branch = PublisherValue(("agent/issue-", "-", ""), ("ISSUE_NUMBER", "GITHUB_RUN_ID"))
+    actions = {"actor": {"__typename": "App", "slug": "github-actions"}}
+    answer = json.loads(
+        _classic_rules(
+            _bpr("agent/**", restrictsPushes=True, pushAllowances={"nodes": [actions, app]})
+        )
+    )
+    assert classic_publisher_branch_problems(answer, branch, GITHUB_ACTIONS_PUSHER) == []
+    unknown = classic_publisher_branch_problems(answer, branch, "the checkout persists X")
+    assert len(unknown) == 1 and "could not be determined (the checkout persists X)" in unknown[0]

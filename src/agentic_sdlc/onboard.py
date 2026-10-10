@@ -1348,7 +1348,12 @@ def ruleset_payload(spec: OnboardSpec) -> dict:
                 "type": "required_status_checks",
                 "parameters": {
                     "strict_required_status_checks_policy": True,
-                    "required_status_checks": [{"context": REQUIRED_CHECK}],
+                    # Bound to GitHub Actions: an unbound context accepts a `test` status from ANY
+                    # integration or credential with commit-status access, which could then
+                    # satisfy the gate without running ci.yml's policy gates.
+                    "required_status_checks": [
+                        {"context": REQUIRED_CHECK, "integration_id": GITHUB_ACTIONS_INTEGRATION_ID}
+                    ],
                 },
             },
         ],
@@ -1431,6 +1436,10 @@ def _parameter_shortfall(kind: str, key: str, wanted: object, have: object) -> l
                     f"{', '.join(foreign)}, not GitHub Actions ({GITHUB_ACTIONS_INTEGRATION_ID}): "
                     "ci.yml's job can never satisfy it"
                 )
+            elif "integration_id" in want_check and any(
+                c.get("integration_id") is None for c in matching
+            ):
+                problems.append(_unbound_check_problem(context))
         return problems
     if isinstance(wanted, list):
         listed = have if isinstance(have, list) else []
@@ -1444,6 +1453,14 @@ def _parameter_shortfall(kind: str, key: str, wanted: object, have: object) -> l
             for problem in _parameter_shortfall(kind, f"{key}.{sub}", value, nested.get(sub))
         ]
     return [] if have == wanted else [f"{kind} {key} is {have!r}, must be {wanted!r}"]
+
+
+def _unbound_check_problem(context: str) -> str:
+    return (
+        f"status check '{context}' is not bound to GitHub Actions "
+        f"(integration {GITHUB_ACTIONS_INTEGRATION_ID}): any app or credential with "
+        "commit-status access can report it and satisfy the gate without ci.yml running"
+    )
 
 
 def _foreign_integration(check: dict) -> bool:
@@ -1462,7 +1479,8 @@ _RULESET_MAX_PARAMS = ("required_approving_review_count",)
 def _merge_rule_parameters(existing: dict, forge: dict) -> dict:
     """Forge's parameters merged into an existing rule's, never weakening either: every existing
     key survives, booleans stay true when either side sets them, counts take the larger value,
-    and the required status checks are the union (an existing check keeps its integration)."""
+    and the required status checks are the union (an existing check keeps its integration,
+    except Forge's own `test`, which is always bound to GitHub Actions)."""
     merged = dict(existing)
     for key, want in forge.items():
         have = merged.get(key)
@@ -1477,13 +1495,13 @@ def _merge_rule_parameters(existing: dict, forge: dict) -> dict:
                 merged[key] = want
         elif key == "required_status_checks":
             checks = [c for c in have if isinstance(c, dict)] if isinstance(have, list) else []
-            # Forge's own `test` context is reported by GitHub Actions: a binding to another
-            # app is dropped (never preserved -- it could not be satisfied), and duplicates fold.
+            # Forge's own `test` context is reported by GitHub Actions and bound to it: an
+            # unbound requirement (any integration may report it) or a binding to another app
+            # (it could never be satisfied) is rebound to GitHub Actions, and duplicates fold.
             kept: list[dict] = []
             for check in checks:
                 if check.get("context") == REQUIRED_CHECK:
-                    if _foreign_integration(check):
-                        check = {k: v for k, v in check.items() if k != "integration_id"}
+                    check = {**check, "integration_id": GITHUB_ACTIONS_INTEGRATION_ID}
                     if any(k.get("context") == check.get("context") for k in kept):
                         continue
                 kept.append(check)
@@ -2631,6 +2649,123 @@ def publisher_commit(doc: object) -> PublisherCommit | str:
     return PublisherCommit(message, author, author, pushed)
 
 
+@dataclass(frozen=True)
+class PublisherPusher:
+    """The actor whose credential performs the publisher's `git push` of its agent branch: the
+    one a classic push allowlist or a ruleset bypass covering agent/** must admit."""
+
+    label: str
+    app_slug: str
+
+
+#: `actions/checkout` persists the token it was given in the local git config, and `git push`
+#: then authenticates with it: with the default `github.token` the push is made by the GitHub
+#: Actions app (`github-actions[bot]`), not by the Publisher App (whose token only opens the PR).
+GITHUB_ACTIONS_PUSHER = PublisherPusher(
+    f"github-actions[bot] (the GitHub Actions app, integration {GITHUB_ACTIONS_INTEGRATION_ID}, "
+    "via the checkout's persisted github.token)",
+    "github-actions",
+)
+_DEFAULT_TOKEN_EXPRESSIONS = frozenset({"${{github.token}}", "${{secrets.github_token}}"})
+#: Actions that may run in the publishing job before the push without touching git's
+#: credentials (any other `uses:` step could rewrite them, so the pusher is then unknown).
+_CREDENTIAL_NEUTRAL_ACTIONS = (
+    "actions/create-github-app-token@",
+    "actions/download-artifact@",
+    "actions/upload-artifact@",
+)
+#: `git config` keys a publishing step may set without changing how `git push` authenticates.
+_CREDENTIAL_NEUTRAL_GIT_CONFIG = frozenset({"user.name", "user.email", "core.hookspath"})
+_CREDENTIAL_ENV = re.compile(r"\bGIT_[A-Z_]*=|ASKPASS|SSH_AUTH_SOCK")
+
+
+def _credential_env_keys(env: object) -> list[str]:
+    if not isinstance(env, dict):
+        return []
+    return [
+        str(k)
+        for k in env
+        if str(k).upper().startswith("GIT_") or str(k).upper() in ("SSH_ASKPASS", "SSH_AUTH_SOCK")
+    ]
+
+
+def publisher_push_actor(doc: object) -> PublisherPusher | str:
+    """Who performs the publisher's `git push`, read from the parsed `reusable-implement.yml`:
+    the credential the ONE `actions/checkout` before the pushing step persists (`token:`,
+    `persist-credentials:`), provided nothing between the checkout and the push can replace it
+    (another action, a credential/remote/`-c` git config, a GIT_*/ASKPASS environment). Only the
+    default `github.token` is recognised (`GITHUB_ACTIONS_PUSHER`); anything else is a str
+    saying why the pusher is unknown, which doctor reports as a manual TODO."""
+    jobs = doc.get("jobs") if isinstance(doc, dict) else None
+    if not isinstance(jobs, dict):
+        return "reusable-implement.yml declares no jobs"
+    pushing = []
+    for job_id, job in jobs.items():
+        steps = job.get("steps") if isinstance(job, dict) else None
+        for index, step in enumerate(steps if isinstance(steps, list) else []):
+            run = step.get("run") if isinstance(step, dict) else None
+            if isinstance(run, str) and any(c[:2] == ("git", "push") for c in _shell_commands(run)):
+                pushing.append((job_id, job, steps, index))
+    if len(pushing) != 1:
+        return f"expected one step that runs `git push`, found {len(pushing)}"
+    job_id, job, steps, push_index = pushing[0]
+    where = f"job {job_id}"
+    for env in (doc.get("env"), job.get("env"), steps[push_index].get("env")):
+        if keys := _credential_env_keys(env):
+            return f"{where} sets {', '.join(keys)} for the push"
+    checkouts = [
+        i
+        for i, step in enumerate(steps[:push_index])
+        if isinstance(step, dict) and str(step.get("uses") or "").startswith("actions/checkout@")
+    ]
+    if len(checkouts) != 1:
+        return f"{where}: expected one actions/checkout before the push, found {len(checkouts)}"
+    checkout = steps[checkouts[0]]
+    options = checkout.get("with") if checkout.get("with") is not None else {}
+    if not isinstance(options, dict):
+        return f"{where}: the checkout's `with:` could not be read"
+    if "ssh-key" in options:
+        return f"{where}: the checkout authenticates with an SSH key"
+    persist = options.get("persist-credentials", True)
+    if persist is not True and str(persist).strip().lower() != "true":
+        return f"{where}: the checkout does not persist its credentials ({persist!r})"
+    token = options.get("token")
+    if token is not None and re.sub(r"\s+", "", str(token)).lower() not in (
+        _DEFAULT_TOKEN_EXPRESSIONS
+    ):
+        return f"{where}: the checkout persists the token {token!r}, not github.token"
+    for step in steps[: push_index + 1]:
+        if not isinstance(step, dict):
+            return f"{where}: a step could not be read"
+        name = step.get("name") or step.get("id") or "?"
+        uses = str(step.get("uses") or "")
+        if uses and not uses.startswith(("actions/checkout@", *_CREDENTIAL_NEUTRAL_ACTIONS)):
+            return (
+                f"{where}: step {name!r} ({uses}) runs before the push and may change git's "
+                "credentials"
+            )
+        run = step.get("run")
+        if not isinstance(run, str):
+            continue
+        if _CREDENTIAL_ENV.search(run):
+            return f"{where}: step {name!r} sets a git credential variable"
+        for command in _shell_commands(run):
+            if command[:1] == ("gh",) and command[1:3] == ("auth", "setup-git"):
+                return f"{where}: step {name!r} runs `gh auth setup-git`"
+            if command[:1] != ("git",) or len(command) < 2:
+                continue
+            if command[1] in ("-c", "--config-env", "remote", "credential"):
+                return f"{where}: step {name!r} runs `git {command[1]}`"
+            if command[1] == "config" and (
+                len(command) < 3 or command[2].lower() not in _CREDENTIAL_NEUTRAL_GIT_CONFIG
+            ):
+                return f"{where}: step {name!r} runs `{' '.join(command[:3])}`"
+    pushes = [c for c in _shell_commands(steps[push_index]["run"]) if c[:2] == ("git", "push")]
+    if len(pushes) != 1 or len(pushes[0]) < 3 or pushes[0][2] != "origin":
+        return f"{where}: the push is not `git push origin ...` (the checkout's remote)"
+    return GITHUB_ACTIONS_PUSHER
+
+
 def _portable_regex(pattern: str) -> re.Pattern[str] | None:
     """`pattern` compiled, when Python evaluates it as GitHub's ruleset engine does: literals,
     `.`, classes, groups `(...)`/`(?:...)`, alternation, quantifiers, anchors `^`/`$` and the
@@ -2813,6 +2948,9 @@ def effective_rule_problems(
                         f"({GITHUB_ACTIONS_INTEGRATION_ID}): the installed workflow job can "
                         "never satisfy it"
                     )
+                elif context == REQUIRED_CHECK and (check or {}).get("integration_id") is None:
+                    # Forge's gate: unbound, any integration can satisfy it in ci.yml's stead.
+                    problems.append(f"{source}: {_unbound_check_problem(context)}")
         elif kind == "required_deployments":
             envs = ", ".join(params.get("required_deployment_environments") or []) or "?"
             problems.append(
@@ -3019,8 +3157,17 @@ def publisher_branch_scope_problems(
     return problems
 
 
+def _pusher_label(pusher: PublisherPusher | str) -> str:
+    if isinstance(pusher, PublisherPusher):
+        return pusher.label
+    return f"an actor doctor could not determine ({pusher})"
+
+
 def publisher_branch_rule_problems(
-    rules: Sequence[dict], publisher: PublisherCommit, branch: str
+    rules: Sequence[dict],
+    publisher: PublisherCommit,
+    branch: str,
+    pusher: PublisherPusher | str = "the pushing credential was not read",
 ) -> list[str]:
     """What in the EFFECTIVE rules of `branch` (`rules/branches/{branch}`: one value of the
     `agent/...` branch the Actions publisher creates and pushes) can reject that push: creating
@@ -3044,12 +3191,12 @@ def publisher_branch_rule_problems(
         elif kind == "creation":
             problems.append(
                 f"{source}: restricts creating {branch}, which the publisher's push creates → "
-                "exempt agent/** or give the publisher App a bypass"
+                f"exempt agent/** or give the pushing actor a bypass: {_pusher_label(pusher)}"
             )
         elif kind == "update":
             problems.append(
                 f"{source}: restricts updates to {branch}, which the publisher pushes → exempt "
-                "agent/** or give the publisher App a bypass"
+                f"agent/** or give the pushing actor a bypass: {_pusher_label(pusher)}"
             )
         elif kind == "required_status_checks" and params.get("do_not_enforce_on_create") is True:
             continue  # the publisher only ever creates its branch
@@ -3091,14 +3238,23 @@ query($owner: String!, $name: String!) {
 """
 
 
-def classic_publisher_branch_problems(answer: object, branch: PublisherValue) -> list[str]:
+def classic_publisher_branch_problems(
+    answer: object,
+    branch: PublisherValue,
+    pusher: PublisherPusher | str = "the pushing credential was not read",
+) -> list[str]:
     """What the repository's CLASSIC branch-protection rules do to the publisher's push of a
     new `agent/issue-<N>-<RUN>` branch (Codex 4239397979). A rule's pattern (fnmatch with
     FNM_PATHNAME, relative to refs/heads/) is judged over the whole branch domain, like a
     ruleset's: one matching every agent branch is reported for each requirement the push cannot
     meet (required checks or reviews, signatures, deployments, a push allowlist without the
-    publisher App, a lock); one matching some of them, or one doctor cannot evaluate, is a
-    manual TODO; one matching none is ignored. An unreadable answer is a manual TODO."""
+    actor that pushes, a lock); one matching some of them, or one doctor cannot evaluate, is a
+    manual TODO; one matching none is ignored. An unreadable answer is a manual TODO.
+
+    The allowlist is judged against `pusher` (`publisher_push_actor`): the credential that
+    actually runs `git push` -- the GitHub Actions app for the checkout's `github.token`, NOT
+    the Publisher App, whose token only opens the pull request (Codex 4239510543). An unknown
+    pusher (a str) never passes an allowlist."""
     data = answer.get("data") if isinstance(answer, dict) else None
     repo = data.get("repository") if isinstance(data, dict) else None
     rules = repo.get("branchProtectionRules") if isinstance(repo, dict) else None
@@ -3146,18 +3302,21 @@ def classic_publisher_branch_problems(answer: object, branch: PublisherValue) ->
             readable = isinstance(actors, list) and not (
                 (allowances.get("pageInfo") or {}).get("hasNextPage")
             )
-            publisher_allowed = readable and any(
+            if not readable:
+                needs.append("a push/creation allowlist that could not be read")
+            elif not isinstance(pusher, PublisherPusher):
+                needs.append(
+                    "a push/creation allowlist, and which actor the publisher pushes as could "
+                    f"not be determined ({pusher})"
+                )
+            elif not any(
                 isinstance(a, dict)
                 and isinstance(a.get("actor"), dict)
                 and a["actor"].get("__typename") == "App"
-                and PUBLISHER_APP_SLUG_HINT in str(a["actor"].get("slug") or "").lower()
+                and str(a["actor"].get("slug") or "").lower() == pusher.app_slug
                 for a in actors
-            )
-            if not publisher_allowed:
-                needs.append(
-                    "a push/creation allowlist "
-                    + ("without the publisher App" if readable else "that could not be read")
-                )
+            ):
+                needs.append(f"a push/creation allowlist without the pushing actor {pusher.label}")
         if scope is None:
             problems.append(
                 f"{name}: matches some of the publisher's branches {branch.template!r} or "
@@ -3228,6 +3387,11 @@ def legacy_protection_problems(
                     f"({GITHUB_ACTIONS_INTEGRATION_ID}): the installed workflow job can never "
                     "satisfy it"
                 )
+            elif context == REQUIRED_CHECK and apps != {GITHUB_ACTIONS_INTEGRATION_ID}:
+                # Forge's gate must be bound to GitHub Actions: a `checks[]` entry with no app
+                # (null / -1: any source), or only a bare `contexts` entry whose binding cannot
+                # be read, lets any integration satisfy it in ci.yml's stead.
+                problems.append(_unbound_check_problem(context))
     if _enabled(protection.get("required_signatures")):
         problems.append(
             "requires signed commits; verify the Forge publisher's commits are verified (manual)"
@@ -6216,31 +6380,26 @@ def doctor(
         ]
         return problems + drift + disabled
 
-    pages = _safe_json(
-        gh,
-        [
-            "api",
-            f"repos/{project_id}/rules/branches/{_q(effective_branch)}",
-            "--paginate",
-            "--slurp",
-        ],
-    )
+    # --slurp pages, each a list of rule objects; any other shape is unreadable, never "no rules"
+    effective_rules = _paged_items(gh, f"repos/{project_id}/rules/branches/{_q(effective_branch)}")
     effective_queue: bool | None = None  # unknown until the effective rules are read
     # What the Actions publisher pushes (commit message, emails, branch), read from the pinned
     # reusable-implement.yml: metadata-pattern rules are judged against it.
     publisher: PublisherCommit | str
+    # ... and WHO pushes it: the credential the pinned checkout persists for `git push`.
+    pusher: PublisherPusher | str
     if cloud:
-        publisher = "the cloud routine commits as its owner's account, in its own format"
+        publisher = pusher = "the cloud routine commits as its owner's account, in its own format"
     elif not ref:
-        publisher = "the platform pin is unknown"
+        publisher = pusher = "the platform pin is unknown"
     else:
         implement_doc = load_callee("reusable-implement.yml", ref)
-        publisher = (
-            publisher_commit(implement_doc)
-            if implement_doc is not None
-            else f"reusable-implement.yml is unreadable at {ref[:12]}"
-        )
-    if not isinstance(pages, list) or not all(isinstance(page, list) for page in pages):
+        if implement_doc is None:
+            publisher = pusher = f"reusable-implement.yml is unreadable at {ref[:12]}"
+        else:
+            publisher = publisher_commit(implement_doc)
+            pusher = publisher_push_actor(implement_doc)
+    if isinstance(effective_rules, Unreadable):
         add(
             Check(
                 EFFECTIVE_RULES_CHECK,
@@ -6252,7 +6411,7 @@ def doctor(
             )
         )
     else:
-        rules = [rule for page in pages for rule in page if isinstance(rule, dict)]
+        rules = effective_rules
         effective_queue = any(r.get("type") == "merge_queue" for r in rules)
         required_contexts = [
             str((check or {}).get("context") or "")
@@ -6353,20 +6512,11 @@ def doctor(
                     ],
                 ),
                 publisher.branch,
+                pusher,
             )
             branch = publisher.branch.example
-            branch_pages = _safe_json(
-                gh,
-                [
-                    "api",
-                    f"repos/{project_id}/rules/branches/{_q(branch)}",
-                    "--paginate",
-                    "--slurp",
-                ],
-            )
-            if not isinstance(branch_pages, list) or not all(
-                isinstance(page, list) for page in branch_pages
-            ):
+            branch_rules = _paged_items(gh, f"repos/{project_id}/rules/branches/{_q(branch)}")
+            if isinstance(branch_rules, Unreadable):
                 branch_problems.append(
                     f"could not read the rules that apply to {branch} "
                     f"(GET repos/{project_id}/rules/branches/{{branch}}) → check org and "
@@ -6374,9 +6524,7 @@ def doctor(
                 )
             else:
                 branch_problems += publisher_branch_rule_problems(
-                    [r for page in branch_pages for r in page if isinstance(r, dict)],
-                    publisher,
-                    branch,
+                    branch_rules, publisher, branch, pusher
                 )
             branch_problems = list(dict.fromkeys(branch_problems))
             add(
