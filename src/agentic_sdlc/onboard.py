@@ -507,11 +507,17 @@ def _paged_names(gh: GhRunner, path: str, key: str) -> set[str] | Unreadable:
     return {str(item.get("name")) for item in items}
 
 
+def _q(ref: str) -> str:
+    """A git ref (branch, tag, SHA) as ONE URL path component or query value: `/` and `%` in a
+    valid ref name (`feature/onboarding`) must not split the REST path or read as an escape."""
+    return quote(ref, safe="")
+
+
 def resolve_platform_ref(platform_repository: str, ref: str, gh: GhRunner = run_gh) -> str:
     """Accept a SHA as-is; otherwise resolve a branch/tag on the platform repo to its commit SHA."""
     if _SHA.fullmatch(ref):
         return ref
-    sha = gh(["api", f"repos/{platform_repository}/commits/{ref}", "--jq", ".sha"]).strip()
+    sha = gh(["api", f"repos/{platform_repository}/commits/{_q(ref)}", "--jq", ".sha"]).strip()
     if not _SHA.fullmatch(sha):
         raise OnboardError(f"could not resolve {platform_repository}@{ref} to a commit SHA")
     return sha
@@ -1847,11 +1853,15 @@ def _action_allowed(action: str, selected: dict, consumer_owner: str) -> bool | 
     return None if selected.get("verified_allowed") is True else False
 
 
-def actions_permissions_check(gh: GhRunner, project_id: str, uses: set[str]) -> Check:
+def actions_permissions_check(
+    gh: GhRunner, project_id: str, uses: set[str], uninspected: Sequence[str] = ()
+) -> Check:
     """The consumer's own Actions policy (`GET repos/{o}/{r}/actions/permissions`) must let every
     generated workflow run: Actions enabled, and `all` actions allowed -- or `selected` with an
     allowlist that admits every action and reusable workflow in `uses`. `local_only` cannot run
-    them (they use GitHub's and third-party actions). Unreadable is a manual TODO, never READY."""
+    them (they use GitHub's and third-party actions). Unreadable is a manual TODO, never READY.
+    `uninspected` names reusable workflows in the call graph whose actions could not be
+    collected: under `selected` they cannot be proven admitted, so that is a manual TODO too."""
     fix = f"Settings → Actions → General on {project_id}"
     perms = _safe_json(gh, ["api", f"repos/{project_id}/actions/permissions"])
     if not isinstance(perms, dict) or not isinstance(perms.get("enabled"), bool):
@@ -1912,6 +1922,16 @@ def actions_permissions_check(gh: GhRunner, project_id: str, uses: set[str]) -> 
             "admitted only if their creators are Marketplace-verified (doctor cannot check): "
             + ", ".join(unverified)
             + f" → confirm, or add them to the allowlist in {fix}",
+            manual=True,
+        )
+    if uninspected:
+        return Check(
+            ACTIONS_PERMISSIONS_CHECK,
+            False,
+            "the selected-actions policy admits every collected dependency, but the actions of "
+            "some called reusable workflows could not be collected: "
+            + "; ".join(uninspected)
+            + f" → confirm in {fix} that everything they use is allowed",
             manual=True,
         )
     return Check(
@@ -2138,19 +2158,73 @@ def _matrix_job_names(name: str, strategy: object) -> list[str] | None:
     return sorted(names)
 
 
-def _branch_glob_matches(pattern: str, branch: str) -> bool:
-    """GitHub's branch filter glob: `**` any characters, `*` any but `/`, `?` one character."""
+_GLOB_SPECIAL = frozenset("*?+[]\\!")
+_GLOB_RANGE_ENDS = ("az", "AZ", "09")
+
+
+def _glob_class(body: str) -> str | None:
+    """A `[...]` filter class as a regex class: GitHub admits only alphanumeric characters and
+    the ranges a-z, A-Z and 0-9 (or sub-ranges of one of them). None: anything else."""
+    out, i = "", 0
+    if not body:
+        return None
+    while i < len(body):
+        char = body[i]
+        if not (char.isascii() and char.isalnum()):
+            return None
+        if body[i + 1 : i + 2] == "-" and i + 2 < len(body):
+            end = body[i + 2]
+            if not any(
+                lo <= char <= end <= hi and (char.isdigit() == end.isdigit())
+                for lo, hi in _GLOB_RANGE_ENDS
+            ):
+                return None
+            out, i = out + f"{char}-{end}", i + 3
+        else:
+            out, i = out + char, i + 1
+    return f"[{out}]"
+
+
+def _branch_glob_matches(pattern: str, branch: str) -> bool | None:
+    """GitHub's branch filter pattern (workflow syntax, filter pattern cheat sheet), exactly:
+    `*` zero or more characters but not `/`, `**` zero or more of any character, `?` zero or one
+    of the PRECEDING character, `+` one or more of the preceding character, `[...]` one
+    alphanumeric character listed or in a range (a-z, A-Z, 0-9), `\\` escapes the next special
+    character; anything else is literal. None: a pattern doctor cannot evaluate exactly (a
+    leading `!` negation, a `?`/`+` with no plain preceding character, a malformed class,
+    `***`, a trailing `\\`) -- the caller then treats the workflow as not proven to run."""
+    if not pattern or pattern.startswith("!"):
+        return None
     regex = ""
     i = 0
+    quantifiable = False  # does the regex end in ONE plain character `?`/`+` may apply to?
     while i < len(pattern):
+        char = pattern[i]
+        if pattern.startswith("***", i):
+            return None
         if pattern.startswith("**", i):
-            regex, i = regex + ".*", i + 2
-        elif pattern[i] == "*":
-            regex, i = regex + "[^/]*", i + 1
-        elif pattern[i] == "?":
-            regex, i = regex + "[^/]", i + 1
+            regex, i, quantifiable = regex + ".*", i + 2, False
+        elif char == "*":
+            regex, i, quantifiable = regex + "[^/]*", i + 1, False
+        elif char in "?+":
+            if not quantifiable:
+                return None
+            regex, i, quantifiable = regex + char, i + 1, False
+        elif char == "[":
+            close = pattern.find("]", i + 1)
+            cls = _glob_class(pattern[i + 1 : close]) if close > i else None
+            if cls is None:
+                return None
+            regex, i, quantifiable = regex + cls, close + 1, False
+        elif char == "]":
+            return None
+        elif char == "\\":
+            nxt = pattern[i + 1 : i + 2]
+            if nxt not in _GLOB_SPECIAL:
+                return None
+            regex, i, quantifiable = regex + re.escape(nxt), i + 2, False
         else:
-            regex, i = regex + re.escape(pattern[i]), i + 1
+            regex, i, quantifiable = regex + re.escape(char), i + 1, True
     return re.fullmatch(regex, branch) is not None
 
 
@@ -2179,7 +2253,7 @@ def _reports_on_protected_pull_requests(doc: dict, default_branch: str) -> bool:
                 continue
             patterns = [str(b) for b in listed]
             if any(p.startswith("!") for p in patterns) or not any(
-                _branch_glob_matches(p, default_branch) for p in patterns
+                _branch_glob_matches(p, default_branch) is True for p in patterns
             ):
                 continue
         if "types" in spec:
@@ -2304,7 +2378,7 @@ def _reports_on_merge_groups(doc: dict, default_branch: str) -> bool:
             return False
         patterns = [str(b) for b in listed]
         if any(p.startswith("!") for p in patterns) or not any(
-            _branch_glob_matches(p, default_branch) for p in patterns
+            _branch_glob_matches(p, default_branch) is True for p in patterns
         ):
             return False
     if "types" in spec:
@@ -2658,6 +2732,59 @@ def effective_rule_problems(
             problems.append(
                 f"{source}: rule type {kind or '?'!r} is not one doctor understands → verify "
                 "Forge's pull requests and pushes satisfy it"
+            )
+    return problems
+
+
+PUBLISHER_BRANCH_RULES_CHECK = "effective rules on the publisher's agent branches allow its push"
+# Rule types that cannot reject the publisher's push of a NEW branch carrying one new commit:
+# deleting or force-pushing it (it does neither), linear history (one commit on top of the
+# base), tag names (it pushes no tags).
+_PUBLISHER_PUSH_COMPATIBLE = frozenset(
+    {"deletion", "non_fast_forward", "required_linear_history", "tag_name_pattern"}
+)
+#: At most this many sample branch names are queried for their effective rules.
+_PUBLISHER_BRANCH_SAMPLES = 8
+
+
+def publisher_branch_rule_problems(
+    rules: Sequence[dict], publisher: PublisherCommit, branch: str
+) -> list[str]:
+    """What in the EFFECTIVE rules of `branch` (`rules/branches/{branch}`: a sample of the
+    `agent/...` branch the Actions publisher creates and pushes) can reject that push: creating
+    the branch, updating it, required status checks that are enforced on creation, signatures,
+    pull requests, deployments, workflows, code scanning, a merge queue -- and the
+    commit-metadata and branch-name pattern rules, evaluated against what the publisher pushes.
+    A rule type doctor does not know is never silently compatible: it is reported."""
+    problems: list[str] = []
+    for rule in rules:
+        kind = str(rule.get("type") or "")
+        params = rule.get("parameters") if isinstance(rule.get("parameters"), dict) else {}
+        source = (
+            f"{rule.get('ruleset_source_type') or 'ruleset'} "
+            f"{rule.get('ruleset_source') or ''} (ruleset {rule.get('ruleset_id', '?')})"
+        ).replace("  ", " ")
+        if kind in _PUBLISHER_PUSH_COMPATIBLE:
+            continue
+        if kind in _PATTERN_RULE_FIELDS:
+            if found := _pattern_rule_problem(source, kind, params, publisher):
+                problems.append(f"{found} [on {branch}]")
+        elif kind == "creation":
+            problems.append(
+                f"{source}: restricts creating {branch}, which the publisher's push creates → "
+                "exempt agent/** or give the publisher App a bypass"
+            )
+        elif kind == "update":
+            problems.append(
+                f"{source}: restricts updates to {branch}, which the publisher pushes → exempt "
+                "agent/** or give the publisher App a bypass"
+            )
+        elif kind == "required_status_checks" and params.get("do_not_enforce_on_create") is True:
+            continue  # the publisher only ever creates its branch
+        else:
+            problems.append(
+                f"{source}: rule {kind or '?'!r} applies to {branch} and can reject the "
+                "publisher's push → exempt agent/** or verify the push satisfies it"
             )
     return problems
 
@@ -3347,7 +3474,7 @@ def platform_callee_loader(
                         [
                             "api",
                             f"repos/{platform_repository}/contents/.github/workflows/"
-                            f"{name}?ref={sha}",
+                            f"{name}?ref={_q(sha)}",
                         ],
                     )
                 )
@@ -3427,6 +3554,92 @@ def _pull_request_off_hosted(
     return found
 
 
+#: How deep doctor follows nested platform reusable workflows (GitHub itself allows ten levels
+#: of nesting, top-level caller included); a deeper graph fails closed.
+_CALLEE_GRAPH_MAX_DEPTH = 10
+
+
+@dataclass
+class CalleeGraph:
+    """Every platform reusable workflow reachable from the top-level callees, each as parsed at
+    its pinned SHA (`docs`, roots included), every nested reusable call found in them (`calls`:
+    where, the calling job, callee file, its parsed doc or None when it could not be read) and
+    why any part of the graph could not be inspected (`uninspectable`: fail closed). `unfollowed`
+    is the subset that is a nested CALL doctor could not follow (its contract is unverified)."""
+
+    docs: dict[tuple[str, str], dict] = field(default_factory=dict)
+    calls: list[tuple[str, dict, str, object]] = field(default_factory=list)
+    uninspectable: list[str] = field(default_factory=list)
+    unfollowed: list[str] = field(default_factory=list)
+
+
+def platform_callee_graph(
+    roots: dict[str, object],
+    root_ref: str,
+    platform_repository: str,
+    load_callee: CalleeLoader,
+    max_depth: int = _CALLEE_GRAPH_MAX_DEPTH,
+) -> CalleeGraph:
+    """Walk the reusable-workflow calls of the platform workflows `roots` (file -> parsed doc at
+    `root_ref`) transitively: a job calling a platform workflow pinned to a full SHA is loaded
+    at that SHA (`load_callee`) and walked in turn. A callee that cannot be read, a call doctor
+    cannot follow (a branch/tag ref, another repository's workflow, a `./` call inside the
+    platform), a cycle, or a graph deeper than `max_depth` is recorded as uninspectable."""
+    graph = CalleeGraph()
+    stack: list[tuple[str, str, dict, int, tuple[tuple[str, str], ...]]] = []
+    for name, doc in roots.items():
+        if isinstance(doc, dict):
+            graph.docs[(name, root_ref)] = doc
+            stack.append((name, root_ref, doc, 1, ((name, root_ref),)))
+        else:
+            graph.uninspectable.append(f"{name} could not be read at {root_ref[:12]}")
+
+    def unfollowed(why: str) -> None:
+        graph.uninspectable.append(why)
+        graph.unfollowed.append(why)
+
+    while stack:
+        name, sha, doc, depth, path = stack.pop()
+        jobs = doc.get("jobs")
+        for job_name, job in jobs.items() if isinstance(jobs, dict) else ():
+            if not isinstance(job, dict) or "uses" not in job:
+                continue
+            uses = str(job.get("uses") or "").strip()
+            where = f"{name}@{sha[:12]}:{job_name}"
+            found = _REMOTE_REUSABLE.fullmatch(uses)
+            if not (
+                found and found.group(1) == platform_repository and _SHA.fullmatch(found.group(3))
+            ):
+                unfollowed(
+                    f"{where} calls {uses}, which doctor cannot follow (only platform workflows "
+                    "pinned to a full SHA are inspected)"
+                )
+                continue
+            target = (found.group(2), found.group(3))
+            if target in path:
+                unfollowed(f"{where}: reusable workflow cycle through {target[0]}@{target[1][:12]}")
+                continue
+            if depth + 1 > max_depth:
+                unfollowed(f"{where}: calls nested deeper than {max_depth} levels")
+                continue
+            called = graph.docs.get(target)
+            if called is None:
+                loaded = load_callee(*target)
+                called = loaded if isinstance(loaded, dict) else None
+            graph.calls.append((where, job, target[0], called))
+            if called is None:
+                graph.uninspectable.append(
+                    f"{where}: {target[0]} could not be read at {target[1][:12]}"
+                )
+                continue
+            if target not in graph.docs:
+                graph.docs[target] = called
+                stack.append((*target, called, depth + 1, (*path, target)))
+    graph.uninspectable = list(dict.fromkeys(graph.uninspectable))
+    graph.unfollowed = list(dict.fromkeys(graph.unfollowed))
+    return graph
+
+
 _WORKFLOW_FILE = re.compile(r"^[A-Za-z0-9._-]+\.ya?ml$")
 
 
@@ -3439,7 +3652,9 @@ def remote_workflow_files(
     name or content cannot be read makes the whole set unreadable: a partial set proves nothing."""
     if not ref:
         return None, "the repository's default branch is unknown"
-    listing = _safe_json(gh, ["api", f"repos/{project_id}/contents/.github/workflows?ref={ref}"])
+    listing = _safe_json(
+        gh, ["api", f"repos/{project_id}/contents/.github/workflows?ref={_q(ref)}"]
+    )
     if not isinstance(listing, list):
         return None, f"could not list .github/workflows on {ref}"
     files: dict[str, bytes] = {}
@@ -3452,7 +3667,7 @@ def remote_workflow_files(
         if not _WORKFLOW_FILE.fullmatch(name):
             return None, f"unexpected workflow file name {name!r} on {ref}"
         blob = _safe_json(
-            gh, ["api", f"repos/{project_id}/contents/.github/workflows/{name}?ref={ref}"]
+            gh, ["api", f"repos/{project_id}/contents/.github/workflows/{name}?ref={_q(ref)}"]
         )
         if not isinstance(blob, dict) or blob.get("encoding") != "base64":
             return None, f"could not read .github/workflows/{name} on {ref}"
@@ -5082,6 +5297,10 @@ def doctor(
     caller_docs += [(c.name, _workflow_doc(c) or {}) for c in callers]
     for _, doc in caller_docs:
         dependencies |= {u for u in workflow_uses(doc) if not u.endswith("@" + "0" * 40)}
+    callees: dict[str, object] = {}
+    # Why some platform workflow's actions could not be collected: the allowlist check then
+    # cannot prove they are admitted (fail closed).
+    uninspected: list[str] = []
     if ref:
         probes = ["reusable-plan.yml"]
         if not cloud:
@@ -5095,7 +5314,6 @@ def doctor(
                     calls.append((f"{label}:{job_name}", job, found.group(2)))
                     if found.group(2) not in probes:
                         probes.append(found.group(2))
-        callees: dict[str, object] = {}
         absent: list[str] = []
         unread_probes: list[str] = []
         for name in probes:
@@ -5103,7 +5321,7 @@ def doctor(
                 gh,
                 [
                     "api",
-                    f"repos/{platform_repository}/contents/.github/workflows/{name}?ref={ref}",
+                    f"repos/{platform_repository}/contents/.github/workflows/{name}?ref={_q(ref)}",
                 ],
             )
             if isinstance(blob, Unreadable):
@@ -5132,8 +5350,18 @@ def doctor(
                 manual=not absent and bool(unread_probes),
             )
         )
-        for doc in callees.values():
+        # The platform reusable workflows as fetched at the pin: runner diagnosis reads their
+        # jobs, and every platform workflow they call in turn (pinned) is walked too -- its
+        # actions must be allowed and each nested call must match its callee's contract.
+        load_callee = platform_callee_loader(
+            gh, platform_repository, {(name, ref): doc for name, doc in callees.items()}
+        )
+        graph = platform_callee_graph(callees, ref, platform_repository, load_callee)
+        for doc in graph.docs.values():
             dependencies |= workflow_uses(doc)
+        uninspected += [f"{name} could not be read at {ref[:12]}" for name in absent]
+        uninspected += [f"{entry} could not be read" for entry in unread_probes]
+        uninspected += graph.uninspectable
         mismatches: list[str] = []
         for where, job, callee in calls:
             if callee in absent:
@@ -5142,6 +5370,12 @@ def doctor(
                 mismatches.append(f"{where}: could not read {callee} at {ref[:12]}")
                 continue
             mismatches += reusable_call_mismatches(where, job, callee, callees[callee])
+        for where, job, callee, callee_doc in graph.calls:
+            if callee_doc is None:
+                mismatches.append(f"{where}: could not read {callee} at its pin")
+                continue
+            mismatches += reusable_call_mismatches(where, job, callee, callee_doc)
+        mismatches += [f"{why}: its call contract cannot be verified" for why in graph.unfollowed]
         mismatches = list(dict.fromkeys(mismatches))
         add(
             Check(
@@ -5154,13 +5388,8 @@ def doctor(
                 f"declared at {ref[:12]}",
             )
         )
-
-    # The platform reusable workflows as fetched at the pin: runner diagnosis reads their jobs.
-    load_callee = platform_callee_loader(
-        gh,
-        platform_repository,
-        {(name, ref): doc for name, doc in callees.items()} if ref else {},
-    )
+    else:
+        load_callee = platform_callee_loader(gh, platform_repository, {})
 
     # --- a private platform must also admit this repository as a caller (Actions access)
     if repo_info is None:
@@ -5207,7 +5436,7 @@ def doctor(
             f"{platform_repository}/.github/workflows/{name}@{ref}"
             for name in ("reusable-plan.yml", *(() if cloud else ("reusable-implement.yml",)))
         }
-    add(actions_permissions_check(gh, project_id, dependencies))
+    add(actions_permissions_check(gh, project_id, dependencies, uninspected))
 
     # --- default branch in the policy is the repository's actual default branch
     actual_branch = repo_info.get("default_branch") if isinstance(repo_info, dict) else None
@@ -5242,7 +5471,7 @@ def doctor(
     unpushed = []
     for relative in managed:
         blob = _safe_json(
-            gh, ["api", f"repos/{project_id}/contents/{relative}?ref={remote_branch or 'HEAD'}"]
+            gh, ["api", f"repos/{project_id}/contents/{relative}?ref={_q(remote_branch or 'HEAD')}"]
         )
         if isinstance(blob, Unreadable) and not blob.not_found:
             unpushed.append(f"{relative} (unreadable: {blob.why})")
@@ -5270,7 +5499,7 @@ def doctor(
         if relative in owned:
             continue
         state = _remote_file_state(
-            gh, ["api", f"repos/{project_id}/contents/{relative}?ref={remote_branch or 'HEAD'}"]
+            gh, ["api", f"repos/{project_id}/contents/{relative}?ref={_q(remote_branch or 'HEAD')}"]
         )
         if state == "present":
             unpushed.append(
@@ -5479,7 +5708,7 @@ def doctor(
         gh,
         [
             "api",
-            f"repos/{project_id}/rules/branches/{quote(effective_branch, safe='')}",
+            f"repos/{project_id}/rules/branches/{_q(effective_branch)}",
             "--paginate",
             "--slurp",
         ],
@@ -5554,13 +5783,69 @@ def doctor(
             )
         )
 
+    # --- the publisher creates and pushes agent/... branches: rulesets targeting only that
+    # namespace (org/enterprise ones included) are invisible in the default branch's rules.
+    if not cloud:
+        if isinstance(publisher, str):
+            add(
+                Check(
+                    PUBLISHER_BRANCH_RULES_CHECK,
+                    False,
+                    f"the publisher's branch name could not be read ({publisher}) → check that "
+                    "no ruleset restricts creating or pushing Forge's agent/** branches",
+                    manual=True,
+                )
+            )
+        else:
+            branch_problems: list[str] = []
+            unread_branches: list[str] = []
+            for branch in publisher.branches[:_PUBLISHER_BRANCH_SAMPLES]:
+                branch_pages = _safe_json(
+                    gh,
+                    [
+                        "api",
+                        f"repos/{project_id}/rules/branches/{_q(branch)}",
+                        "--paginate",
+                        "--slurp",
+                    ],
+                )
+                if not isinstance(branch_pages, list) or not all(
+                    isinstance(page, list) for page in branch_pages
+                ):
+                    unread_branches.append(branch)
+                    continue
+                branch_problems += publisher_branch_rule_problems(
+                    [r for page in branch_pages for r in page if isinstance(r, dict)],
+                    publisher,
+                    branch,
+                )
+            branch_problems = list(dict.fromkeys(branch_problems))
+            if unread_branches:
+                branch_problems.append(
+                    "could not read the rules that apply to "
+                    + ", ".join(unread_branches)
+                    + f" (GET repos/{project_id}/rules/branches/{{branch}}) → check org and "
+                    "enterprise rulesets targeting agent/** by hand"
+                )
+            add(
+                Check(
+                    PUBLISHER_BRANCH_RULES_CHECK,
+                    not branch_problems,
+                    "; ".join(branch_problems)
+                    if branch_problems
+                    else "no rule blocks the publisher's push to "
+                    + ", ".join(publisher.branches[:_PUBLISHER_BRANCH_SAMPLES]),
+                    manual=True,
+                )
+            )
+
     # --- classic branch protection is enforced alongside rulesets and is NOT in rules/branches
     try:
         legacy = json.loads(
             gh(
                 [
                     "api",
-                    f"repos/{project_id}/branches/{quote(effective_branch, safe='')}/protection",
+                    f"repos/{project_id}/branches/{_q(effective_branch)}/protection",
                 ]
             )
             or "null"
