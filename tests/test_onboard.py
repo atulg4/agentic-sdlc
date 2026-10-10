@@ -117,6 +117,8 @@ class FakeGh:
             return _blob(path.read_bytes())
         for prefix, value in self.answers.items():
             if key.startswith(prefix):
+                if isinstance(value, Exception):
+                    raise value
                 return value
         for prefix in self.fail:
             if key.startswith(prefix):
@@ -394,6 +396,9 @@ def _healthy_gh() -> FakeGh:
     return FakeGh(
         {
             # before "api repos/owner/comic": answers match by prefix, in this order
+            "api repos/owner/comic/branches/main/protection": OnboardError(
+                "gh: Branch not protected (HTTP 404)"
+            ),
             "api repos/owner/comic/rules/branches/main": _effective_rules(),
             "api repos/owner/comic/rulesets/11": json.dumps({"id": 11, **ruleset_payload(spec())}),
             "api repos/owner/comic/labels": json.dumps(
@@ -1818,7 +1823,7 @@ def test_doctor_validates_the_runner_a_caller_hands_its_reusable_workflow(tmp_pa
     doc["jobs"]["plan"]["with"]["runs_on"] = '["self-hosted","linux","arm64"]'
     path.write_text(yaml.safe_dump(doc, sort_keys=False))
     failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh()))
-    assert "agent-plan.yml:plan (runs_on)" in (
+    assert "agent-plan.yml:plan > reusable-plan.yml:plan" in (
         failed["self-hosted runner online for this repo"].detail
     )
 
@@ -2466,13 +2471,14 @@ def _pr_caller(uses: str, with_: str = "") -> str:
             },
             True,
         ),
+        # no with.runs_on: the pinned callee's own default ('"ubuntu-latest"') applies
         (
             {
                 "pr.yml": _pr_caller(
                     f"owner/agentic-sdlc/.github/workflows/reusable-review.yml@{SHA}"
                 )
             },
-            True,
+            False,
         ),
         (
             {
@@ -2492,9 +2498,25 @@ def test_public_runner_safety_follows_reusable_workflows(tmp_path, files, expose
     write_onboarding(repo, spec(fork_exposed=True))
     for name, text in files.items():
         _wf(repo, name, text)
-    found = _pull_request_off_hosted(repo, "owner/agentic-sdlc")
+    found = _pull_request_off_hosted(repo, "owner/agentic-sdlc", _platform_loader())
     assert bool(found) is exposed, found
     assert not any(f.startswith("ci.yml:") for f in found)  # the hosted CI stays clean
+    if any("agentic-sdlc/" in text for text in files.values()):
+        # without the pinned callee nothing about a platform call is provable: fails closed
+        assert _pull_request_off_hosted(repo, "owner/agentic-sdlc")
+
+
+def _platform_loader(**overrides):
+    """A CalleeLoader serving this repository's own reusable workflows (the real contract) at
+    any pin, with `overrides` (file name -> parsed doc, None = unreadable) in their place."""
+
+    def load(name, sha):
+        if name in overrides:
+            return overrides[name]
+        path = PLATFORM_WORKFLOWS / name
+        return yaml.safe_load(path.read_text()) if path.is_file() else None
+
+    return load
 
 
 def test_doctor_fails_a_public_repo_whose_pr_workflow_calls_a_self_hosted_reusable(tmp_path):
@@ -2511,16 +2533,50 @@ def test_doctor_fails_a_public_repo_whose_pr_workflow_calls_a_self_hosted_reusab
     assert "pr.yml:call > reuse.yml:build" in check.detail
 
 
-def test_platform_runs_on_workflows_run_every_job_on_the_runs_on_input():
-    from agentic_sdlc.onboard import PLATFORM_RUNS_ON_WORKFLOWS
+# Codex 4238739193: runner diagnosis used to trust a list of platform file names whose jobs
+# "all run on inputs.runs_on". It now reads the callee AS FETCHED at the pin: a pinned workflow
+# that hard-codes another runner is reported wherever the caller's runs_on points.
+def test_runner_diagnosis_reads_the_pinned_callee_not_its_file_name(tmp_path):
+    from agentic_sdlc.onboard import _job_runner_targets
 
-    workflows = Path(__file__).resolve().parents[1] / ".github/workflows"
-    pinned = set()
-    for path in workflows.glob("reusable-*.yml"):
-        jobs = yaml.safe_load(path.read_text())["jobs"].values()
-        if all(job.get("runs-on") == "${{ fromJSON(inputs.runs_on) }}" for job in jobs):
-            pinned.add(path.name)
-    assert pinned >= PLATFORM_RUNS_ON_WORKFLOWS
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(runs_on=("ubuntu-latest",)))
+    plan = repo / ".github/workflows/agent-plan.yml"
+    honest = _job_runner_targets(repo, plan, "owner/agentic-sdlc", load_callee=_platform_loader())
+    assert all(isinstance(t, set) for t in honest.values()), honest
+    assert {k for k in honest if k.startswith("agent-plan.yml:plan > reusable-plan.yml:")}
+
+    callee = yaml.safe_load((PLATFORM_WORKFLOWS / "reusable-plan.yml").read_text())
+    first = next(iter(callee["jobs"]))
+    callee["jobs"][first]["runs-on"] = "macos-15"
+    targets = _job_runner_targets(
+        repo,
+        plan,
+        "owner/agentic-sdlc",
+        load_callee=_platform_loader(**{"reusable-plan.yml": callee}),
+    )
+    assert targets[f"agent-plan.yml:plan > reusable-plan.yml:{first}"] == {"macos-15"}
+
+    unreadable = _job_runner_targets(
+        repo,
+        plan,
+        "owner/agentic-sdlc",
+        load_callee=_platform_loader(**{"reusable-plan.yml": None}),
+    )
+    assert "could not be read at that pin" in str(unreadable["agent-plan.yml:plan"])
+
+    # End to end: the pinned callee (served by the platform contents API) hard-codes macOS and a
+    # self-hosted runner nobody registered; the caller's ubuntu runs_on does not hide either.
+    callee["jobs"][first]["runs-on"] = ["self-hosted", "linux", "gpu"]
+    gh = _healthy_gh()
+    gh.answers[PLATFORM_CONTENTS + ".github/workflows/reusable-plan.yml"] = _blob(
+        yaml.safe_dump(callee).encode()
+    )
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))
+    detail = failed["self-hosted runner online for this repo"].detail
+    assert f"agent-plan.yml:plan > reusable-plan.yml:{first} ['gpu', 'linux', 'self-hosted']" in (
+        detail
+    )
 
 
 @pytest.mark.parametrize(
@@ -3299,7 +3355,10 @@ def test_doctor_fails_implementation_on_a_macos_runner(tmp_path):
     )
     failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh()))
     detail = failed[LINUX_CHECK].detail
-    assert "agent-auto-implement.yml:implement (runs_on)" in detail and "macos-15" in detail
+    assert (
+        "agent-auto-implement.yml:implement > reusable-implement.yml:" in detail
+        and "macos-15" in detail
+    )
     assert DRIFT not in failed  # the runner is a tunable knob, checked here instead
 
 
@@ -4136,7 +4195,7 @@ def test_doctor_fails_a_cloud_routine_plan_caller_on_macos(tmp_path):
         repo, "agent-plan.yml", lambda d: d["jobs"]["plan"]["with"].update(runs_on='["macos-15"]')
     )
     failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh()))
-    assert "agent-plan.yml:plan (runs_on)" in failed[LINUX_CHECK].detail
+    assert "agent-plan.yml:plan > reusable-plan.yml:" in failed[LINUX_CHECK].detail
     # ci.yml alone may run on macOS
     repo = _repo(tmp_path / "ci")
     write_onboarding(
@@ -5118,3 +5177,165 @@ def test_cli_onboard_apply_writes_the_canonical_project_id(tmp_path, monkeypatch
     assert cli.main([*args, "--output", str(tmp_path / "o.json")]) == 0
     assert 'id = "owner/comic"' in (repo / "agentic-sdlc.toml").read_text()
     assert seen == ["owner/comic", "owner/comic"]
+
+
+# ---------------------------------------------------------------- Codex 4238739183
+# An INTERNAL caller can use only internal (or public) reusable workflows: a private platform
+# rejects it whatever the access setting; an unknown platform visibility is a manual TODO.
+def test_platform_access_rejects_an_internal_caller_of_a_private_platform(tmp_path):
+    from agentic_sdlc.onboard import platform_access_check
+
+    access = {"api repos/plat/forge/actions/permissions/access": '{"access_level": "organization"}'}
+    internal = {**access, "api repos/plat/comic": '{"visibility": "internal", "private": true}'}
+    private = {**access, "api repos/plat/comic": '{"visibility": "private", "private": true}'}
+
+    rejected = platform_access_check(
+        FakeGh(dict(internal)), "plat/comic", "plat/forge", None, "private"
+    )
+    assert not rejected.ok and not rejected.manual and "INTERNAL or public" in rejected.detail
+    unknown = platform_access_check(FakeGh(dict(internal)), "plat/comic", "plat/forge", None, None)
+    assert not unknown.ok and unknown.manual and "internal" in unknown.detail
+    assert platform_access_check(
+        FakeGh(dict(internal)), "plat/comic", "plat/forge", None, "internal"
+    ).ok
+    for platform in ("private", "internal", None):
+        assert platform_access_check(
+            FakeGh(dict(private)), "plat/comic", "plat/forge", None, platform
+        ).ok
+    # cross-owner enterprise sharing stays unverifiable for an internal pairing
+    cross = platform_access_check(
+        FakeGh(
+            {
+                "api repos/plat/forge/actions/permissions/access": '{"access_level": "enterprise"}',
+                "api repos/owner/comic": '{"visibility": "internal"}',
+            }
+        ),
+        "owner/comic",
+        "plat/forge",
+        None,
+        "internal",
+    )
+    assert not cross.ok and cross.manual and "same enterprise" in cross.detail
+
+    # end to end: doctor reads the platform's visibility
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _private_platform_gh("organization")
+    gh.answers = {
+        "api repos/owner/agentic-sdlc --jq {visibility}": '{"visibility": "private"}',
+        **gh.answers,
+    }
+    gh.answers["api repos/owner/comic"] = json.dumps(
+        {"default_branch": "main", "visibility": "internal", "private": True}
+    )
+    check = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))[PLATFORM_ACCESS]
+    assert not check.manual and "is internal" in check.detail
+    gh.answers["api repos/owner/agentic-sdlc --jq {visibility}"] = '{"visibility": "internal"}'
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    assert next(c for c in report.checks if c.name == PLATFORM_ACCESS).ok
+
+
+# ---------------------------------------------------------------- Codex 4238739188
+# Only workflows that run on EVERY pull request into the protected branch produce required
+# contexts: schedule/dispatch-only and path- or branch-filtered workflows do not count.
+@pytest.mark.parametrize(
+    ("on", "counts"),
+    [
+        ("pull_request", True),
+        ("[pull_request, schedule]", True),
+        ("{pull_request_target: {branches: [main]}}", True),
+        ("{pull_request: {branches: ['ma*']}}", True),
+        ("{pull_request: {branches: ['**']}}", True),
+        ("{schedule: [{cron: '0 0 * * *'}]}", False),
+        ("workflow_dispatch", False),
+        ("{workflow_call: {}}", False),
+        ("push", False),
+        ("{pull_request: {paths: ['src/**']}}", False),
+        ("{pull_request: {paths-ignore: ['docs/**']}}", False),
+        ("{pull_request: {branches: [develop]}}", False),
+        ("{pull_request: {branches-ignore: [develop]}}", False),
+        ("{pull_request: {branches: ['**', '!main']}}", False),
+        ("{pull_request: {types: [opened]}}", False),
+    ],
+)
+def test_required_contexts_come_only_from_workflows_running_on_protected_prs(tmp_path, on, counts):
+    from agentic_sdlc.onboard import effective_rule_problems, workflow_check_contexts
+
+    workflows = tmp_path / ".github/workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "scan.yml").write_text(
+        f"on: {on}\njobs:\n  security-scan:\n    runs-on: ubuntu-latest\n"
+        "    steps: [{run: 'true'}]\n"
+    )
+    produced = workflow_check_contexts(tmp_path, "main")
+    assert ("security-scan" in produced[0]) is counts
+    rules = [
+        {
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [{"context": "security-scan"}]},
+        }
+    ]
+    assert (effective_rule_problems(rules, produced) == []) is counts
+
+
+# ---------------------------------------------------------------- Codex 4238739196
+# Classic branch protection is enforced alongside rulesets but is not in rules/branches: doctor
+# reads it too (404 = none; unreadable = manual TODO) and applies the same incompatibility rules.
+LEGACY = "classic branch protection on the default branch fits Forge"
+
+
+def test_legacy_protection_problems():
+    from agentic_sdlc.onboard import legacy_protection_problems
+
+    produced = ({"test", "lint"}, ("call / ",), False)
+    assert legacy_protection_problems({}, produced) == []
+    fine = {
+        "required_status_checks": {
+            "contexts": ["test", "call / plan"],
+            "checks": [{"context": "test", "app_id": 15368}, {"context": "lint", "app_id": None}],
+        },
+        "required_linear_history": {"enabled": True},
+        "required_signatures": {"enabled": False},
+        "lock_branch": {"enabled": False},
+        "required_pull_request_reviews": {"required_approving_review_count": 1},
+    }
+    assert legacy_protection_problems(fine, produced) == []
+    bad = {
+        "required_status_checks": {
+            "contexts": ["security-scan", "lint"],
+            "checks": [{"context": "lint", "app_id": 999}],
+        },
+        "required_signatures": {"enabled": True},
+        "restrictions": {"users": [], "teams": [], "apps": []},
+        "lock_branch": {"enabled": True},
+    }
+    problems = legacy_protection_problems(bad, produced)
+    assert len(problems) == 5
+    assert any("'security-scan'" in p and "no installed" in p for p in problems)
+    assert any("'lint' from app 999" in p for p in problems)
+    assert any("signed commits" in p for p in problems)
+    assert any("restricts who can push" in p for p in problems)
+    assert any("locks the branch" in p for p in problems)
+
+
+def test_doctor_checks_classic_branch_protection(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    key = "api repos/owner/comic/branches/main/protection"
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh())
+    assert report.ok, report.render()
+    assert next(c for c in report.checks if c.name == LEGACY).ok
+
+    gh = _healthy_gh()
+    gh.answers[key] = json.dumps(
+        {
+            "required_status_checks": {"contexts": ["security-scan"], "checks": []},
+            "required_signatures": {"enabled": True},
+        }
+    )
+    check = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))[LEGACY]
+    assert "'security-scan'" in check.detail and "signed commits" in check.detail
+
+    gh.answers[key] = OnboardError("gh: Must have admin rights to Repository. (HTTP 403)")
+    check = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))[LEGACY]
+    assert check.manual and "cannot read branch protection" in check.detail
