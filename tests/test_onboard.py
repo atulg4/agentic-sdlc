@@ -176,7 +176,7 @@ def test_workflows_use_self_hosted_runners_and_the_pinned_platform():
 def test_auto_implement_requires_all_three_labels_and_uses_the_event_issue():
     auto = render_onboarding(spec())[".github/workflows/agent-auto-implement.yml"]
     doc = yaml.safe_load(auto)
-    cond = doc["jobs"]["preflight"]["if"]
+    cond = doc["jobs"]["authorize"]["if"]
     for label in ("claude-ready", "human-review-required", IMPLEMENTATION_LABEL):
         assert f"contains(github.event.issue.labels.*.name, '{label}')" in cond
     assert (
@@ -185,7 +185,7 @@ def test_auto_implement_requires_all_three_labels_and_uses_the_event_issue():
     )
     assert doc["jobs"]["implement"]["with"]["agent"] == "route"
     assert doc["jobs"]["implement"]["with"]["executor_registry_path"] == ".forge/executors.json"
-    assert doc["jobs"]["implement"]["needs"] == "preflight"
+    assert doc["jobs"]["implement"]["needs"] == ["authorize", "preflight"]
 
 
 def test_claude_implementer_has_no_routing_files_or_deepseek_preflight():
@@ -2027,7 +2027,9 @@ def test_runner_labels_render_as_yaml_strings():
             continue
         want = list(labels) if name.endswith("/ci.yml") else list(agent_labels)
         for job_name, job in (yaml.safe_load(content).get("jobs") or {}).items():
-            if name.endswith("/agent-auto-plan.yml") and job_name == "preflight":
+            if (name.endswith("/agent-auto-plan.yml") and job_name == "preflight") or (
+                name.endswith("/agent-auto-implement.yml") and job_name == "authorize"
+            ):
                 assert job["runs-on"] == "ubuntu-latest"  # authorizes before RUNS_ON is used
                 continue
             if "runs-on" in job:
@@ -3062,7 +3064,7 @@ def test_doctor_requires_the_exact_label_conditions(tmp_path, condition):
     write_onboarding(repo, spec())
     for name, job in (
         ("agent-auto-plan.yml", "preflight"),
-        ("agent-auto-implement.yml", "preflight"),
+        ("agent-auto-implement.yml", "authorize"),
     ):
         path = repo / ".github/workflows" / name
         doc = yaml.safe_load(path.read_text())
@@ -3150,7 +3152,7 @@ def test_every_template_placeholder_round_trips_as_a_string(value):
     steps = {s.get("name"): s for s in ci["jobs"]["test"]["steps"]}
     assert steps["Test"]["run"] == value
     auto = yaml.safe_load(workflows[".github/workflows/agent-auto-implement.yml"])
-    assert f"'{value}''s'" in auto["jobs"]["preflight"]["if"]
+    assert f"'{value}''s'" in auto["jobs"]["authorize"]["if"]
     hooks = rendered[".claude/hooks/forge_session_start.py"]
     assert f"DEFAULT_BRANCH = {json.dumps(value)}" in hooks
 
@@ -3186,7 +3188,7 @@ def test_doctor_tolerates_only_the_tunable_knobs(tmp_path):
     write_onboarding(repo, spec())
 
     def runners(doc):
-        for job in doc["jobs"].values():  # not the auto-plan authorization: GitHub-hosted
+        for job in doc["jobs"].values():  # not the labeler authorizations: GitHub-hosted
             if "runs-on" in job and "authorized" not in (job.get("outputs") or {}):
                 job["runs-on"] = "ubuntu-24.04"
             if "runs_on" in (job.get("with") or {}):
@@ -5618,3 +5620,57 @@ def test_doctor_requires_the_auto_plan_authorization_preflight(tmp_path, change)
     _edit_workflow(repo, "agent-auto-plan.yml", change)
     drift = _drift(repo)
     assert drift is not None and "agent-auto-plan.yml" in drift
+
+
+# Codex 4238935445: a Triage user can apply the approval labels without write access; the labeler
+# is authorized on a GitHub-hosted runner before any job is scheduled on the configured runner.
+@pytest.mark.parametrize("implementer", ["route", "claude", "codex"])
+def test_auto_implement_authorizes_the_labeler_on_a_hosted_runner_first(implementer):
+    files = render_onboarding(spec(implementer=implementer, runs_on=("self-hosted", "linux")))
+    doc = yaml.safe_load(files[".github/workflows/agent-auto-implement.yml"])
+    plan = yaml.safe_load(files[".github/workflows/agent-auto-plan.yml"])
+    authorize = doc["jobs"]["authorize"]
+    assert authorize["runs-on"] == "ubuntu-latest"
+    assert "github.event.label.name == 'implementation-approved'" in authorize["if"]
+    assert authorize["outputs"]["authorized"] == "${{ steps.authorize.outputs.authorized }}"
+    # the same authorization as automatic planning, step for step but the notice wording
+    step, plan_step = authorize["steps"][0], plan["jobs"]["preflight"]["steps"][0]
+    assert step["env"] == plan_step["env"]
+    assert step["run"].replace("Implementation", "Planning") == plan_step["run"]
+    assert "admin|write) ;;" in step["run"]
+    gate = "needs.authorize.outputs.authorized == 'true'"
+    for name, job in doc["jobs"].items():
+        if name == "authorize":
+            continue
+        needs = job.get("needs")
+        needs = [needs] if isinstance(needs, str) else needs or []
+        assert "authorize" in needs, name
+        assert gate in job["if"], name
+    assert doc["jobs"]["preflight"]["if"] == gate
+    assert doc["jobs"]["implement"]["if"] == gate
+    assert doc["jobs"]["notify_failure"]["if"].startswith(f"${{{{ always() && {gate} &&")
+    # workflow_dispatch already requires write access: no authorization job there
+    manual = yaml.safe_load(files[".github/workflows/agent-implement.yml"])
+    assert "authorize" not in manual["jobs"]
+    assert manual["jobs"]["implement"]["needs"] == "preflight"
+    assert "if" not in manual["jobs"]["preflight"]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda d: d["jobs"]["authorize"].update({"runs-on": ["self-hosted", "linux"]}),
+        lambda d: d["jobs"]["preflight"].pop("if"),
+        lambda d: d["jobs"]["preflight"].pop("needs"),
+        lambda d: d["jobs"]["implement"].pop("if"),
+        lambda d: d["jobs"]["notify_failure"].update({"needs": ["preflight", "implement"]}),
+        lambda d: d["jobs"].pop("authorize"),
+    ],
+)
+def test_doctor_requires_the_auto_implement_authorization(tmp_path, change):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    assert _drift(repo) is None
+    _edit_workflow(repo, "agent-auto-implement.yml", change)
+    drift = _drift(repo)
+    assert drift is not None and "agent-auto-implement.yml" in drift

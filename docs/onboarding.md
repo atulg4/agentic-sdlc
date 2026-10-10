@@ -105,9 +105,9 @@ The only tunable knobs, each validated by its own check instead:
 
 | Knob | Validated by |
 |---|---|
-| every job's `runs-on` (except `agent-auto-plan.yml:preflight`, below), and a reusable call's `with.runs_on` | the runner checks (hosted label or an online runner; Linux for implementation) |
+| every job's `runs-on` (except `agent-auto-plan.yml:preflight` and `agent-auto-implement.yml:authorize`, below), and a reusable call's `with.runs_on` | the runner checks (hosted label or an online runner; Linux for implementation) |
 | `with.route_budget_usd` on a reusable call (may be added) | "implement callers pass a readable route_budget_usd" |
-| the `if:` of `agent-auto-plan.yml:preflight` and `agent-auto-implement.yml:preflight` | must be exactly the generated condition for the POLICY's labels |
+| the `if:` of `agent-auto-plan.yml:preflight` and `agent-auto-implement.yml:authorize` | must be exactly the generated condition for the POLICY's labels |
 | the platform pin (`uses: ...@<sha>`, `with.platform_ref`) | the template is rendered at the caller's own pin; "workflows pin the platform to a commit SHA" requires one SHA on the platform repository |
 
 Everything else in those files is the template. To change it, change the policy and re-run
@@ -121,6 +121,15 @@ labeler (`github.event.sender`) and `github.actor` have write, maintain or admin
 `plan` call runs only `if: needs.preflight.outputs.authorized == 'true'`. An outsider's issue
 therefore never occupies a self-hosted runner; a maintainer who re-applies the ready label starts
 planning. (`agent-plan.yml` is `workflow_dispatch` only, which already requires write access.)
+
+`agent-auto-implement.yml` does the same, with the same step (one shared template fragment): a
+user with the Triage role can apply and remove the approval labels without write access, so its
+first job, `authorize` (`ubuntu-latest`, carrying the label condition, NOT tunable), runs the
+identical collaborator-permission check, and every job that can reach your runners --
+`preflight`, the reusable `implement` call and `notify_failure` -- lists `authorize` in `needs`
+and runs only when `needs.authorize.outputs.authorized == 'true'`. Toggling a label without write
+access therefore never schedules anything on a self-hosted runner. (`agent-implement.yml` is
+`workflow_dispatch` only and has no `authorize` job.)
 
 ### Other managed files
 
