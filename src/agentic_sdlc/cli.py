@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import re
+import shlex
 import sys
 from collections.abc import Iterable
 from pathlib import Path
@@ -404,8 +405,8 @@ def _verified_base(repository: str, project: str, base: str) -> str:
     if local != remote:
         raise ValueError(
             f"--base {base} is {local[:12]}, but the default branch {branch} of {project} is at "
-            f"{remote[:12]} on GitHub; fetch it again (`git fetch origin {branch}`) and use "
-            "that; not concluding"
+            f"{remote[:12]} on GitHub; fetch it again (`git fetch origin "
+            f"{shlex.quote('refs/heads/' + branch)}`) and use that; not concluding"
         )
     _status(f"base verified: {base} is {project}'s {branch} head {remote[:12]} on GitHub")
     return remote
@@ -1222,10 +1223,29 @@ def _confirm_cloud_routine(args: argparse.Namespace) -> int:
     return 0
 
 
+def _explicit_lease_policy(args: argparse.Namespace) -> ProjectPolicy | None:
+    """The policy an explicit `--config` names, or None when it was omitted. A path that was
+    given but is missing or unreadable is an error (exit 2) before any GitHub call, never a
+    quiet fall-back to the defaults (Codex 4242643524): a typo would otherwise lease with the
+    default TTL instead of the one the policy sets."""
+    if args.config is None:
+        return None
+    try:
+        return load_policy(args.config)
+    except (OSError, ValueError) as exc:
+        raise LeaseError(f"--config {args.config} could not be read ({exc})") from exc
+
+
 def _lease_ttl(args: argparse.Namespace) -> int:
+    """`--ttl-minutes`, else the TTL of the policy `--config` names (which must be readable),
+    else -- only when `--config` was omitted -- that of ./agentic-sdlc.toml if it exists, else
+    the default."""
+    policy = _explicit_lease_policy(args)
     if args.ttl_minutes is not None:  # an explicit 0 must reach validation, not the default
         return args.ttl_minutes
-    config = Path(args.config) if args.config else Path("agentic-sdlc.toml")
+    if policy is not None:
+        return policy.lease_ttl_minutes
+    config = Path("agentic-sdlc.toml")
     if config.exists():
         return load_policy(config).lease_ttl_minutes
     return DEFAULT_TTL_MINUTES
@@ -1271,6 +1291,7 @@ def _renew(args: argparse.Namespace) -> int:
 
 
 def _release(args: argparse.Namespace) -> int:
+    _explicit_lease_policy(args)  # no TTL to read, but a bad explicit --config is still an error
     release(
         args.project,
         args.issue,
@@ -1290,12 +1311,16 @@ def _approval_labels(args: argparse.Namespace) -> list[str]:
     from `--config` (Codex 4240421144). A policy that cannot be read is an error (exit 2), never a
     smaller set."""
     if args.label:
+        # --label decides; an explicit --config is still not ignored when it cannot be read
+        # (Codex 4242643524)
+        _explicit_lease_policy(args)
         return list(args.label)
+    config = args.config if args.config is not None else "agentic-sdlc.toml"
     try:
-        policy = load_policy(args.config)
+        policy = load_policy(config)
     except (OSError, ValueError) as exc:
         raise LeaseError(
-            f"cannot read the approval labels from {args.config} ({exc}); pass every label of "
+            f"cannot read the approval labels from {config} ({exc}); pass every label of "
             "the approval set with --label; not authorizing"
         ) from exc
     return [policy.implementation_label, policy.ready_label, policy.human_review_label]
@@ -1836,7 +1861,11 @@ def build_parser() -> argparse.ArgumentParser:
         parser.add_argument("--project", required=True, help="owner/name on GitHub")
         parser.add_argument("--issue", type=int, required=True)
         parser.add_argument("--session", required=True, help="unique id of this agent run/session")
-        parser.add_argument("--config", help="agentic-sdlc.toml (for lease_ttl_minutes)")
+        parser.add_argument(
+            "--config",
+            help="the policy file for lease_ttl_minutes; given explicitly, it must be readable "
+            "(exit 2 otherwise). Omitted: ./agentic-sdlc.toml if it exists, else the default",
+        )
         parser.add_argument("--ttl-minutes", type=int)
         parser.add_argument("--output")
 
@@ -1878,7 +1907,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="a label of the approval set (repeat for each; the first is the approval label); "
         "default: the implementation, ready and human-review labels of --config",
     )
-    authorize.add_argument("--config", default="agentic-sdlc.toml")
+    authorize.add_argument(
+        "--config",
+        help="the policy file for the default approval set (default: agentic-sdlc.toml); "
+        "given explicitly, it must be readable even with --label",
+    )
     authorize.add_argument("--output")
     authorize.set_defaults(handler=_authorize_labeler)
 

@@ -4945,7 +4945,6 @@ def test_ready_label_accepts_distinct_names(label):
     + [
         "main.",
         "-main",
-        "@",
         "HEAD",
         "a@{1}",
         "a b",
@@ -12334,7 +12333,7 @@ def test_cloud_routine_checks_the_diff_policy_right_before_pushing():
         "--base",
         "origin/trunk",
     ]
-    assert "`git fetch origin trunk`" in step and "Commit everything first" in step
+    assert "`git fetch origin refs/heads/trunk`" in step and "Commit everything first" in step
     assert "On any non-zero exit do NOT push or open a PR" in step
     assert "Make no commit after this check" in step
     assert "every commit of the series" in step  # Codex 4241839922
@@ -12366,7 +12365,7 @@ def test_cloud_routine_renews_its_lease_and_verifies_it_before_pushing():
     )
     flat = " ".join(prompt.split())
     assert flat.count(renew) == 1  # step 3a; 4a and 4c repeat "the step 3a renew command"
-    implement = prompt.index("3. `git fetch origin main`")
+    implement = prompt.index("3. `git fetch origin refs/heads/main`")
     renew_1 = prompt.index("3a. Renew the lease")
     verify = prompt.index("4. Run each")
     renew_2 = prompt.index("4a. Renew the lease again, exactly as in step 3a")
@@ -12406,7 +12405,7 @@ def test_cloud_routine_checks_the_request_and_its_dependencies_before_implementi
         "--base",
         "origin/main",
     ]
-    assert "`git fetch origin main`, then" in step
+    assert "`git fetch origin refs/heads/main`, then" in step
     assert "keep that value as <digest>" in step
     assert "Exit 0: continue" in step
     assert "Exit 3: not a valid work request" in step and "add label `claude-blocked`" in step
@@ -12820,7 +12819,7 @@ def test_apply_repo_settings_refuses_a_bad_variable_name_before_any_gh_call():
 # except the characters the platform's double-quoted shell sink cannot carry; every sink Forge
 # renders itself quotes or escapes it.
 
-GIT_VALID_BRANCHES = ["release+next", "feature@two", "a{b}!c", "x&y;(z)", "it's"]
+GIT_VALID_BRANCHES = ["release+next", "feature@two", "a{b}!c", "x&y;(z)", "it's", "@"]
 
 
 @pytest.mark.parametrize("branch", GIT_VALID_BRANCHES)
@@ -12857,7 +12856,7 @@ def test_git_valid_default_branches_round_trip_through_onboarding(branch, tmp_pa
     # the cloud routine prompt passes it as one shell word
     prompt = _routine_prompt(default_branch=branch)
     fetch = re.search(r"`(git fetch origin [^`]*)`", prompt).group(1)
-    assert shlex.split(fetch) == ["git", "fetch", "origin", branch]
+    assert shlex.split(fetch) == ["git", "fetch", "origin", f"refs/heads/{branch}"]
     check = re.search(r"`(sdlcctl check-diff [^`]*)`", prompt).group(1)
     assert shlex.split(check)[-2:] == ["--base", f"origin/{branch}"]
     # doctor, offline, finds nothing about it that it would not find for `main`
@@ -12869,6 +12868,49 @@ def test_git_valid_default_branches_round_trip_through_onboarding(branch, tmp_pa
         return {c.name for c in report.checks if not c.ok}
 
     assert failures(repo) == failures(plain)
+
+
+# Codex 4242643519: a branch literally named `@` is valid, but revision syntax reads a bare `@`
+# as HEAD (`git fetch origin @` fetches the remote's HEAD and leaves origin/@ stale). The
+# routine's commands name it fully qualified, so they act on the branch itself.
+def test_a_default_branch_named_at_is_fetched_and_resolved_as_the_branch(tmp_path):
+    import shlex
+    import subprocess
+
+    def git(cwd, *args):
+        return subprocess.run(
+            ["git", "-c", "init.defaultBranch=other", *args],
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"},
+        ).stdout.strip()
+
+    ident = ("-c", "user.name=t", "-c", "user.email=t@example.com")
+    remote, clone = tmp_path / "remote", tmp_path / "clone"
+    remote.mkdir()
+    git(remote, "init", "-q")
+    git(remote, *ident, "commit", "-q", "--allow-empty", "-m", "base")
+    git(remote, "branch", "@")
+    git(remote, *ident, "commit", "-q", "--allow-empty", "-m", "other moves on")
+    git(tmp_path, "clone", "-q", str(remote), str(clone))
+    # the remote's `@` branch moves; its HEAD (`other`) is a different commit
+    git(remote, "checkout", "-q", "@")
+    git(remote, *ident, "commit", "-q", "--allow-empty", "-m", "on @")
+    git(remote, "checkout", "-q", "other")
+    at_head = git(remote, "rev-parse", "refs/heads/@")
+    assert git(remote, "rev-parse", "@") != at_head  # bare `@` is HEAD, not the branch
+
+    prompt = _routine_prompt(default_branch="@")
+    fetches = set(re.findall(r"`(git fetch origin [^`]*)`", prompt))
+    assert fetches == {"git fetch origin refs/heads/@"}
+    git(clone, *shlex.split(fetches.pop())[1:])
+    base = shlex.split(re.search(r"`(sdlcctl check-diff [^`]*)`", prompt).group(1))[-1]
+    assert base == "origin/@"
+    assert git(clone, "rev-parse", "--verify", f"{base}^{{commit}}") == at_head
+    git(clone, "checkout", "-q", "-b", "forge/issue-1-1", base)
+    assert git(clone, "rev-parse", "HEAD") == at_head
 
 
 @pytest.mark.parametrize("branch", ['a"b', "a$b", "a${{x}}", "a`b"])

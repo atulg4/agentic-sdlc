@@ -1077,7 +1077,11 @@ def render_cloud_routine_md(spec: OnboardSpec) -> str:
     release = f"`sdlcctl release {lease}`"
     renew = f"`sdlcctl renew {lease} --config agentic-sdlc.toml`"
     # Shell words (Codex 4242545214): a Git-valid branch name can hold `&`, `;`, `(`, `'` ...
-    branch = shlex.quote(spec.default_branch)
+    # Fully qualified (Codex 4242643519): `git fetch origin @` fetches the remote's HEAD, not a
+    # branch named `@`, and leaves origin/@ stale; a bare name would also prefer a same-named
+    # tag (refs/tags/ is searched before refs/heads/). `refs/heads/<name>` is that branch alone
+    # and still updates origin/<name> through the configured refspec.
+    branch = shlex.quote(f"refs/heads/{spec.default_branch}")
     base = shlex.quote(f"origin/{spec.default_branch}")
     check_request = (
         f"sdlcctl check-request --project {spec.project_id} --issue <n> "

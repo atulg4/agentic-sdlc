@@ -3333,3 +3333,58 @@ def test_cli_renew_fails_once_the_issue_is_closed(monkeypatch, capsys):
     gh.issues[7]["state"] = "closed"
     assert cli.main([*argv, "--ttl-minutes", "60"]) == 2
     assert "is closed; not renewing" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------- Codex 4242643524
+# An explicit --config that is missing or unreadable is an error (exit 2) before any GitHub
+# call, never a quiet fall-back to the default lease TTL; only an omitted --config uses defaults.
+
+_POLICY = 'version = 1\n[project]\nid = "owner/repo"\n[automation]\nlease_ttl_minutes = 30\n'
+
+
+@pytest.mark.parametrize("subcommand", ["claim", "renew", "release", "authorize-labeler"])
+@pytest.mark.parametrize("problem", ["missing", "unparseable"])
+def test_an_explicit_config_that_cannot_be_read_is_an_error(
+    subcommand, problem, tmp_path, monkeypatch, capsys
+):
+    from agentic_sdlc import cli
+
+    config = tmp_path / "agentic-sdlc.toml"
+    if problem == "unparseable":
+        config.write_text("version = [\n")
+    # a readable policy in the working directory must not stand in for the one named
+    (tmp_path / "cwd").mkdir()
+    (tmp_path / "cwd" / "agentic-sdlc.toml").write_text(_POLICY)
+    monkeypatch.chdir(tmp_path / "cwd")
+    gh = FakeGh().issue(7)
+    monkeypatch.setattr(cli, "run_gh", gh)
+    argv = {
+        "claim": ["claim", "--agent", "me", "--branch", "b"],
+        "renew": ["renew"],
+        "release": ["release"],
+        "authorize-labeler": ["authorize-labeler", "--label", APPROVAL],
+    }[subcommand] + ["--project", PROJECT, "--issue", "7", "--config", str(config)]
+    if subcommand != "authorize-labeler":
+        argv += ["--session", "s1"]
+    assert cli.main(argv) == 2
+    assert str(config) in capsys.readouterr().err
+    assert gh.calls == []  # refused before any GitHub call
+    if subcommand in ("claim", "renew"):  # an explicit TTL does not excuse it either
+        assert cli.main([*argv, "--ttl-minutes", "60"]) == 2
+        assert gh.calls == []
+
+
+def test_the_lease_ttl_comes_from_the_named_config_else_the_default(tmp_path, monkeypatch):
+    import argparse
+
+    from agentic_sdlc import cli
+
+    named = tmp_path / "named.toml"
+    named.write_text(_POLICY)
+    monkeypatch.chdir(tmp_path)
+    assert cli._lease_ttl(argparse.Namespace(ttl_minutes=None, config=str(named))) == 30
+    assert cli._lease_ttl(argparse.Namespace(ttl_minutes=5, config=str(named))) == 5
+    # omitted: ./agentic-sdlc.toml when it exists, else the default
+    assert cli._lease_ttl(argparse.Namespace(ttl_minutes=None, config=None)) == 240
+    (tmp_path / "agentic-sdlc.toml").write_text(_POLICY.replace("30", "45"))
+    assert cli._lease_ttl(argparse.Namespace(ttl_minutes=None, config=None)) == 45

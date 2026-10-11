@@ -25,8 +25,11 @@ def git_branch_format_problem(name: str) -> str:
     own rules, so the answer does not depend on a git binary being installed."""
     if not name:
         return "must not be empty"
-    if name in ("@", "HEAD"):
-        return f"must not be {name!r}"
+    if name == "HEAD":
+        # `@` alone is accepted (git does too). Revision syntax reads a bare `@` as HEAD, so
+        # every command Forge renders names the branch fully qualified (`refs/heads/<name>` for
+        # a fetch, `origin/<name>` for a revision), never bare (Codex 4242643519).
+        return "must not be 'HEAD'"
     if name.startswith("-"):
         return "must not start with '-'"
     if name.startswith("/") or name.endswith("/") or "//" in name:
