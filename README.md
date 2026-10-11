@@ -121,10 +121,12 @@ Three owner choices are recorded in `agentic-sdlc.toml` and checked by `doctor`:
   about a self-hosted label without it. Hosted minutes cost money and a hosted VM cannot reach a
   private network: that trade-off is the owner's.
 - **Required approvals** (`--required-approvals N`, `[policy] required_approvals`): the "Protect
-  main" ruleset's approving-review count. Default with `--apply`: 1 when the repository has a
-  collaborator with write/maintain/admin access other than the owner and the authenticated user,
-  else 0 (GitHub never lets an author approve their own PR, so 1 would leave a solo owner unable
-  to merge anything); offline, 0. At 0 the human-merge boundary is not enforced server-side --
+  main" ruleset's approving-review count. Default in the Actions modes (`route`, `claude`,
+  `codex`): 1 -- the Publisher App authors the PR, so the owner can approve it. In
+  `cloud-routine` mode, where the routine authors it as the owner, with `--apply`: 1 when the
+  repository has a collaborator with write/maintain/admin access other than the owner and the
+  authenticated user, else 0 (GitHub never lets an author approve their own PR, so 1 would leave
+  a solo owner unable to merge anything); offline, 0. At 0 the human-merge boundary is not enforced server-side --
   in `cloud-routine` mode the routine acts as the owner and could merge its own PR -- and both
   `onboard` and `doctor` say so loudly.
 - **Executable trust mode** (`--trust-mode strict|local`, `[automation] trust_mode`, default
@@ -275,6 +277,12 @@ sdlcctl scaffold \
   --platform-ref 0123456789abcdef0123456789abcdef01234567 \
   --automation-level 1
 ```
+
+On GitHub, levels 2 and 3 also need `--publisher-bot-login <app-slug>[bot]`: the
+login of the Publisher App whose `PUBLISHER_APP_CLIENT_ID` / `PUBLISHER_APP_PRIVATE_KEY`
+the implementation workflow uses. It is written to `[automation] publisher_bot_login`,
+the only App bot whose issue-lease markers count; without it the scaffold refuses,
+since every implementation run would otherwise fail at its claim.
 
 The generated policy contains no guessed build or test commands. Draft-PR
 automation therefore fails closed until the project owner adds and reviews its

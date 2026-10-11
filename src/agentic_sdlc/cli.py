@@ -88,6 +88,7 @@ from .onboard import (
     copy_variables,
     default_required_approvals,
     doctor,
+    gh_http_status,
     installed_bot_login,
     installed_trust_mode,
     policy_trust_mode,
@@ -1147,6 +1148,7 @@ def _scaffold(args: argparse.Namespace) -> int:
         platform_ref=args.platform_ref,
         default_branch=args.default_branch,
         automation_level=args.automation_level,
+        publisher_bot_login=args.publisher_bot_login,
     )
     _write(
         {"created": [str(path.relative_to(destination)) for path in created]},
@@ -1208,12 +1210,15 @@ def _onboard(args: argparse.Namespace) -> int:
             ) from exc
     else:
         fork_exposed = args.visibility == "public"
-    # Codex 4243193100: required approvals. Not given: with --apply, 1 when another collaborator
-    # with write access can approve (a solo owner cannot approve their own PR), else 0; offline, 0.
+    # Codex 4243193100 / 4243386518: required approvals. Not given: in the Actions modes 1 (the
+    # Publisher App authors the PR, so the owner can approve it); in cloud-routine mode, with
+    # --apply, 1 when another collaborator with write access can approve (the routine opens the
+    # PR as the owner, who cannot approve their own), else 0; cloud-routine offline, 0.
     approvals = args.required_approvals
     if approvals is None:
-        if args.apply:
-            approvals, why = default_required_approvals(project_id, run_gh)
+        cloud = args.implementer == "cloud-routine"
+        if args.apply or not cloud:
+            approvals, why = default_required_approvals(project_id, run_gh, cloud=cloud)
         else:
             approvals, why = 0, "onboard ran without --apply, so collaborators were not read"
         print(
@@ -1335,7 +1340,9 @@ def _committed_lease_policy(project: str) -> ProjectPolicy | None:
     the trusted `gh` (Codex 4242925440): a lease command run where no policy file is at hand
     -- the failure-cleanup job's `release` runs in an empty workspace with no `--config` --
     still learns the Publisher bot whose claim it has to release. None only when GitHub
-    answers 404 for that file (the repository commits no policy). Any other failure, or an
+    answers 404 for that file (the repository commits no policy) -- the status of the
+    response as `run_gh` parsed it (`gh_http_status`), never a "404" anywhere in the message,
+    which echoes the request path (Codex 4243386515). Any other failure, or an
     answer that is not a readable policy, raises LeaseError: never read as "no Publisher bot"."""
     try:
         repo = json.loads(run_gh(["api", f"repos/{project}"]) or "null")
@@ -1353,7 +1360,7 @@ def _committed_lease_policy(project: str) -> ProjectPolicy | None:
             ]
         )
     except Exception as exc:
-        if re.search(r"\b404\b|Not Found", str(exc)):
+        if gh_http_status(exc) == 404:  # GitHub's answer, not the path (Codex 4243386515)
             return None
         raise LeaseError(f"cannot read the committed policy {where} ({exc})") from exc
     try:
@@ -1962,6 +1969,12 @@ def build_parser() -> argparse.ArgumentParser:
     scaffold.add_argument("--platform-ref", required=True)
     scaffold.add_argument("--default-branch", default="main")
     scaffold.add_argument("--automation-level", choices=(1, 2, 3), type=int, default=1)
+    scaffold.add_argument(
+        "--publisher-bot-login",
+        default="",
+        help="the Publisher App's bot login, `<app-slug>[bot]`; required on GitHub at "
+        "automation level 2 or 3 (written to [automation] publisher_bot_login)",
+    )
     scaffold.add_argument("--output")
     scaffold.set_defaults(handler=_scaffold)
 

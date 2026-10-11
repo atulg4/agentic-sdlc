@@ -174,6 +174,47 @@ class OnboardError(ValueError):
     """Raised when a repository cannot be onboarded safely."""
 
 
+class GhCommandError(OnboardError):
+    """A trusted `gh` call that exited non-zero. `http_status` is the HTTP status of GitHub's
+    answer when -- and only when -- `gh` reported one unambiguously (`gh_error_http_status`);
+    None for a timeout, a transport failure, or any output that is not a clean API error."""
+
+    def __init__(self, message: str, *, http_status: int | None = None) -> None:
+        super().__init__(message)
+        self.http_status = http_status
+
+
+#: The last line `gh api` prints on stderr for an HTTP error answer: `gh: <message> (HTTP nnn)`.
+_GH_HTTP_ERROR_LINE = re.compile(r"^gh: .*\(HTTP ([1-5][0-9]{2})\)$")
+
+
+def gh_error_http_status(stderr: str, stdout: str = "") -> int | None:
+    """The HTTP status of a failed `gh api` call, read from the RESPONSE, never the request
+    (Codex 4243386515: a repository or branch literally named `404` puts "404" in every echoed
+    request path). That is the status `gh` reports on the last line of stderr
+    (`gh: Not Found (HTTP 404)`); when the error body `gh` prints on stdout carries GitHub's own
+    `status` field, it must agree. None whenever the two disagree or either is not that shape:
+    callers treat None as "unknown", i.e. fail closed."""
+    lines = [line.strip() for line in (stderr or "").strip().splitlines() if line.strip()]
+    match = _GH_HTTP_ERROR_LINE.match(lines[-1]) if lines else None
+    if match is None:
+        return None
+    status = int(match.group(1))
+    try:
+        body = json.loads(stdout) if (stdout or "").strip() else None
+    except ValueError:
+        body = None
+    if isinstance(body, dict) and "status" in body and str(body["status"]) != str(status):
+        return None
+    return status
+
+
+def gh_http_status(exc: BaseException) -> int | None:
+    """The HTTP status a failed trusted `gh` call reported (`GhCommandError.http_status`), else
+    None -- for any other exception, whatever its message says."""
+    return exc.http_status if isinstance(exc, GhCommandError) else None
+
+
 def gate_command_problem(command: object) -> str:
     """Why a policy gate command cannot be rendered into ci.yml unchanged ('' = it can). A gate
     is ONE line: a newline is a shell command separator, so folding it into a space would change
@@ -661,8 +702,9 @@ def run_gh(args: Sequence[str], input: str | None = None) -> str:
             "not concluding"
         ) from exc
     if proc.returncode != 0:
-        raise OnboardError(
-            f"gh {' '.join(shlex.quote(a) for a in args)} failed: {proc.stderr.strip()[:400]}"
+        raise GhCommandError(
+            f"gh {' '.join(shlex.quote(a) for a in args)} failed: {proc.stderr.strip()[:400]}",
+            http_status=gh_error_http_status(proc.stderr, proc.stdout),
         )
     return proc.stdout
 
@@ -2152,16 +2194,30 @@ def authenticated_login(gh: GhRunner) -> str | None:
     return login if isinstance(login, str) and login else None
 
 
-def default_required_approvals(project_id: str, gh: GhRunner) -> tuple[int, str]:
-    """(count, why) for `--required-approvals` left unset at `onboard --apply`: 1 when another
-    collaborator with write access can approve, else 0 (a solo owner cannot approve their own
-    pull request, so 1 would leave every PR unmergeable). Unreadable: 0, said so."""
+def default_required_approvals(project_id: str, gh: GhRunner, *, cloud: bool) -> tuple[int, str]:
+    """(count, why) for `--required-approvals` left unset at `onboard --apply`.
+
+    Actions implementer modes (`cloud=False`: route, claude, codex): 1, read nothing -- the
+    pull request is opened by the Publisher App (`publish_draft` runs with its token), so the
+    repository owner is NOT its author and can approve it (Codex 4243386518).
+
+    Cloud-routine mode (`cloud=True`): the routine opens the PR as the owner, who cannot approve
+    their own pull request. 1 when another collaborator with write access can approve, else 0
+    (1 would leave every PR unmergeable). Unreadable: 0, said so."""
+    if not cloud:
+        return 1, (
+            "the Publisher App authors the implementation pull requests, so the owner can "
+            "approve them"
+        )
     found = other_writers(project_id, gh, me=authenticated_login(gh))
     if isinstance(found, Unreadable):
         return 0, f"the collaborators of {project_id} could not be read ({found.why})"
     if found:
         return 1, f"{len(found)} other collaborator(s) with write access can approve"
-    return 0, f"no collaborator of {project_id} but the owner has write access"
+    return 0, (
+        f"no collaborator of {project_id} but the owner has write access, and in cloud-routine "
+        "mode the owner authors the pull requests"
+    )
 
 
 HUMAN_MERGE_NOT_ENFORCED = (
@@ -2835,24 +2891,29 @@ def approvals_check(count: int, *, cloud: bool, writers: list[str] | Unreadable 
     """Codex 4243193100: the ruleset's required approvals (the policy's `required_approvals`,
     which the ruleset check holds the ruleset to). 0 in cloud-routine mode is a loud warning: the
     human-merge boundary is not enforced server-side. `writers`: the other collaborators with
-    write access (who could approve), when read."""
+    write access (who could approve), when read -- cloud-routine mode only, where the owner
+    authors the PR. In the Actions modes the Publisher App authors it, so the owner can approve
+    and 0 is always a warning with the fix (Codex 4243386518)."""
     if count >= 1:
         return Check(APPROVALS_CHECK, True, f"[policy] required_approvals = {count}")
     detail = "[policy] required_approvals = 0"
-    if isinstance(writers, list) and writers:
-        detail += (
-            f"; {', '.join(writers)} could approve -- re-run `sdlcctl onboard --force --apply "
-            "--required-approvals 1`"
-        )
     if cloud:
+        if isinstance(writers, list) and writers:
+            detail += (
+                f"; {', '.join(writers)} could approve -- re-run `sdlcctl onboard --force "
+                "--apply --required-approvals 1`"
+            )
         return Check(
             APPROVALS_CHECK, True, f"WARNING: {detail}: {HUMAN_MERGE_NOT_ENFORCED}", warning=True
         )
     return Check(
         APPROVALS_CHECK,
         True,
-        detail + " (merges are gated by a human pressing merge, not by a required review)",
-        warning=bool(isinstance(writers, list) and writers),
+        f"WARNING: {detail}: the Publisher App authors the implementation pull requests, so the "
+        "owner (or any collaborator with write access) can approve them -- re-run `sdlcctl "
+        "onboard --force --apply --required-approvals 1` to make GitHub require that review "
+        "(today merges are gated only by a human pressing merge)",
+        warning=True,
     )
 
 
@@ -8669,7 +8730,8 @@ def doctor(
         approvals_check(
             policy_required_approvals(installed_policy),
             cloud=cloud,
-            writers=other_writers(project_id, gh, me=authenticated_login(gh)),
+            # who could approve matters only where the owner authors the PR (cloud-routine)
+            writers=other_writers(project_id, gh, me=authenticated_login(gh)) if cloud else None,
         )
     )
 
@@ -9038,17 +9100,44 @@ def doctor(
             )
         )
 
-    # --- variables & secrets (names only)
+    # --- variables & secrets (names only). Workflows also see the organization's secrets and
+    # variables shared with this repository (Codex 4243386524): an organization-owned repository
+    # unions the inherited inventories in (a repository variable wins over an organization one of
+    # the same name, as in GitHub). An inherited inventory that cannot be read leaves what is
+    # missing at repository scope UNVERIFIABLE -- a warning, never "missing".
     variable_rows = _paged_items(gh, f"repos/{project_id}/actions/variables", "variables")
+    secret_names = _paged_names(gh, f"repos/{project_id}/actions/secrets", "secrets")
+    org_owned = (
+        isinstance(repo_info, dict)
+        and isinstance(repo_info.get("owner"), dict)
+        and repo_info["owner"].get("type") == "Organization"
+    )
+    org_variable_rows: list[dict] | Unreadable = (
+        _paged_items(gh, f"repos/{project_id}/actions/organization-variables", "variables")
+        if org_owned
+        else []
+    )
+    org_secret_names: set[str] | Unreadable = (
+        _paged_names(gh, f"repos/{project_id}/actions/organization-secrets", "secrets")
+        if org_owned
+        else set()
+    )
+    org_vars_unread = org_variable_rows.why if isinstance(org_variable_rows, Unreadable) else ""
+    org_secrets_unread = org_secret_names.why if isinstance(org_secret_names, Unreadable) else ""
     variable_values = (
         {}
-        if isinstance(variable_rows, Unreadable)
-        else {str(v.get("name")): str(v.get("value") or "") for v in variable_rows}
+        if isinstance(org_variable_rows, Unreadable)
+        else {str(v.get("name")): str(v.get("value") or "") for v in org_variable_rows}
     )
+    if not isinstance(variable_rows, Unreadable):
+        variable_values.update(
+            {str(v.get("name")): str(v.get("value") or "") for v in variable_rows}
+        )
     variables = {name for name, value in variable_values.items() if value.strip()}
     empty_vars = sorted(name for name, value in variable_values.items() if not value.strip())
-    secret_names = _paged_names(gh, f"repos/{project_id}/actions/secrets", "secrets")
-    secrets = set() if isinstance(secret_names, Unreadable) else secret_names
+    secrets = (set() if isinstance(secret_names, Unreadable) else set(secret_names)) | (
+        set() if isinstance(org_secret_names, Unreadable) else org_secret_names
+    )
     need_vars = set() if cloud else {"PUBLISHER_APP_CLIENT_ID"}
     need_secrets = {"CLAUDE_CODE_OAUTH_TOKEN"} | (set() if cloud else {"PUBLISHER_APP_PRIVATE_KEY"})
     if not platform_public:  # GITHUB_TOKEN cannot check out another private repository
@@ -9065,6 +9154,8 @@ def doctor(
         need_secrets |= {"OPENAI_API_KEY"}
     mv, ms = sorted(need_vars - variables), sorted(need_secrets - secrets)
     empty_required = [name for name in mv if name in empty_vars]
+    # set nowhere we could read, and possibly inherited from an organization we could not read
+    unverifiable_vars = [n for n in mv if n not in variable_values] if org_vars_unread else []
     if isinstance(variable_rows, Unreadable) and need_vars:
         add(
             Check(
@@ -9074,6 +9165,18 @@ def doctor(
                 + ", ".join(sorted(need_vars))
                 + " are set",
                 manual=True,
+            )
+        )
+    elif mv and len(unverifiable_vars) == len(mv):
+        add(
+            Check(
+                "repo variables set (non-empty)",
+                True,
+                "WARNING: not set at repository scope: "
+                + ", ".join(mv)
+                + f"; the organization variables {project_id} inherits could not be read "
+                f"({org_vars_unread}) → confirm they are set there, or set them on the repository",
+                warning=True,
             )
         )
     else:
@@ -9089,21 +9192,35 @@ def doctor(
                 else ", ".join(sorted(need_vars)),
             )
         )
-    add(
-        Check(
-            "repo secrets set (by name)",
-            not ms,
-            (
-                f"could not read the secret names of {project_id} ({secret_names.why}) → "
-                "confirm: " + ", ".join(ms)
-                if isinstance(secret_names, Unreadable)
-                else "missing: " + ", ".join(ms) + " → gh secret set NAME --repo " + project_id
+    if ms and org_secrets_unread and not isinstance(secret_names, Unreadable):
+        add(
+            Check(
+                "repo secrets set (by name)",
+                True,
+                "WARNING: not set at repository scope: "
+                + ", ".join(ms)
+                + f"; the organization secrets {project_id} inherits could not be read "
+                f"({org_secrets_unread}) → confirm they are shared with it, or gh secret set NAME "
+                f"--repo {project_id}",
+                warning=True,
             )
-            if ms
-            else ", ".join(sorted(need_secrets)),
-            manual=True,
         )
-    )
+    else:
+        add(
+            Check(
+                "repo secrets set (by name)",
+                not ms,
+                (
+                    f"could not read the secret names of {project_id} ({secret_names.why}) → "
+                    "confirm: " + ", ".join(ms)
+                    if isinstance(secret_names, Unreadable)
+                    else "missing: " + ", ".join(ms) + " → gh secret set NAME --repo " + project_id
+                )
+                if ms
+                else ", ".join(sorted(need_secrets)),
+                manual=True,
+            )
+        )
 
     # --- runners: every job of every active caller, and ci.yml's `test` job, must run somewhere
     # that exists, or the run (or every PR's required check) sits queued forever.
