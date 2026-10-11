@@ -41,6 +41,7 @@ comments as MEMBER). The commit-guard hook mirrors the same rule.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -1059,29 +1060,49 @@ def _check_ttl(ttl_minutes: int) -> None:
         raise LeaseError(f"ttl_minutes must be between 1 and {MAX_TTL_MINUTES}")
 
 
+Clock = Callable[[], datetime]
+
+
+def _clock(now: datetime | None, clock: Clock | None) -> Clock:
+    """The clock an operation reads: `clock` when given, else a fixed `now` (tests), else the
+    wall clock. Codex 4241196647: a lease's expiry and its arbitration read the clock when they
+    happen, not once at the start of an operation whose reads may take a while."""
+    if clock is not None:
+        return clock
+    if now is not None:
+        return lambda: now
+    return lambda: datetime.now(UTC)
+
+
+def _retract(project: str, issue: int, session: str, why: str, gh: GhRunner) -> None:
+    """Post `session`'s release marker: the claim it just posted is withdrawn."""
+    _comment(project, issue, _marker_comment(format_release_marker(session), why), gh)
+
+
 def _post_and_arbitrate(
-    project: str, issue: int, session: str, body: str, gh: GhRunner, now: datetime
+    project: str, issue: int, session: str, body: str, gh: GhRunner, clock: Clock
 ) -> Lease | None:
     """Post a claim/renewal marker, then re-read the thread and keep it only if it is authoritative.
 
     GitHub has no compare-and-set, so every lease acquisition -- fresh claim, takeover or
     renewal -- appends its marker and re-reads; only the session `current_lease()` names keeps
-    it, everyone else retracts. Returns the winner (``None`` when nothing is live).
+    it, everyone else retracts. The re-read is judged at a FRESH reading of `clock` (Codex
+    4241196647): a marker already expired by then is not a lease, and is retracted. Returns the
+    winner (``None`` when nothing is live).
     """
     _comment(project, issue, body, gh)
-    winner = current_lease(project, issue, gh, now)
-    if winner is not None and not winner.live(now):
+    at = clock()
+    winner = current_lease(project, issue, gh, at)
+    expired_own = winner is not None and winner.session == session and not winner.live(at)
+    if winner is not None and not winner.live(at):
         winner = None
     if winner is None or winner.session != session:
-        _comment(
-            project,
-            issue,
-            _marker_comment(
-                format_release_marker(session),
-                f"Lost the claim race to session `{getattr(winner, 'session', '?')}`; retracting.",
-            ),
-            gh,
+        why = (
+            f"The claim had already expired when it was re-read ({_iso(at)}); retracting."
+            if expired_own
+            else f"Lost the claim race to session `{getattr(winner, 'session', '?')}`; retracting."
         )
+        _retract(project, issue, session, why, gh)
     return winner
 
 
@@ -1374,9 +1395,15 @@ def claim(
     gh: GhRunner,
     now: datetime | None = None,
     assignee: str | None = None,
+    clock: Clock | None = None,
 ) -> ClaimResult:
-    """Take the lease if free (or expired, or already ours). Never mutates on refusal."""
-    now = now or datetime.now(UTC)
+    """Take the lease if free (or expired, or already ours). Never mutates on refusal.
+
+    The lease's expiry is computed from the clock immediately before its marker is posted, and
+    arbitration reads the clock again (Codex 4241196647); after winning, the open-PR inventory
+    is read again and the claim retracted if a PR appeared meanwhile (Codex 4241196645)."""
+    clock = _clock(now, clock)
+    now = clock()
     _check_ttl(ttl_minutes)
     lease = Lease(
         issue, agent, session, branch, now + timedelta(minutes=ttl_minutes), assignee or ""
@@ -1408,6 +1435,7 @@ def claim(
             assignee=existing.assignee,
             owns_assignee=existing.owns_assignee,
             disowned=existing.disowned,
+            expires=clock() + timedelta(minutes=ttl_minutes),
         )
         winner = _post_and_arbitrate(
             project,
@@ -1417,7 +1445,7 @@ def claim(
                 format_claim_marker(lease), f"Lease renewed until {_iso(lease.expires)}."
             ),
             gh,
-            now,
+            clock,
         )
         if winner is None or winner.session != session:
             return ClaimResult(
@@ -1435,12 +1463,6 @@ def claim(
         return ClaimResult(
             False, None, reason=f"issue #{issue} already has an open pull request: {urls}"
         )
-    note = (
-        f"Claimed by `{agent}` (session `{session}`) on branch `{branch}`; "
-        f"lease expires {_iso(lease.expires)}."
-    )
-    if took_over:
-        note = f"Took over an expired lease from session `{took_over}`. " + note
     inherited = False
     if assignee:
         # The lease owns an assignment the expired lease it takes over owned (that lease will
@@ -1460,15 +1482,63 @@ def claim(
             is False
         )
         lease = replace(lease, owns_assignee=inherited)
+    # Codex 4241196647: the TTL starts now, after the reads above (which may have been slow),
+    # not when the operation began.
+    lease = replace(lease, expires=clock() + timedelta(minutes=ttl_minutes))
+    note = (
+        f"Claimed by `{agent}` (session `{session}`) on branch `{branch}`; "
+        f"lease expires {_iso(lease.expires)}."
+    )
+    if took_over:
+        note = f"Took over an expired lease from session `{took_over}`. " + note
     marker = format_claim_marker(lease)
-    winner = _post_and_arbitrate(project, issue, session, _marker_comment(marker, note), gh, now)
-    if winner is None or winner.session != session:
+    winner = _post_and_arbitrate(project, issue, session, _marker_comment(marker, note), gh, clock)
+    if winner is None:
+        return ClaimResult(
+            False,
+            None,
+            reason=(
+                f"issue #{issue}: the claim was no longer live when re-read (it expired while "
+                "GitHub was being read, or was released); retracted -- retry"
+            ),
+        )
+    if winner.session != session:
         return ClaimResult(
             False,
             winner,
             reason=(
                 f"issue #{issue}: lost the claim race to session={getattr(winner, 'session', '?')}"
             ),
+        )
+    # Codex 4241196645: the open-PR inventory above was read before the marker was posted; a
+    # pull request opened in between is durable work this claim would duplicate. Read it again
+    # now that the claim is authoritative, and retract on a PR -- or on an unreadable inventory.
+    try:
+        late = open_prs_for_issue(project, issue, gh)
+    except Exception:
+        # best effort: the read failure is what matters
+        with contextlib.suppress(Exception):
+            _retract(
+                project,
+                issue,
+                session,
+                "The open pull requests could not be re-read after claiming; retracting.",
+                gh,
+            )
+        raise
+    if late:
+        urls = ", ".join(str(p.get("url") or f"#{p.get('number')}") for p in late)
+        _retract(
+            project,
+            issue,
+            session,
+            f"A pull request for this issue was opened while claiming ({urls}); retracting.",
+            gh,
+        )
+        return ClaimResult(
+            False,
+            None,
+            reason=f"issue #{issue} got an open pull request while it was being claimed: {urls}",
         )
     flags = ["--add-label", IN_PROGRESS_LABEL]
     if assignee:
@@ -1552,8 +1622,10 @@ def renew(
     ttl_minutes: int = DEFAULT_TTL_MINUTES,
     gh: GhRunner,
     now: datetime | None = None,
+    clock: Clock | None = None,
 ) -> Lease:
-    now = now or datetime.now(UTC)
+    clock = _clock(now, clock)
+    now = clock()
     _check_ttl(ttl_minutes)
     existing = current_lease(project, issue, gh, now)
     if existing is None or existing.session != session:
@@ -1561,11 +1633,11 @@ def renew(
     if not existing.live(now):
         # An expired lease is up for takeover; renewing it could race a new claimant. Claim again.
         raise LeaseError(f"issue #{issue}: the lease of session {session} has expired; claim again")
-    lease = replace(existing, expires=now + timedelta(minutes=ttl_minutes))
+    lease = replace(existing, expires=clock() + timedelta(minutes=ttl_minutes))
     body = _marker_comment(
         format_claim_marker(lease), f"Lease renewed until {_iso(lease.expires)}."
     )
-    winner = _post_and_arbitrate(project, issue, session, body, gh, now)
+    winner = _post_and_arbitrate(project, issue, session, body, gh, clock)
     if winner is None or winner.session != session:
         raise LeaseError(
             f"issue #{issue}: renewal lost to session={getattr(winner, 'session', '?')}"
@@ -1795,6 +1867,13 @@ def render_claims(rows: Sequence[ClaimRow]) -> str:
 # unreadable, a label with no `labeled` event, an event without an actor -- is unverifiable and
 # refuses (LeaseError), never reads as authorized. A label of the set removed since it was last
 # applied is unauthorized.
+#
+# Codex 4241196649: an approval is bound to the issue content it saw. The title (its `renamed`
+# events) and the body (GraphQL `lastEditedAt` and the latest `userContentEdits` entry) must have
+# been last edited BEFORE the most recent application of EACH label of the set; an issue edited
+# since is unauthorized until the labels are re-applied, and an edit time that cannot be read
+# refuses (LeaseError). The Actions path applies the same rule, and an `edited` event cancels a
+# queued or running authorized run there.
 
 
 @dataclass(frozen=True)
@@ -1848,6 +1927,72 @@ def labeler_permission(project: str, login: str, gh: GhRunner) -> str | None:
     return str(data.get("permission") or "") or None
 
 
+#: When the issue's body was last edited (Codex 4241196649). `lastEditedAt` is null for a body
+#: never edited; the newest `userContentEdits` entry is read too, and the later of the two counts.
+_ISSUE_EDITS_QUERY = """\
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      lastEditedAt
+      userContentEdits(last: 1) { nodes { editedAt } }
+    }
+  }
+}"""
+
+
+def _last_content_edit(
+    project: str, issue: int, events: list[dict], gh: GhRunner
+) -> tuple[datetime, str] | None:
+    """The time and kind ("title" or "body") of the issue's latest title or body edit; None when
+    neither was ever edited. Anything unreadable raises LeaseError: an approval whose content
+    cannot be dated never authorizes."""
+    latest: tuple[datetime, str] | None = None
+
+    def later(at: datetime, what: str) -> None:
+        nonlocal latest
+        if latest is None or at > latest[0]:
+            latest = (at, what)
+
+    for event in events:
+        if event.get("event") != "renamed":
+            continue
+        at = _parse_iso(str(event.get("created_at") or ""))
+        if at is None:
+            raise LeaseError(
+                f"issue #{issue}: a title edit carries no readable time; not authorizing"
+            )
+        later(at, "title")
+    owner, _, name = project.partition("/")
+    what = f"issue #{issue}: when its body was last edited could not be read"
+    args = ["api", "graphql", "-f", f"query={_ISSUE_EDITS_QUERY}"]
+    args += ["-f", f"owner={owner}", "-f", f"name={name}", "-F", f"number={issue}"]
+    try:
+        answer = json.loads(gh(args) or "null")
+    except Exception as exc:  # noqa: BLE001 -- an undatable body never authorizes
+        raise LeaseError(f"{what} ({str(exc).strip()[:200]}); not authorizing") from exc
+    data = answer.get("data") if isinstance(answer, dict) else None
+    repo = data.get("repository") if isinstance(data, dict) else None
+    node = repo.get("issue") if isinstance(repo, dict) else None
+    edits = node.get("userContentEdits") if isinstance(node, dict) else None
+    nodes = edits.get("nodes") if isinstance(edits, dict) else None
+    if (
+        not isinstance(answer, dict)
+        or answer.get("errors")
+        or not isinstance(node, dict)
+        or "lastEditedAt" not in node
+        or not isinstance(nodes, list)
+    ):
+        raise LeaseError(f"{what} (unreadable answer); not authorizing")
+    stamps = [node["lastEditedAt"]] if node["lastEditedAt"] is not None else []
+    stamps += [n.get("editedAt") if isinstance(n, dict) else None for n in nodes]
+    for stamp in stamps:
+        at = _parse_iso(stamp) if isinstance(stamp, str) else None
+        if at is None:
+            raise LeaseError(f"{what} (an edit carries no readable time); not authorizing")
+        later(at, "body")
+    return latest
+
+
 def authorize_labeler(
     project: str, issue: int, labels: str | Sequence[str], gh: GhRunner
 ) -> LabelerAuthorization:
@@ -1896,6 +2041,30 @@ def authorize_labeler(
             None,
             False,
             f"{', '.join(map(repr, removed))} was removed after it was last applied",
+        )
+    applied_at: dict[str, datetime] = {}
+    for key in keys:
+        at = _parse_iso(str(latest[key].get("created_at") or ""))
+        if at is None:
+            raise LeaseError(
+                f"issue #{issue}: the {spelled[key]!r} event carries no readable time; "
+                "not authorizing"
+            )
+        applied_at[key] = at
+    edited = _last_content_edit(project, issue, events, gh)
+    approved_from = min(applied_at.values())
+    if edited is not None and edited[0] >= approved_from:
+        stale = [spelled[key] for key in keys if applied_at[key] <= edited[0]]
+        return LabelerAuthorization(
+            issue,
+            approval,
+            "",
+            None,
+            False,
+            f"the issue's {edited[1]} was edited at {_iso(edited[0])}, after "
+            f"{', '.join(map(repr, stale))} was last applied: the approval does not cover the "
+            "current content. A maintainer must review it and re-apply (remove and add) "
+            + ("that label" if len(stale) == 1 else "those labels"),
         )
     appliers: dict[str, str] = {}
     for key in keys:

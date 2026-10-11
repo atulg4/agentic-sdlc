@@ -71,12 +71,15 @@ REQUIRED_CHECK = "test"
 #: status check pinned (`integration_id`) to any other app can never be satisfied by it.
 GITHUB_ACTIONS_INTEGRATION_ID = 15368
 
+#: The label a cloud routine puts on an issue it cannot work on (an invalid body); step 1 of the
+#: routine never selects an issue that carries it (Codex 4241196636).
+BLOCKED_LABEL = "claude-blocked"
 LABELS = {
     "claude-ready": ("0e8a16", "Specified precisely enough for the implementation worker"),
     HUMAN_REVIEW_LABEL: ("5319e7", "A human must review before merge"),
     IMPLEMENTATION_LABEL: ("1d76db", "Owner explicitly approved agent implementation"),
     "agentic-sdlc": ("0052cc", "Managed by the Forge agentic SDLC"),
-    "claude-blocked": ("b60205", "Agent could not proceed; needs the owner"),
+    BLOCKED_LABEL: ("b60205", "Agent could not proceed; needs the owner"),
     "in-progress": ("fbca04", "Leased: an agent/session is actively implementing this"),
 }
 
@@ -768,11 +771,15 @@ def _expr_str(value: str) -> str:
 
 
 def auto_plan_condition(ready: str, human_review: str, implementation: str) -> str:
-    """The `if:` of agent-auto-plan.yml's `preflight` job. Only the ready label triggers: an issue
-    opened with both labels fires one `labeled` run per label, and both would plan."""
+    """The `if:` of agent-auto-plan.yml's `preflight` job. Either planning label triggers (Codex
+    4241196642: removing `human-review-required` cancels planning, and re-adding it must start it
+    again), and both must be on the issue. An issue opened with both labels fires one `labeled`
+    run per label: they share one concurrency group, so they run one after the other, and the
+    `dedupe` job skips the second when a plan was already posted for the current approval."""
     return (
         "github.event.action == 'labeled' &&\n"
-        f"github.event.label.name == {_expr_str(ready)} &&\n"
+        f"(github.event.label.name == {_expr_str(ready)} ||\n"
+        f" github.event.label.name == {_expr_str(human_review)}) &&\n"
         "github.event.issue.pull_request == null &&\n"
         f"contains(github.event.issue.labels.*.name, {_expr_str(ready)}) &&\n"
         f"contains(github.event.issue.labels.*.name, {_expr_str(human_review)}) &&\n"
@@ -797,17 +804,20 @@ def auto_implement_condition(ready: str, human_review: str, implementation: str)
 
 def auto_concurrency_group(kind: str, triggers: Sequence[str], required: Sequence[str]) -> str:
     """The workflow `concurrency.group` of agent-auto-{kind}.yml (Codex 4240628982). A `labeled`
-    event of a label that TRIGGERS the work and an `unlabeled` event of a label the work REQUIRES
-    share one group per issue, so removing an approval label cancels a run that is queued or
-    running (`cancel-in-progress` is true for `unlabeled` runs only); every other label event --
-    the lease's own `in-progress` label included -- gets a group of its own and cancels nothing."""
+    event of a label that TRIGGERS the work, an `unlabeled` event of a label the work REQUIRES
+    and an `edited` event (Codex 4241196649: a title or body edit invalidates the approval)
+    share one group per issue, so removing an approval label or editing the issue cancels a run
+    that is queued or running (`cancel-in-progress` is true for `unlabeled` and `edited` runs
+    only, `AUTO_CANCEL_IN_PROGRESS`); every other label event -- the lease's own `in-progress`
+    label included -- gets a group of its own and cancels nothing."""
 
     def named(labels: Sequence[str]) -> str:
         return " || ".join(f"github.event.label.name == {_expr_str(label)}" for label in labels)
 
     return (
         f"${{{{ ((github.event.action == 'labeled' && ({named(triggers)})) ||\n"
-        f"(github.event.action == 'unlabeled' && ({named(required)}))) &&\n"
+        f"(github.event.action == 'unlabeled' && ({named(required)})) ||\n"
+        "github.event.action == 'edited') &&\n"
         f"format('forge-auto-{kind}-{{0}}', github.event.issue.number) ||\n"
         f"format('forge-auto-{kind}-{{0}}-run-{{1}}',\n"
         "github.event.issue.number, github.run_id) }}"
@@ -951,27 +961,43 @@ Read `AGENTS.md` first; it is the authoritative agent guide. Highlights:
 """
 
 
+def _routine_search(spec: OnboardSpec) -> str:
+    """The GitHub issue search step 1 of the cloud routine runs: every approval label, no
+    `claude-blocked`, oldest first. (Open PRs are excluded by `sdlcctl claim`, which refuses an
+    issue with one.)"""
+    labels = (spec.ready_label, HUMAN_REVIEW_LABEL, IMPLEMENTATION_LABEL)
+    terms = [f"label:{json.dumps(label)}" for label in labels]
+    return " ".join([*terms, f"-label:{json.dumps(BLOCKED_LABEL)}", "sort:created-asc"])
+
+
 def render_cloud_routine_md(spec: OnboardSpec) -> str:
+    search = shlex.quote(_routine_search(spec))
     prompt = f"""Repository: {spec.project_id}. Every run:
 1. List open issues that carry ALL of: {_md_code(spec.ready_label)}, {_md_code(HUMAN_REVIEW_LABEL)},
    {_md_code(IMPLEMENTATION_LABEL)}
-   and have no open PR referencing them. Take the oldest one; if none, stop.
+   and do NOT carry {_md_code(BLOCKED_LABEL)}, and have no open PR referencing them:
+   `gh issue list --repo {spec.project_id} --state open --search {search}`.
+   Take the oldest one; if none, stop.
 1a. Authorize the approval before claiming (labels alone are no authority: Triage users can
    apply them):
    `sdlcctl authorize-labeler --project {spec.project_id} --issue <n>
     --label {shlex.quote(IMPLEMENTATION_LABEL)} --label {shlex.quote(spec.ready_label)}
     --label {shlex.quote(HUMAN_REVIEW_LABEL)}`.
    Proceed ONLY on exit 0 (whoever applied EACH of the three labels last has
-   write/maintain/admin). Exit 3: not authorized -- do not claim; unless you already commented
-   so on this issue, comment that a maintainer must re-apply the labels, then take the next
-   issue.
+   write/maintain/admin, and the title and body were last edited BEFORE each label was last
+   applied: Codex 4241196649). Exit 3: not authorized -- do not claim; unless you already
+   commented so on this issue, comment that a maintainer must review it and re-apply the
+   labels, then take the next issue.
    Any other exit: authorization could not be verified -- do not claim, take the next issue.
 1b. Claim it before touching code:
    `sdlcctl claim --project {spec.project_id} --issue <n> --agent cloud-routine
     --session <run id> --branch forge/issue-<n>`.
    If the claim is refused (exit 2), skip that issue and take the next one.
 2. Validate the issue body has the required sections (Summary, Acceptance Criteria, Required Tests,
-   Non-Goals, Dependencies). If not, comment what is missing, add label `claude-blocked`, stop.
+   Non-Goals, Dependencies). If not, retire it so it cannot starve the queue (Codex
+   4241196636): comment what is missing, add label {_md_code(BLOCKED_LABEL)} (step 1 skips
+   it from then on), then `sdlcctl release --project {spec.project_id} --issue <n>
+   --session <run id>`; then go back to step 1 for the next issue.
 3. On a new branch `forge/issue-<n>`, implement the smallest change that satisfies the acceptance
    criteria, tests first. Never touch `forbidden_paths` from agentic-sdlc.toml; stay within
    max_changed_files={spec.max_changed_files} and max_diff_lines={spec.max_diff_lines}.
@@ -999,9 +1025,13 @@ definitive write/maintain/admin permission for whoever applied EACH label of the
 ({_md_code(IMPLEMENTATION_LABEL)}, {_md_code(spec.ready_label)},
 {_md_code(HUMAN_REVIEW_LABEL)}) most recently -- so a Triage user cannot complete the set after
 a writer approved (a 404 is unauthorized; any other failure is unverifiable and the issue is
-skipped) -- and runs it AGAIN right before pushing, so a label removed and re-applied while
-the routine worked stops the push. Suggested routine prompt (create it with the
-`schedule` skill or the claude.ai routines UI):
+skipped) -- and requires the issue's title and body to have been last edited BEFORE each of
+those labels was last applied, so an edit after approval is never implemented unapproved (an
+edit time that cannot be read is unverifiable). It runs it AGAIN right before pushing,
+so a label removed and re-applied, or the issue edited, while the routine worked stops the
+push. An issue whose body is not a valid work request is labelled
+{_md_code(BLOCKED_LABEL)} and its lease released; step 1 never selects a blocked issue.
+Suggested routine prompt (create it with the `schedule` skill or the claude.ai routines UI):
 
 {_md_block(prompt.splitlines())}
 
@@ -1428,7 +1458,9 @@ def _render_workflow(name: str, spec: OnboardSpec, issue_expr: str | None = None
         # Codex 4240628982: removing an approval label cancels a queued or running run.
         "AUTO_CONCURRENCY_GROUP": _yaml_folded(
             auto_concurrency_group(
-                "plan", [spec.ready_label], [spec.ready_label, HUMAN_REVIEW_LABEL]
+                "plan",
+                [spec.ready_label, HUMAN_REVIEW_LABEL],
+                [spec.ready_label, HUMAN_REVIEW_LABEL],
             )
             if name == "agent-auto-plan.yml"
             else auto_concurrency_group(
@@ -3772,7 +3804,12 @@ def _ruleset_branch_scope(
 
 
 def publisher_branch_scope_problems(
-    rulesets: Sequence[tuple[dict, object]], branch: PublisherValue, default_branch: str
+    rulesets: Sequence[tuple[dict, object]],
+    branch: PublisherValue,
+    default_branch: str,
+    *,
+    who: str = "the publisher",
+    namespace: str = "agent/**",
 ) -> list[str]:
     """The rulesets (summary, detail) whose branch targeting matches SOME of the publisher's
     branches but not others -- `agent/issue-<N>-<RUN>` for every issue and run -- or cannot be
@@ -3792,16 +3829,16 @@ def publisher_branch_scope_problems(
             continue
         if not isinstance(detail, dict):
             problems.append(
-                f"{name}: could not be read → check whether it targets agent/** branches"
+                f"{name}: could not be read → check whether it targets {namespace} branches"
             )
             continue
         if detail.get("enforcement") == "disabled" or detail.get("target") in ("tag", "push"):
             continue
         if _ruleset_branch_scope(detail.get("conditions"), ref, default_branch) is None:
             problems.append(
-                f"{name}: targets some of the publisher's branches {branch.template!r} but "
+                f"{name}: targets some of {who}'s branches {branch.template!r} but "
                 "doctor cannot prove it targets all or none of them (it depends on the issue or "
-                "run number) → verify it does not block the publisher's push"
+                f"run number) → verify it does not block {who}'s push"
             )
     return problems
 
@@ -3891,6 +3928,9 @@ def classic_publisher_branch_problems(
     answer: object,
     branch: PublisherValue,
     pusher: PublisherPusher | str = "the pushing credential was not read",
+    *,
+    who: str = "the publisher",
+    namespace: str = "agent/**",
 ) -> list[str]:
     """What the repository's CLASSIC branch-protection rules do to the publisher's push of a
     new `agent/issue-<N>-<RUN>` branch (Codex 4239397979). A rule's pattern (fnmatch with
@@ -3912,14 +3952,14 @@ def classic_publisher_branch_problems(
         why = answer.why if isinstance(answer, Unreadable) else "unreadable answer"
         return [
             f"could not read the classic branch-protection rules ({why}; GraphQL "
-            "repository.branchProtectionRules) → check that no rule pattern matches agent/** "
+            f"repository.branchProtectionRules) → check that no rule pattern matches {namespace} "
             "branches"
         ]
     problems: list[str] = []
     if (rules.get("pageInfo") or {}).get("hasNextPage"):
         problems.append(
             "more than 100 classic branch-protection rules: the rest were not inspected → check "
-            "that none matches agent/** branches"
+            f"that none matches {namespace} branches"
         )
     ref = PublisherValue(
         ("refs/heads/" + branch.literals[0], *branch.literals[1:]), branch.variables
@@ -3955,7 +3995,7 @@ def classic_publisher_branch_problems(
                 needs.append("a push/creation allowlist that could not be read")
             elif not isinstance(pusher, PublisherPusher):
                 needs.append(
-                    "a push/creation allowlist, and which actor the publisher pushes as could "
+                    f"a push/creation allowlist, and which actor {who} pushes as could "
                     f"not be determined ({pusher})"
                 )
             elif not any(
@@ -3968,15 +4008,178 @@ def classic_publisher_branch_problems(
                 needs.append(f"a push/creation allowlist without the pushing actor {pusher.label}")
         if scope is None:
             problems.append(
-                f"{name}: matches some of the publisher's branches {branch.template!r} or "
-                "cannot be evaluated → verify it does not block the publisher's push"
+                f"{name}: matches some of {who}'s branches {branch.template!r} or "
+                f"cannot be evaluated → verify it does not block {who}'s push"
                 + (f" (it requires {'; '.join(needs)})" if needs else "")
             )
         elif needs:
             problems.append(
-                f"{name}: matches every publisher branch {branch.template!r} and requires "
-                f"{'; '.join(needs)}, which the publisher's push cannot meet → exempt agent/** "
+                f"{name}: matches every one of {who}'s branches {branch.template!r} and "
+                f"requires {'; '.join(needs)}, which {who}'s push cannot meet → exempt {namespace} "
                 "from the rule or narrow its pattern"
+            )
+    return problems
+
+
+# ---- Codex 4241196640: in cloud-routine mode the routine itself pushes `forge/issue-<N>` with
+# the repository owner's credentials (a user, not an App). A ruleset or classic protection rule
+# targeting that namespace is invisible in the default branch's rules, so the same branch-domain
+# checks run against the routine's branch; the actor is a user, so an App allowlist or bypass
+# cannot be matched against it: a push restriction is an owner TODO, as is any rule doctor
+# cannot evaluate. The routine's commit message and identity are the owner's: unknowable here.
+CLOUD_BRANCH_RULES_CHECK = (
+    "effective rules on the cloud routine's forge/issue-<N> branches allow its push"
+)
+CLOUD_ROUTINE_BRANCH = PublisherValue(("forge/issue-", ""), ("ISSUE_NUMBER",))
+CLOUD_ROUTINE_WHO = "the cloud routine"
+CLOUD_ROUTINE_NAMESPACE = "forge/**"
+CLOUD_ROUTINE_PUSHER = (
+    "the repository owner's own credentials -- a user account, which doctor cannot match "
+    "against an allowlist or bypass"
+)
+
+
+def _branch_ruleset_details(
+    gh: GhRunner, project_id: str, listed: list[dict]
+) -> list[tuple[dict, object]]:
+    """(summary, detail) of every listed ruleset that can target branches (not disabled, not a
+    tag or push ruleset); a detail that cannot be read is whatever `_safe_json` returned."""
+    details: list[tuple[dict, object]] = []
+    for summary in listed:
+        skip = summary.get("enforcement") == "disabled" or summary.get("target") in ("tag", "push")
+        detail = (
+            None
+            if skip
+            else _safe_json(gh, ["api", f"repos/{project_id}/rulesets/{summary.get('id')}"])
+        )
+        details.append((summary, detail))
+    return details
+
+
+def _cloud_branch_rules_check(
+    gh: GhRunner, project_id: str, listed: object, effective_branch: str
+) -> Check:
+    """CLOUD_BRANCH_RULES_CHECK: rulesets (by their branch targeting over every issue number),
+    classic protection patterns and the effective rules of one `forge/issue-<N>` branch, judged
+    for the cloud routine's push. Anything unreadable is a manual TODO."""
+    problems: list[str] = []
+    who, namespace = CLOUD_ROUTINE_WHO, CLOUD_ROUTINE_NAMESPACE
+    if isinstance(listed, Unreadable):
+        problems.append(
+            f"could not list the rulesets that apply to {project_id} ({listed.why}) → check "
+            f"that no org or enterprise ruleset targets {namespace} branches"
+        )
+    else:
+        problems += publisher_branch_scope_problems(
+            _branch_ruleset_details(gh, project_id, listed),
+            CLOUD_ROUTINE_BRANCH,
+            effective_branch,
+            who=who,
+            namespace=namespace,
+        )
+    owner, _, name = project_id.partition("/")
+    problems += classic_publisher_branch_problems(
+        _safe_json(
+            gh,
+            [
+                "api",
+                "graphql",
+                "-f",
+                f"query={CLASSIC_PROTECTION_QUERY}",
+                "-F",
+                f"owner={owner}",
+                "-F",
+                f"name={name}",
+            ],
+        ),
+        CLOUD_ROUTINE_BRANCH,
+        CLOUD_ROUTINE_PUSHER,
+        who=who,
+        namespace=namespace,
+    )
+    branch = CLOUD_ROUTINE_BRANCH.example
+    rules = _paged_items(gh, f"repos/{project_id}/rules/branches/{_q(branch)}")
+    if isinstance(rules, Unreadable):
+        problems.append(
+            f"could not read the rules that apply to {branch} "
+            f"(GET repos/{project_id}/rules/branches/{{branch}}) → check org and enterprise "
+            f"rulesets targeting {namespace} by hand"
+        )
+    else:
+        problems += cloud_branch_rule_problems(rules, branch)
+    problems = list(dict.fromkeys(problems))
+    return Check(
+        CLOUD_BRANCH_RULES_CHECK,
+        not problems,
+        "; ".join(problems)
+        if problems
+        else f"no rule blocks the cloud routine's push to any {CLOUD_ROUTINE_BRANCH.template}",
+        manual=True,
+    )
+
+
+def cloud_branch_rule_problems(rules: Sequence[dict], branch: str) -> list[str]:
+    """What in the EFFECTIVE rules of `branch` (one `forge/issue-<N>` branch the cloud routine
+    creates and pushes as the owner) can reject that push. Only rules that cannot reject a new
+    branch carrying new commits pass, plus a branch-name pattern proven for every issue number
+    and required checks not enforced on creation; everything else is reported, and the
+    commit-metadata patterns (the owner's own message and identity) are owner TODOs."""
+    problems: list[str] = []
+    for rule in rules:
+        kind = str(rule.get("type") or "")
+        params = rule.get("parameters") if isinstance(rule.get("parameters"), dict) else {}
+        source = (
+            f"{rule.get('ruleset_source_type') or 'ruleset'} "
+            f"{rule.get('ruleset_source') or ''} (ruleset {rule.get('ruleset_id', '?')})"
+        ).replace("  ", " ")
+        fix = f"exempt {CLOUD_ROUTINE_NAMESPACE} or give the repository owner a bypass"
+        if kind in _PUBLISHER_PUSH_COMPATIBLE:
+            continue
+        if kind == "required_status_checks" and params.get("do_not_enforce_on_create") is True:
+            continue  # the routine creates its branch
+        if kind == "branch_name_pattern":
+            shown = f"{params.get('operator')} {params.get('pattern')!r}"
+            verdict, witness = _value_verdict(params, CLOUD_ROUTINE_BRANCH)
+            if verdict is True:
+                continue
+            problems.append(
+                f"{source}: requires the branch name to match {shown}; the cloud routine's "
+                + (
+                    f"branch {witness!r} does not, so its push is rejected"
+                    if verdict is False
+                    else f"branch {CLOUD_ROUTINE_BRANCH.template!r} cannot be proven to for "
+                    "every issue number"
+                )
+                + f" → {fix}"
+            )
+        elif kind in _PATTERN_RULE_FIELDS:
+            what = _PATTERN_RULE_FIELDS[kind][1]
+            problems.append(
+                f"{source}: restricts the {what} ({params.get('operator')} "
+                f"{params.get('pattern')!r}) of what is pushed to {branch}; the cloud routine "
+                f"commits with the owner's own {what.split()[-1]}, which doctor cannot read → "
+                "verify the routine's commits satisfy it"
+            )
+        elif kind == "creation":
+            problems.append(
+                f"{source}: restricts creating {branch}, which the cloud routine's push creates "
+                f"as {CLOUD_ROUTINE_PUSHER} → {fix}"
+            )
+        elif kind == "update":
+            problems.append(
+                f"{source}: restricts updates to {branch}, which the cloud routine pushes as "
+                f"{CLOUD_ROUTINE_PUSHER} → {fix}"
+            )
+        elif kind == "required_signatures":
+            problems.append(
+                f"{source}: requires signed commits on {branch}; the cloud routine's commits "
+                "must be signed with a key verified for the owner → configure signing for the "
+                f"routine or {fix}"
+            )
+        else:
+            problems.append(
+                f"{source}: rule {kind or '?'!r} applies to {branch} and can reject the cloud "
+                f"routine's push → {fix}, or verify the push satisfies it"
             )
     return problems
 
@@ -6041,7 +6244,7 @@ _LABEL_CONDITION_JOBS = {
 #: report a FAILED authorization from one too (`authorization_failed`, Codex 4239667541).
 AUTHORIZATION_FAILED_JOB = "authorization_failed"
 _HOSTED_JOBS = {
-    "agent-auto-plan.yml": frozenset({"preflight", AUTHORIZATION_FAILED_JOB}),
+    "agent-auto-plan.yml": frozenset({"preflight", "dedupe", AUTHORIZATION_FAILED_JOB}),
     "agent-auto-implement.yml": frozenset({"authorize", AUTHORIZATION_FAILED_JOB}),
 }
 
@@ -7653,6 +7856,11 @@ def doctor(
         )
     )
 
+    # --- Codex 4241196640: the cloud routine creates and pushes forge/issue-<N> as the owner:
+    # the same branch-domain checks, against its branch and (user) actor.
+    if cloud:
+        add(_cloud_branch_rules_check(gh, project_id, listed, effective_branch))
+
     # --- the publisher creates and pushes agent/... branches: rulesets targeting only that
     # namespace (org/enterprise ones included) are invisible in the default branch's rules.
     if not cloud:
@@ -7677,22 +7885,10 @@ def doctor(
                     "check that no org or enterprise ruleset targets only some agent/** branches"
                 )
             else:
-                details: list[tuple[dict, object]] = []
-                for summary in listed:
-                    skip = summary.get("enforcement") == "disabled" or summary.get("target") in (
-                        "tag",
-                        "push",
-                    )
-                    detail = (
-                        None
-                        if skip
-                        else _safe_json(
-                            gh, ["api", f"repos/{project_id}/rulesets/{summary.get('id')}"]
-                        )
-                    )
-                    details.append((summary, detail))
                 branch_problems += publisher_branch_scope_problems(
-                    details, publisher.branch, effective_branch
+                    _branch_ruleset_details(gh, project_id, listed),
+                    publisher.branch,
+                    effective_branch,
                 )
             owner, _, name = project_id.partition("/")
             branch_problems += classic_publisher_branch_problems(

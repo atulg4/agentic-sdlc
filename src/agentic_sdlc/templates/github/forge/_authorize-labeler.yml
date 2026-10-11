@@ -9,6 +9,7 @@
     outputs:
       authorized: ${{ steps.authorize.outputs.authorized }}
       approver: ${{ steps.authorize.outputs.approver }}
+      approved_at: ${{ steps.authorize.outputs.approved_at }}
     steps:
       - name: Require repository write authority from the labeler and the approver
         id: authorize
@@ -33,23 +34,34 @@
           # label of the set (REQUIRED_LABELS, a JSON list) most recently -- the same rule as
           # `sdlcctl authorize-labeler`. History that cannot be read, or that never shows a label
           # applied, FAILS the job; a label removed since it was last applied is unauthorized.
+          # Codex 4241196649: the approval is bound to the content it saw -- the title (its
+          # `renamed` events) and the body (GraphQL lastEditedAt / userContentEdits) must have been
+          # last edited BEFORE the latest application of EACH label; an issue edited since is
+          # unauthorized until the labels are re-applied, and an edit time that cannot be read
+          # FAILS the job. (An `edited` event also cancels a queued or running run: concurrency.)
           approver=""
           labelers=""
           removed=false
+          renamed=""
           for attempt in 1 2 3; do
             removed=false
             approver=""
             labelers=""
+            renamed=""
             if events="$(gh api --method GET --paginate \
               "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/events?per_page=100" \
-              --jq '.[] | select(.event == "labeled" or .event == "unlabeled")
-                | {event, name: .label.name, login: .actor.login}' 2>"$errors")" &&
+              --jq '.[] | select(.event == "labeled" or .event == "unlabeled" or .event == "renamed")
+                | {event, name: .label.name, login: .actor.login, at: .created_at}' 2>"$errors")" &&
               latest="$(jq -sc --argjson labels "$REQUIRED_LABELS" '
-                if any(.[]; (.name | type) != "string") then error("a label event names no label")
-                else . as $events | [$labels[] as $label
+                [.[] | select(.event != "renamed")] as $events
+                | if any($events[]; (.name | type) != "string")
+                then error("a label event names no label")
+                else [$labels[] as $label
                   | ([$events[] | select((.name | ascii_downcase) == ($label | ascii_downcase))]
                     | last) // {event: "none", name: $label}]
-                end' <<<"$events" 2>"$errors")"; then
+                end' <<<"$events" 2>"$errors")" &&
+              renamed="$(jq -sr '[.[] | select(.event == "renamed") | .at | fromdateiso8601]
+                | max // 0' <<<"$events" 2>"$errors")"; then
               if jq -e 'any(.[]; .event == "unlabeled")' <<<"$latest" >/dev/null; then
                 removed=true
                 printf '::warning::attempt %s: an approval label was removed after it was last applied\n' \
@@ -97,6 +109,49 @@
               "$REQUIRED_LABELS" "$ISSUE_NUMBER"
             exit 1
           fi
+          if ! approved_at="$(jq -er '[.[] | .at | fromdateiso8601] | min' <<<"$latest" 2>"$errors")"; then
+            printf '::error::Could not read when each of %s was applied to issue #%s; failing instead of authorizing.\n' \
+              "$REQUIRED_LABELS" "$ISSUE_NUMBER"
+            exit 1
+          fi
+          edited=""
+          for attempt in 1 2 3; do
+            if answer="$(gh api graphql \
+              -f query='query($owner: String!, $name: String!, $number: Int!) {
+                repository(owner: $owner, name: $name) { issue(number: $number) {
+                  lastEditedAt userContentEdits(last: 1) { nodes { editedAt } } } } }' \
+              -f owner="${GITHUB_REPOSITORY%%/*}" -f name="${GITHUB_REPOSITORY#*/}" \
+              -F number="$ISSUE_NUMBER" 2>"$errors")" &&
+              edited="$(jq -er --argjson renamed "$renamed" '
+                .data.repository.issue as $issue
+                | if (.errors // null) != null or ($issue | type) != "object"
+                    or ($issue | has("lastEditedAt") | not)
+                    or ($issue.userContentEdits.nodes | type) != "array"
+                  then error("no edit times in the answer")
+                  else [$renamed, ($issue.lastEditedAt | if . == null then empty
+                      else fromdateiso8601 end),
+                    ($issue.userContentEdits.nodes[] | .editedAt | fromdateiso8601)] | max
+                  end' <<<"$answer" 2>"$errors")"; then
+              break
+            fi
+            edited=""
+            printf '::warning::attempt %s: could not read when issue #%s was last edited: %s\n' \
+              "$attempt" "$ISSUE_NUMBER" "$(head -c 300 "$errors" | tr '\n' ' ')"
+            if [ "$attempt" -lt 3 ]; then
+              sleep "$((attempt * 10))"
+            fi
+          done
+          if ! [[ "$edited" =~ ^[0-9]+$ && "$approved_at" =~ ^[0-9]+$ ]]; then
+            printf '::error::Could not read when issue #%s was last edited; failing instead of authorizing an approval that may not cover its current content. Re-run this job.\n' \
+              "$ISSUE_NUMBER"
+            exit 1
+          fi
+          if [ "$edited" -ge "$approved_at" ]; then
+            printf 'authorized=false\napprover=\n' >> "$GITHUB_OUTPUT"
+            printf '::notice::AUTHORIZED_WORK not scheduled: issue #%s was edited after its approval labels were applied. A maintainer must review the current title and body and re-apply (remove and add) each of %s.\n' \
+              "$ISSUE_NUMBER" "$REQUIRED_LABELS"
+            exit 0
+          fi
           mapfile -t logins <<<"$labelers"
           for login in "$SENDER" "$ACTOR" "${logins[@]}"; do
             encoded="$(jq -rn --arg login "$login" '$login | @uri')"
@@ -129,7 +184,8 @@
               *) authorized=false ;;
             esac
           done
-          printf 'authorized=%s\napprover=%s\n' "$authorized" "$approver" >> "$GITHUB_OUTPUT"
+          printf 'authorized=%s\napprover=%s\napproved_at=%s\n' "$authorized" "$approver" \
+            "$approved_at" >> "$GITHUB_OUTPUT"
           if [ "$authorized" != true ]; then
             printf '::notice::AUTHORIZED_WORK not scheduled: the labeler lacks repository write authority.\n'
           fi

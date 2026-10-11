@@ -159,8 +159,14 @@ read to the last page; a page that cannot be read, a manual link whose PR cannot
 identified, or a cross-referencing PR of another repository that cannot be read (inaccessible,
 deleted, API failure, more than 100 closing issues) refuses the claim rather than reading as
 "no PR" -- the refusal names that PR; there is no override, so check it by hand and make it
-readable to the `gh` login (or let the outage pass) before retrying;
-expired leases can be taken over (the takeover is commented). Markers count only when posted by
+readable to the `gh` login (or let the outage pass) before retrying.
+Those PR signals are read again right after the claim marker wins arbitration (Codex
+4241196645): a PR opened while the claim was being made -- or a re-read that fails -- retracts
+the marker (a release marker) and the claim fails naming the PR. The lease's expiry is computed
+from the clock immediately before its marker is posted, and arbitration re-reads the clock
+(Codex 4241196647): a marker that has already expired by then (slow reads, a short
+`lease_ttl_minutes`) is retracted and the claim fails, so a reported claim is always live.
+Expired leases can be taken over (the takeover is commented). Markers count only when posted by
 a user whose repository permission (read per run from the collaborator permission API) is
 write, maintain or admin, by `github-actions[bot]`, or by the Forge Publisher App's bot (a
 `<slug>[bot]` whose slug contains `agentic-sdlc`, or exactly the logins in

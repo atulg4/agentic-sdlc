@@ -2,7 +2,7 @@ name: Automatic planning
 
 on:
   issues:
-    types: [labeled, unlabeled]
+    types: [labeled, unlabeled, edited]
 
 permissions: {}
 
@@ -13,10 +13,13 @@ permissions: {}
 # group per issue; an `unlabeled` run cancels what is in it (and itself starts nothing: its label
 # is gone, so the label condition is false), while `labeled` runs queue as before. Any later run
 # re-authorizes from the label history. Other label events (the lease's `in-progress` label among
-# them) get a group of their own, so they never cancel the work.
+# them) get a group of their own, so they never cancel the work. Codex 4241196649: an approval
+# covers the title and body it saw, so an `edited` event joins the group and cancels too (and
+# starts nothing itself); a later run is authorized only once the labels are re-applied after
+# the edit.
 concurrency:
   group: AUTO_CONCURRENCY_GROUP
-  cancel-in-progress: ${{ github.event.action == 'unlabeled' }}
+  cancel-in-progress: ${{ github.event.action == 'unlabeled' || github.event.action == 'edited' }}
 
 jobs:
   # Anyone may open the work-request issue template, which applies the planning labels itself.
@@ -25,14 +28,76 @@ jobs:
   # (the reusable workflow checks again; this check only keeps unauthorized runs off it).
   # Not tunable: doctor requires this job, its runner and the `plan` gate exactly as generated.
   preflight:
-    # Only the ready label triggers. An issue opened with both labels fires one `labeled` run per
-    # label, and both would see both labels and plan twice; the other is required, not a trigger.
+    # Either planning label triggers (Codex 4241196642: re-adding a removed label must restart
+    # the planning its removal cancelled); both must be on the issue. An issue opened with both
+    # labels fires one `labeled` run per label: the shared concurrency group runs them one after
+    # the other, and `dedupe` skips the later one once a plan covers the approval.
     if: AUTO_PLAN_IF
 LABELER_AUTHORIZATION
 
-  plan:
+  # Duplicate suppression: no new plan when the platform's plan comment (posted by
+  # github-actions[bot], starting "## Agentic SDLC plan") is newer than the latest application of
+  # each planning label -- a plan already covers this approval. Re-applying a label (after a
+  # cancellation, an edit or a failure) makes the approval newer than any plan, so it plans
+  # again. Comments that cannot be read FAIL the job (reported by notify_failure), never plan
+  # twice in silence. Not tunable: GitHub-hosted, read-only.
+  dedupe:
     needs: preflight
     if: needs.preflight.outputs.authorized == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: read
+    outputs:
+      fresh: ${{ steps.dedupe.outputs.fresh }}
+    steps:
+      - name: Skip planning when a plan already covers the current approval
+        id: dedupe
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          APPROVED_AT: ${{ needs.preflight.outputs.approved_at }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$APPROVED_AT" =~ ^[0-9]+$ ]]; then
+            printf '::error::The approval time of issue #%s is unknown; not planning.\n' "$ISSUE_NUMBER"
+            exit 1
+          fi
+          errors="$(mktemp)"
+          planned=""
+          for attempt in 1 2 3; do
+            if planned="$(gh api --method GET --paginate \
+              "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments?per_page=100" \
+              --jq '.[] | select(.user.login == "github-actions[bot]"
+                and ((.body // "") | startswith("## Agentic SDLC plan")))
+                | .created_at | fromdateiso8601' 2>"$errors")"; then
+              break
+            fi
+            planned="unreadable"
+            printf '::warning::attempt %s: could not read the comments of issue #%s: %s\n' \
+              "$attempt" "$ISSUE_NUMBER" "$(head -c 300 "$errors" | tr '\n' ' ')"
+            if [ "$attempt" -lt 3 ]; then
+              sleep "$((attempt * 10))"
+            fi
+          done
+          if [ "$planned" = unreadable ]; then
+            printf '::error::Could not read the comments of issue #%s; not planning.\n' "$ISSUE_NUMBER"
+            exit 1
+          fi
+          fresh=true
+          while IFS= read -r at; do
+            if [ -n "$at" ] && [ "$at" -gt "$APPROVED_AT" ]; then
+              fresh=false
+            fi
+          done <<<"$planned"
+          printf 'fresh=%s\n' "$fresh" >> "$GITHUB_OUTPUT"
+          if [ "$fresh" != true ]; then
+            printf '::notice::A plan was already posted for the current approval of issue #%s; not planning again.\n' "$ISSUE_NUMBER"
+          fi
+
+  plan:
+    needs: [preflight, dedupe]
+    if: needs.preflight.outputs.authorized == 'true' && needs.dedupe.outputs.fresh == 'true'
     permissions:
       contents: read
       issues: write
@@ -50,10 +115,11 @@ LABELER_AUTHORIZATION
       PLATFORM_READ_TOKEN: ${{ secrets.PLATFORM_READ_TOKEN }}
 
   notify_failure:
-    needs: [plan]
+    needs: [dedupe, plan]
     if: >-
       ${{ always() &&
-      (needs.plan.result == 'failure' || needs.plan.result == 'cancelled') }}
+      (needs.dedupe.result == 'failure' || needs.dedupe.result == 'cancelled' ||
+      needs.plan.result == 'failure' || needs.plan.result == 'cancelled') }}
     runs-on: RUNS_ON_YAML
     permissions:
       issues: write
