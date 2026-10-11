@@ -1,8 +1,10 @@
 # GitHub Publisher App
 
 The publisher App is the only identity allowed to open an automated draft pull
-request and post its issue comment. It is separate from Codex, Claude, the
-user's personal login, and the normal Actions token.
+request and post its issue comment, and the identity that writes the Actions
+path's issue lease (claim and release marker comments and the `in-progress`
+label). It is separate from Codex, Claude, the user's personal
+login, and the normal Actions token.
 
 ## Create the App
 
@@ -39,13 +41,30 @@ access is explicitly limited.
 
 ## Runtime Boundary
 
-The implementation workflow creates an installation token only in the final
-publisher job. No owner or repository list is supplied, so the token is scoped
-to the current repository. It requests only the three permissions above,
-expires after about one hour, and is revoked when the job ends. The native job
-token pushes the already attested branch; the App token opens the pull request
-and posts its issue comment. The AI and verification jobs never receive the App
-key or installation token.
+`reusable-implement.yml` mints a Publisher App installation token
+(`actions/create-github-app-token`) in three places, each in its own job and
+each requesting only what that job needs. No owner or repository list is
+supplied, so every token is scoped to the current repository; each expires
+after about one hour and is revoked when its job ends.
+
+| Job | When | Permissions requested | Used for |
+|---|---|---|---|
+| `prepare` | Every run, as the job's last steps, after the approval, dependency and duplicate-PR checks pass | Issues: write, Pull requests: read | `sdlcctl claim`: reads the issue's lease history and its open/linked pull requests, then posts the claim marker comment and adds the `in-progress` label (the Actions claim assigns no one). A held lease or an open PR for the issue refuses the run. |
+| `publish_draft` | After the patch is generated, verified and attested | Contents: read, Issues: write, Pull requests: write | Opens the draft pull request, posts its issue comment, and releases the lease (`sdlcctl release`: release marker and label cleanup). |
+| `release_lease_on_failure` | Only when `prepare` succeeded and a later job did not | Issues: write | Releases the lease so another agent can retry. |
+
+The `prepare` and `release_lease_on_failure` tokens never reach the pull
+request: they cannot open, edit or merge one, and neither job pushes. The
+native job token pushes the already attested branch in `publish_draft`; the App
+token never pushes. The AI and verification jobs (`generate_patch`, `verify`,
+`attest_patch`) never receive the App key or any installation token.
+
+The lease markers count only because the App's bot is a trusted marker author:
+`sdlcctl` and the commit-guard hook accept markers from the Publisher App bot
+(a `<slug>[bot]` login whose slug contains `agentic-sdlc`, or exactly the
+logins in `FORGE_LEASE_BOT_LOGINS`) and `github-actions[bot]`, besides users
+with write access. Suspending or uninstalling the App therefore also stops the
+Actions path from claiming issues.
 
 GitHub limits workflow chaining for events created with `GITHUB_TOKEN`. The
 framework uses that behavior intentionally for the branch push, preventing

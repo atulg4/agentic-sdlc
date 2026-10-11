@@ -2845,19 +2845,21 @@ def _workflow_job_contexts(
     platform_repository: str | None,
     load_callee: CalleeLoader | None,
     seen: tuple[object, ...],
-) -> set[str]:
-    """The exact contexts the jobs of one workflow report (`_job_context_names`). A job that
-    calls a reusable workflow reports `caller / callee-job` for each job of the callee as GitHub
-    would run it (`_callee_doc`), recursively; an unresolvable callee contributes nothing (fail
-    closed), and so does a matrix caller (its `name (...) / ...` contexts are not enumerated)."""
-    exact: set[str] = set()
+) -> list[str]:
+    """The exact contexts the jobs of one workflow report (`_job_context_names`), once per job
+    that reports it -- two jobs of one workflow reporting the same name are two producers. A job
+    that calls a reusable workflow reports `caller / callee-job` for each job of the callee as
+    GitHub would run it (`_callee_doc`), recursively; an unresolvable callee contributes nothing
+    (fail closed), and so does a matrix caller (its `name (...) / ...` contexts are not
+    enumerated)."""
+    exact: list[str] = []
     jobs = doc.get("jobs")
     for job_id, job in (jobs if isinstance(jobs, dict) else {}).items():
         if not isinstance(job, dict):
             continue
         names = _job_context_names(str(job_id), job)
         if not job.get("uses"):
-            exact.update(names)
+            exact.extend(names)
             continue
         strategy = job.get("strategy")
         if isinstance(strategy, dict) and strategy.get("matrix"):
@@ -2869,7 +2871,7 @@ def _workflow_job_contexts(
             continue
         inner = _workflow_job_contexts(base, called, platform_repository, load_callee, (*seen, key))
         for name in names:
-            exact.update(f"{name} / {context}" for context in inner)
+            exact.extend(f"{name} / {context}" for context in inner)
     return exact
 
 
@@ -2908,11 +2910,22 @@ def _reports_on_merge_groups(doc: dict, default_branch: str) -> bool:
 class ProducedContexts:
     """What a workflow set reports: the exact contexts of the workflows that run on every pull
     request into the default branch, those of the workflows that run on every merge group (a
-    merge queue's checks), and whether any workflow declares `merge_group` at all."""
+    merge queue's checks), and whether any workflow declares `merge_group` at all.
+
+    `pull_request_producers` / `merge_group_producers` keep WHO reports each context on that
+    event: one entry (the workflow file) per job that reports it. A required context with more
+    than one producer for the same event is ambiguous (`ambiguous_context`); an empty mapping
+    (a hand-built value) records no producers, so nothing is ambiguous."""
 
     pull_request: frozenset[str] = frozenset()
     merge_group: frozenset[str] = frozenset()
     merge_group_declared: bool = False
+    pull_request_producers: Mapping[str, tuple[str, ...]] = field(
+        default_factory=dict, compare=False, hash=False
+    )
+    merge_group_producers: Mapping[str, tuple[str, ...]] = field(
+        default_factory=dict, compare=False, hash=False
+    )
 
 
 def workflow_check_contexts(
@@ -2929,8 +2942,8 @@ def workflow_check_contexts(
     A workflow whose file name is in `inactive` (disabled in Actions) reports nothing: it does
     not respond to its triggers. Doctor passes the DEFAULT BRANCH's workflow set, not the
     checkout."""
-    pull_request: set[str] = set()
-    merge_group: set[str] = set()
+    pull_request: dict[str, list[str]] = {}
+    merge_group: dict[str, list[str]] = {}
     declared = False
     workflows = base / ".github/workflows"
     paths = sorted([*workflows.glob("*.yml"), *workflows.glob("*.yaml")])
@@ -2946,17 +2959,46 @@ def workflow_check_contexts(
         found = _workflow_job_contexts(
             base, doc, platform_repository, load_callee, (path.resolve(),)
         )
-        if on_pull_request:
-            pull_request |= found
-        if on_merge_group:
-            merge_group |= found
-    return ProducedContexts(frozenset(pull_request), frozenset(merge_group), declared)
+        for context in found:
+            if on_pull_request:
+                pull_request.setdefault(context, []).append(path.name)
+            if on_merge_group:
+                merge_group.setdefault(context, []).append(path.name)
+    return ProducedContexts(
+        frozenset(pull_request),
+        frozenset(merge_group),
+        declared,
+        {c: tuple(p) for c, p in pull_request.items()},
+        {c: tuple(p) for c, p in merge_group.items()},
+    )
 
 
 def context_produced(context: str, produced: ProducedContexts) -> bool:
     """Does `produced` (`workflow_check_contexts`) report `context` on pull requests? Exactly:
     no prefix ever proves a context (a matrix job's contexts are enumerated)."""
     return context in produced.pull_request
+
+
+def ambiguous_context(context: str, produced: ProducedContexts) -> str | None:
+    """Why required `context` is ambiguous in `produced`, or None: more than one workflow job
+    reports that exact name for the same triggering event (pull_request, merge_group -- judged
+    separately). GitHub then cannot tell which result the requirement means and the duplicate
+    can leave pull requests blocked; the context must be reported by exactly one job."""
+    reasons = []
+    for event, producers in (
+        ("pull_request", produced.pull_request_producers),
+        ("merge_group", produced.merge_group_producers),
+    ):
+        found = producers.get(context, ())
+        if len(found) > 1:
+            reasons.append(f"{len(found)} jobs on {event} ({', '.join(sorted(found))})")
+    if not reasons:
+        return None
+    return (
+        f"required status check '{context}' is reported by "
+        + " and ".join(reasons)
+        + " → rename or remove the duplicate job name so exactly one job reports it"
+    )
 
 
 # Rule types a Forge PR always satisfies (no parameter of theirs can block it): deleting or
@@ -3411,6 +3453,8 @@ def effective_rule_problems(
                         f"{source}: requires status check '{context}', which no installed "
                         "workflow job reports"
                     )
+                elif context and (ambiguous := ambiguous_context(context, produced)):
+                    problems.append(f"{source}: {ambiguous}")
                 elif context and queued and context not in produced.merge_group:
                     problems.append(
                         f"{source}: requires status check '{context}' and a merge queue, but no "
@@ -3969,6 +4013,8 @@ def legacy_protection_problems(
                     f"requires status check '{context}', which no installed pull-request "
                     "workflow job reports"
                 )
+            elif ambiguous := ambiguous_context(context, produced):
+                problems.append(ambiguous)
             elif merge_queue and context not in produced.merge_group:
                 problems.append(
                     f"requires status check '{context}' and the branch has a merge queue, but "
@@ -7311,13 +7357,19 @@ def doctor(
             publisher = publisher_commit(implement_doc)
             pusher = publisher_push_actor(implement_doc)
     if isinstance(effective_rules, Unreadable):
+        # `Protect main` (generated) requires REQUIRED_CHECK whatever else applies: its
+        # ambiguity is judged even when the effective rules cannot be read.
+        protect_ambiguous = (
+            ambiguous_context(REQUIRED_CHECK, produced) if produced is not None else None
+        )
         add(
             Check(
                 EFFECTIVE_RULES_CHECK,
                 False,
                 f"could not read the rules that apply to {effective_branch} "
                 f"(GET repos/{project_id}/rules/branches/{effective_branch}) → check org and "
-                "enterprise rulesets by hand",
+                "enterprise rulesets by hand"
+                + (f"; ruleset '{RULESET_NAME}': {protect_ambiguous}" if protect_ambiguous else ""),
                 manual=True,
             )
         )

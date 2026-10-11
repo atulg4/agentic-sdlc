@@ -1649,19 +1649,126 @@ def release(
     _reconcile_best_effort(project, issue, gh, now)
 
 
-def list_claims(project: str, gh: GhRunner, now: datetime | None = None) -> list[ClaimRow]:
+#: The inventory finds leases by their MARKERS, not only by the mutable `in-progress` label (Codex
+#: 4240839923: a Triage user removing the label hid a live lease that `claim` still refuses). A
+#: live lease's newest claim marker was posted at most MAX_TTL_MINUTES ago (its expiry is capped
+#: at post time + MAX_TTL_MINUTES, whatever TTL it asked for), so the repository's comments
+#: updated since then hold every live lease's marker. They are read page by page up to the cap;
+#: reaching it, or any unreadable answer, makes the inventory INCOMPLETE.
+CLAIMS_COMMENT_PAGE_SIZE = 100
+CLAIMS_COMMENT_PAGE_CAP = 20
+_ISSUE_URL = re.compile(r"/issues/(\d+)$")
+
+
+@dataclass(frozen=True)
+class ClaimInventory:
+    """The leases of a repository's open issues, and why the list may be incomplete (`gaps`:
+    empty when every source was read in full)."""
+
+    rows: tuple[ClaimRow, ...]
+    gaps: tuple[str, ...] = ()
+
+    @property
+    def complete(self) -> bool:
+        return not self.gaps
+
+
+def _api_json(path: str, gh: GhRunner) -> object:
+    return json.loads(gh(["api", path]) or "null")
+
+
+def _marker_issue_numbers(
+    project: str, gh: GhRunner, since: datetime, page_cap: int
+) -> tuple[set[int], list[str]]:
+    """The issues (or PRs) with a claim-marker comment updated since `since`, and the gaps."""
+    numbers: set[int] = set()
+    for page in range(1, page_cap + 1):
+        path = (
+            f"repos/{project}/issues/comments?since={_iso(since)}"
+            f"&per_page={CLAIMS_COMMENT_PAGE_SIZE}&page={page}"
+        )
+        try:
+            rows = _api_json(path, gh)
+        except Exception as exc:  # noqa: BLE001 -- an unreadable page is a gap, never "none"
+            return numbers, [f"recent comments page {page} unreadable ({type(exc).__name__})"]
+        if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+            return numbers, [f"recent comments page {page} unreadable (not a list of objects)"]
+        for row in rows:
+            body = str(row.get("body") or "")
+            marker = _marker(body)
+            if marker is None or marker[0] != CLAIM_MARKER:
+                continue
+            found = _ISSUE_URL.search(str(row.get("issue_url") or ""))
+            if found is None:
+                return numbers, [f"a claim marker comment ({row.get('id')}) names no issue"]
+            numbers.add(int(found.group(1)))
+        if len(rows) < CLAIMS_COMMENT_PAGE_SIZE:
+            return numbers, []
+    return numbers, [
+        f"more than {page_cap * CLAIMS_COMMENT_PAGE_SIZE} comments since {_iso(since)} "
+        "(page cap reached)"
+    ]
+
+
+def claim_inventory(
+    project: str,
+    gh: GhRunner,
+    now: datetime | None = None,
+    *,
+    page_cap: int = CLAIMS_COMMENT_PAGE_CAP,
+) -> ClaimInventory:
+    """Every open issue's authoritative lease (`current_lease`), live or expired. Candidates are
+    the open issues labelled `in-progress` (a hint only) AND every issue with a claim-marker
+    comment updated within MAX_TTL_MINUTES -- so removing the label never hides a live lease.
+    Anything unreadable, or the comment page cap, is recorded in `gaps`."""
     now = now or datetime.now(UTC)
-    issues = _paged(
-        f"repos/{project}/issues?labels={IN_PROGRESS_LABEL}&state=open&per_page=100", gh
+    gaps: list[str] = []
+    candidates: set[int] = set()
+    try:
+        labelled = _paged(
+            f"repos/{project}/issues?labels={IN_PROGRESS_LABEL}&state=open&per_page=100", gh
+        )
+    except Exception as exc:  # noqa: BLE001 -- recorded as a gap
+        gaps.append(f"the {IN_PROGRESS_LABEL} issue list is unreadable ({type(exc).__name__})")
+        labelled = []
+    candidates.update(
+        int(item["number"])
+        for item in labelled
+        if not item.get("pull_request") and isinstance(item.get("number"), int)
     )
-    rows = []
-    for item in issues:
-        if item.get("pull_request"):
+    marked, marker_gaps = _marker_issue_numbers(
+        project, gh, now - timedelta(minutes=MAX_TTL_MINUTES), page_cap
+    )
+    gaps.extend(marker_gaps)
+    for number in sorted(marked - candidates):
+        try:
+            issue = _api_json(f"repos/{project}/issues/{number}", gh)
+        except Exception as exc:  # noqa: BLE001 -- recorded as a gap
+            gaps.append(f"issue #{number} unreadable ({type(exc).__name__})")
             continue
-        lease = current_lease(project, int(item["number"]), gh)
+        if not isinstance(issue, dict):
+            gaps.append(f"issue #{number} unreadable (not an object)")
+        elif not issue.get("pull_request") and issue.get("state") == "open":
+            candidates.add(number)
+    rows = []
+    for number in sorted(candidates):
+        try:
+            lease = current_lease(project, number, gh)
+        except Exception as exc:  # noqa: BLE001 -- recorded as a gap
+            gaps.append(f"the lease of #{number} is unreadable ({exc})")
+            continue
         if lease is not None:
             rows.append(ClaimRow(lease, expired=not lease.live(now)))
-    return sorted(rows, key=lambda r: r.lease.issue)
+    return ClaimInventory(tuple(sorted(rows, key=lambda r: r.lease.issue)), tuple(gaps))
+
+
+def list_claims(project: str, gh: GhRunner, now: datetime | None = None) -> list[ClaimRow]:
+    """`claim_inventory`'s rows; raises LeaseError when the inventory is incomplete (a partial
+    list must never read as the whole one)."""
+    inventory = claim_inventory(project, gh, now)
+    if not inventory.complete:
+        raise LeaseError("lease inventory INCOMPLETE: " + "; ".join(inventory.gaps))
+    return list(inventory.rows)
 
 
 def render_claims(rows: Sequence[ClaimRow]) -> str:

@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 PROJECT = "PROJECT_ID"
@@ -39,10 +40,10 @@ FETCH_WARNING = (
 )
 
 INCOMPLETE_WARNING = (
-    "[Forge] WARNING: lease inventory INCOMPLETE -- only the first {count} open in-progress "
-    "issue(s) could be read (a page was unreadable or the page cap was reached). Issues not "
-    "listed below may still be leased: run `sdlcctl claims --project {project}` before starting "
-    "issue work."
+    "[Forge] WARNING: lease inventory INCOMPLETE -- only {count} open issue(s) could be checked "
+    "(the in-progress issue list or the recent lease-marker comments: a page was unreadable or "
+    "the page cap was reached). Issues not listed below may still be leased: run `sdlcctl "
+    "claims --project {project}` before starting issue work."
 )
 PAYLOAD_WARNING = (
     "[Forge] WARNING: could not read the SessionStart hook payload (not a JSON object), so this "
@@ -51,6 +52,15 @@ PAYLOAD_WARNING = (
 #: open in-progress issues read per page, and the most pages read (100 x 50 = 5000 leases)
 ISSUE_PAGE_SIZE = 100
 ISSUE_PAGE_CAP = 50
+#: Codex 4240839923: the `in-progress` label is a hint, the marker is the lease. A live lease's
+#: newest claim marker was posted at most LEASE_WINDOW_MINUTES ago (leases.MAX_TTL_MINUTES: its
+#: expiry is capped at post time + that), so the comments updated since then are scanned for
+#: claim markers, page by page up to COMMENT_PAGE_CAP; the label's removal never hides a lease.
+LEASE_WINDOW_MINUTES = 7 * 24 * 60
+COMMENT_PAGE_SIZE = 100
+COMMENT_PAGE_CAP = 20
+_CLAIM_LINE = re.compile(r"^<!--\s*forge-claim\s[^>]*-->$")
+_ISSUE_URL = re.compile(r"/issues/(\d+)$")
 
 
 def run(cmd: list[str]) -> str | None:
@@ -151,11 +161,65 @@ def in_progress_issues() -> tuple[list, str]:
     return issues, "truncated"
 
 
+def marker_issues(known: set[int]) -> tuple[list, str]:
+    """The open issues (not in `known`, the labelled ones) with a claim-marker comment updated
+    within LEASE_WINDOW_MINUTES, each marked `unlabelled`. The state is as for
+    `in_progress_issues`; an issue whose details cannot be read is kept (its lease decides)."""
+    since = datetime.now(UTC) - timedelta(minutes=LEASE_WINDOW_MINUTES)
+    stamp = since.strftime("%Y-%m-%dT%H:%M:%SZ")
+    numbers: set[int] = set()
+    state = "truncated"
+    for page in range(1, COMMENT_PAGE_CAP + 1):
+        raw = run(
+            [
+                "gh",
+                "api",
+                f"repos/{PROJECT}/issues/comments?since={stamp}"
+                f"&per_page={COMMENT_PAGE_SIZE}&page={page}",
+            ]
+        )
+        try:
+            rows = json.loads(raw) if raw is not None else None
+        except json.JSONDecodeError:
+            rows = None
+        if not isinstance(rows, list):
+            state = "unavailable" if page == 1 else "partial"
+            break
+        for row in rows:
+            body = str(row.get("body") or "") if isinstance(row, dict) else ""
+            lines = body.splitlines()
+            if not lines or not _CLAIM_LINE.match(lines[0].strip()):
+                continue
+            found = _ISSUE_URL.search(str(row.get("issue_url") or ""))
+            if found is None:
+                state = "partial"
+                continue
+            numbers.add(int(found.group(1)))
+        if len(rows) < COMMENT_PAGE_SIZE:
+            if state == "truncated":
+                state = "complete"
+            break
+    issues: list = []
+    for number in sorted(numbers - known):
+        raw = run(["gh", "api", f"repos/{PROJECT}/issues/{number}"])
+        try:
+            row = json.loads(raw) if raw is not None else None
+        except json.JSONDecodeError:
+            row = None
+        if not isinstance(row, dict):
+            row = {"number": number, "title": "(issue details unreadable)", "assignees": []}
+        elif "pull_request" in row or row.get("state", "open") != "open":
+            continue
+        issues.append({**row, "number": number, "unlabelled": True})
+    return issues, state
+
+
 def classify_leased(
     issues: list, lease_lookup, session: str = ""
 ) -> tuple[list[str], list[str], list[str]]:
     """Split `in-progress` issues into live leases held by OTHER sessions, expired/released ones
-    (label left over), and this `session`'s own live leases (never "another agent's")."""
+    (label left over), and this `session`'s own live leases (never "another agent's"). An issue
+    found only by its marker (`unlabelled`) is listed when its lease is live, never as stale."""
     live: list[str] = []
     stale: list[str] = []
     mine: list[str] = []
@@ -164,11 +228,14 @@ def classify_leased(
             str(a.get("login", "")) for a in issue.get("assignees") or [] if isinstance(a, dict)
         )
         line = f"#{issue.get('number')} {issue.get('title', '')} (assignee: {who})"
+        if issue.get("unlabelled"):
+            line += " [in-progress label missing]"
         lease = lease_lookup(int(issue.get("number")))
         if isinstance(lease, dict) and lease.get("unavailable"):
             live.append(f"{line} -- lease unreadable, treat as held")
         elif lease is None:
-            stale.append(line)
+            if not issue.get("unlabelled"):
+                stale.append(line)
         elif (
             isinstance(session, str)
             and session.strip()
@@ -219,10 +286,21 @@ def main() -> int:
             '.[] | "#\\(.number) \\(.title) [\\(.headRefName)]"',
         ]
     )
-    issues, inventory_state = in_progress_issues()
-    listed = inventory_state != "unavailable"  # only a read list may ever print "none"
-    if inventory_state == "unavailable":
+    issues, label_state = in_progress_issues()
+    marked, marker_state = marker_issues({int(i["number"]) for i in issues})
+    issues += marked
+    if label_state == "unavailable":
         warnings.append("the in-progress issue list")
+    if marker_state == "unavailable":
+        warnings.append("the recent lease-marker comments")
+    states = {label_state, marker_state}
+    if states == {"unavailable"}:
+        inventory_state = "unavailable"
+    elif states == {"complete"}:
+        inventory_state = "complete"
+    else:
+        inventory_state = "truncated" if "truncated" in states else "partial"
+    listed = inventory_state != "unavailable"  # only a read list may ever print "none"
     live, stale, mine = classify_leased(issues, _lease_lookup(), session)
     if any(line.endswith("treat as held") for line in live):
         warnings.append("at least one issue's lease")

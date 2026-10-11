@@ -48,7 +48,7 @@ from .leases import (
     LeaseError,
     authorize_labeler,
     claim,
-    list_claims,
+    claim_inventory,
     release,
     render_claims,
     renew,
@@ -947,7 +947,8 @@ def _authorize_labeler(args: argparse.Namespace) -> int:
 
 
 def _claims(args: argparse.Namespace) -> int:
-    rows = list_claims(args.project, run_gh)
+    inventory = claim_inventory(args.project, run_gh)
+    rows = inventory.rows
     _status(render_claims(rows))
     _write(
         [
@@ -963,6 +964,10 @@ def _claims(args: argparse.Namespace) -> int:
         ],
         args.output,
     )
+    if not inventory.complete:
+        # A partial list must never read as the whole one: issues not listed may be leased.
+        _status("INCOMPLETE: more leases may exist -- " + "; ".join(inventory.gaps))
+        return 3
     return 0
 
 
