@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "projects": [
+    {
+      "projectId": "forge",
+      "displayName": "Forge",
+      "group": "platform",
+      "defaultBranch": "main",
+      "repositories": [
+        {"provider": "github", "identifier": "atulg4/agentic-sdlc", "role": "primary"}
+      ],
+      "capabilities": [
+        "planning",
+        "implementation",
+        "independent-review",
+        "protected-merge"
+      ]
+    },
+    {
+      "projectId": "marketmaestro",
+      "displayName": "MarketMaestro",
+      "group": "maestro",
+      "defaultBranch": "main",
+      "repositories": [
+        {"provider": "github", "identifier": "atulg4/marketmaestro", "role": "primary"}
+      ],
+      "environments": [
+        {"name": "production", "kind": "production", "requiresHumanApproval": true}
+      ],
+      "capabilities": [
+        "planning",
+        "implementation",
+        "independent-review",
+        "protected-merge",
+        "deploy"
+      ]
+    },
+    {
+      "projectId": "marketingmaestro",
+      "displayName": "Marketing Maestro",
+      "group": "maestro",
+      "defaultBranch": "main",
+      "repositories": [
+        {"provider": "github", "identifier": "atulg4/MarketingMaestro", "role": "primary"}
+      ],
+      "capabilities": ["planning", "implementation", "independent-review"]
+    }
+  ]
+}

@@ -135,6 +135,11 @@ aliases, fallback semantics, and credential boundaries.
 9. Consider low-risk auto-merge only after a separate threat review and a
    substantial history of clean runs.
 
+Every managed project's live status, epic tree, blockers and declared
+remediations are projected into one read-only snapshot by
+`sdlcctl control-center`, documented in
+[Forge Control Center](docs/control-center.md).
+
 The phone-first operating model is documented in
 [Phone Control](docs/phone-control.md).
 
