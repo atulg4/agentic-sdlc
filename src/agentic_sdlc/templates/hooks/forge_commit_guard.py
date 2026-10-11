@@ -11,8 +11,9 @@ a short allowlist of read-only subcommands proven by plain literal tokens (`_rea
 status, log, diff, show, blame, grep (no `-O` pager), ls-files, ls-tree, rev-parse, describe,
 shortlog, reflog (show/list), branch (only --list/-l/-a/-r/-v/--show-current/--contains, no
 positional arguments), remote (-v/show), config (--get*/--list/-l, no write mode), fetch (no
---update-head-ok/-u, --upload-pack or refspec), stash list/show, tag (-l/--list, no create or
-delete flag), help, version, cat-file, for-each-ref, name-rev, merge-base, check-ignore,
+--update-head-ok/-u, --upload-pack or refspec, and no configured `remote.*.fetch` refspec that
+writes a local branch -- see `_configured_fetch_refs`), stash list/show, tag (-l/--list, no
+create or delete flag), help, version, cat-file, for-each-ref, name-rev, merge-base, check-ignore,
 check-attr. Everything else -- commit, merge, cherry-pick, revert, rebase, am, apply, pull, reset,
 checkout, switch, stash push/pop/apply, notes, tag creation, update-ref, commit-tree,
 fast-import, filter-branch, replace, worktree, push, `git-<name>` programs, aliases and unknown
@@ -64,6 +65,12 @@ need issue 7's lease (see `_named_refs`). One whose destinations cannot be known
 (`git push --all`, a glob refspec, a push driven by `remote.*.push` or `push.default`
 upstream/matching, an alias to a shell command, `rebase --update-refs`, ...) is blocked on any
 branch: name the destinations explicitly.
+
+The repository a guarded command acts on must be resolvable before it runs (Codex 4239868022):
+a selector the shell rewrites (`git -C "$DIR"`, `--git-dir=$X`, `--work-tree`, GIT_DIR=/
+GIT_WORK_TREE= set to an expansion, `cd $DIR`, `$(...)`, backticks, a glob, an ambiguous `~`)
+is refused outright, and a branch lookup that fails for any reason but "no repository there"
+(`git clone`/`git init` from a plain directory) is unknown and refuses, never "no branch".
 
 Out of scope: programs that run git without naming it on the command line (a script file, a
 Makefile target) and direct writes into `.git/`.
@@ -603,6 +610,10 @@ def _commit_targets(argv: list[str], depth: int = 0, cwd: str | None = None) -> 
             # checked-out branch (`git push origin HEAD:forge/issue-7` from main).
             refs = _named_refs(word, rest, _where(cwd, chdirs), target[0], unsafe)
             return target + [_with_ref(target[0], ref) for ref in refs]
+        if word == "fetch":  # Codex 4239868024: configured refspecs may write local branches
+            refs = _configured_fetch_refs(_where(cwd, chdirs), target[0], unsafe)
+            if refs:
+                return target + [_with_ref(target[0], ref) for ref in refs]
         reason = _helper_reason(word, rest, _where(cwd, chdirs), target[0])
         if reason:  # Codex 4239667542: configuration can make it run a program
             _HELPER_NOTES[reason] = None
@@ -1132,6 +1143,8 @@ def _named_refs(
         return _symbolic_ref_refs(args)
     if sub in ("fetch", "pull"):
         refs = _fetch_refs(args)
+        if UNKNOWN_REF not in refs:
+            refs += [r for r in _configured_fetch_refs(where, target, unsafe) if r not in refs]
         if sub == "pull" and UNKNOWN_REF not in refs and "--no-rebase" not in args:
             refs += _rebase_update_refs(where, target, unsafe)
         return refs
@@ -1343,6 +1356,55 @@ def _fetch_refs(args: list[str]) -> list[str]:
             return [UNKNOWN_REF]
         if dst and _branch_name(dst) not in refs:
             refs.append(_branch_name(dst))
+    return refs
+
+
+# ---- Configured fetch refspecs (Codex 4239868024). `git fetch origin` with no refspec on the
+# command line fetches what `remote.origin.fetch` says, and even with one it updates the refs
+# those configured refspecs map it onto; `+refs/heads/main:refs/heads/forge/issue-7` there makes
+# a "read-only" fetch (or a pull) write an issue branch. Every remote's configured refspecs are
+# read -- a superset of the remotes the fetch can reach (the default remote, `--all`,
+# `--multiple`, `remotes.<group>`) -- and each destination that is a local branch (`refs/heads/X`
+# or an unqualified name git may resolve to one) is a named destination; `--prune` deletes only
+# under those same destinations. A glob destination outside refs/remotes, refs/tags and the
+# other non-branch namespaces, configuration given on the command line, or configuration that
+# cannot be read is unknown. The standard `+refs/heads/*:refs/remotes/origin/*` stays read-only.
+_NON_BRANCH_REF = re.compile(r"^refs/(?!heads/)[^/]+/")
+
+
+def _fetch_destination(spec: str) -> str | None:
+    """The local branch one configured fetch refspec writes; None when it writes none."""
+    spec = spec.strip()
+    if spec.startswith("^"):
+        return None  # a negative refspec excludes, never writes
+    src, colon, dst = (spec[1:] if spec.startswith("+") else spec).partition(":")
+    if not colon or not dst:
+        return None  # `refs/heads/main`: FETCH_HEAD only
+    if _NON_BRANCH_REF.match(dst):
+        return None  # refs/remotes/..., refs/tags/..., refs/notes/...
+    name = _branch_name(dst)
+    if not name or "*" in name or name in ("HEAD", "@") or name.startswith("refs/"):
+        return UNKNOWN_REF
+    return name
+
+
+def _configured_fetch_refs(where: str, target: Target, unsafe: bool) -> list[str]:
+    """The local branches every configured `remote.*.fetch` refspec writes (see above)."""
+    if unsafe:
+        return [UNKNOWN_REF]  # `-c remote.origin.fetch=...`: not in the configuration read here
+    config = _read_config(where, target)
+    if config is None:
+        return [UNKNOWN_REF]
+    refs: list[str] = []
+    for key, values in config.items():
+        if not (key.startswith("remote.") and key.endswith(".fetch")):
+            continue
+        for spec in values:
+            ref = _fetch_destination(spec)
+            if ref == UNKNOWN_REF:
+                return [UNKNOWN_REF]
+            if ref and ref not in refs:
+                refs.append(ref)
     return refs
 
 
@@ -1672,8 +1734,69 @@ def is_git_commit(command: str, depth: int = 0, cwd: str | None = None) -> bool:
         return _mentions_git(command) or _raw_unproven(command)
 
 
-def target_branch(target: Target, cwd: str | None) -> str:
-    """The branch `git <repo options> ...` acts on, asked of git itself."""
+# ---- Repository selectors (Codex 4239868022). The branch a guarded command acts on is asked of
+# git in the repository the command selects: `cd DIR`, `env -C DIR`, `git -C DIR`, `--git-dir`,
+# `--work-tree`, GIT_DIR=/GIT_WORK_TREE= prefixes. A selector the shell rewrites before git sees it
+# (`"$DIR"`, `$(pwd)`, backticks, a glob, a brace expansion, a `~` the shell may or may not
+# expand) cannot be resolved here: the probe would ask git about the literal text, fail, and a
+# failure that read as "no branch" let `DIR=wt; git -C "$DIR" commit` into an unleased issue
+# checkout. Such a target is UNRESOLVED_REPO and blocks; a probe that fails for any reason other
+# than "there is no repository there" is BRANCH_UNKNOWN and blocks too.
+UNRESOLVED_REPO = "\0unresolved-repo"
+BRANCH_UNKNOWN = "\0branch-unknown"  # git could not report the branch: unknown, never "none"
+_SELECTOR_EXPANSION = re.compile(r"[$`*?\[]")
+_QUOTED_TILDE = re.compile(r"[\"'\\]~")
+
+
+def _unresolvable(value: str, word_start: bool, quoted_tilde: bool) -> bool:
+    """Can the shell turn this selector value into something else before git sees it?
+    `word_start`: the value is a whole shell word (or an assignment's value), where the shell
+    expands a leading `~` (resolved here with expanduser) -- unless the command also quotes or
+    escapes a `~`, when which one is literal cannot be told from the cooked words."""
+    if _SELECTOR_EXPANSION.search(value) or _BRACE_EXPANSION.search(value):
+        return True
+    if "~" not in value:
+        return False
+    return not word_start or not value.startswith("~") or "~" in value[1:] or quoted_tilde
+
+
+def _selector_values(target: Target) -> list[tuple[str, bool]]:
+    """(value, whole word) for every repository selector of `target`."""
+    chdirs, opts, env = target
+    values = [(d, True) for d in chdirs if d != "-"]
+    index = 0
+    while index < len(opts):
+        opt = opts[index]
+        if opt in GIT_REPO_OPTS and index + 1 < len(opts):
+            values.append((opts[index + 1], True))
+            index += 2
+            continue
+        values.append((opt.partition("=")[2], False))  # `--git-dir=X`: no tilde expansion
+        index += 1
+    values += [(value, True) for key, value in env if key in GIT_REPO_ENV]
+    return values
+
+
+def _resolve_opts(opts: tuple[str, ...]) -> tuple[str, ...]:
+    """`-C ~/wt` as the shell passes it to git (git itself never expands `~`)."""
+    out = list(opts)
+    for index in range(1, len(out)):
+        if out[index - 1] in GIT_REPO_OPTS and out[index].startswith("~"):
+            out[index] = os.path.expanduser(out[index])
+    return tuple(out)
+
+
+def _resolve_env(env: dict[str, str]) -> dict[str, str]:
+    """GIT_DIR=~/x as the shell assigns it (a leading `~` of an assignment is expanded)."""
+    return {
+        key: os.path.expanduser(value) if key in GIT_REPO_ENV else value
+        for key, value in env.items()
+    }
+
+
+def target_branch(target: Target, cwd: str | None, quoted_tilde: bool = False) -> str:
+    """The branch `git <repo options> ...` acts on, asked of git itself. UNRESOLVED_REPO when a
+    repository selector cannot be resolved before the shell runs (Codex 4239868022)."""
     chdirs, opts, env = target
     named = dict(env).get(_REF_KEY)
     if named is not None:
@@ -1681,7 +1804,9 @@ def target_branch(target: Target, cwd: str | None) -> str:
     moved = dict(env).pop(_BRANCH_KEY, None)
     if moved is not None:
         return moved  # a branch change earlier in the command put HEAD there
-    return current_branch(_where(cwd, chdirs), opts, dict(env))
+    if any(_unresolvable(v, whole, quoted_tilde) for v, whole in _selector_values(target)):
+        return UNRESOLVED_REPO
+    return current_branch(_where(cwd, chdirs), _resolve_opts(opts), _resolve_env(dict(env)))
 
 
 def commit_branches(command: str, cwd: str | None) -> list[str]:
@@ -1695,9 +1820,10 @@ def commit_branches(command: str, cwd: str | None) -> list[str]:
     if not targets:
         return [current_branch(cwd)]
     branches: list[str] = []
+    quoted_tilde = bool(_QUOTED_TILDE.search(command))
     for target in targets:
         for candidate in (target, ((), target[1], target[2])):
-            branch = target_branch(candidate, cwd)
+            branch = target_branch(candidate, cwd, quoted_tilde)
             if branch not in branches:
                 branches.append(branch)
     return branches
@@ -1711,20 +1837,38 @@ def _real_env(env: dict[str, str]) -> dict[str, str]:
 def current_branch(
     cwd: str | None, git_opts: tuple[str, ...] = (), env: dict[str, str] | None = None
 ) -> str:
-    try:
+    """The checked-out branch ("HEAD" when detached). "" ONLY when git positively answers that
+    there is no repository there (`git clone`/`git init` from a plain directory: no history to
+    protect). Any other failure -- a directory that does not exist, git missing, an unreadable or
+    untrusted repository -- is BRANCH_UNKNOWN (Codex 4239868022): a failure that read as "no
+    branch" let a command into an issue checkout the probe never saw."""
+    run_env = {**os.environ, **_real_env(env or {}), "LC_ALL": "C", "LANGUAGE": ""}
+
+    def probe(*args: str) -> subprocess.CompletedProcess:
         return subprocess.run(
-            ["git", *git_opts, "rev-parse", "--abbrev-ref", "HEAD"],
+            ["git", *git_opts, *args],
             cwd=cwd,
-            env={**os.environ, **_real_env(env)} if env else None,
+            env=run_env,
             capture_output=True,
             text=True,
-            check=True,
+            check=False,
             timeout=GIT_TIMEOUT,
-        ).stdout.strip()
+        )
+
+    try:
+        proc = probe("rev-parse", "--abbrev-ref", "HEAD")
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout.strip()
+        if "not a git repository" in (proc.stderr or ""):
+            return ""
+        unborn = probe("symbolic-ref", "--short", "HEAD")  # a repository with no commits yet
+        if unborn.returncode == 0 and unborn.stdout.strip():
+            return unborn.stdout.strip()
     except subprocess.TimeoutExpired:
         return BRANCH_TIMEOUT  # unknown, not "no branch": refuses (Codex 4239667544)
-    except (OSError, subprocess.CalledProcessError):
-        return ""
+    except OSError:
+        return BRANCH_UNKNOWN
+    return BRANCH_UNKNOWN
 
 
 def _parse_iso(text: str) -> datetime | None:
@@ -1985,6 +2129,22 @@ def _decide_branch(payload: dict, branch: str, lease_lookup, pr_lookup) -> tuple
             "piped script, a `cd` to an expanded path, ...) and then runs git that needs the "
             "issue lease. Run the branch change and the git command as SEPARATE commands so the "
             "guard can check the branch the second one acts on."
+        )
+    if branch == UNRESOLVED_REPO:
+        return 2, (
+            "Forge guard: this git command selects its repository through text the shell "
+            'expands before git runs (`git -C "$DIR"`, `--git-dir=$X`, `--work-tree`, '
+            "GIT_DIR=/GIT_WORK_TREE= set to an expansion, `cd $DIR`, `$(...)`, backticks, a glob "
+            "or an ambiguous `~`), so the branch it acts on -- and the lease it needs -- cannot be "
+            "checked. Spell the repository as a literal path (git -C /path/to/checkout commit) or "
+            "cd there in a separate command first."
+        )
+    if branch == BRANCH_UNKNOWN:
+        return 2, (
+            "Forge guard: git could not report the branch of the repository this command acts on "
+            "(a directory that does not exist yet, an unreadable or untrusted repository, git "
+            "unavailable), so the lease it needs cannot be checked. Create or enter the "
+            "directory in a separate command first, then run the git command on its own."
         )
     if branch == BRANCH_TIMEOUT:
         return 2, (

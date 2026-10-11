@@ -109,7 +109,9 @@ sdlcctl doctor --destination /path/to/consumer-repository   # exit 2 until READY
 
 `--implementer` is one of `route` (multi-provider, needs `.forge/` + DeepSeek secrets),
 `claude`, `codex`, or `cloud-routine` (no Actions implementer; see the generated
-`docs/forge/cloud-implementer.md` for the routine prompt). Work requests must follow the
+`docs/forge/cloud-implementer.md` for the routine prompt, which authorizes the approval labeler
+with `sdlcctl authorize-labeler` before claiming; once the routine is scheduled on claude.ai,
+record it with `sdlcctl confirm-cloud-routine` -- `doctor` stays NOT READY until then). Work requests must follow the
 generated `.github/ISSUE_TEMPLATE/agent-work-request.md`: `## Summary`, `## Acceptance
 Criteria`, `## Required Tests`, `## Non-Goals`, `## Dependencies`, the last two as lists.
 

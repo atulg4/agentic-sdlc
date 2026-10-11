@@ -585,27 +585,40 @@ def repository_fork_exposed(project_id: str, gh: GhRunner = run_gh) -> bool:
     return fork_pull_request_exposure(info, gh, project_id)[0] != "safe"
 
 
+# `owner/name` as GitHub answers it in `full_name`.
+_FULL_NAME = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}$")
+
+
 def _canonical_full_name(repo_info: object, project_id: str) -> str | None:
-    """GitHub's own `owner/name` spelling of `project_id` from `GET repos/{project_id}`, when
-    it names the same repository (logins and repository names are case-insensitive, so the API
-    answers any spelling); None when unread or naming another repository (a rename)."""
+    """GitHub's own `owner/name` for `project_id` from `GET repos/{project_id}`: the same name in
+    GitHub's spelling (logins and repository names are case-insensitive, so the API answers any
+    spelling), or -- after a rename or transfer, which the API follows as a redirect -- the
+    CURRENT name (Codex 4239868019: every run passes that current `$GITHUB_REPOSITORY`, so the
+    stale slug can never be the canonical one). None when unread or malformed."""
     name = repo_info.get("full_name") if isinstance(repo_info, dict) else None
-    if not isinstance(name, str) or name.casefold() != project_id.casefold():
+    if not isinstance(name, str) or not _FULL_NAME.fullmatch(name):
         return None
     return name
 
 
 def canonical_project_id(project_id: str, gh: GhRunner = run_gh) -> str:
-    """`project_id` as GitHub spells it (`full_name`): every workflow run passes the canonical
+    """`project_id` as GitHub names it now (`full_name`): every workflow run passes the canonical
     `$GITHUB_REPOSITORY` to `prepare-request`, which compares it EXACTLY with the policy's id, so
-    the policy must carry that spelling. A repository answering under another name (a rename):
-    the given spelling (doctor reports it). Unreadable: raises -- `--apply` writes this id into
-    the policy and configures the repository by it, so it never proceeds on a guess."""
+    the policy must carry that name -- GitHub's spelling, and the new name of a renamed or
+    transferred repository (the caller tells the user). Unreadable, or an answer without a
+    `full_name`: raises -- `--apply` writes this id into the policy and configures the
+    repository by it, so it never proceeds on a guess."""
     info = _safe_json(gh, ["api", f"repos/{project_id}"])
     if not isinstance(info, dict):
         why = info.why if isinstance(info, Unreadable) else "not a repository object"
         raise OnboardError(f"could not read {project_id} from GitHub ({why}); nothing was changed")
-    return _canonical_full_name(info, project_id) or project_id
+    canonical = _canonical_full_name(info, project_id)
+    if canonical is None:
+        raise OnboardError(
+            f"could not read {project_id} from GitHub (no valid full_name in the answer); "
+            "nothing was changed"
+        )
+    return canonical
 
 
 def repository_default_branch(project_id: str, gh: GhRunner = run_gh) -> str:
@@ -847,6 +860,14 @@ def render_cloud_routine_md(spec: OnboardSpec) -> str:
 1. List open issues that carry ALL of: {_md_code(spec.ready_label)}, {_md_code(HUMAN_REVIEW_LABEL)},
    {_md_code(IMPLEMENTATION_LABEL)}
    and have no open PR referencing them. Take the oldest one; if none, stop.
+1a. Authorize the approval before claiming (labels alone are no authority: Triage users can
+   apply them):
+   `sdlcctl authorize-labeler --project {spec.project_id} --issue <n>
+    --label {IMPLEMENTATION_LABEL}`.
+   Proceed ONLY on exit 0 (whoever applied {_md_code(IMPLEMENTATION_LABEL)} last has
+   write/maintain/admin). Exit 3: not authorized -- do not claim; unless you already commented
+   so on this issue, comment that a maintainer must re-apply the label, then take the next issue.
+   Any other exit: authorization could not be verified -- do not claim, take the next issue.
 1b. Claim it before touching code:
    `sdlcctl claim --project {spec.project_id} --issue <n> --agent cloud-routine
     --session <run id> --branch forge/issue-<n>`.
@@ -870,16 +891,102 @@ def render_cloud_routine_md(spec: OnboardSpec) -> str:
 Implementation for this repository is done by a **Claude Code cloud routine** (a scheduled cloud
 agent on claude.ai), not by a GitHub Actions job, so no self-hosted runner is required for it.
 The routine must obey `AGENTS.md`, `CLAUDE.md` and `agentic-sdlc.toml` exactly as an Actions
-implementer would. Suggested routine prompt (create it with the `schedule` skill or the
-claude.ai routines UI):
+implementer would -- including the labeler check the Actions path runs: before claiming an
+issue it runs `sdlcctl authorize-labeler`, which reads the issue's label events and requires a
+definitive write/maintain/admin permission for whoever applied
+{_md_code(IMPLEMENTATION_LABEL)} most recently (a 404 is unauthorized; any other failure is
+unverifiable and the issue is skipped). Suggested routine prompt (create it with the
+`schedule` skill or the claude.ai routines UI):
 
 {_md_block(prompt.splitlines())}
+
+Once the routine is scheduled, record it: `sdlcctl confirm-cloud-routine` (sets
+`[automation] {CLOUD_ROUTINE_CONFIRMED} = true` in agentic-sdlc.toml). `sdlcctl doctor` cannot
+see claude.ai routines and reports NOT READY until then; `onboard --force` drops the
+confirmation, so re-check the routine against this document and confirm again.
 
 Required GitHub state (created by `sdlcctl onboard --apply`): the three labels, the
 `{RULESET_NAME}` ruleset requiring the `{REQUIRED_CHECK}` check and review-thread resolution.
 CI (`.github/workflows/ci.yml`) provides the `{REQUIRED_CHECK}` check and runs on
 `{", ".join(spec.ci_labels)}`.
 """
+
+
+# ---- The cloud routine itself (Codex 4239868034). Onboarding writes only a document with a
+# suggested prompt; the scheduled routine lives on claude.ai, where nothing here can verify that
+# it exists. Until the owner records that it does -- `sdlcctl confirm-cloud-routine`, which sets
+# `[automation] cloud_routine_confirmed = true` -- doctor reports it as a manual TODO and the
+# repository is NOT READY: approved issues would otherwise wait forever for a worker that was
+# never created. `onboard --force` rewrites the policy (and may change the routine prompt), so it
+# drops the confirmation: re-check the routine against the new document and confirm again.
+CLOUD_ROUTINE_CHECK = "cloud implementer routine is scheduled"
+CLOUD_ROUTINE_CONFIRMED = "cloud_routine_confirmed"
+
+
+def cloud_routine_check(policy_doc: object) -> Check:
+    automation = policy_doc.get("automation") if isinstance(policy_doc, dict) else None
+    confirmed = automation.get(CLOUD_ROUTINE_CONFIRMED) if isinstance(automation, dict) else None
+    if confirmed is True:
+        return Check(
+            CLOUD_ROUTINE_CHECK,
+            True,
+            f"owner-confirmed ([automation] {CLOUD_ROUTINE_CONFIRMED} = true); doctor cannot see "
+            "claude.ai routines, so keep it matching docs/forge/cloud-implementer.md",
+        )
+    return Check(
+        CLOUD_ROUTINE_CHECK,
+        False,
+        "no scheduled implementer routine can be verified from here, and none is confirmed → "
+        "create the routine on claude.ai from the prompt in docs/forge/cloud-implementer.md, "
+        "then record it with `sdlcctl confirm-cloud-routine` (sets [automation] "
+        f"{CLOUD_ROUTINE_CONFIRMED} = true in agentic-sdlc.toml)",
+        manual=True,
+    )
+
+
+def confirm_cloud_routine(root: str | Path) -> Path:
+    """Record the owner's confirmation that the cloud implementer routine is scheduled:
+    `[automation] cloud_routine_confirmed = true` in `root`/agentic-sdlc.toml (only for a
+    cloud-routine policy). The rest of the file is kept byte for byte."""
+    path = Path(root) / "agentic-sdlc.toml"
+    try:
+        text = path.read_text(encoding="utf-8")
+        doc = tomllib.loads(text)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise OnboardError(f"cannot read {path}: {exc}") from exc
+    agents = doc.get("agents") if isinstance(doc.get("agents"), dict) else {}
+    if agents.get("implementation_mode") != "cloud-routine":
+        raise OnboardError(
+            f"{path}: [agents] implementation_mode is not 'cloud-routine'; nothing to confirm"
+        )
+    if not isinstance(doc.get("automation"), dict):
+        raise OnboardError(f"{path}: no [automation] table to record the confirmation in")
+    lines = text.splitlines(keepends=True)
+    header = next((i for i, line in enumerate(lines) if line.strip() == "[automation]"), None)
+    if header is None:
+        raise OnboardError(f"{path}: [automation] is not a plain table header; edit it by hand")
+    end = next(
+        (i for i in range(header + 1, len(lines)) if lines[i].lstrip().startswith("[")),
+        len(lines),
+    )
+    setting = f"{CLOUD_ROUTINE_CONFIRMED} = true\n"
+    key = re.compile(rf"^\s*{CLOUD_ROUTINE_CONFIRMED}\s*=")
+    existing = [i for i in range(header + 1, end) if key.match(lines[i])]
+    if existing:
+        lines[existing[0]] = setting
+        for i in reversed(existing[1:]):
+            del lines[i]
+    else:
+        lines.insert(header + 1, setting)
+    updated = "".join(lines)
+    try:
+        written = tomllib.loads(updated)
+    except tomllib.TOMLDecodeError as exc:  # pragma: no cover - defensive
+        raise OnboardError(f"{path}: could not record the confirmation ({exc})") from exc
+    if written.get("automation", {}).get(CLOUD_ROUTINE_CONFIRMED) is not True:
+        raise OnboardError(f"{path}: could not record the confirmation")  # pragma: no cover
+    path.write_text(updated, encoding="utf-8")
+    return path
 
 
 def default_executors(spec: OnboardSpec) -> dict:
@@ -6058,14 +6165,21 @@ def doctor(
         # Every plan/implement run passes $GITHUB_REPOSITORY -- GitHub's canonical spelling --
         # as --expected-project-id, and prepare-request compares it EXACTLY: the policy must
         # carry the canonical `full_name`, not merely a spelling the API also answers to.
-        canonical = _canonical_full_name(repo_info, project_id) or project_id
-        same = policy.project_id == canonical
-        if remote and not isinstance(repo_info, dict):
-            same = False
+        # Codex 4239868019: after a rename or transfer the API follows the redirect and answers
+        # with the NEW `full_name`; that, not the slug doctor was given, is what runs pass.
+        found = _canonical_full_name(repo_info, project_id) if remote else None
+        canonical = found or project_id
+        unread = remote and found is None
+        same = not unread and policy.project_id == canonical
+        if unread:
             detail = (
                 f"could not read GET repos/{project_id} ("
-                + (repo_info.why if isinstance(repo_info, Unreadable) else "not a repository")
-                + ") → GitHub's spelling of the repository is unverified; rerun doctor"
+                + (
+                    repo_info.why
+                    if isinstance(repo_info, Unreadable)
+                    else "no valid full_name in the answer"
+                )
+                + ") → GitHub's name for the repository is unverified; rerun doctor"
             )
         elif same:
             detail = ""
@@ -6074,6 +6188,14 @@ def doctor(
                 f"policy names {policy.project_id}; use {canonical} (GitHub's spelling, which "
                 "every run passes as $GITHUB_REPOSITORY and prepare-request compares exactly)"
             )
+        elif canonical.casefold() != project_id.casefold():
+            detail = (
+                f"policy names {policy.project_id}, but GitHub answers {project_id} as "
+                f"{canonical} (renamed or transferred): every run passes "
+                f"$GITHUB_REPOSITORY={canonical}, which prepare-request compares exactly → set "
+                f'[project].id = "{canonical}" (re-run `sdlcctl onboard --force --project-id '
+                f"{canonical}`)"
+            )
         else:
             detail = f"policy names {policy.project_id}, not {canonical}"
         add(
@@ -6081,7 +6203,7 @@ def doctor(
                 "policy project id matches the repository",
                 same,
                 detail,
-                manual=remote and not isinstance(repo_info, dict),
+                manual=unread,
             )
         )
 
@@ -7357,6 +7479,7 @@ def doctor(
                 "Publisher GitHub App", True, "not needed: the cloud routine opens PRs as the owner"
             )
         )
+        add(cloud_routine_check(policy_doc))
         return rep
     installs = _paged_items(gh, "/user/installations", "installations")
     if isinstance(installs, Unreadable):
