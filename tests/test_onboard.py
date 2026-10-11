@@ -1592,9 +1592,15 @@ def _issue_rows(first: int, count: int) -> list:
     return [{"number": n, "title": f"t{n}", "assignees": []} for n in range(first, first + count)]
 
 
-def _run_session_start(start, monkeypatch, pages, leases=None):
+def _is_comment_page(cmd) -> bool:
+    """A session-start read of one page of the repository's recent issue comments (REST)."""
+    return cmd[:2] == ["gh", "api"] and "/issues/comments?since=" in cmd[2]
+
+
+def _run_session_start(start, monkeypatch, pages, leases=None, comments=None, details=None):
     """Run main() with the in-progress listing served from `pages` (page number -> JSON text or
-    None); returns (stdout, the page numbers requested)."""
+    None), the recent comments from `comments` (likewise; default: none) and single issues from
+    `details` (number -> row); returns (stdout, the page numbers requested)."""
     import io
 
     asked = []
@@ -1604,6 +1610,12 @@ def _run_session_start(start, monkeypatch, pages, leases=None):
             page = int(cmd[2].rsplit("page=", 1)[1])
             asked.append(page)
             return pages(page)
+        if _is_comment_page(cmd):
+            return (comments or (lambda page: "[]"))(int(cmd[2].rsplit("page=", 1)[1]))
+        number = cmd[2].rsplit("/issues/", 1)[-1] if cmd[:2] == ["gh", "api"] else ""
+        if number.isdigit():
+            row = (details or {}).get(int(number))
+            return json.dumps(row) if row is not None else None
         return ""
 
     monkeypatch.setattr(start, "run", run)
@@ -1653,6 +1665,75 @@ def test_session_start_says_the_lease_inventory_is_incomplete(tmp_path, monkeypa
     assert "lease inventory INCOMPLETE" in text and "sdlcctl claims" in text
     others = text.split("other agents (do NOT work on these):\n")[1].split("[Forge]")[0]
     assert "#1 t1" in others and "INCOMPLETE" in others and "  none" not in others
+
+
+def _marker_comment_row(number: int, session: str = "other") -> dict:
+    body = f"<!-- forge-claim agent=a session={session} branch=b expires=2099-01-01T00:00:00Z -->"
+    return {
+        "body": body + "\nclaimed",
+        "issue_url": f"https://api.github.com/repos/owner/comic/issues/{number}",
+    }
+
+
+def test_session_start_lists_a_live_lease_whose_label_was_removed(tmp_path, monkeypatch):
+    """Codex 4240839923: the in-progress label is only a hint. An issue whose label was removed
+    but whose claim marker is live is still listed as held; a PR or a closed issue with a marker
+    is not, and a marker issue with no live lease is not reported as a stale label."""
+    start = _guard_module(tmp_path, "forge_session_start")
+    comments = [
+        _marker_comment_row(40),
+        _marker_comment_row(41),
+        _marker_comment_row(42),
+        _marker_comment_row(43),
+        {
+            "body": "just chatting",
+            "issue_url": "https://api.github.com/repos/owner/comic/issues/44",
+        },
+    ]
+    details = {
+        40: {"number": 40, "title": "unlabelled", "state": "open", "assignees": []},
+        41: {"number": 41, "title": "a pr", "state": "open", "pull_request": {}},
+        42: {"number": 42, "title": "closed", "state": "closed", "assignees": []},
+        43: {"number": 43, "title": "released", "state": "open", "assignees": []},
+    }
+    leases = {40: {"session": "other"}, 41: {"session": "other"}, 42: {"session": "other"}}
+    text, _ = _run_session_start(
+        start,
+        monkeypatch,
+        lambda p: "[]",
+        leases,
+        comments=lambda p: json.dumps(comments if p == 1 else []),
+        details=details,
+    )
+    others = text.split("other agents (do NOT work on these):\n")[1].split("[Forge]")[0]
+    assert "#40 unlabelled" in others and "in-progress label missing" in others
+    assert "#41" not in text and "#42" not in text and "#43" not in text and "#44" not in text
+    assert "INCOMPLETE" not in text and "lease inventory unavailable" not in text
+
+
+@pytest.mark.parametrize("failure", ["unreadable", "cap"])
+def test_session_start_is_incomplete_when_marker_comments_cannot_be_read(
+    tmp_path, monkeypatch, failure
+):
+    """Codex 4240839923: the recent comments are part of the inventory; an unreadable page or
+    the page cap reached makes it INCOMPLETE, never the whole list."""
+    start = _guard_module(tmp_path, "forge_session_start")
+    if failure == "unreadable":
+
+        def comments(page):
+            return None
+
+    else:
+
+        def comments(page):
+            return json.dumps([{"body": "chat", "issue_url": "x/issues/1"}] * 100)
+
+    text, _ = _run_session_start(start, monkeypatch, lambda p: "[]", comments=comments)
+    assert "lease inventory INCOMPLETE" in text
+    if failure == "unreadable":
+        assert "the recent lease-marker comments could not be read" in text
+    others = text.split("other agents (do NOT work on these):\n")[1].split("[Forge]")[0]
+    assert "INCOMPLETE" in others and "  none" not in others
 
 
 @pytest.mark.parametrize("stdin", ["", "not json", "[1, 2]", '"text"', "null", '{"session_id"'])
@@ -10795,3 +10876,82 @@ def test_confirm_cloud_routine_refuses_a_symlinked_or_irregular_policy(tmp_path)
     assert policy.stat().st_ino != inode and (policy.stat().st_mode & 0o777) == 0o640
     assert outside.read_bytes() == before
     assert not [p for p in repo.iterdir() if p.name.endswith(".tmp")]
+
+
+# ---- Codex 4240839925: a required context reported by more than one job is ambiguous.
+
+
+def _required_rules(*contexts):
+    checks = [{"context": c, "integration_id": 15368} for c in contexts]
+    return [{"type": "required_status_checks", "parameters": {"required_status_checks": checks}}]
+
+
+_TEST_JOB = "jobs:\n  test:\n    runs-on: ubuntu-latest\n    steps: [{run: 'true'}]\n"
+
+
+def test_a_second_pull_request_workflow_with_a_test_job_makes_the_required_check_ambiguous(
+    tmp_path,
+):
+    from agentic_sdlc.onboard import (
+        ambiguous_context,
+        effective_rule_problems,
+        legacy_protection_problems,
+        workflow_check_contexts,
+    )
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    workflows = repo / ".github/workflows"
+    unique = workflow_check_contexts(repo, "main")
+    assert "test" in unique.pull_request and ambiguous_context("test", unique) is None
+    assert effective_rule_problems(_required_rules("test"), unique) == []
+
+    (workflows / "other.yml").write_text("on: pull_request\n" + _TEST_JOB)
+    produced = workflow_check_contexts(repo, "main")
+    why = ambiguous_context("test", produced)
+    # the managed ci.yml counts as one of the producers
+    assert why and "2 jobs on pull_request (ci.yml, other.yml)" in why
+    problems = effective_rule_problems(_required_rules("test"), produced)
+    assert len(problems) == 1 and "reported by 2 jobs on pull_request" in problems[0]
+    legacy = legacy_protection_problems(
+        {"required_status_checks": {"checks": [{"context": "test", "app_id": 15368}]}}, produced
+    )
+    assert any("reported by 2 jobs on pull_request" in p for p in legacy)
+    # a context only one job reports stays fine next to the ambiguous one
+    assert ambiguous_context("lint-only", produced) is None
+
+
+def test_duplicate_required_contexts_are_judged_per_triggering_event(tmp_path):
+    from agentic_sdlc.onboard import ambiguous_context, workflow_check_contexts
+
+    workflows = tmp_path / ".github/workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "pr.yml").write_text("on: pull_request\n" + _TEST_JOB)
+    (workflows / "queue.yml").write_text("on: merge_group\n" + _TEST_JOB)
+    split = workflow_check_contexts(tmp_path, "main")
+    assert "test" in split.pull_request and "test" in split.merge_group
+    assert ambiguous_context("test", split) is None  # one producer per event
+
+    (workflows / "queue2.yml").write_text("on: merge_group\n" + _TEST_JOB)
+    queued = workflow_check_contexts(tmp_path, "main")
+    why = ambiguous_context("test", queued)
+    assert why and "2 jobs on merge_group (queue.yml, queue2.yml)" in why
+    assert "on pull_request" not in why
+
+
+def test_two_jobs_of_one_workflow_with_the_same_name_are_two_producers(tmp_path):
+    from agentic_sdlc.onboard import ambiguous_context, workflow_check_contexts
+
+    workflows = tmp_path / ".github/workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "ci.yml").write_text(
+        "on: pull_request\njobs:\n"
+        "  unit:\n    name: test\n    runs-on: ubuntu-latest\n    steps: [{run: 'true'}]\n"
+        "  e2e:\n    name: test\n    runs-on: ubuntu-latest\n    steps: [{run: 'true'}]\n"
+    )
+    produced = workflow_check_contexts(tmp_path, "main")
+    assert "2 jobs on pull_request (ci.yml, ci.yml)" in (ambiguous_context("test", produced) or "")
+    # a disabled workflow reports nothing, so it produces nothing either
+    (workflows / "dup.yml").write_text("on: pull_request\n" + _TEST_JOB)
+    inactive = workflow_check_contexts(tmp_path, "main", inactive=frozenset({"dup.yml"}))
+    assert inactive.pull_request_producers["test"] == ("ci.yml", "ci.yml")

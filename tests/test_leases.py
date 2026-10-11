@@ -85,6 +85,8 @@ class FakeGh:
         # (owner/name, number) -> another repository's PR answer (dict, raw text or exception);
         # unknown ones answer NOT_FOUND
         self.external_prs: dict[tuple[str, int], object] = {}
+        self.repo_comments_error: Exception | None = None  # the repo-wide comment list fails
+        self.repo_comment_pages: list[int] = []  # pages of it read
 
     def issue(self, number, labels=(), assignees=(), comments=()):
         self.issues[number] = {
@@ -128,6 +130,21 @@ class FakeGh:
             return self._pages(self.events.get(n, []), args)
         if args[0] == "api" and args[1].split("?")[0].endswith("/timeline"):
             return json.dumps(_timeline_page(self.timeline, args[1]))
+        if args[0] == "api" and args[1].startswith(f"repos/{PROJECT}/issues/comments?"):
+            # the repository's issue comments updated since `since`, one `page` at a time
+            if self.repo_comments_error is not None:
+                raise self.repo_comments_error
+            query = dict(kv.split("=", 1) for kv in args[1].split("?", 1)[1].split("&"))
+            since = datetime.fromisoformat(query["since"].replace("Z", "+00:00"))
+            rows = [
+                {**c, "issue_url": f"https://api.github.com/repos/{PROJECT}/issues/{n}"}
+                for n, issue in sorted(self.issues.items())
+                for c in issue["comments"]
+                if datetime.fromisoformat(c["created_at"].replace("Z", "+00:00")) >= since
+            ]
+            size, page = int(query["per_page"]), int(query["page"])
+            self.repo_comment_pages.append(page)
+            return json.dumps(rows[(page - 1) * size : page * size])
         if args[0] == "api" and args[1].split("?")[0].endswith("/comments") and "-X" not in args:
             n = int(args[1].split("/")[4])
             return self._pages(self.issues[n]["comments"], args)
@@ -2753,3 +2770,59 @@ def test_an_unreadable_external_cross_reference_fails_closed_naming_the_pr(answe
     message = str(raised.value)
     assert "other/repo#82" in message and "no override" in message
     assert not any(c[:3] == ("api", "-X", "POST") for c in gh.calls)
+
+
+# ---- Codex 4240839923: the inventory follows the authoritative markers, not the mutable label.
+
+
+def _unlabelled_live_lease() -> FakeGh:
+    """Issue 7 holds a live lease whose `in-progress` label a Triage user removed."""
+    live = format_claim_marker(Lease(7, "a", "s1", "b", NOW + timedelta(hours=1)))
+    return FakeGh().issue(7, labels=["bug"], comments=[live])
+
+
+def test_claims_lists_a_live_lease_whose_label_was_removed():
+    gh = _unlabelled_live_lease()
+    gh.issue(8, labels=["bug"], comments=["just chatting"])
+    rows = list_claims(PROJECT, gh, now=NOW)
+    assert [(r.lease.issue, r.lease.session, r.expired) for r in rows] == [(7, "s1", False)]
+    # the comments are read only as far back as the longest lease a marker can carry
+    since = next(c[1] for c in gh.calls if c[1].startswith(f"repos/{PROJECT}/issues/comments?"))
+    assert "since=2026-09-23T12:00:00Z" in since
+
+
+def test_claims_skips_marker_comments_on_pull_requests_and_closed_issues():
+    gh = _unlabelled_live_lease()
+    gh.issues[7]["extra"] = {"pull_request": {"url": "x"}}
+    live = format_claim_marker(Lease(9, "a", "s9", "b", NOW + timedelta(hours=1)))
+    gh.issue(9, comments=[live])
+    gh.issues[9]["state"] = "closed"
+    assert list_claims(PROJECT, gh, now=NOW) == []
+
+
+def test_claims_inventory_is_incomplete_when_recent_comments_are_unreadable(monkeypatch, capsys):
+    from agentic_sdlc import cli
+    from agentic_sdlc.leases import claim_inventory
+
+    gh = _unlabelled_live_lease()
+    gh.repo_comments_error = RuntimeError("gh: HTTP 502")
+    inventory = claim_inventory(PROJECT, gh, now=NOW)
+    assert not inventory.complete and "page 1 unreadable" in inventory.gaps[0]
+    with pytest.raises(LeaseError, match="INCOMPLETE"):
+        list_claims(PROJECT, gh, now=NOW)
+    monkeypatch.setattr(cli, "run_gh", gh)
+    assert cli.main(["claims", "--project", PROJECT]) == 3
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == [] and "INCOMPLETE" in captured.err
+
+
+def test_claims_inventory_is_incomplete_at_the_comment_page_cap():
+    from agentic_sdlc.leases import CLAIMS_COMMENT_PAGE_SIZE, claim_inventory
+
+    gh = _unlabelled_live_lease()
+    gh.issue(8, comments=[f"chatter {i}" for i in range(2 * CLAIMS_COMMENT_PAGE_SIZE)])
+    inventory = claim_inventory(PROJECT, gh, now=NOW, page_cap=2)
+    assert gh.repo_comment_pages == [1, 2]
+    assert not inventory.complete and "page cap reached" in inventory.gaps[0]
+    full = claim_inventory(PROJECT, gh, now=NOW, page_cap=3)
+    assert full.complete and [r.lease.issue for r in full.rows] == [7]
