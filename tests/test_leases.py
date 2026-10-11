@@ -553,10 +553,108 @@ def test_open_pr_detection_needs_a_closing_keyword_and_accepts_qualified_forms()
             "body": "Resolves other/repo#7",
             "headRefName": "q",
         },
-        {"number": 5, "url": "u5", "title": "t", "body": "", "headRefName": "forge/issue-7"},
+        {
+            "number": 5,
+            "url": "u5",
+            "title": "t",
+            "body": "",
+            "headRefName": "forge/issue-7",
+            **_SAME_REPO_HEAD,
+        },
         {"number": 6, "url": "u6", "title": "t", "body": "closes #70", "headRefName": "w"},
     ]
     assert [p["number"] for p in open_prs_for_issue(PROJECT, 7, gh)] == [2, 3, 5]
+
+
+_SAME_REPO_HEAD = {
+    "isCrossRepository": False,
+    "headRepository": {"name": "repo"},
+    "headRepositoryOwner": {"login": "owner"},
+}
+
+
+def _fork_pr(number, head="forge/issue-7", body="", **fields):
+    row = {
+        "number": number,
+        "url": f"https://x/pr/{number}",
+        "title": "t",
+        "body": body,
+        "headRefName": head,
+        "isCrossRepository": True,
+        "headRepository": {"name": "repo"},
+        "headRepositoryOwner": {"login": "mallory"},
+    }
+    row.update(fields)
+    return row
+
+
+def test_a_fork_pr_named_after_the_issue_does_not_block_claims():
+    """Codex 4239667540: a fork PR from `forge/issue-7` is not durable work for issue 7."""
+    gh = FakeGh().issue(7)
+    gh.prs = [_fork_pr(30)]
+    result = claim(PROJECT, 7, agent="me", session="s1", branch="b", ttl_minutes=60, gh=gh, now=NOW)
+    assert result.ok, result.reason
+
+
+def test_pr_list_requests_the_head_repository_fields():
+    from agentic_sdlc.leases import open_prs_for_issue
+
+    gh = FakeGh().issue(7)
+    open_prs_for_issue(PROJECT, 7, gh)
+    pr_calls = [c for c in gh.calls if c[:2] == ("pr", "list")]
+    assert pr_calls
+    fields = pr_calls[-1][pr_calls[-1].index("--json") + 1].split(",")
+    assert {"headRepository", "headRepositoryOwner", "isCrossRepository"} <= set(fields)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {},  # the fork's own repository
+        {"isCrossRepository": None},
+        {"isCrossRepository": "false"},
+        {"isCrossRepository": False, "headRepositoryOwner": {"login": "mallory"}},
+        {"isCrossRepository": False, "headRepository": {"name": "other"}},
+        {"isCrossRepository": False, "headRepository": None},
+        {"isCrossRepository": False, "headRepositoryOwner": "owner"},
+        {"isCrossRepository": False, "headRepository": {"name": ""}},
+        {
+            "isCrossRepository": False,
+            "headRefName": None,
+            "headRepositoryOwner": {"login": "owner"},
+        },
+    ],
+)
+def test_branch_name_match_needs_a_provably_same_repository_head(fields):
+    from agentic_sdlc.leases import open_prs_for_issue
+
+    gh = FakeGh().issue(7)
+    gh.prs = [_fork_pr(31, **fields)]
+    assert open_prs_for_issue(PROJECT, 7, gh) == []
+
+
+def test_same_repository_branch_match_is_case_insensitive():
+    from agentic_sdlc.leases import open_prs_for_issue
+
+    gh = FakeGh().issue(7)
+    gh.prs = [
+        _fork_pr(
+            32,
+            isCrossRepository=False,
+            headRepository={"name": "REPO"},
+            headRepositoryOwner={"login": "Owner"},
+        )
+    ]
+    assert [p["number"] for p in open_prs_for_issue(PROJECT, 7, gh)] == [32]
+    result = claim(PROJECT, 7, agent="me", session="s1", branch="b", ttl_minutes=60, gh=gh, now=NOW)
+    assert not result.ok and "pr/32" in result.reason
+
+
+def test_a_fork_pr_that_explicitly_closes_the_issue_still_blocks_claims():
+    gh = FakeGh().issue(7)
+    gh.prs = [_fork_pr(33, head="patch-1", body="Closes #7")]
+    result = claim(PROJECT, 7, agent="me", session="s1", branch="b", ttl_minutes=60, gh=gh, now=NOW)
+    assert not result.ok and "pr/33" in result.reason
 
 
 # ------------------------------------------------------- every lease mutation is arbitrated

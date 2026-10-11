@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 import tomllib
 from dataclasses import replace
@@ -183,7 +184,10 @@ def test_renders_every_file_with_placeholders_resolved():
             "PLATFORM_REPOSITORY",
             "PLATFORM_COMMIT_SHA",
             "RUNS_ON_",
-            "_COMMAND",
+            # the workflow placeholders; the guard names GIT_SSH_COMMAND etc. on purpose
+            "SETUP_COMMAND",
+            "QUALITY_COMMAND",
+            "TEST_COMMAND",
             "IMPLEMENT_JOBS",
             "PREFLIGHT_EXTRA",
         ):
@@ -2088,8 +2092,10 @@ def test_runner_labels_render_as_yaml_strings():
             continue
         want = list(labels) if name.endswith("/ci.yml") else list(agent_labels)
         for job_name, job in (yaml.safe_load(content).get("jobs") or {}).items():
-            if (name.endswith("/agent-auto-plan.yml") and job_name == "preflight") or (
-                name.endswith("/agent-auto-implement.yml") and job_name == "authorize"
+            if (
+                (name.endswith("/agent-auto-plan.yml") and job_name == "preflight")
+                or (name.endswith("/agent-auto-implement.yml") and job_name == "authorize")
+                or job_name == "authorization_failed"
             ):
                 assert job["runs-on"] == "ubuntu-latest"  # authorizes before RUNS_ON is used
                 continue
@@ -3250,8 +3256,10 @@ def test_doctor_tolerates_only_the_tunable_knobs(tmp_path):
     write_onboarding(repo, spec())
 
     def runners(doc):
-        for job in doc["jobs"].values():  # not the labeler authorizations: GitHub-hosted
-            if "runs-on" in job and "authorized" not in (job.get("outputs") or {}):
+        # not the labeler authorizations nor their failure reporters: GitHub-hosted
+        for job_name, job in doc["jobs"].items():
+            hosted = "authorized" in (job.get("outputs") or {})
+            if "runs-on" in job and not hosted and job_name != "authorization_failed":
                 job["runs-on"] = "ubuntu-24.04"
             if "runs_on" in (job.get("with") or {}):
                 job["with"]["runs_on"] = '["ubuntu-24.04"]'
@@ -3956,6 +3964,7 @@ def test_commit_guard_fails_closed_on_substitutions_and_eval(tmp_path, command):
 )
 def test_commit_guard_fail_closed_still_proves_non_commits(tmp_path, command):
     guard = _guard_module(tmp_path, "forge_commit_guard")
+    (tmp_path / "sub").mkdir()  # a directory whose configuration can be read (Codex 4239667542)
     assert not guard.is_git_commit(command, cwd=str(tmp_path))
 
 
@@ -4313,7 +4322,6 @@ def test_commit_guard_treats_assembled_programs_as_unproven(tmp_path, command):
         "git log --grep commit",
         "ls",
         "ls -la && git status",
-        'git -C "$dir" status',
         "# a note\nls",
         "if [ -f x ]; then echo 'it''s'; fi",
         "sh -e script.sh",
@@ -5076,7 +5084,6 @@ def test_commit_guard_denies_git_by_default(tmp_path, command):
         "git for-each-ref refs/heads",
         "git merge-base main HEAD",
         "git rev-parse --show-toplevel",
-        'cd "$(git rev-parse --show-toplevel)" && git status',
         "LC_ALL=C git log",
         "git status | head",
         "git log --oneline | xargs echo",
@@ -5787,8 +5794,8 @@ def test_auto_implement_authorizes_the_labeler_on_a_hosted_runner_first(implemen
     assert "admin|write) ;;" in step["run"]
     gate = "needs.authorize.outputs.authorized == 'true'"
     for name, job in doc["jobs"].items():
-        if name == "authorize":
-            continue
+        if name in ("authorize", "authorization_failed"):
+            continue  # the hosted failure reporter runs exactly when authorization did not
         needs = job.get("needs")
         needs = [needs] if isinstance(needs, str) else needs or []
         assert "authorize" in needs, name
@@ -7864,3 +7871,420 @@ def test_doctor_reports_an_undeterminable_token_ceiling_as_manual(tmp_path):
     failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))
     assert TOKEN_PERMISSIONS_CHECK not in failed
     assert "grants at most issues: none" in failed[PLATFORM_CONTRACT_CHECK].detail
+
+
+# ---------------------------------------------------------------- Codex review 5481273396
+
+
+@pytest.fixture
+def helper_repo(tmp_path, monkeypatch):
+    """A git repository on `forge/issue-7` whose configuration is ONLY what a test writes: no
+    global/system configuration, no GIT_CONFIG_* or helper variables from the environment."""
+    import subprocess
+
+    for name in list(os.environ):
+        if name.startswith("GIT_CONFIG") or name in (
+            "GIT_EXTERNAL_DIFF", "GIT_EXEC_PATH", "GIT_PAGER", "PAGER", "GIT_SSH",
+            "GIT_SSH_COMMAND", "GIT_ASKPASS", "SSH_ASKPASS", "GIT_PROXY_COMMAND", "GIT_DIR",
+            "GIT_WORK_TREE",
+        ):  # fmt: skip
+            monkeypatch.delenv(name, raising=False)
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".gitconfig").write_text("")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(home / ".gitconfig"))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args):
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+
+    git("init", "-q", "-b", "forge/issue-7")
+    git("config", "user.name", "t")
+    git("config", "user.email", "t@example.com")
+    git("config", "commit.gpgsign", "false")
+    (repo / "a.txt").write_text("a\n")
+    git("add", "a.txt")
+    git("commit", "-q", "-m", "init")
+    git("remote", "add", "origin", "https://github.com/owner/comic.git")
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    return guard, repo, git
+
+
+def _guarded_decision(guard, repo, command, lease=None):
+    payload = {
+        "tool_name": "Bash",
+        "session_id": "s1",
+        "cwd": str(repo),
+        "tool_input": {"command": command},
+    }
+    branches = guard.commit_branches(command, str(repo))
+    return guard.decide(payload, branches, lambda n: lease, lambda b: False)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git status",
+        "git diff",
+        "git log -p",
+        "git show HEAD",
+        "git blame a.txt",
+        "git grep -n a",
+        "git fetch origin",
+        "git remote show origin",
+        "git help commit",
+        "git log --show-signature",
+    ],
+)
+def test_commit_guard_read_only_git_without_helpers_still_passes(helper_repo, command):
+    guard, repo, git = helper_repo
+    git("config", "core.pager", "less -R")  # plain pagers and booleans run nothing
+    git("config", "pager.log", "false")
+    git("config", "core.fsmonitor", "false")
+    git("config", "filter.lfs.clean", "git-lfs clean -- %f")
+    git("config", "filter.lfs.smudge", "git-lfs smudge --skip -- %f")
+    git("config", "filter.lfs.process", "git-lfs filter-process")
+    git("config", "credential.helper", "store")
+    git("config", "gpg.ssh.program", "/opt/sign")  # only verifying commands run it
+    git("config", "url.https://github.com/.insteadOf", "git@github.com:")
+    if command.endswith("--show-signature"):
+        git("config", "--unset", "gpg.ssh.program")
+    assert not guard.is_git_commit(command, cwd=str(repo)), command
+    assert _guarded_decision(guard, repo, command) == (0, "")
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "command"),
+    [
+        ("diff.external", "/tmp/evil", "git diff"),
+        ("diff.foo.textconv", "/tmp/evil", "git log -p"),
+        ("diff.foo.command", "/tmp/evil", "git show HEAD"),
+        ("filter.foo.clean", "/tmp/evil", "git status"),
+        ("filter.foo.process", "/tmp/evil", "git diff"),
+        ("filter.lfs.clean", "git-lfs clean -- %f; /tmp/evil", "git status"),
+        ("core.pager", "sh -c /tmp/evil", "git log"),
+        ("pager.log", "/tmp/evil", "git log"),
+        ("core.fsmonitor", "/tmp/evil", "git status"),
+        ("submodule.lib.url", "https://github.com/o/lib", "git status"),
+        ("gpg.program", "/tmp/evil", "git log --show-signature"),
+        ("gpg.ssh.program", "/tmp/evil", "git log --format=%G?"),
+        ("core.sshCommand", "/tmp/evil", "git fetch origin"),
+        ("core.askPass", "/tmp/evil", "git fetch origin"),
+        ("credential.helper", "!/tmp/evil", "git fetch origin"),
+        ("credential.https://github.com.helper", "/tmp/evil", "git remote show origin"),
+        ("remote.origin.uploadpack", "/tmp/evil", "git fetch origin"),
+        ("remote.origin.vcs", "evil", "git fetch origin"),
+        ("remote.origin.url", "ext::sh -c /tmp/evil", "git fetch origin"),
+        ("remote.origin.url", "evil://host/repo", "git fetch origin"),
+        ("remote.origin.url", "fd::3", "git remote show origin"),
+        ("url.ext::sh -c x.insteadOf", "https://", "git fetch origin"),
+        ("core.gitProxy", "/tmp/evil", "git fetch origin"),
+        ("man.viewer", "evil", "git help commit"),
+    ],
+)
+def test_commit_guard_read_only_git_with_a_configured_helper_needs_the_lease(
+    helper_repo, key, value, command
+):
+    """Codex 4239667542: configuration can make a "read-only" subcommand run a program (that
+    could commit or push), so it is not read-only any more: it needs the lease."""
+    guard, repo, git = helper_repo
+    git("config", key, value)
+    assert guard.is_git_commit(command, cwd=str(repo)), (key, command)
+    code, message = _guarded_decision(guard, repo, command)
+    assert code == 2 and "no live lease exists" in message, message
+    assert "configured outside the command" in message and key.split(".")[0] in message.lower()
+    # with the lease it is allowed, and off an issue branch nothing changes
+    lease = {"session": "s1", "agent": "a", "expires": None}
+    assert _guarded_decision(guard, repo, command, lease) == (0, "")
+    git("switch", "-q", "-c", "main")
+    assert _guarded_decision(guard, repo, command) == (0, "")
+
+
+def test_commit_guard_network_helpers_only_matter_to_network_subcommands(helper_repo):
+    guard, repo, git = helper_repo
+    git("config", "credential.helper", "!/tmp/evil")
+    git("config", "core.sshCommand", "/tmp/evil")
+    assert not guard.is_git_commit("git diff", cwd=str(repo))
+    assert not guard.is_git_commit("git remote -v", cwd=str(repo))
+    assert not guard.is_git_commit("git remote show -n origin", cwd=str(repo))
+    assert guard.is_git_commit("git fetch origin", cwd=str(repo))
+    assert guard.is_git_commit("git remote show origin", cwd=str(repo))
+
+
+def test_commit_guard_follows_includes_git_resolves(helper_repo):
+    guard, repo, git = helper_repo
+    extra = repo.parent / "extra.gitconfig"
+    extra.write_text("[diff]\n\texternal = /tmp/evil\n")
+    git("config", "include.path", str(extra))
+    assert guard.is_git_commit("git diff", cwd=str(repo))
+    extra.write_text("")
+    git("config", f"includeIf.gitdir:{repo}/.path", str(extra))
+    extra.write_text("[core]\n\tpager = /tmp/evil\n")
+    git("config", "--unset", "include.path")
+    assert guard.is_git_commit("git log", cwd=str(repo))
+
+
+def test_commit_guard_global_configuration_counts_too(helper_repo):
+    guard, repo, _ = helper_repo
+    (Path(os.environ["GIT_CONFIG_GLOBAL"])).write_text("[diff]\n\texternal = /tmp/evil\n")
+    assert guard.is_git_commit("git diff", cwd=str(repo))
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "command"),
+    [
+        ("GIT_EXTERNAL_DIFF", "/tmp/evil", "git diff"),
+        ("GIT_EXEC_PATH", "/tmp/evil", "git status"),
+        ("GIT_PAGER", "/tmp/evil", "git log"),
+        ("PAGER", "sh -c /tmp/evil", "git log"),
+        ("GIT_SSH_COMMAND", "/tmp/evil", "git fetch origin"),
+        ("GIT_SSH", "/tmp/evil", "git fetch origin"),
+        ("GIT_ASKPASS", "/tmp/evil", "git fetch origin"),
+        ("GIT_PROXY_COMMAND", "/tmp/evil", "git fetch origin"),
+        ("GIT_CONFIG_PARAMETERS", "'diff.external'='/tmp/evil'", "git diff"),
+    ],
+)
+def test_commit_guard_environment_helpers_need_the_lease(
+    helper_repo, monkeypatch, name, value, command
+):
+    guard, repo, _ = helper_repo
+    monkeypatch.setenv(name, value)
+    assert guard.is_git_commit(command, cwd=str(repo)), name
+
+
+def test_commit_guard_harmless_environment_pagers_pass(helper_repo, monkeypatch):
+    guard, repo, _ = helper_repo
+    monkeypatch.setenv("PAGER", "less")
+    monkeypatch.setenv("GIT_PAGER", "cat")
+    monkeypatch.setenv("GIT_ASKPASS", "")  # empty: unset
+    monkeypatch.setenv("GIT_SSH_COMMAND", "/tmp/evil")  # only network subcommands use it
+    assert not guard.is_git_commit("git log", cwd=str(repo))
+    assert not guard.is_git_commit("git diff", cwd=str(repo))
+
+
+@pytest.mark.parametrize(
+    ("hook", "command"),
+    [
+        ("post-index-change", "git status"),
+        ("reference-transaction", "git fetch origin"),
+        ("pre-auto-gc", "git fetch origin"),
+    ],
+)
+def test_commit_guard_hooks_a_read_only_command_runs_need_the_lease(helper_repo, hook, command):
+    guard, repo, git = helper_repo
+    assert not guard.is_git_commit(command, cwd=str(repo))
+    hooks = repo / ".git/hooks"
+    (hooks / hook).write_text("#!/bin/sh\n")
+    assert guard.is_git_commit(command, cwd=str(repo))
+    # found from a subdirectory and through `-C` as well (git answers relative paths)
+    (repo / "sub").mkdir()
+    assert guard.is_git_commit(command, cwd=str(repo / "sub"))
+    assert guard.is_git_commit(command.replace("git ", "git -C repo ", 1), cwd=str(repo.parent))
+    (hooks / hook).unlink()
+    assert not guard.is_git_commit(command.replace("git ", "git -C repo ", 1), cwd=str(repo.parent))
+    elsewhere = repo.parent / "hooks"
+    elsewhere.mkdir()
+    (elsewhere / hook).write_text("#!/bin/sh\n")
+    git("config", "core.hooksPath", str(elsewhere))
+    assert guard.is_git_commit(command, cwd=str(repo))
+
+
+def test_commit_guard_submodules_need_the_lease(helper_repo):
+    guard, repo, _ = helper_repo
+    (repo / ".gitmodules").write_text('[submodule "lib"]\n\tpath = lib\n')
+    assert guard.is_git_commit("git status", cwd=str(repo))
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git diff --ext-diff",
+        "git log -p --ext-diff",
+        "git show --textconv HEAD",
+        "git grep --textconv a",
+        "git cat-file --textconv HEAD:a.txt",
+        "git cat-file --filters HEAD:a.txt",
+    ],
+)
+def test_commit_guard_helper_options_need_the_lease(helper_repo, command):
+    guard, repo, _ = helper_repo
+    assert guard.is_git_commit(command, cwd=str(repo))
+    assert _guarded_decision(guard, repo, command)[0] == 2
+
+
+@pytest.mark.parametrize("command", ["git -c diff.external=/tmp/evil diff", "git -c x=y status"])
+def test_commit_guard_config_overrides_on_read_only_git_need_the_lease(helper_repo, command):
+    guard, repo, _ = helper_repo
+    assert guard.is_git_commit(command, cwd=str(repo))
+
+
+def test_commit_guard_unreadable_configuration_fails_closed(helper_repo, monkeypatch):
+    import subprocess
+
+    guard, repo, _ = helper_repo
+    config = repo / ".git/config"
+    good = config.read_text()
+    config.write_text(good + "[broken\n")
+    assert guard.is_git_commit("git status", cwd=str(repo))
+    config.write_text(good)
+    assert not guard.is_git_commit("git status", cwd=str(repo))
+    real = subprocess.run
+
+    def slow_config(args, **kwargs):
+        if "config" in args:
+            raise subprocess.TimeoutExpired(args, kwargs.get("timeout"))
+        return real(args, **kwargs)
+
+    monkeypatch.setattr(guard.subprocess, "run", slow_config)
+    assert guard.is_git_commit("git status", cwd=str(repo))
+    # a location whose configuration cannot be known is not proven read-only either
+    monkeypatch.setattr(guard.subprocess, "run", real)
+    assert guard.is_git_commit('git -C "$dir" status', cwd=str(repo))
+    assert guard.is_git_commit('cd "$(git rev-parse --show-toplevel)" && git status', cwd=str(repo))
+
+
+def test_commit_guard_bounds_every_subprocess_call():
+    """Codex 4239667544: every subprocess.run in the guard carries a timeout."""
+    import ast
+
+    source = render_onboarding(spec())[".claude/hooks/forge_commit_guard.py"]
+    calls = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "run"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "subprocess"
+    ]
+    assert len(calls) >= 6
+    for call in calls:
+        timeouts = [k for k in call.keywords if k.arg == "timeout"]
+        assert timeouts, f"subprocess.run at line {call.lineno} has no timeout"
+
+
+def test_commit_guard_github_lookups_time_out_as_unavailable(tmp_path, monkeypatch):
+    import subprocess
+
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    seen: list[float | None] = []
+
+    def stalled(args, **kwargs):
+        seen.append(kwargs.get("timeout"))
+        raise subprocess.TimeoutExpired(args, kwargs.get("timeout"))
+
+    monkeypatch.setattr(guard.subprocess, "run", stalled)
+    monkeypatch.setattr(guard, "_PERMISSIONS", {})
+    assert guard.lease_unavailable(guard.lease_for(7))
+    assert guard.open_pr_for("forge/issue-7") is None
+    with pytest.raises(guard.LeaseUnavailable, match="timed out"):
+        guard.repo_permission("someone")
+    assert seen == [guard.GH_TIMEOUT] * 3 and 0 < guard.GH_TIMEOUT <= 60
+    commit = {"tool_name": "Bash", "session_id": "s1", "tool_input": {"command": "git commit"}}
+    code, message = guard.decide(commit, "forge/issue-7", guard.lease_for, guard.open_pr_for)
+    assert code == 2 and "Lease inventory unavailable" in message
+    code, message = guard.decide(commit, "forge/issue-7", lambda n: None, guard.open_pr_for)
+    assert code == 2 and "could not be read" in message
+    # a marker whose author's permission read stalls makes the lease unreadable, not free
+    expires = "2999-01-01T00:00:00Z"
+    claim = f"<!-- forge-claim agent=a session=s9 branch=b expires={expires} -->"
+    comments = [{"body": claim, "user": {"login": "owner", "type": "User"}}]
+    with pytest.raises(guard.LeaseUnavailable):
+        guard.lease_from_comments(comments)
+
+
+def test_commit_guard_local_git_timeouts_refuse(tmp_path, monkeypatch):
+    import subprocess
+
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+
+    def stalled(args, **kwargs):
+        assert kwargs.get("timeout") == guard.GIT_TIMEOUT
+        raise subprocess.TimeoutExpired(args, kwargs.get("timeout"))
+
+    monkeypatch.setattr(guard.subprocess, "run", stalled)
+    assert guard.current_branch(str(tmp_path)) == guard.BRANCH_TIMEOUT
+    assert guard._git_config(str(tmp_path), ((), (), ()), "--get", "x") == (-1, "")
+    assert not guard._branch_exists("main", str(tmp_path), ((), (), ()))
+    commit = {"tool_name": "Bash", "session_id": "s1", "tool_input": {"command": "git commit"}}
+    branches = guard.commit_branches("git commit", str(tmp_path))
+    assert branches == [guard.BRANCH_TIMEOUT]
+    code, message = guard.decide(commit, branches, lambda n: None, lambda b: False)
+    assert code == 2 and "did not report the checked-out branch" in message
+
+
+def test_guard_and_leases_agree_on_same_repository_prs(tmp_path, monkeypatch):
+    """Codex 4239667540: `claim()` and the commit guard apply ONE same-repository rule."""
+    from agentic_sdlc import leases
+
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    monkeypatch.setattr(guard, "PROJECT", "Owner/Comic")
+    own = {
+        "isCrossRepository": False,
+        "headRepository": {"name": "comic"},
+        "headRepositoryOwner": {"login": "owner"},
+    }
+    rows = [
+        own,
+        {**own, "isCrossRepository": True},
+        {**own, "isCrossRepository": None},
+        {**own, "headRepositoryOwner": {"login": "mallory"}},
+        {**own, "headRepository": {"name": "other"}},
+        {**own, "headRepository": None},
+        {**own, "headRepositoryOwner": {"login": ""}},
+        {k: v for k, v in own.items() if k != "isCrossRepository"},
+        "not a dict",
+    ]
+    for row in rows:
+        assert guard._same_repository_pr(row) == leases._same_repository_pr(row, "Owner/Comic")
+
+
+def test_auto_workflows_report_a_failed_authorization_from_a_hosted_runner():
+    """Codex 4239667541: a FAILED authorization job (not a definitive `authorized=false`) is
+    reported on the issue by a GitHub-hosted job, so the label event is not silently consumed."""
+    files = render_onboarding(spec(runs_on=("self-hosted", "linux")))
+    for name, job_name, work in (
+        ("agent-auto-plan.yml", "preflight", "Planning"),
+        ("agent-auto-implement.yml", "authorize", "Implementation"),
+    ):
+        doc = yaml.safe_load(files[f".github/workflows/{name}"])
+        report = doc["jobs"]["authorization_failed"]
+        assert report["needs"] == job_name
+        assert report["runs-on"] == "ubuntu-latest"
+        assert report["permissions"] == {"issues": "write"}
+        condition = report["if"]
+        assert "always()" in condition
+        assert f"needs.{job_name}.result == 'failure'" in condition
+        assert f"needs.{job_name}.result == 'cancelled'" in condition
+        assert "authorized" not in condition  # a definitive "no" is not a failure
+        step = report["steps"][0]
+        assert step["uses"].startswith("actions/github-script@")
+        assert step["env"]["ISSUE_NUMBER"] == "${{ github.event.issue.number }}"
+        assert "createComment" in step["with"]["script"]
+        assert f"{work} was not started" in step["with"]["script"]
+        assert "could not be verified" in step["with"]["script"]
+        # the existing notifiers still never reach RUNS_ON for an unauthorized labeler
+        notify = doc["jobs"]["notify_failure"]
+        assert notify["runs-on"] == ["self-hosted", "linux"]
+
+
+@pytest.mark.parametrize("name", ["agent-auto-plan.yml", "agent-auto-implement.yml"])
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda d: d["jobs"]["authorization_failed"].update({"runs-on": ["self-hosted", "linux"]}),
+        lambda d: d["jobs"]["authorization_failed"].update({"permissions": {"issues": "read"}}),
+        lambda d: d["jobs"]["authorization_failed"].update({"if": "false"}),
+        lambda d: d["jobs"].pop("authorization_failed"),
+    ],
+)
+def test_doctor_requires_the_authorization_failure_reporter(tmp_path, name, change):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    assert _drift(repo) is None
+    _edit_workflow(repo, name, change)
+    drift = _drift(repo)
+    assert drift is not None and name in drift

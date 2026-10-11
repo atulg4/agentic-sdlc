@@ -1072,7 +1072,10 @@ def _render_workflow(name: str, spec: OnboardSpec, issue_expr: str | None = None
             extra = '          test -n "$OPENAI_API_KEY"\n'
         jobs = jobs.replace("PREFLIGHT_EXTRA\n", extra)
         if name == "agent-auto-implement.yml":
-            # Every job that can reach the configured runner waits on the hosted `authorize`.
+            # Every job that can reach the configured runner waits on the hosted `authorize`,
+            # `notify_failure` included: it runs on RUNS_ON, which an unverified labeler must
+            # never reach. A FAILED `authorize` is reported instead by the hosted
+            # `authorization_failed` job (Codex 4239667541), which needs no authorization.
             gate = "    if: needs.authorize.outputs.authorized == 'true'\n"
             for old, new in (
                 ("  preflight:\n", "  preflight:\n    needs: authorize\n" + gate),
@@ -1095,7 +1098,13 @@ def _render_workflow(name: str, spec: OnboardSpec, issue_expr: str | None = None
         authorization = _resource("github/forge/_authorize-labeler.yml").replace(
             "AUTHORIZED_WORK", work
         )
-        text = text.replace("LABELER_AUTHORIZATION\n", authorization)
+        # Codex 4239667541: a hosted reporter for a FAILED authorization job, right after it.
+        report = (
+            _resource("github/forge/_authorization-failure.yml")
+            .replace("AUTHORIZE_JOB", _LABEL_CONDITION_JOBS[name])
+            .replace("AUTHORIZED_WORK", work)
+        )
+        text = text.replace("LABELER_AUTHORIZATION\n", authorization + report)
     labels = (spec.ready_label, HUMAN_REVIEW_LABEL, IMPLEMENTATION_LABEL)
     platform = spec.platform_repository
     # Every placeholder is a WHOLE YAML value: strings go through `_yaml_str`, label lists
@@ -1140,6 +1149,7 @@ TEMPLATE_PLACEHOLDERS = (
     "PREFLIGHT_EXTRA",
     "LABELER_AUTHORIZATION",
     "AUTHORIZED_WORK",
+    "AUTHORIZE_JOB",
 )
 
 
@@ -5448,8 +5458,13 @@ _LABEL_CONDITION_JOBS = {
     "agent-auto-implement.yml": "authorize",
 }
 #: Jobs whose `runs-on` is NOT tunable: the automatic callers authorize the labeler on a
-#: GitHub-hosted runner before anything is scheduled on the (self-hosted) RUNS_ON labels.
-_HOSTED_JOBS = {"agent-auto-plan.yml": "preflight", "agent-auto-implement.yml": "authorize"}
+#: GitHub-hosted runner before anything is scheduled on the (self-hosted) RUNS_ON labels, and
+#: report a FAILED authorization from one too (`authorization_failed`, Codex 4239667541).
+AUTHORIZATION_FAILED_JOB = "authorization_failed"
+_HOSTED_JOBS = {
+    "agent-auto-plan.yml": frozenset({"preflight", AUTHORIZATION_FAILED_JOB}),
+    "agent-auto-implement.yml": frozenset({"authorize", AUTHORIZATION_FAILED_JOB}),
+}
 
 
 def _mask_tunables(name: str, doc: object) -> object:
@@ -5462,7 +5477,7 @@ def _mask_tunables(name: str, doc: object) -> object:
     for job_name, job in jobs.items():
         if not isinstance(job, dict):
             continue
-        if "runs-on" in job and _HOSTED_JOBS.get(name) != job_name:
+        if "runs-on" in job and job_name not in _HOSTED_JOBS.get(name, frozenset()):
             job["runs-on"] = _TUNED
         passed = job.get("with")
         if isinstance(passed, dict):
