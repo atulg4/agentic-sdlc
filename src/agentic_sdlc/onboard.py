@@ -1331,6 +1331,108 @@ def _replace_file(path: Path, content: str) -> None:
         raise
 
 
+SETTINGS_FILE = ".claude/settings.json"
+
+
+def _previous_guides(base: Path, spec: OnboardSpec) -> list[dict[str, str]]:
+    """The guide texts the INSTALLED policy renders (what doctor's containment check compares,
+    `rendered_managed_files`), under the policy's own project id and this one: the managed
+    fragment a forced re-onboard replaces. Empty when the installed policy cannot be read."""
+    try:
+        policy_doc = tomllib.loads((base / "agentic-sdlc.toml").read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return []
+    project = policy_doc.get("project") if isinstance(policy_doc.get("project"), dict) else {}
+    ids = dict.fromkeys(i for i in (project.get("id"), spec.project_id) if isinstance(i, str))
+    renders = []
+    for project_id in ids:
+        try:
+            rendered, _ = rendered_managed_files(
+                policy_doc, project_id, spec.platform_repository, cloud=False
+            )
+        except (OnboardError, TypeError, ValueError):
+            continue
+        renders.append(rendered)
+    return renders
+
+
+def _merge_guide(rel: str, have: str, want: str, previous: list[dict[str, str]]) -> str:
+    """A forced re-onboard of a guide (AGENTS.md, CLAUDE.md): doctor accepts repository notes
+    AROUND the generated text, so only that text is replaced. Already containing `want`: kept
+    as is. Containing a previous render (`_previous_guides`): that fragment is replaced in place.
+    No Forge guide in it at all (a pre-existing file): `want` is appended after the owner's
+    content. A Forge guide that was edited in place cannot be told apart from the notes around
+    it, so that refuses rather than delete anything (fail closed)."""
+    if want in have:
+        return have
+    for rendered in previous:
+        old = rendered.get(rel)
+        if old and old in have:
+            return have.replace(old, want, 1)
+    headings = {want.splitlines()[0]}
+    headings.update(r[rel].splitlines()[0] for r in previous if r.get(rel))
+    if any(line in headings for line in have.splitlines()):
+        raise OnboardError(
+            f"{rel} holds an edited Forge guide that cannot be separated from the notes around "
+            "it; restore its generated text (or move your notes aside and delete the file), then "
+            "re-run `sdlcctl onboard --force`"
+        )
+    if not have.strip():
+        return want
+    return have.rstrip("\n") + "\n\n" + want
+
+
+def _merge_settings(have: str, want: str) -> str:
+    """A forced re-onboard of `.claude/settings.json`: the managed Forge hook groups are merged
+    into the existing settings, keeping every unrelated key and hook (`hook_problems` accepts
+    them). Every existing handler running a Forge script (`_hook_runs`) -- a stale, duplicated or
+    deviating copy -- is dropped, a group left empty by that is dropped, and the managed groups
+    are appended, so a re-run yields the same file. `disableAllHooks: true` would switch the
+    managed hooks off, so it goes. Unparseable or misshapen settings are refused, never
+    replaced."""
+    try:
+        settings = json.loads(have)
+    except json.JSONDecodeError as exc:
+        raise OnboardError(
+            f"{SETTINGS_FILE} is not valid JSON ({str(exc)[:80]}); fix or remove it, then "
+            "re-run `sdlcctl onboard --force` (it is merged, never overwritten)"
+        ) from exc
+    if not isinstance(settings, dict):
+        raise OnboardError(f"{SETTINGS_FILE} is not a JSON object; fix or remove it")
+    hooks = settings.get("hooks", {})
+    if not isinstance(hooks, dict):
+        raise OnboardError(f"{SETTINGS_FILE} `hooks` is not an object; fix or remove it")
+    managed = json.loads(want)["hooks"]
+    scripts = tuple(HOOK_SCRIPTS.values())
+    merged: dict = {}
+    for event, groups in hooks.items():
+        if not isinstance(groups, list):
+            if event in managed:
+                raise OnboardError(
+                    f"{SETTINGS_FILE} `hooks.{event}` is not a list; fix or remove it"
+                )
+            merged[event] = groups
+            continue
+        kept = []
+        for group in groups:
+            entries = group.get("hooks") if isinstance(group, dict) else None
+            if not isinstance(entries, list):
+                kept.append(group)
+                continue
+            rest = [e for e in entries if not any(_hook_runs(e, s) for s in scripts)]
+            if len(rest) == len(entries):
+                kept.append(group)
+            elif rest:
+                kept.append({**group, "hooks": rest})
+        merged[event] = kept
+    for event, groups in managed.items():
+        merged[event] = [*merged.get(event, []), *groups]
+    settings["hooks"] = merged
+    if settings.get("disableAllHooks") is True:
+        del settings["disableAllHooks"]
+    return json.dumps(settings, indent=2) + "\n"
+
+
 def write_onboarding(
     root: str | Path, spec: OnboardSpec, *, force: bool = False
 ) -> tuple[Path, ...]:
@@ -1350,6 +1452,15 @@ def write_onboarding(
         raise OnboardError(
             "refusing to overwrite existing files (use --force): " + ", ".join(existing)
         )
+    # Tunable files keep what the repository added around the managed part (Codex 4239780830):
+    # every merge is computed before anything is written, so a refusal writes nothing.
+    previous = _previous_guides(base, spec) if existing else {}
+    for rel in existing:
+        path = base / rel
+        if rel in CONTAINED_MANAGED_FILES:
+            files[rel] = _merge_guide(rel, path.read_text(encoding="utf-8"), files[rel], previous)
+        elif rel == SETTINGS_FILE:
+            files[rel] = _merge_settings(path.read_text(encoding="utf-8"), files[rel])
     written = []
     for rel, content in files.items():
         path = base / rel
@@ -4460,8 +4571,9 @@ def reusable_workflow_limit_problems(
     return problems
 
 
-#: GITHUB_TOKEN permission scopes and levels (`none` < `read` < `write`). `metadata` is always
-#: read and never requested, so it is not compared.
+#: GITHUB_TOKEN permission scopes and levels (`none` < `read` < `write`): GitHub's finite
+#: `permissions` syntax. A scope outside it (a typo such as `issuse`, or `metadata`, which a
+#: workflow cannot request) makes GitHub reject the workflow before any job runs.
 TOKEN_SCOPES = (
     "actions",
     "attestations",
@@ -4480,6 +4592,9 @@ TOKEN_SCOPES = (
     "statuses",
 )
 _TOKEN_LEVELS = {"none": 0, "read": 1, "write": 2}
+#: Scopes that accept only some levels (Codex 4239780832): an OIDC token can only be minted or
+#: not (`id-token: read` is invalid), and GitHub Models is read-only (`models: write` is invalid).
+_TOKEN_SCOPE_LEVELS = {"id-token": ("write", "none"), "models": ("read", "none")}
 _TOKEN_LEVEL_NAMES = {v: k for k, v in _TOKEN_LEVELS.items()}
 TOKEN_PERMISSIONS_CHECK = "GITHUB_TOKEN permissions hold across reusable-workflow calls"
 #: The repository default for a workflow/job that sets no `permissions`
@@ -4496,18 +4611,23 @@ TokenPermissions = dict[str, int]
 
 def token_permissions(value: object) -> TokenPermissions | str:
     """A `permissions:` value as {scope: level} (a scope it does not name is `none`), or why it
-    cannot be read. `read-all`/`write-all` grant every scope; `{}` none of them."""
+    is not valid GitHub `permissions` syntax. `read-all`/`write-all` grant every scope; `{}`
+    none of them. Only a scope of `TOKEN_SCOPES` at a level that scope accepts
+    (`_TOKEN_SCOPE_LEVELS`) is valid; anything else is returned as the reason, which callers
+    report as a contract mismatch -- GitHub rejects such a workflow outright."""
     if value in ("read-all", "write-all"):
         level = _TOKEN_LEVELS[str(value).split("-")[0]]
         return dict.fromkeys(TOKEN_SCOPES, level)
     if not isinstance(value, dict):
-        return f"unreadable permissions {value!r}"
+        return f"invalid permissions {value!r}"
     out: TokenPermissions = {}
     for scope, level in value.items():
-        if not isinstance(scope, str) or level not in _TOKEN_LEVELS:
-            return f"unreadable permission {scope!r}: {level!r}"
-        if scope != "metadata":
-            out[scope] = _TOKEN_LEVELS[level]
+        if not isinstance(scope, str) or scope not in TOKEN_SCOPES:
+            return f"invalid permission scope {scope!r}"
+        allowed = _TOKEN_SCOPE_LEVELS.get(scope, tuple(_TOKEN_LEVELS))
+        if not isinstance(level, str) or level not in allowed:
+            return f"invalid permission {scope}: {level!r} (allowed: {'|'.join(allowed)})"
+        out[scope] = _TOKEN_LEVELS[level]
     return out
 
 
@@ -4536,8 +4656,10 @@ def token_permission_problems(
     `permissions` (else its workflow's, else the repository default from `repo_default`) is the
     CEILING of every job of the callee, and of everything that job calls in turn. A callee job
     (or the callee's workflow-level default it inherits) requesting more than its ceiling is a
-    mismatch: GitHub refuses the run or the job's API calls fail on a downgraded token. A
-    ceiling or a request doctor cannot read, or a callee missing from `graph`, is an unknown
+    mismatch: GitHub refuses the run or the job's API calls fail on a downgraded token. So is a
+    `permissions` value that is not valid GitHub syntax (`token_permissions`: an unknown scope,
+    a level the scope does not accept): GitHub rejects that workflow before any job runs. A
+    repository default doctor cannot read, or a callee missing from `graph`, is an unknown
     (fail closed). The walk follows `graph`'s pinned platform calls (the edges
     `platform_callee_graph` resolved); calls it could not follow are already reported there."""
     mismatches: list[str] = []
@@ -4568,7 +4690,7 @@ def token_permission_problems(
             if source is not None:
                 requested = token_permissions(source["permissions"])
                 if isinstance(requested, str):
-                    unknowns.append(f"{where}: {requested}")
+                    mismatches.append(f"{where}: {requested}; GitHub rejects the workflow")
                     continue
                 over = [s for s, level in requested.items() if level > ceiling.get(s, 0)]
                 for scope in sorted(over):
@@ -4586,10 +4708,11 @@ def token_permission_problems(
         label = where.rsplit(":", 1)[0]
         doc = docs_by_label.get(label)
         doc = doc if isinstance(doc, dict) else {}
-        if "permissions" in job:
-            ceiling = token_permissions(job["permissions"])
-        elif "permissions" in doc:
-            ceiling = token_permissions(doc["permissions"])
+        if "permissions" in job or "permissions" in doc:
+            ceiling = token_permissions((job if "permissions" in job else doc)["permissions"])
+            if isinstance(ceiling, str):
+                mismatches.append(f"{where}: {ceiling}; GitHub rejects the workflow")
+                continue
         else:
             ceiling = repo_default()
         if isinstance(ceiling, str):

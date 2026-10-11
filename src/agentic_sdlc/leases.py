@@ -385,9 +385,19 @@ def _trust(project: str, gh: GhRunner) -> PermissionCache:
 
 
 def _trusted_comments(project: str, issue: int, gh: GhRunner) -> list[dict]:
-    """The issue's comments whose authors may post lease markers, in order."""
+    """The issue's marker comments whose authors may post lease markers, in order.
+
+    Only a comment carrying a syntactically valid claim/release/cleanup marker (`_marker`, the
+    commit guard's `comment_marker`) can change lease state, so only its author's permission is
+    resolved (Codex 4239780833): ordinary discussion costs no permission read, and a failed read
+    for a chatter's account cannot refuse the lease operation. A marker author whose permission
+    cannot be read still refuses it (`PermissionCache`)."""
     permission = _trust(project, gh)
-    return [c for c in _comments(project, issue, gh) if trusted_marker_author(c, permission)]
+    return [
+        c
+        for c in _comments(project, issue, gh)
+        if _marker(str(c.get("body") or "")) is not None and trusted_marker_author(c, permission)
+    ]
 
 
 def current_lease(
@@ -623,13 +633,21 @@ def open_prs_for_issue(project: str, issue: int, gh: GhRunner) -> list[dict]:
                 "1000",
                 "--json",
                 "number,url,body,title,headRefName,"
-                "headRepository,headRepositoryOwner,isCrossRepository",
+                "headRepository,headRepositoryOwner,isCrossRepository,"
+                "closingIssuesReferences",
             ]
         )
         or "[]"
     )
+    try:
+        prs = json.loads(raw)
+    except ValueError as exc:
+        raise LeaseError("unreadable answer from gh pr list: not JSON") from exc
+    # An unreadable inventory is never "no open PR": that would let a claim start duplicate work.
+    if not isinstance(prs, list) or not all(isinstance(pr, dict) for pr in prs):
+        raise LeaseError("unreadable answer from gh pr list: not a list of pull requests")
     hits = []
-    for pr in json.loads(raw):
+    for pr in prs:
         text = f"{pr.get('title', '')}\n{pr.get('body', '')}"
         refs = set()
         for m in _PR_REF.finditer(text):
@@ -646,9 +664,36 @@ def open_prs_for_issue(project: str, issue: int, gh: GhRunner) -> list[dict]:
             and _same_repository_pr(pr, project)
             and re.search(rf"(^|[/-])issue-{issue}($|[^0-9])", head) is not None
         )
-        if issue in refs or by_branch:
+        if issue in refs or by_branch or _links_issue(pr, project, issue):
             hits.append(pr)
     return hits
+
+
+def _links_issue(pr: dict, project: str, issue: int) -> bool:
+    """Does the PR's `closingIssuesReferences` -- which carries the issues linked through the
+    Development sidebar as well as closing keywords (Codex 4239780827) -- name issue `issue` of
+    `project` itself? Owner/name compare case-insensitively; a malformed field or entry proves
+    nothing (the textual and branch signals still decide)."""
+    refs = pr.get("closingIssuesReferences")
+    if not isinstance(refs, list):
+        return False
+    for ref in refs:
+        if not isinstance(ref, dict):
+            continue
+        number = ref.get("number")
+        if isinstance(number, bool) or not isinstance(number, int) or number != issue:
+            continue
+        repo = ref.get("repository")
+        if not isinstance(repo, dict):
+            continue
+        owner = repo.get("owner")
+        name = repo.get("name")
+        login = owner.get("login") if isinstance(owner, dict) else None
+        if not isinstance(name, str) or not isinstance(login, str) or not name or not login:
+            continue
+        if f"{login}/{name}".lower() == project.lower():
+            return True
+    return False
 
 
 def _same_repository_pr(pr: object, project: str) -> bool:
