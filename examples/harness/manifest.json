@@ -1,0 +1,149 @@
+{
+  "schemaVersion": 1,
+  "harness": {
+    "id": "python-bug-fix",
+    "version": "1.0.0",
+    "recipeDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  },
+  "work": {
+    "projectId": "example/project",
+    "workRef": "example/project#42",
+    "unitId": "example-42",
+    "taskSpecDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "baseCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidateTree": null,
+    "publishedHeadCommit": null,
+    "patchDigest": null
+  },
+  "lineage": {
+    "attemptId": "example-42-implementation-1",
+    "parentManifestDigest": null,
+    "budgetLedgerId": "example-42-budget"
+  },
+  "policy": {
+    "platformCommit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "projectPolicyCommit": "cccccccccccccccccccccccccccccccccccccccc",
+    "projectPolicyDigest": "1567cf435db9f900bc008d3a034c207a2dea1483117d0f7c6829238193728ba3",
+    "missionRegistryDigest": "f2da5cbcb3e4a736298148ab6d93e95f7f48629b4bc7369bab3409f4776559d9",
+    "skillRegistryDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "executorRegistryDigest": "aff4edb2b04f467df8e6f5c92da5c89bbc4bfe6f81a0feb9bc0b4e58806ded04",
+    "routingPolicyDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "riskPolicyDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  },
+  "classification": {
+    "taskType": "bug",
+    "domains": [
+      "python",
+      "api"
+    ],
+    "complexity": "bounded",
+    "evidenceRefs": [
+      "task-spec",
+      "affected-paths"
+    ]
+  },
+  "risk": {
+    "effective": "medium",
+    "ruleMatches": [
+      "default-medium"
+    ],
+    "decisionDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  },
+  "mission": {
+    "id": "implementation-worker",
+    "version": "1.0.0",
+    "contractDigest": "d7f08db1a409bda84ba51d6db4714adef29012f39fff32829601a43cfb90b6fd",
+    "requiredCapabilities": [
+      "edit-code",
+      "author-tests",
+      "run-commands"
+    ],
+    "independentOf": []
+  },
+  "skills": [
+    {
+      "id": "python-regression-fix",
+      "version": "1.0.0",
+      "contentDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    }
+  ],
+  "context": {
+    "packDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "renderedInputDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "indexSnapshotDigest": null,
+    "sourceRevisionDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "tokenizerId": "example-tokenizer",
+    "inputTokenLimit": 24000,
+    "outputTokenReserve": 8000,
+    "requiredEvidenceRefs": [
+      "task-spec",
+      "project-rules",
+      "affected-source",
+      "regression-test"
+    ],
+    "exclusions": []
+  },
+  "permissions": {
+    "readPaths": [
+      "src/**",
+      "tests/**",
+      "docs/**"
+    ],
+    "writePaths": [
+      "src/api/**",
+      "tests/api/**"
+    ],
+    "toolProfileId": "isolated-patch-editor-v1",
+    "networkProfileId": "approved-model-endpoint-only-v1",
+    "commandProfileIds": [
+      "trusted-repository-inspection-v1"
+    ],
+    "denyCapabilities": [
+      "merge",
+      "deploy",
+      "production-secrets",
+      "edit-governance"
+    ]
+  },
+  "executor": {
+    "executorId": "example-api-worker",
+    "adapter": "example-adapter",
+    "adapterVersion": "1.0.0",
+    "executionType": "direct-api",
+    "authMode": "api-key",
+    "provider": "openai",
+    "model": "example-model",
+    "modelAlias": "gpt-5",
+    "profileDigest": "783a0b711122afc4157b3f9df32b1e49cde29493f62763c1a61789bbc39b67b6",
+    "routeDecisionDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  },
+  "budget": {
+    "maxCostUsd": 2.0,
+    "maxTotalTokens": 60000,
+    "maxRuntimeSeconds": 1200,
+    "maxModelCalls": 4,
+    "maxRepairCycles": 1,
+    "maxConcurrentMissions": 1
+  },
+  "verification": {
+    "requiredGateIds": [
+      "deterministic-ci",
+      "independent-agent-review",
+      "human-merge-approval"
+    ],
+    "additionalGateIds": [
+      "targeted-api-regression"
+    ],
+    "requiredArtifactTypes": [
+      "patch",
+      "patch-manifest",
+      "gate-report",
+      "review-report"
+    ]
+  },
+  "escalation": {
+    "failurePolicyId": "bounded-diagnostic-repair-v1",
+    "maxContextExpansions": 1,
+    "terminalAction": "block-and-escalate"
+  }
+}

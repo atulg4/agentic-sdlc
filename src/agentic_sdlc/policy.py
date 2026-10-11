@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .models import PolicyDecision, RiskLevel, TaskSpec
+from .spec_stage import spec_review_block
 
 _PROJECT_ID = re.compile(r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+$")
 _BRANCH = re.compile(r"^[A-Za-z0-9._/-]+$")
@@ -96,8 +97,14 @@ def _patterns(
 
 
 def load_policy(path: str | Path) -> ProjectPolicy:
-    with Path(path).open("rb") as handle:
-        data = tomllib.load(handle)
+    return load_policy_bytes(Path(path).read_bytes())
+
+
+def load_policy_bytes(raw: bytes) -> ProjectPolicy:
+    """Parse a policy from one byte snapshot (so a digest of `raw` binds what is enforced)."""
+    if type(raw) is not bytes:
+        raise TypeError("policy input must be immutable bytes")
+    data = tomllib.loads(raw.decode("utf-8"))
     if data.get("version") != 1:
         raise ValueError("policy version must be 1")
     project = _table(data, "project")
@@ -176,6 +183,10 @@ def evaluate_task(
     missing = required_labels - set(task.labels)
     if missing:
         reasons.append("missing required labels: " + ", ".join(sorted(missing)))
+    if mode in {"plan", "implement"}:
+        held = spec_review_block(task.labels)
+        if held:
+            reasons.append(held)
 
     text = f"{task.title}\n{task.raw_body}"
     for pattern in policy.forbidden_task_patterns:
