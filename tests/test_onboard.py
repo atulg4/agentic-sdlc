@@ -5811,7 +5811,10 @@ def test_auto_implement_authorizes_the_labeler_on_a_hosted_runner_first(implemen
     assert authorize["outputs"]["authorized"] == "${{ steps.authorize.outputs.authorized }}"
     # the same authorization as automatic planning, step for step but the notice wording
     step, plan_step = authorize["steps"][0], plan["jobs"]["preflight"]["steps"][0]
-    assert step["env"] == plan_step["env"]
+    # (but the label whose latest applier it authorizes: Codex 4239965189)
+    assert step["env"]["APPROVAL_LABEL"] == "implementation-approved"
+    assert plan_step["env"]["APPROVAL_LABEL"] == "claude-ready"
+    assert {**step["env"], "APPROVAL_LABEL": "x"} == {**plan_step["env"], "APPROVAL_LABEL": "x"}
     assert step["run"].replace("Implementation", "Planning") == plan_step["run"]
     assert "admin|write) ;;" in step["run"]
     gate = "needs.authorize.outputs.authorized == 'true'"
@@ -6840,6 +6843,20 @@ def test_doctor_fails_closed_when_agent_branch_rulesets_are_unreadable(tmp_path)
 # ---------------------------------------------------------------- Codex 4239269950
 # Only a definitive answer (200 with a permission, or 404) may make the labeler unauthorized; an
 # API failure is retried and then FAILS the job instead of silently consuming the label event.
+def _gh_events_prelude(events_script: str) -> str:
+    """A fake `gh` prelude answering the label-events read with `events_script`'s pages, each
+    filtered through the step's own `--jq` program as `gh api --paginate --jq` does."""
+    return (
+        'jqexpr=""; prev=""\n'
+        'for a in "$@"; do [ "$prev" = "--jq" ] && jqexpr="$a"; prev="$a"; done\n'
+        'for a in "$@"; do case "$a" in */events*)\n'
+        f'  out="$( {events_script} )" || exit $?\n'
+        '  [ -z "$jqexpr" ] && { printf \'%s\\n\' "$out"; exit 0; }\n'
+        '  printf \'%s\\n\' "$out" | jq -c "$jqexpr"; exit $? ;;\n'
+        "esac; done\n"
+    )
+
+
 def _run_authorize(tmp_path: Path, script: str, workflow: str = "agent-auto-plan.yml"):
     import shutil
     import subprocess
@@ -6855,7 +6872,12 @@ def _run_authorize(tmp_path: Path, script: str, workflow: str = "agent-auto-plan
     )
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    (bin_dir / "gh").write_text("#!/usr/bin/env bash\n" + script)
+    label = step["env"]["APPROVAL_LABEL"]
+    applied = json.dumps(
+        [{"event": "labeled", "label": {"name": label}, "actor": {"login": "alice"}}]
+    )
+    prelude = _gh_events_prelude(f"printf '%s' '{applied}'")
+    (bin_dir / "gh").write_text("#!/usr/bin/env bash\n" + prelude + script)
     (bin_dir / "sleep").write_text("#!/usr/bin/env bash\nexit 0\n")  # no real backoff in tests
     for tool in ("gh", "sleep"):
         (bin_dir / tool).chmod(0o755)
@@ -6865,6 +6887,8 @@ def _run_authorize(tmp_path: Path, script: str, workflow: str = "agent-auto-plan
         "PATH": f"{bin_dir}:/usr/bin:/bin",
         "SENDER": "alice",
         "ACTOR": "alice",
+        "ISSUE_NUMBER": "7",
+        "APPROVAL_LABEL": label,
         "GITHUB_REPOSITORY": "owner/comic",
         "GITHUB_OUTPUT": str(output),
         "GH_COUNT": str(tmp_path / "count"),
@@ -6916,7 +6940,7 @@ def test_labeler_authorization_fails_on_unreadable_permissions(
         assert "authorized=" not in output  # nothing is decided: the job fails
         assert "::error::" in done.stdout
     else:
-        assert output.strip() == f"authorized={authorized}"
+        assert output.strip() == f"authorized={authorized}\napprover=alice"
 
 
 # ---------------------------------------------------------------- Codex 4239269954
@@ -8749,3 +8773,275 @@ def test_cloud_routine_prompt_authorizes_the_labeler_before_claiming():
     assert authorize < doc.index("sdlcctl claim --project owner/comic")
     assert "--label implementation-approved" in doc
     assert "Proceed ONLY on exit 0" in doc and "do not claim" in doc
+
+
+# ---------------------------------------------------------------- review regressions (PR 139, 11)
+# Codex review 5481591166.
+
+
+# Codex 4239965192: `--root [BRANCH]` has ONE operand, the branch; every rebase form's branch
+# operand is a destination needing its lease, and operands that cannot be told apart block.
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git rebase --onto main --root forge/issue-7",
+        "git rebase --root forge/issue-7",
+        "git rebase --root --onto=main forge/issue-7",
+        "git rebase -i --root forge/issue-7",
+        "git rebase main forge/issue-7",
+        "git rebase --onto main main forge/issue-7",
+        "git rebase --keep-base main forge/issue-7",
+        "git rebase --fork-point main forge/issue-7",
+        "git rebase -i main forge/issue-7",
+        "git rebase -S main forge/issue-7",  # -S takes an ATTACHED value only
+        "git rebase --gpg-sign main forge/issue-7",
+        "git rebase -r main forge/issue-7",
+        "git rebase -Sabc -s ort -X ours main forge/issue-7",
+        "git rebase -sort main forge/issue-7",
+        "git rebase -C 3 main forge/issue-7",
+        "git rebase main refs/heads/forge/issue-7",
+        "git rebase -- main forge/issue-7",
+    ],
+)
+def test_commit_guard_checks_every_rebase_branch_operand(tmp_path, command):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    repo = _branch_flow_repo(tmp_path)
+    code, message = _flow_code(guard, command, repo)
+    assert code == 2 and "issue #7" in message, (command, message)
+    assert _flow_code(guard, command, repo, leased=(7,))[0] == 0, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git rebase --ont main forge/issue-7",  # an abbreviation git expands: unknowable
+        "git rebase --no-such-option main forge/issue-7",
+        "git rebase main other forge/issue-7",  # too many operands: never guess
+        "git rebase --root main forge/issue-7",
+        "git rebase -Z main forge/issue-7",
+        "git rebase --onto",
+        "git rebase --continue forge/issue-7",
+    ],
+)
+def test_commit_guard_blocks_unknowable_rebase_operands(tmp_path, command):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    repo = _branch_flow_repo(tmp_path)
+    code, message = _flow_code(guard, command, repo, leased=(7, 9))  # every lease held
+    assert code == 2 and "cannot be known before it runs" in message, (command, message)
+
+
+def test_commit_guard_plain_rebases_stay_allowed(tmp_path):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    repo = _branch_flow_repo(tmp_path)
+    _git(repo, "branch", "feature")
+    for allowed in (
+        "git rebase main",
+        "git rebase --root",
+        "git rebase -i --autosquash main",
+        "git rebase --onto main main feature",
+        "git rebase --root feature",
+        "git rebase -S main feature",
+        "git rebase --keep-base --fork-point main",
+        "git rebase --abort",
+    ):
+        assert _flow_code(guard, allowed, repo)[0] == 0, allowed
+    assert guard._rebase_branch(["--onto", "main", "--root", "forge/issue-7"]) == "forge/issue-7"
+    assert guard._rebase_branch(["--root"]) is None
+    assert guard._rebase_branch(["-S", "main", "x"]) == "x"
+    assert guard._rebase_branch(["main"]) is None
+
+
+# Codex 4239965189: the authorization must cover whoever applied the approval label LAST, not
+# only the sender of the event that completed the label set.
+def _events_page(*events):
+    return json.dumps(
+        [
+            {"event": kind, "label": {"name": name}, "actor": {"login": login}}
+            for kind, name, login in events
+        ]
+    )
+
+
+def _run_approval(tmp_path, workflow, events_script, permissions, sender="writer"):
+    """Run the rendered authorization step with a fake gh answering the label events with
+    `events_script` and each collaborator permission from `permissions` (login -> answer)."""
+    perm = "".join(
+        f'  *"/collaborators/{login}/permission"*) {answer} ;;\n'
+        for login, answer in permissions.items()
+    )
+    script = _gh_events_prelude(events_script) + (
+        'for a in "$@"; do case "$a" in\n'
+        f"{perm}"
+        "  *) continue ;;\n"
+        "esac; done\n"
+        'echo unexpected "$*" >&2; exit 1\n'
+    )
+    import shutil
+    import subprocess
+
+    if not (shutil.which("bash") and shutil.which("jq")):
+        pytest.skip("bash and jq are needed to run the generated authorization step")
+    doc = yaml.safe_load(render_onboarding(spec())[f".github/workflows/{workflow}"])
+    step = next(
+        s
+        for job in doc["jobs"].values()
+        for s in job.get("steps") or []
+        if s.get("id") == "authorize"
+    )
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "gh").write_text("#!/usr/bin/env bash\n" + script)
+    (bin_dir / "sleep").write_text("#!/usr/bin/env bash\nexit 0\n")
+    for tool in ("gh", "sleep"):
+        (bin_dir / tool).chmod(0o755)
+    output = tmp_path / "output"
+    output.write_text("")
+    env = {
+        "PATH": f"{bin_dir}:/usr/bin:/bin",
+        "SENDER": sender,
+        "ACTOR": sender,
+        "ISSUE_NUMBER": "7",
+        "APPROVAL_LABEL": step["env"]["APPROVAL_LABEL"],
+        "GITHUB_REPOSITORY": "owner/comic",
+        "GITHUB_OUTPUT": str(output),
+    }
+    done = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", step["run"]],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return done, dict(line.split("=", 1) for line in output.read_text().splitlines() if "=" in line)
+
+
+APPROVED = "implementation-approved"
+
+
+def _print_events(*events) -> str:
+    return f"printf '%s' '{json.dumps(list(events))}'; exit 0"
+
+
+WRITE = 'echo \'{"permission": "write"}\'; exit 0'
+TRIAGE = 'echo \'{"permission": "read", "role_name": "triage"}\'; exit 0'
+
+
+def test_auto_implement_authorizes_the_approval_labeler_not_the_last_labeler(tmp_path):
+    events = _events_page(
+        ("labeled", "implementation-approved", "triager"),
+        ("labeled", "claude-ready", "writer"),
+        ("labeled", "human-review-required", "writer"),
+    )
+    done, out = _run_approval(
+        tmp_path,
+        "agent-auto-implement.yml",
+        f"printf '%s' '{events}'; exit 0",
+        {"writer": WRITE, "triager": TRIAGE},
+    )
+    assert done.returncode == 0, done.stderr
+    assert out["authorized"] == "false" and out["approver"] == "triager"
+
+
+@pytest.mark.parametrize(
+    ("events", "approver"),
+    [
+        # the latest application counts, across pages and label-name case
+        (
+            [
+                ("labeled", "implementation-approved", "triager"),
+                ("unlabeled", "implementation-approved", "writer"),
+                ("labeled", "Implementation-Approved", "maintainer"),
+            ],
+            "maintainer",
+        ),
+        ([("labeled", "implementation-approved", "writer")], "writer"),
+    ],
+)
+def test_auto_implement_passes_the_verified_approver(tmp_path, events, approver):
+    pages = " ".join(f"'{_events_page(e)}'" for e in events)  # one event per page
+    done, out = _run_approval(
+        tmp_path,
+        "agent-auto-implement.yml",
+        f"printf '%s\\n' {pages}; exit 0",
+        {"writer": WRITE, "maintainer": WRITE, "triager": TRIAGE},
+    )
+    assert done.returncode == 0, done.stderr
+    assert out == {"authorized": "true", "approver": approver}
+
+
+@pytest.mark.parametrize(
+    "events_script",
+    [
+        "echo 'gh: Server Error (HTTP 502)' >&2; exit 1",  # unreadable history
+        "printf '%s' '[]'; exit 0",  # the label never applied
+        "printf '%s' '{\"message\": \"x\"}'; exit 0",
+        _print_events({"event": "labeled", "label": None, "actor": {"login": "w"}}),
+        _print_events({"event": "labeled", "label": {"name": APPROVED}, "actor": None}),
+        _print_events({"event": "labeled", "label": {"name": APPROVED}, "actor": {"login": "a b"}}),
+    ],
+)
+def test_auto_implement_fails_when_the_approver_cannot_be_verified(tmp_path, events_script):
+    done, out = _run_approval(
+        tmp_path, "agent-auto-implement.yml", events_script, {"writer": WRITE}
+    )
+    assert done.returncode == 1, (done.stdout, done.stderr)
+    assert "authorized" not in out  # nothing decided: authorization_failed reports it
+    assert "::error::" in done.stdout
+
+
+def test_a_removed_approval_label_is_unauthorized(tmp_path):
+    events = _events_page(
+        ("labeled", "implementation-approved", "writer"),
+        ("unlabeled", "implementation-approved", "writer"),
+    )
+    done, out = _run_approval(
+        tmp_path,
+        "agent-auto-implement.yml",
+        f"printf '%s' '{events}'; exit 0",
+        {"writer": WRITE},
+    )
+    assert done.returncode == 0, done.stderr
+    assert out["authorized"] == "false"
+
+
+def test_auto_plan_authorizes_the_ready_labeler(tmp_path):
+    events = _events_page(("labeled", "claude-ready", "outsider"))
+    done, out = _run_approval(
+        tmp_path,
+        "agent-auto-plan.yml",
+        f"printf '%s' '{events}'; exit 0",
+        {"writer": WRITE, "outsider": "echo 'gh: Not Found (HTTP 404)' >&2; exit 1"},
+    )
+    assert done.returncode == 0, done.stderr
+    assert out["authorized"] == "false" and out["approver"] == "outsider"
+
+
+def test_reusable_calls_receive_the_verified_approver_as_trigger_actor():
+    files = render_onboarding(spec(ready_label="go-plan"))
+    impl = yaml.safe_load(files[".github/workflows/agent-auto-implement.yml"])
+    plan = yaml.safe_load(files[".github/workflows/agent-auto-plan.yml"])
+    manual = yaml.safe_load(files[".github/workflows/agent-implement.yml"])
+    auth = impl["jobs"]["authorize"]
+    assert auth["outputs"]["approver"] == "${{ steps.authorize.outputs.approver }}"
+    assert auth["steps"][0]["env"]["APPROVAL_LABEL"] == "implementation-approved"
+    assert plan["jobs"]["preflight"]["steps"][0]["env"]["APPROVAL_LABEL"] == "go-plan"
+    assert impl["jobs"]["implement"]["with"]["trigger_actor"] == (
+        "${{ needs.authorize.outputs.approver }}"
+    )
+    assert plan["jobs"]["plan"]["with"]["trigger_actor"] == (
+        "${{ needs.preflight.outputs.approver }}"
+    )
+    # workflow_dispatch: the dispatcher is the actor, as before
+    assert manual["jobs"]["implement"]["with"]["trigger_actor"] == "${{ github.actor }}"
+
+
+def test_doctor_requires_the_generated_approval_label(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    assert _drift(repo) is None
+    _edit_workflow(
+        repo,
+        "agent-auto-implement.yml",
+        lambda d: d["jobs"]["authorize"]["steps"][0]["env"].update({"APPROVAL_LABEL": "x"}),
+    )
+    assert "agent-auto-implement.yml" in (_drift(repo) or "")

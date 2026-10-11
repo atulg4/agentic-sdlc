@@ -35,6 +35,28 @@ def _comment_row(cid, body, created_at, login="atulg4", kind="User", association
     }
 
 
+def _graphql_fields(args) -> dict:
+    return dict(a.split("=", 1) for a in args[2:] if "=" in a and not a.startswith("query="))
+
+
+def _open_prs_page(prs, args, size=100):
+    """One page of the open-PR GraphQL query over `prs` (rows in `gh pr list --json` shape;
+    a list `closingIssuesReferences` is wrapped the way GraphQL pages it)."""
+    start = int(_graphql_fields(args).get("after") or 0)
+    nodes = []
+    for pr in prs[start : start + size]:
+        refs = pr.get("closingIssuesReferences")
+        if isinstance(refs, list):
+            pr = {
+                **pr,
+                "closingIssuesReferences": {"pageInfo": {"hasNextPage": False}, "nodes": refs},
+            }
+        nodes.append(pr)
+    more = start + size < len(prs)
+    info = {"hasNextPage": more, "endCursor": str(start + size) if more else None}
+    return {"data": {"repository": {"pullRequests": {"pageInfo": info, "nodes": nodes}}}}
+
+
 class FakeGh:
     """Minimal GitHub: issues with labels/assignees/comments, open PRs."""
 
@@ -149,8 +171,8 @@ class FakeGh:
                     **issue.get("extra", {}),
                 }
             )
-        if args[:2] == ("pr", "list"):
-            return json.dumps(self.prs)
+        if args[:2] == ("api", "graphql"):
+            return json.dumps(_open_prs_page(self.prs, args))
         if args[:2] == ("label", "create"):
             return ""
         raise AssertionError(f"unexpected gh call: {' '.join(args)}")
@@ -601,10 +623,11 @@ def test_pr_list_requests_the_head_repository_fields():
 
     gh = FakeGh().issue(7)
     open_prs_for_issue(PROJECT, 7, gh)
-    pr_calls = [c for c in gh.calls if c[:2] == ("pr", "list")]
+    pr_calls = [c for c in gh.calls if c[:2] == ("api", "graphql")]
     assert pr_calls
-    fields = pr_calls[-1][pr_calls[-1].index("--json") + 1].split(",")
-    assert {"headRepository", "headRepositoryOwner", "isCrossRepository"} <= set(fields)
+    query = next(a for a in pr_calls[-1] if a.startswith("query="))
+    for field in ("headRepository", "headRepositoryOwner", "isCrossRepository"):
+        assert field in query
 
 
 @pytest.mark.parametrize(
@@ -2029,13 +2052,39 @@ def test_a_pr_linked_through_the_development_sidebar_blocks_claims():
         _fork_pr(49, head="x", closingIssuesReferences=[_linked(7, name="")]),
     ]
     assert [p["number"] for p in open_prs_for_issue(PROJECT, 7, gh)] == [40, 41]
-    fields = [c for c in gh.calls if c[:2] == ("pr", "list")][-1]
-    assert "closingIssuesReferences" in fields[fields.index("--json") + 1].split(",")
+    call = [c for c in gh.calls if c[:2] == ("api", "graphql")][-1]
+    assert "closingIssuesReferences" in next(a for a in call if a.startswith("query="))
     result = claim(PROJECT, 7, agent="me", session="s1", branch="b", ttl_minutes=60, gh=gh, now=NOW)
     assert not result.ok and "pr/40" in result.reason
 
 
-@pytest.mark.parametrize("answer", ['{"number": 1}', "[1, 2]", "not json", '[{"n": 1}, null]'])
+def _page(nodes, more=False, cursor=None):
+    info = {"hasNextPage": more, "endCursor": cursor}
+    return json.dumps(
+        {"data": {"repository": {"pullRequests": {"pageInfo": info, "nodes": nodes}}}}
+    )
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        '{"number": 1}',
+        "[1, 2]",
+        "not json",
+        '[{"n": 1}, null]',
+        "null",
+        '{"errors": [{"message": "rate limited"}], "data": null}',
+        '{"data": {"repository": null}}',
+        '{"data": {"repository": {"pullRequests": {"nodes": []}}}}',
+        _page([None]),
+        _page([], more=None),
+        _page([], more=True),  # "there is more" without a cursor
+        _page([], more=True, cursor=""),
+        # a PR whose linked issues fill more than one page: the unread ones could be #7
+        _page([{"number": 9, "closingIssuesReferences": {"pageInfo": {"hasNextPage": True}}}]),
+        _page([{"number": 9, "closingIssuesReferences": {"nodes": []}}]),
+    ],
+)
 def test_an_unreadable_open_pr_inventory_is_never_no_pr(answer):
     from agentic_sdlc.leases import open_prs_for_issue
 
@@ -2043,14 +2092,56 @@ def test_an_unreadable_open_pr_inventory_is_never_no_pr(answer):
     real = gh.__call__
 
     def broken(args, input=None):
-        if tuple(args[:2]) == ("pr", "list"):
+        if tuple(args[:2]) == ("api", "graphql"):
             return answer
         return real(args, input=input)
 
-    with pytest.raises(LeaseError, match="gh pr list"):
+    with pytest.raises(LeaseError, match="pull request"):
         open_prs_for_issue(PROJECT, 7, broken)
     with pytest.raises(LeaseError):
         claim(PROJECT, 7, agent="me", session="s1", branch="b", gh=broken, now=NOW)
+
+
+# Codex 4239965191: `gh pr list --limit 1000` truncated the inventory; every page is read now.
+@pytest.mark.parametrize("position", [0, 150, 1000, 2499])
+def test_open_pr_detection_reads_every_page(position):
+    from agentic_sdlc.leases import open_prs_for_issue
+
+    gh = FakeGh().issue(7)
+    gh.prs = [_fork_pr(1000 + i, head=f"feat/{i}") for i in range(2500)]
+    gh.prs[position] = _fork_pr(1000 + position, head="patch", body="Closes #7")
+    assert [p["number"] for p in open_prs_for_issue(PROJECT, 7, gh)] == [1000 + position]
+    pages = [c for c in gh.calls if c[:2] == ("api", "graphql")]
+    assert len(pages) == 25
+    assert not any(a.startswith("after=") for a in pages[0])
+    assert tuple(pages[1][-2:]) == ("-f", "after=100")
+    result = claim(PROJECT, 7, agent="me", session="s1", branch="b", ttl_minutes=60, gh=gh, now=NOW)
+    assert not result.ok and f"pr/{1000 + position}" in result.reason
+
+
+def test_an_open_pr_page_that_fails_mid_inventory_refuses_the_claim():
+    gh = FakeGh().issue(7)
+    gh.prs = [_fork_pr(1000 + i, head=f"feat/{i}") for i in range(250)]
+    real = gh.__call__
+
+    def flaky(args, input=None):
+        if tuple(args[:2]) == ("api", "graphql") and "after=200" in args:
+            raise RuntimeError("gh: HTTP 502")
+        return real(args, input=input)
+
+    with pytest.raises(Exception, match="502"):
+        claim(PROJECT, 7, agent="me", session="s1", branch="b", gh=flaky, now=NOW)
+    assert not gh.issues[7]["comments"]
+
+
+def test_a_cursor_that_never_advances_refuses():
+    from agentic_sdlc.leases import open_prs_for_issue
+
+    def stuck(args, input=None):
+        return _page([], more=True, cursor="same")
+
+    with pytest.raises(LeaseError, match="next one starts"):
+        open_prs_for_issue(PROJECT, 7, stuck)
 
 
 # Codex 4239868029: a cloud routine claims only work whose approval label a writer applied.

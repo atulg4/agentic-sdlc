@@ -4,13 +4,16 @@
       contents: read
     outputs:
       authorized: ${{ steps.authorize.outputs.authorized }}
+      approver: ${{ steps.authorize.outputs.approver }}
     steps:
-      - name: Require repository write authority from the labeler
+      - name: Require repository write authority from the labeler and the approver
         id: authorize
         env:
           GH_TOKEN: ${{ github.token }}
           SENDER: ${{ github.event.sender.login }}
           ACTOR: ${{ github.actor }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          APPROVAL_LABEL: APPROVAL_LABEL_VALUE
         run: |
           set -euo pipefail
           # Only a DEFINITIVE answer decides: HTTP 200 with a permission field, or 404 (not a
@@ -18,7 +21,62 @@
           # job: never read as "unauthorized", which would silently consume the label event.
           authorized=true
           errors="$(mktemp)"
-          for login in "$SENDER" "$ACTOR"; do
+          # Codex 4239965189: the event's sender is not necessarily who APPROVED. A Triage user can
+          # apply the approval label first and a writer the last prerequisite label later; so the
+          # label events are read (every page) and whoever applied APPROVAL_LABEL most recently
+          # must ALSO hold write authority -- the same rule as `sdlcctl authorize-labeler`. History
+          # that cannot be read, or that never shows the label applied, FAILS the job.
+          approver=""
+          removed=false
+          for attempt in 1 2 3; do
+            removed=false
+            if events="$(gh api --method GET --paginate \
+              "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/events?per_page=100" \
+              --jq '.[] | select(.event == "labeled" or .event == "unlabeled")
+                | {event, name: .label.name, login: .actor.login}' 2>"$errors")" &&
+              latest="$(jq -sc --arg label "$APPROVAL_LABEL" '
+                if any(.[]; (.name | type) != "string") then error("a label event names no label")
+                else [.[] | select((.name | ascii_downcase) == ($label | ascii_downcase))] | last
+                end' <<<"$events" 2>"$errors")"; then
+              case "$(jq -r '.event // "none"' <<<"$latest")" in
+                labeled)
+                  approver="$(jq -r '.login // empty | strings' <<<"$latest")"
+                  if [[ "$approver" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*(\[bot\])?$ ]]; then
+                    break
+                  fi
+                  approver=""
+                  printf '::warning::attempt %s: the latest %s event names no valid actor\n' \
+                    "$attempt" "$APPROVAL_LABEL"
+                  ;;
+                unlabeled)
+                  removed=true
+                  printf '::warning::attempt %s: %s was removed after it was last applied\n' \
+                    "$attempt" "$APPROVAL_LABEL"
+                  ;;
+                *)
+                  printf '::warning::attempt %s: no labeled event for %s yet\n' \
+                    "$attempt" "$APPROVAL_LABEL"
+                  ;;
+              esac
+            else
+              printf '::warning::attempt %s: could not read the label events of issue #%s: %s\n' \
+                "$attempt" "$ISSUE_NUMBER" "$(head -c 300 "$errors" | tr '\n' ' ')"
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              sleep "$((attempt * 10))"
+            fi
+          done
+          if [ "$removed" = true ]; then
+            printf 'authorized=false\napprover=\n' >> "$GITHUB_OUTPUT"
+            printf '::notice::AUTHORIZED_WORK not scheduled: the approval label was removed.\n'
+            exit 0
+          fi
+          if [ -z "$approver" ]; then
+            printf '::error::Could not determine who applied %s to issue #%s; failing instead of authorizing. Re-run this job or re-apply the label.\n' \
+              "$APPROVAL_LABEL" "$ISSUE_NUMBER"
+            exit 1
+          fi
+          for login in "$SENDER" "$ACTOR" "$approver"; do
             encoded="$(jq -rn --arg login "$login" '$login | @uri')"
             permission=""
             for attempt in 1 2 3; do
@@ -49,7 +107,7 @@
               *) authorized=false ;;
             esac
           done
-          printf 'authorized=%s\n' "$authorized" >> "$GITHUB_OUTPUT"
+          printf 'authorized=%s\napprover=%s\n' "$authorized" "$approver" >> "$GITHUB_OUTPUT"
           if [ "$authorized" != true ]; then
             printf '::notice::AUTHORIZED_WORK not scheduled: the labeler lacks repository write authority.\n'
           fi

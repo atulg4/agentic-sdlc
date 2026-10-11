@@ -33,7 +33,7 @@ LABELER_AUTHORIZATION
     with:
       runs_on: RUNS_ON_JSON
       issue_number: ${{ format('{0}', github.event.issue.number) }}
-      trigger_actor: ${{ github.actor }}
+      trigger_actor: ${{ needs.preflight.outputs.approver }}
       config_path: agentic-sdlc.toml
       platform_ref: PLATFORM_COMMIT_SHA
       platform_repository: PLATFORM_REPOSITORY

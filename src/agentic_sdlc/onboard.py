@@ -1160,6 +1160,7 @@ WORKFLOW_PLACEHOLDERS = (
     "PYTHON_VERSION",
     "AUTO_PLAN_IF",
     "AUTO_IMPLEMENT_IF",
+    "APPROVAL_LABEL_VALUE",
 )
 
 
@@ -1194,6 +1195,13 @@ def _render_workflow(name: str, spec: OnboardSpec, issue_expr: str | None = None
                 (
                     "      ${{ always() &&\n",
                     "      ${{ always() && needs.authorize.outputs.authorized == 'true' &&\n",
+                ),
+                # Codex 4239965189: the reusable workflow re-checks `trigger_actor`; that is the
+                # actor who applied the approval label last (`authorize` verified it), not the
+                # sender of whichever label event happened to complete the set.
+                (
+                    "      trigger_actor: ${{ github.actor }}\n",
+                    "      trigger_actor: ${{ needs.authorize.outputs.approver }}\n",
                 ),
             ):
                 if jobs.count(old) != 1:
@@ -1239,6 +1247,11 @@ def _render_workflow(name: str, spec: OnboardSpec, issue_expr: str | None = None
         "PYTHON_VERSION": _yaml_str(spec.python_version),
         "AUTO_PLAN_IF": _yaml_folded(auto_plan_condition(*labels), " " * 6),
         "AUTO_IMPLEMENT_IF": _yaml_folded(auto_implement_condition(*labels), " " * 6),
+        # The label whose most recent applier `_authorize-labeler.yml` authorizes: the ready
+        # label for planning (its trigger), implementation approval for implementing.
+        "APPROVAL_LABEL_VALUE": _yaml_str(
+            spec.ready_label if name == "agent-auto-plan.yml" else IMPLEMENTATION_LABEL
+        ),
     }
     if set(replacements) != set(WORKFLOW_PLACEHOLDERS):
         raise OnboardError("workflow placeholders and their renderings disagree")
@@ -5000,6 +5013,15 @@ def policy_python_version(policy_doc: dict) -> str:
     return str(value) if value is not None else DEFAULT_PYTHON_VERSION
 
 
+def _policy_ready_label(policy_doc: dict) -> str:
+    """The policy's `[automation] ready_label` (onboard's default when absent). The workflows are
+    rendered with it: agent-auto-plan.yml's authorization step names the label whose most recent
+    applier it authorizes (Codex 4239965189), so a rebuilt template must carry the policy's."""
+    automation = policy_doc.get("automation")
+    automation = automation if isinstance(automation, dict) else {}
+    return str(automation.get("ready_label") or "claude-ready")
+
+
 def _template_spec(policy_doc: dict, **fields) -> OnboardSpec:
     """An OnboardSpec carrying the policy's gate commands and Python version (raises
     OnboardError when the policy's commands cannot be rendered)."""
@@ -5800,6 +5822,7 @@ def managed_workflow_drift(
                 platform_ref=pin,
                 implementer=implementer,
                 default_branch=default_branch,
+                ready_label=_policy_ready_label(policy_doc),
             )
             rendered = render_onboarding(spec)[f".github/workflows/{name}"]
         except (OnboardError, KeyError) as exc:
@@ -5848,16 +5871,13 @@ def rendered_managed_files(
     writes, rendered from the repository's own policy (ready label, default branch, caps, gate
     commands). A file that cannot be rendered is a problem, never silently skipped."""
     project = policy_doc.get("project") if isinstance(policy_doc.get("project"), dict) else {}
-    automation = (
-        policy_doc.get("automation") if isinstance(policy_doc.get("automation"), dict) else {}
-    )
     caps = policy_doc.get("policy") if isinstance(policy_doc.get("policy"), dict) else {}
     fields = dict(
         project_id=project_id,
         platform_repository=platform_repository,
         platform_ref="0" * 40,
         default_branch=str(project.get("default_branch") or "main"),
-        ready_label=str(automation.get("ready_label") or "claude-ready"),
+        ready_label=_policy_ready_label(policy_doc),
         implementer="cloud-routine" if cloud else "claude",
     )
     rendered: dict[str, str] = {}
@@ -6051,6 +6071,7 @@ def _generated_workflows(
                 platform_ref=pin,
                 implementer=implementer,
                 default_branch=default_branch,
+                ready_label=_policy_ready_label(policy_doc),
             )
             rendered = render_onboarding(spec)
             return {
