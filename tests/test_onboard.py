@@ -718,6 +718,88 @@ def test_commit_guard_blocks_only_unleased_issue_branch_commits(tmp_path):
     assert guard.decide({**commit, "tool_name": "Edit"}, "forge/issue-7", lambda n: None)[0] == 0
 
 
+_NO_SESSION = [
+    pytest.param({}, id="missing"),
+    pytest.param({"session_id": None}, id="null"),
+    pytest.param({"session_id": ""}, id="empty"),
+    pytest.param({"session_id": "   "}, id="blank"),
+    pytest.param({"session_id": 123}, id="int"),
+    pytest.param({"session_id": ["s1"]}, id="list"),
+    pytest.param({"session_id": {"id": "s1"}}, id="dict"),
+]
+
+
+@pytest.mark.parametrize("session_field", _NO_SESSION)
+@pytest.mark.parametrize("lease_session", ["s1", "", "123"])
+def test_commit_guard_refuses_a_live_lease_without_a_usable_session_id(
+    tmp_path, session_field, lease_session
+):
+    """Codex 4240101138: a payload without a non-empty string session_id must not have any
+    live lease accepted as its own -- the guard fails closed on issue branches."""
+    from datetime import UTC, datetime, timedelta
+
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    lease = {
+        "agent": "claude-code",
+        "session": lease_session,
+        "expires": datetime.now(UTC) + timedelta(hours=1),
+    }
+    payload = {"tool_name": "Bash", "tool_input": {"command": "git commit -m x"}, **session_field}
+    code, msg = guard.decide(payload, "forge/issue-7", lambda n: lease, lambda b: False)
+    assert code == 2 and "no usable session_id" in msg
+    # not an issue branch: still unguarded
+    assert guard.decide(payload, "main", lambda n: lease, lambda b: False) == (0, "")
+
+
+def test_commit_guard_matches_a_lease_only_on_the_exact_session_id(tmp_path):
+    from datetime import UTC, datetime, timedelta
+
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    lease = {
+        "agent": "claude-code",
+        "session": "s1",
+        "expires": datetime.now(UTC) + timedelta(hours=1),
+    }
+    commit = {"tool_name": "Bash", "tool_input": {"command": "git commit -m x"}}
+    assert guard.decide({**commit, "session_id": "s1"}, "forge/issue-7", lambda n: lease)[0] == 0
+    for other in ("s2", "S1", "s1 ", " s1"):
+        code, msg = guard.decide({**commit, "session_id": other}, "forge/issue-7", lambda n: lease)
+        assert code == 2 and "is leased by agent=claude-code session=s1" in msg
+    assert guard.payload_session({"session_id": "s1"}) == "s1"
+    assert guard.payload_session({"session_id": 1}) == ""
+
+
+@pytest.mark.parametrize("session_field", _NO_SESSION)
+def test_session_start_claims_no_lease_without_a_usable_session_id(
+    tmp_path, monkeypatch, session_field
+):
+    """Codex 4240101138 (SessionStart side): no usable session id means no lease is reported
+    as this session's -- every live one is listed as another agent's."""
+    import io
+
+    start = _guard_module(tmp_path, "forge_session_start")
+    issues = [{"number": 5, "title": "held", "assignees": []}]
+    for lease_session in ("", "123", "None"):
+        leases = {5: {"session": lease_session}}
+        session = session_field.get("session_id")
+        live, stale, mine = start.classify_leased(issues, leases.get, session)
+        assert mine == [] and [x.split()[0] for x in live] == ["#5"]
+
+    leases = {5: {"session": "123"}}
+
+    def run(cmd):
+        return json.dumps(issues) if cmd[:3] == ["gh", "issue", "list"] else ""
+
+    monkeypatch.setattr(start, "run", run)
+    monkeypatch.setattr(start, "_lease_lookup", lambda: leases.get)
+    monkeypatch.setattr(start.sys, "stdin", io.StringIO(json.dumps(session_field)))
+    out = io.StringIO()
+    monkeypatch.setattr(start.sys, "stdout", out)
+    assert start.main() == 0
+    text = out.getvalue()
+    assert "Your current lease" not in text and "#5 held" in text
+
+
 # ---------------------------------------------------------------- review follow-ups
 
 
