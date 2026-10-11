@@ -1245,7 +1245,7 @@ A fresh cloud environment has no `sdlcctl`, and every gate below is an `sdlcctl`
 this into the setup script of the routine's cloud environment (claude.ai: the environment's
 settings); it installs the platform at exactly the commit this repository's workflows pin:
 
-{_md_block(cloud_routine_setup_script(spec).splitlines())}
+{_md_block(cloud_routine_setup_script(spec).splitlines(), "sh")}
 
 `--user` installs `sdlcctl` into `~/.local/bin`, which must be on the routine's PATH. If
 `{spec.platform_repository}` is private, the environment needs read access to it. Step 0 of the
