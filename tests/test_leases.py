@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -87,6 +88,9 @@ class FakeGh:
         self.external_prs: dict[tuple[str, int], object] = {}
         self.repo_comments_error: Exception | None = None  # the repo-wide comment list fails
         self.repo_comment_pages: list[int] = []  # pages of it read
+        # the policy committed on the default branch (Codex 4242925440): text, an exception
+        # the contents read raises, or None (no committed policy: 404)
+        self.committed_policy: str | Exception | None = None
 
     def issue(self, number, labels=(), assignees=(), comments=()):
         self.issues[number] = {
@@ -117,6 +121,16 @@ class FakeGh:
                 if any(lbl["name"] == IN_PROGRESS_LABEL for lbl in i["labels"])
             ]
             return self._pages(labelled, args)
+        if args[:2] == ("api", f"repos/{PROJECT}"):
+            return json.dumps({"full_name": PROJECT, "default_branch": "main"})
+        if args[0] == "api" and args[1].startswith(f"repos/{PROJECT}/contents/"):
+            assert args[1] == f"repos/{PROJECT}/contents/agentic-sdlc.toml?ref=main"
+            if isinstance(self.committed_policy, Exception):
+                raise self.committed_policy
+            if self.committed_policy is None:
+                raise RuntimeError("gh: Not Found (HTTP 404)")
+            content = base64.b64encode(self.committed_policy.encode()).decode()
+            return json.dumps({"type": "file", "encoding": "base64", "content": content})
         if args[0] == "api" and args[1].startswith(f"repos/{PROJECT}/collaborators/"):
             login = args[1].split("/")[4]
             known = {k.casefold(): v for k, v in self.permissions.items()}  # GitHub: any case
@@ -3458,3 +3472,193 @@ def test_the_lease_commands_take_the_publisher_bot_from_the_policy(tmp_path, mon
             cli._lease_policy(argparse.Namespace(config=str(policy)))
     finally:
         leases.use_policy_bot_logins("")
+
+
+# ---------------------------------------------------------------- Codex 4242925440
+# The failure-cleanup job runs `release` in an empty workspace with no --config and no
+# FORGE_LEASE_BOT_LOGINS. It must still release the Publisher bot's claim of its session.
+
+_APP = "my-forge[bot]"
+_APP_POLICY = (
+    f'version = 1\n[project]\nid = "{PROJECT}"\n[automation]\npublisher_bot_login = "{_APP}"\n'
+)
+
+
+def _workflow_release_argv(job: str, env: dict[str, str]) -> list[str]:
+    """The `python3 -m agentic_sdlc release ...` arguments of `job` in the platform's
+    reusable-implement.yml, exactly as written there, with the shell variables expanded."""
+    import re
+    import shlex
+    from pathlib import Path
+
+    text = (
+        Path(__file__).resolve().parents[1] / ".github/workflows/reusable-implement.yml"
+    ).read_text()
+    section = text.split(f"\n  {job}:\n", 1)[1]
+    command, lines = "", iter(section.splitlines())
+    for line in lines:
+        if "-m agentic_sdlc release" in line:
+            command = line
+            while command.rstrip().endswith("\\"):
+                command = command.rstrip()[:-1] + " " + next(lines).strip()
+            break
+    assert command, f"no release call in {job}"
+    expanded = re.sub(r"\$\{(\w+)\}|\$(\w+)", lambda m: env[m.group(1) or m.group(2)], command)
+    words = shlex.split(expanded.split(" || ", 1)[0])
+    return words[words.index("agentic_sdlc") + 1 :]
+
+
+def _app_claimed(wall: datetime, session: str) -> FakeGh:
+    gh = FakeGh().issue(7, labels=[IN_PROGRESS_LABEL])
+    gh.posted_at = wall
+    gh.poster = {"login": _APP, "kind": "Bot", "association": "NONE"}  # the App's token
+    claim_ = format_claim_marker(Lease(7, "forge-actions", session, "b", wall + timedelta(hours=1)))
+    gh.issues[7]["comments"].append(_comment_row(1, claim_, wall.isoformat(), _APP, "Bot", "NONE"))
+    return gh
+
+
+def _released(gh: FakeGh, session: str) -> list[dict]:
+    return [
+        c
+        for c in gh.issues[7]["comments"]
+        if c["body"].startswith(f"<!-- forge-release session={session} -->")
+    ]
+
+
+@pytest.mark.parametrize("committed", ["policy", "unreadable", "absent"])
+def test_the_failure_cleanup_release_call_releases_the_publisher_claim(
+    committed, tmp_path, monkeypatch, capsys
+):
+    """The exact `release_lease_on_failure` invocation (no --config, no env, empty
+    workspace): the committed policy names the Publisher bot; if it cannot be read (an
+    issues-only token on a private repository) or there is none, `release` still releases
+    its own session's claim rather than reporting success over a claim it ignored."""
+    from agentic_sdlc import cli, leases
+
+    monkeypatch.delenv(leases.LEASE_BOT_LOGINS_ENV, raising=False)
+    monkeypatch.chdir(tmp_path)  # the job checks nothing out
+    wall = datetime.now(UTC)
+    env = {
+        "GITHUB_REPOSITORY": PROJECT,
+        "ISSUE_NUMBER": "7",
+        "GITHUB_RUN_ID": "4242",
+        "GITHUB_SERVER_URL": "https://github.com",
+    }
+    argv = _workflow_release_argv("release_lease_on_failure", env)
+    assert "--config" not in argv and argv[argv.index("--session") + 1] == "run-4242"
+    gh = _app_claimed(wall, "run-4242")
+    gh.committed_policy = {
+        "policy": _APP_POLICY,
+        "unreadable": RuntimeError("gh: Resource not accessible by integration (HTTP 403)"),
+        "absent": None,
+    }[committed]
+    monkeypatch.setattr(cli, "run_gh", gh)
+    try:
+        assert cli.main(argv) == 0
+        assert len(_released(gh, "run-4242")) == 1
+        # every configured reader (the next claim, the guard) sees the issue free
+        leases.use_policy_bot_logins(_APP)
+        assert current_lease(PROJECT, 7, gh, wall) is None
+        assert IN_PROGRESS_LABEL not in [lbl["name"] for lbl in gh.issues[7]["labels"]]
+        if committed == "unreadable":
+            assert "WARNING" in capsys.readouterr().err
+        # idempotent: a retried cleanup posts nothing more
+        leases.use_policy_bot_logins("")
+        assert cli.main(argv) == 0
+        assert len(_released(gh, "run-4242")) == 1
+    finally:
+        leases.use_policy_bot_logins("")
+
+
+def test_the_draft_release_call_works_from_the_checked_out_base(tmp_path, monkeypatch):
+    """`publish_draft`'s release runs in the checked-out base: ./agentic-sdlc.toml names the
+    bot, so the trusted path releases it (label and all) with no extra read."""
+    from agentic_sdlc import cli, leases
+
+    monkeypatch.delenv(leases.LEASE_BOT_LOGINS_ENV, raising=False)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "agentic-sdlc.toml").write_text(_APP_POLICY)
+    env = {"GITHUB_REPOSITORY": PROJECT, "ISSUE_NUMBER": "7", "GITHUB_RUN_ID": "77"}
+    argv = _workflow_release_argv("publish_draft", env)
+    gh = _app_claimed(datetime.now(UTC), "run-77")
+    monkeypatch.setattr(cli, "run_gh", gh)
+    try:
+        assert cli.main(argv) == 0
+        assert len(_released(gh, "run-77")) == 1
+        assert not any("contents/" in " ".join(c) for c in gh.calls)
+    finally:
+        leases.use_policy_bot_logins("")
+
+
+@pytest.mark.parametrize("subcommand", ["claim", "renew", "claims"])
+def test_claim_and_renew_fail_closed_when_the_committed_policy_is_unreadable(
+    subcommand, tmp_path, monkeypatch, capsys
+):
+    from agentic_sdlc import cli, leases
+
+    monkeypatch.delenv(leases.LEASE_BOT_LOGINS_ENV, raising=False)
+    monkeypatch.chdir(tmp_path)
+    gh = _app_claimed(datetime.now(UTC), "s1")
+    gh.committed_policy = RuntimeError("gh: Resource not accessible by integration (HTTP 403)")
+    monkeypatch.setattr(cli, "run_gh", gh)
+    argv = {
+        "claim": ["claim", "--agent", "me", "--branch", "b"],
+        "renew": ["renew"],
+        "claims": ["claims"],
+    }[subcommand] + ["--project", PROJECT]
+    if subcommand != "claims":
+        argv += ["--issue", "7", "--session", "s1"]
+    before = len(gh.issues[7]["comments"])
+    try:
+        assert cli.main(argv) == 2
+        assert "committed policy" in capsys.readouterr().err
+        assert len(gh.issues[7]["comments"]) == before  # nothing posted
+    finally:
+        leases.use_policy_bot_logins("")
+
+
+def test_the_committed_policy_supplies_bot_and_ttl(tmp_path, monkeypatch):
+    import argparse
+
+    from agentic_sdlc import cli, leases
+
+    monkeypatch.delenv(leases.LEASE_BOT_LOGINS_ENV, raising=False)
+    monkeypatch.chdir(tmp_path)
+    gh = FakeGh()
+    gh.committed_policy = _APP_POLICY + "lease_ttl_minutes = 33\n"
+    monkeypatch.setattr(cli, "run_gh", gh)
+    try:
+        args = argparse.Namespace(ttl_minutes=None, config=None, project=PROJECT)
+        assert cli._lease_ttl(args) == 33
+        assert leases.configured_bot_logins() == _APP
+        gh.committed_policy = "version = [\n"  # committed but unparseable: an error
+        with pytest.raises(LeaseError, match="committed policy"):
+            cli._lease_ttl(args)
+        # FORGE_LEASE_BOT_LOGINS set: no read at all
+        gh.calls.clear()
+        monkeypatch.setenv(leases.LEASE_BOT_LOGINS_ENV, _APP)
+        assert cli._lease_ttl(args) == 240 and gh.calls == []
+    finally:
+        leases.use_policy_bot_logins("")
+
+
+def test_release_settles_its_own_untrusted_claim_but_nobody_elses():
+    """Unit: an own-session claim this process does not trust (an unconfigured App bot, or a
+    forged one by a read-only user) is released; another session's untrusted claim is not."""
+    from agentic_sdlc import leases
+
+    leases.use_policy_bot_logins("")
+    gh = FakeGh().issue(7)
+    gh.permissions["reader"] = "read"
+    mine = format_claim_marker(Lease(7, "x", "s1", "b", NOW + timedelta(hours=1)))
+    theirs = format_claim_marker(Lease(7, "x", "s2", "b", NOW + timedelta(hours=1)))
+    gh.issues[7]["comments"] += [
+        _comment_row(1, mine, NOW.isoformat(), "reader", "User", "MEMBER"),
+        _comment_row(2, theirs, NOW.isoformat(), _APP, "Bot", "NONE"),
+    ]
+    release(PROJECT, 7, session="s1", gh=gh, now=NOW)
+    assert len(_released(gh, "s1")) == 1 and _released(gh, "s2") == []
+    release(PROJECT, 7, session="s1", gh=gh, now=NOW)  # the owner's release counts: no repeat
+    assert len(_released(gh, "s1")) == 1
+    release(PROJECT, 7, session="s3", gh=gh, now=NOW)  # no claim of s3 anywhere: nothing
+    assert _released(gh, "s3") == []

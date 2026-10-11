@@ -66,7 +66,11 @@ named EXACTLY -- `[automation] publisher_bot_login` in the policy (set with
 also sets the `FORGE_LEASE_BOT_LOGINS` repository variable; the commit guard
 carries it as rendered at onboard time), or `FORGE_LEASE_BOT_LOGINS` in the
 environment, which wins -- and `github-actions[bot]`, besides users with write
-access. No App bot is trusted on its slug alone: with no login configured,
+access. With no `--config`, no `./agentic-sdlc.toml` and no variable (the
+failure-cleanup job's `release` runs in an empty workspace), the lease commands
+read the policy committed on the default branch; `release` additionally
+releases its own session's claims whoever posted them, so it never reports
+success over a claim it did not trust. No App bot is trusted on its slug alone: with no login configured,
 the Publisher App's own claims are ignored and every Actions implementation is
 refused at its claim (doctor reports it). Suspending or uninstalling the App therefore also stops the
 Actions path from claiming issues.

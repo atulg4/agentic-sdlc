@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import math
+import os
 import re
 import shlex
 import sys
@@ -1254,16 +1256,76 @@ def _explicit_lease_policy(args: argparse.Namespace) -> ProjectPolicy | None:
         raise LeaseError(f"--config {args.config} could not be read ({exc})") from exc
 
 
-def _lease_policy(args: argparse.Namespace) -> ProjectPolicy | None:
+#: Where `_committed_lease_policy` reads the policy on the repository's default branch.
+COMMITTED_POLICY_PATH = "agentic-sdlc.toml"
+
+
+def _committed_lease_policy(project: str) -> ProjectPolicy | None:
+    """The policy committed at `COMMITTED_POLICY_PATH` on `project`'s default branch, read with
+    the trusted `gh` (Codex 4242925440): a lease command run where no policy file is at hand
+    -- the failure-cleanup job's `release` runs in an empty workspace with no `--config` --
+    still learns the Publisher bot whose claim it has to release. None only when GitHub
+    answers 404 for that file (the repository commits no policy). Any other failure, or an
+    answer that is not a readable policy, raises LeaseError: never read as "no Publisher bot"."""
+    try:
+        repo = json.loads(run_gh(["api", f"repos/{project}"]) or "null")
+    except Exception as exc:  # gh failed (OnboardError) or answered something not JSON
+        raise LeaseError(f"cannot read the default branch of {project} ({exc})") from exc
+    branch = repo.get("default_branch") if isinstance(repo, dict) else None
+    if not isinstance(branch, str) or not branch:
+        raise LeaseError(f"cannot read the default branch of {project}")
+    where = f"{project}@{branch}:{COMMITTED_POLICY_PATH}"
+    try:
+        answer = run_gh(
+            [
+                "api",
+                f"repos/{project}/contents/{COMMITTED_POLICY_PATH}?ref={quote(branch, safe='')}",
+            ]
+        )
+    except Exception as exc:
+        if re.search(r"\b404\b|Not Found", str(exc)):
+            return None
+        raise LeaseError(f"cannot read the committed policy {where} ({exc})") from exc
+    try:
+        document = json.loads(answer or "null")
+        if (
+            not isinstance(document, dict)
+            or document.get("type") != "file"
+            or document.get("encoding") != "base64"
+            or not isinstance(document.get("content"), str)
+        ):
+            raise ValueError("not a base64-encoded file")
+        return load_policy_bytes(base64.b64decode(document["content"]))
+    except (ValueError, UnicodeDecodeError) as exc:  # JSON, base64, TOML or policy errors
+        raise LeaseError(f"the committed policy {where} cannot be read ({exc})") from exc
+
+
+def _lease_policy(
+    args: argparse.Namespace, *, committed_unreadable_ok: bool = False
+) -> ProjectPolicy | None:
     """The policy `--config` names (which must be readable), else -- only when `--config` was
-    omitted -- ./agentic-sdlc.toml if it exists, else None. Its `[automation]
-    publisher_bot_login` becomes the Publisher bot whose lease markers count in this process
-    (FORGE_LEASE_BOT_LOGINS still wins; with neither, no App bot does -- Codex 4242753917)."""
+    omitted -- ./agentic-sdlc.toml if it exists, else (FORGE_LEASE_BOT_LOGINS unset) the
+    policy committed on the repository's default branch (`_committed_lease_policy`, Codex
+    4242925440), else None. Its `[automation] publisher_bot_login` becomes the Publisher bot
+    whose lease markers count in this process (FORGE_LEASE_BOT_LOGINS still wins; with
+    neither, no App bot does -- Codex 4242753917).
+
+    A committed policy that cannot be read is an error (LeaseError: exit 2) -- unless
+    `committed_unreadable_ok`, for `release`, which then proceeds trusting no App bot and
+    says so: `release` settles its own session's claims whoever posted them
+    (`leases.release`), so an unknown Publisher bot cannot make it skip one."""
     policy = _explicit_lease_policy(args)
     if policy is None and args.config is None:
         config = Path("agentic-sdlc.toml")
         if config.exists():
             policy = load_policy(config)
+        elif not os.environ.get(LEASE_BOT_LOGINS_ENV) and getattr(args, "project", None):
+            try:
+                policy = _committed_lease_policy(args.project)
+            except LeaseError as exc:
+                if not committed_unreadable_ok:
+                    raise
+                _status(f"WARNING: {exc}; trusting no Publisher App bot for this release")
     use_policy_bot_logins(policy.publisher_bot_login if policy is not None else "")
     return policy
 
@@ -1318,7 +1380,8 @@ def _renew(args: argparse.Namespace) -> int:
 
 
 def _release(args: argparse.Namespace) -> int:
-    _lease_policy(args)  # the Publisher bot; a bad explicit --config is still an error
+    # the Publisher bot; a bad explicit --config is still an error
+    _lease_policy(args, committed_unreadable_ok=True)
     release(
         args.project,
         args.issue,
@@ -1367,8 +1430,8 @@ def _authorize_labeler(args: argparse.Namespace) -> int:
 
 
 def _claims(args: argparse.Namespace) -> int:
-    config = Path("agentic-sdlc.toml")  # its Publisher bot (Codex 4242753917), if there is one
-    use_policy_bot_logins(load_policy(config).publisher_bot_login if config.exists() else "")
+    # its Publisher bot (Codex 4242753917): ./agentic-sdlc.toml, else the committed policy
+    _lease_policy(argparse.Namespace(config=None, project=args.project))
     inventory = claim_inventory(args.project, run_gh)
     rows = inventory.rows
     _status(render_claims(rows))
@@ -1903,8 +1966,11 @@ def build_parser() -> argparse.ArgumentParser:
         parser.add_argument("--session", required=True, help="unique id of this agent run/session")
         parser.add_argument(
             "--config",
-            help="the policy file for lease_ttl_minutes; given explicitly, it must be readable "
-            "(exit 2 otherwise). Omitted: ./agentic-sdlc.toml if it exists, else the default",
+            help="the policy file for lease_ttl_minutes and publisher_bot_login; given "
+            "explicitly, it must be readable (exit 2 otherwise). Omitted: ./agentic-sdlc.toml "
+            "if it exists, else (FORGE_LEASE_BOT_LOGINS unset) the agentic-sdlc.toml committed "
+            "on the default branch (unreadable: exit 2; `release` warns and still releases "
+            "its own session's claims), else the defaults",
         )
         parser.add_argument("--ttl-minutes", type=int)
         parser.add_argument("--output")

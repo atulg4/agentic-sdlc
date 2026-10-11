@@ -1779,6 +1779,53 @@ def renew(
     return lease
 
 
+def _release_untrusted_own_claims(
+    project: str, issue: int, session: str, note: str, gh: GhRunner
+) -> bool:
+    """Post a release marker for `session` when the thread holds a claim marker of `session`
+    whose author this process does not trust and no release of it has followed (one by that
+    same author, or by a trusted one). True when it posted.
+
+    Codex 4242925440: which App bot is trusted depends on configuration
+    (FORGE_LEASE_BOT_LOGINS / `publisher_bot_login`). A `release` run without it -- the
+    failure-cleanup job's, in an empty workspace -- ignored the Publisher bot's claim, found
+    "nothing to release" and exited 0, while every configured reader kept honouring that
+    claim until its TTL. Releasing one's OWN session is safe whoever claimed under its name:
+    the marker voids only `session`'s claims (a forged claim of it included). Nothing else
+    of an untrusted claim is acted on -- its label and assignee are left to the trusted
+    reconciliation. Idempotent: a retry finds the release it posted (same author)."""
+    permission = _trust(project, gh)
+    open_author: str | None = None
+    for comment in _comments(project, issue, gh):
+        body = str(comment.get("body") or "")
+        marker = _marker(body)
+        if marker is None or marker[1].get("session") != session:
+            continue
+        author = login_key((comment.get("user") or {}).get("login"))
+        if marker[0] == CLAIM_MARKER and parse_marker(body, issue) is not None:
+            if not trusted_marker_author(comment, permission):
+                open_author = author
+        elif (
+            marker[0] == RELEASE_MARKER
+            and open_author is not None
+            and (author == open_author or trusted_marker_author(comment, permission))
+        ):
+            open_author = None
+    if open_author is None:
+        return False
+    _comment(
+        project,
+        issue,
+        _marker_comment(
+            format_release_marker(session),
+            f"Lease released by `{session}` (its claim was posted by `{open_author}`, whose "
+            f"markers this run was not configured to trust). {note}",
+        ),
+        gh,
+    )
+    return True
+
+
 def release(
     project: str,
     issue: int,
@@ -1790,6 +1837,10 @@ def release(
     now: datetime | None = None,
 ) -> None:
     now = now or datetime.now(UTC)
+    # Codex 4242925440: settle this session's claims this process does not trust first -- a
+    # release never reports success while its own claim stands unreleased for a reader who
+    # trusts its author (the Publisher bot, when this process could not learn it).
+    settled = _release_untrusted_own_claims(project, issue, session, note, gh)
     existing = current_lease(project, issue, gh, now)
     if (
         existing is not None
@@ -1813,6 +1864,8 @@ def release(
             None,
         )
         if queued is None:
+            if settled:  # this session's only claim was one released above
+                return
             raise LeaseError(
                 f"issue #{issue} is leased by session {existing.session}, not {session}"
             )

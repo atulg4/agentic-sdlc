@@ -919,19 +919,19 @@ def auto_concurrency_group(kind: str, triggers: Sequence[str], required: Sequenc
     share one group per issue, so removing an approval label or editing the issue cancels a run
     that is queued or running (`cancel-in-progress` is true for `unlabeled` and `edited` runs
     only, `AUTO_CANCEL_IN_PROGRESS`); every other label event -- the lease's own `in-progress`
-    label included -- gets a group of its own and cancels nothing. For implementation a `closed`
-    event joins the issue's group too (Codex 4242753923): closing the issue cancels a queued or
-    running implementation, and the `closed` run itself starts nothing (`authorize` runs only
-    on `labeled`)."""
+    label included -- gets a group of its own and cancels nothing. A `closed` event joins the
+    issue's group too (implementation: Codex 4242753923; planning: Codex 4242925431): closing
+    the issue cancels a queued or running run, and the `closed` run itself starts nothing
+    (`authorize`/`preflight` run only on `labeled`)."""
 
     def named(labels: Sequence[str]) -> str:
         return " || ".join(f"github.event.label.name == {_expr_str(label)}" for label in labels)
 
-    closed = " ||\ngithub.event.action == 'closed'" if kind == "implement" else ""
     return (
         f"${{{{ ((github.event.action == 'labeled' && ({named(triggers)})) ||\n"
         f"(github.event.action == 'unlabeled' && ({named(required)})) ||\n"
-        f"github.event.action == 'edited'{closed}) &&\n"
+        "github.event.action == 'edited' ||\n"
+        "github.event.action == 'closed') &&\n"
         f"format('forge-auto-{kind}-{{0}}', github.event.issue.number) ||\n"
         f"format('forge-auto-{kind}-{{0}}-run-{{1}}',\n"
         "github.event.issue.number, github.run_id) }}"
@@ -6498,15 +6498,83 @@ HOOK_LOADER = (
 )
 
 
+#: The oldest Python the hooks may run under: the package's `requires-python` (pyproject.toml;
+#: a test keeps the two equal). The hook scripts use what that version has.
+HOOK_PYTHON_MIN_VERSION = (3, 11)
+#: The implementation the hook scripts are written and tested for.
+HOOK_PYTHON_IMPLEMENTATION = "cpython"
+#: How long the interpreter probe may take, in seconds.
+HOOK_PYTHON_PROBE_TIMEOUT = 15.0
+#: What the probe runs (`-I -c`): the nonce (argv[1]) back, then the implementation and version.
+_HOOK_PYTHON_PROBE = (
+    "import sys;print(sys.argv[1],sys.implementation.name,sys.version_info[0],sys.version_info[1])"
+)
+_HOOK_PYTHON_PROBED: dict[tuple, str] = {}
+
+
+def _hook_python_probe_problem(path: str) -> str:
+    """Why the executable at `path` is not a Python the hooks can run ('' = it is), found by
+    RUNNING it the way the handler does (Codex 4242925452): isolated (`-I -c`), under
+    HOOK_SAFE_PATH, with a fresh nonce it must echo, a CPython of at least
+    HOOK_PYTHON_MIN_VERSION. A root-owned program that is not that interpreter -- `/bin/true`
+    exits 0 without running anything, so the guard would never run -- is refused, as is a
+    Python too old for the hook scripts. Cached per file identity (device, inode, size, mtime)."""
+    try:
+        info = os.stat(path)
+    except OSError as exc:
+        return f"{path} cannot be read ({exc.strerror or exc})"
+    key = (path, info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+    if key in _HOOK_PYTHON_PROBED:
+        return _HOOK_PYTHON_PROBED[key]
+    nonce = secrets.token_hex(8)
+    want = ".".join(map(str, HOOK_PYTHON_MIN_VERSION))
+    try:
+        proc = subprocess.run(
+            [path, "-I", "-c", _HOOK_PYTHON_PROBE, nonce],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=HOOK_PYTHON_PROBE_TIMEOUT,
+            env={"PATH": HOOK_SAFE_PATH, "LC_ALL": "C"},
+            cwd="/",
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"{path} could not be run as Python ({exc})"
+    words = proc.stdout.split()
+    if (
+        proc.returncode != 0
+        or len(words) != 4
+        or words[0] != nonce
+        or not all(w.isdigit() for w in words[2:])
+    ):
+        problem = (
+            f"{path} is not a Python interpreter (running `{path} -I -c ...` did not answer "
+            f"as one: exit {proc.returncode}, output {proc.stdout.strip()[:80]!r})"
+        )
+    elif words[1] != HOOK_PYTHON_IMPLEMENTATION:
+        problem = f"{path} is {words[1]}, not {HOOK_PYTHON_IMPLEMENTATION} {want}+"
+    elif (int(words[2]), int(words[3])) < HOOK_PYTHON_MIN_VERSION:
+        problem = f"{path} is Python {words[2]}.{words[3]}; the hooks need {want} or newer"
+    else:
+        problem = ""
+    _HOOK_PYTHON_PROBED[key] = problem
+    return problem
+
+
 def hook_python_problem(path: str) -> str:
     """Why `path` may not be the hook interpreter ('' = it may): an absolute path the handler
-    can carry as one shell word, to an executable only root can replace (`trusted_exec`)."""
+    can carry as one shell word, to an executable only root can replace (`trusted_exec`), that
+    IS a CPython of at least HOOK_PYTHON_MIN_VERSION when run the way the handler runs it
+    (`_hook_python_probe_problem`, Codex 4242925452)."""
     if not _HOOK_PYTHON_PATH.fullmatch(path or ""):
         return f"{path!r} is not an absolute path made of [A-Za-z0-9._+/-]"
     from .trusted_exec import candidate_reason
 
     reason = candidate_reason(path)
-    return f"{reason} (it must be a file only root can replace)" if reason else ""
+    if reason:
+        return f"{reason} (it must be a file only root can replace)"
+    return _hook_python_probe_problem(path)
 
 
 def trusted_hook_python(explicit: str | None = None) -> str:

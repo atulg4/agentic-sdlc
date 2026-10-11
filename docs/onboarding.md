@@ -191,14 +191,14 @@ unverified labeler must never reach.
 
 Authorization is read when a run starts, so REMOVING an approval label stops a run that is
 already queued or running (Codex 4240628982): both automatic callers trigger on `issues:
-[labeled, unlabeled, edited]` (the implementation caller on `closed` too), and the
+[labeled, unlabeled, edited, closed]`, and the
 workflow-level `concurrency` puts every `labeled` event of a triggering label, every `unlabeled`
 event of a required label and every `edited` event in one group per issue
 (`forge-auto-implement-<n>` / `forge-auto-plan-<n>`), with `cancel-in-progress` true only for the
-`unlabeled` and `edited` runs. Closing the issue cancels a queued or running implementation the
-same way (Codex 4242753923): the `closed` run joins the issue's group with `cancel-in-progress`
-and starts nothing itself (`authorize` requires `labeled`, although a closed issue keeps its
-labels). The reusable workflow does not yet re-read the issue state just before publishing, so
+`unlabeled` and `edited` runs. Closing the issue cancels a queued or running implementation or
+planning run the same way (Codex 4242753923, 4242925431): the `closed` run joins the issue's
+group with `cancel-in-progress` and starts nothing itself (`authorize` / `preflight` require
+`labeled`, although a closed issue keeps its labels). The reusable workflow does not yet re-read the issue state just before publishing, so
 a close that lands after the patch is generated but before the cancel takes effect can still
 publish a draft PR. A Triage user who removes a writer's label and re-applies it while the
 authorized run waits for a runner therefore cancels that run; the `unlabeled` run itself starts
@@ -431,7 +431,11 @@ through a link). `onboard --force` rewrites the policy and drops the confirmatio
   "${CLAUDE_PROJECT_DIR}/.claude/hooks/<script>.py" <sha256>` (Codex 4242753911, 4242753904):
   `<python>` is an absolute interpreter `onboard` vetted -- `/usr/bin/python3`, else
   `/bin/python3`, or `--hook-python PATH` -- that only root can replace (the file and every
-  directory above it root-owned and not group/other-writable); onboarding FAILS when there is
+  directory above it root-owned and not group/other-writable) and that IS a CPython of at least
+  the package's `requires-python` (3.11): onboard and doctor RUN it as the handler does
+  (`-I -c`, PATH=/usr/bin:/bin) and it must echo a fresh nonce with its implementation and
+  version (Codex 4242925452: a root-owned `/bin/true` exits 0 without running the loader, so
+  ownership alone would let the guard be skipped); onboarding FAILS when there is
   none, and doctor fails a handler whose interpreter is not trusted on the machine it runs on,
   or one that runs a bare `python3` (a PATH lookup: the cloud setup puts the user-writable
   `~/.local/bin` on PATH, where a planted `python3` could exit 0 instead of guarding). `-I`
