@@ -37,7 +37,8 @@ LABELER_AUTHORIZATION
 
   # Duplicate suppression: no new plan when the platform's plan comment (posted by
   # github-actions[bot], starting "## Agentic SDLC plan") is newer than the latest application of
-  # each planning label -- a plan already covers this approval. Re-applying a label (after a
+  # EVERY planning label (the newest of them, `approved_latest_at`) -- a plan already covers this
+  # approval. Re-applying a label (after a
   # cancellation, an edit or a failure) makes the approval newer than any plan, so it plans
   # again. Comments that cannot be read FAIL the job (reported by notify_failure), never plan
   # twice in silence. Not tunable: GitHub-hosted, read-only.
@@ -56,7 +57,9 @@ LABELER_AUTHORIZATION
         env:
           GH_TOKEN: ${{ github.token }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
-          APPROVED_AT: ${{ needs.preflight.outputs.approved_at }}
+          # The NEWEST latest application of the planning labels (Codex 4241327876): re-applying
+          # just one label must outdate an earlier plan.
+          APPROVED_AT: ${{ needs.preflight.outputs.approved_latest_at }}
         run: |
           set -euo pipefail
           if ! [[ "$APPROVED_AT" =~ ^[0-9]+$ ]]; then

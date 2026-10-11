@@ -10,6 +10,7 @@
       authorized: ${{ steps.authorize.outputs.authorized }}
       approver: ${{ steps.authorize.outputs.approver }}
       approved_at: ${{ steps.authorize.outputs.approved_at }}
+      approved_latest_at: ${{ steps.authorize.outputs.approved_latest_at }}
     steps:
       - name: Require repository write authority from the labeler and the approver
         id: authorize
@@ -109,7 +110,13 @@
               "$REQUIRED_LABELS" "$ISSUE_NUMBER"
             exit 1
           fi
-          if ! approved_at="$(jq -er '[.[] | .at | fromdateiso8601] | min' <<<"$latest" 2>"$errors")"; then
+          # Two times, one per question (Codex 4241327876). The content-staleness check below uses
+          # the EARLIEST latest application (`approved_at`): an edit must precede EVERY label.
+          # Plan dedupe uses the NEWEST (`approved_latest_at`): a plan covers the approval only
+          # if it follows every current label application, so re-applying one label re-plans.
+          if ! approved_at="$(jq -er '[.[] | .at | fromdateiso8601] | min' <<<"$latest" 2>"$errors")" ||
+            ! approved_latest_at="$(jq -er '[.[] | .at | fromdateiso8601] | max' <<<"$latest" \
+              2>"$errors")"; then
             printf '::error::Could not read when each of %s was applied to issue #%s; failing instead of authorizing.\n' \
               "$REQUIRED_LABELS" "$ISSUE_NUMBER"
             exit 1
@@ -184,8 +191,8 @@
               *) authorized=false ;;
             esac
           done
-          printf 'authorized=%s\napprover=%s\napproved_at=%s\n' "$authorized" "$approver" \
-            "$approved_at" >> "$GITHUB_OUTPUT"
+          printf 'authorized=%s\napprover=%s\napproved_at=%s\napproved_latest_at=%s\n' \
+            "$authorized" "$approver" "$approved_at" "$approved_latest_at" >> "$GITHUB_OUTPUT"
           if [ "$authorized" != true ]; then
             printf '::notice::AUTHORIZED_WORK not scheduled: the labeler lacks repository write authority.\n'
           fi

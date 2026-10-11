@@ -140,8 +140,10 @@ self-hosted runner; a maintainer who re-applies either planning label starts pla
 re-adding a `human-review-required` whose removal cancelled planning restarts it). Duplicates
 are suppressed by the `dedupe` job (`ubuntu-latest`, NOT tunable, `permissions: issues: read`):
 it skips planning when a `## Agentic SDLC plan` comment by `github-actions[bot]` is newer than
-the latest application of each planning label (`preflight` outputs that time as
-`approved_at`), so an issue opened with both labels -- two `labeled` runs, serialized by the
+the latest application of EVERY planning label (`preflight` outputs the newest of those times as
+`approved_latest_at`; Codex 4241327876: re-applying just one label after a plan therefore plans
+again -- `approved_at`, the earliest, is kept for the content-staleness check, since an edit must
+precede every label), so an issue opened with both labels -- two `labeled` runs, serialized by the
 shared concurrency group -- is planned once; comments it cannot read fail it, and
 `notify_failure` reports that. (`agent-plan.yml` is `workflow_dispatch` only, which already
 requires write access.)
@@ -292,6 +294,11 @@ through a link). `onboard --force` rewrites the policy and drops the confirmatio
   with a `gh issue list --search` that excludes `claude-blocked`, and an issue whose body is not
   a valid work request is commented on, labelled `claude-blocked` and its lease released before
   the routine moves on (Codex 4241196636), so one malformed request cannot starve the queue.
+  The list asks for `--limit 1000` (`gh issue list` returns 30 by default; 1000 is also the
+  most one GitHub issue search returns) and the routine works through it in order, oldest
+  first, until it claims one: an issue skipped because it is unauthorized, unverifiable or
+  leased elsewhere stays in the search, so it moves on to the next candidate instead of ending
+  the run (Codex 4241327879). More than 1000 approved candidates is out of scope.
 - **Cloud routine branch rules** (`cloud-routine` mode, Codex 4241196640): the routine pushes
   `forge/issue-<N>` with the owner's credentials, so "effective rules on the cloud routine's
   forge/issue-<N> branches allow its push" runs the publisher's branch-domain checks against that

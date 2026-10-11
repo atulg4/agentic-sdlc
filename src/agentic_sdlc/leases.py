@@ -41,11 +41,11 @@ comments as MEMBER). The commit-guard hook mirrors the same rule.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import os
 import re
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -1074,13 +1074,66 @@ def _clock(now: datetime | None, clock: Clock | None) -> Clock:
     return lambda: datetime.now(UTC)
 
 
+#: How many times a claim tries to post the retraction of its own marker, and the pause before
+#: each retry (Codex 4241327872). A claim that fails after posting must not leave a live lease
+#: behind: the caller is about to fail and nothing downstream releases it, so the issue would
+#: stay blocked for the whole TTL. Bounded: a GitHub that refuses every write is reported, not
+#: retried forever.
+RETRACT_ATTEMPTS = 3
+RETRACT_PAUSES = (1.0, 2.0)
+_sleep = time.sleep  # replaced in tests
+
+
 def _retract(project: str, issue: int, session: str, why: str, gh: GhRunner) -> None:
-    """Post `session`'s release marker: the claim it just posted is withdrawn."""
-    _comment(project, issue, _marker_comment(format_release_marker(session), why), gh)
+    """Post `session`'s release marker: the claim it just posted is withdrawn. Tried up to
+    RETRACT_ATTEMPTS times; the last failure is raised."""
+    body = _marker_comment(format_release_marker(session), why)
+    for attempt in range(1, RETRACT_ATTEMPTS + 1):
+        try:
+            _comment(project, issue, body, gh)
+            return
+        except Exception as exc:
+            if attempt == RETRACT_ATTEMPTS:
+                raise
+            _log.warning(
+                "issue #%s: retraction of session %s failed (attempt %s/%s): %s",
+                issue,
+                session,
+                attempt,
+                RETRACT_ATTEMPTS,
+                exc,
+            )
+            _sleep(RETRACT_PAUSES[min(attempt, len(RETRACT_PAUSES)) - 1])
+
+
+def _retract_on_failure(project: str, issue: int, session: str, why: str, gh: GhRunner) -> bool:
+    """`_retract` on the way out of a failing claim: the claim's own failure is what the caller
+    must see, so a retraction that fails every attempt is logged, never raised. True when the
+    retraction was posted."""
+    try:
+        _retract(project, issue, session, why, gh)
+    except Exception as exc:  # noqa: BLE001 -- the original failure is what matters
+        _log.error(
+            "issue #%s: could not retract the claim of session %s after %s attempts; it stays "
+            "live until it expires or is released: %s",
+            issue,
+            session,
+            RETRACT_ATTEMPTS,
+            exc,
+        )
+        return False
+    return True
 
 
 def _post_and_arbitrate(
-    project: str, issue: int, session: str, body: str, gh: GhRunner, clock: Clock
+    project: str,
+    issue: int,
+    session: str,
+    body: str,
+    gh: GhRunner,
+    clock: Clock,
+    *,
+    retract_on_error: bool = False,
 ) -> Lease | None:
     """Post a claim/renewal marker, then re-read the thread and keep it only if it is authoritative.
 
@@ -1089,10 +1142,27 @@ def _post_and_arbitrate(
     it, everyone else retracts. The re-read is judged at a FRESH reading of `clock` (Codex
     4241196647): a marker already expired by then is not a lease, and is retracted. Returns the
     winner (``None`` when nothing is live).
+
+    With `retract_on_error` (a FRESH claim: no lease of this session predates it), a failure
+    after the post -- the post's own answer lost, or the arbitration re-read failing -- retracts
+    the marker before it is raised (Codex 4241327872): the caller fails, and a marker left behind
+    would be a live lease nobody releases. A renewal does not: its session already held the
+    lease, and retracting would end that lease too.
     """
-    _comment(project, issue, body, gh)
-    at = clock()
-    winner = current_lease(project, issue, gh, at)
+    try:
+        _comment(project, issue, body, gh)
+        at = clock()
+        winner = current_lease(project, issue, gh, at)
+    except Exception:
+        if retract_on_error:
+            _retract_on_failure(
+                project,
+                issue,
+                session,
+                "The claim could not be confirmed after it was posted; retracting.",
+                gh,
+            )
+        raise
     expired_own = winner is not None and winner.session == session and not winner.live(at)
     if winner is not None and not winner.live(at):
         winner = None
@@ -1492,7 +1562,9 @@ def claim(
     if took_over:
         note = f"Took over an expired lease from session `{took_over}`. " + note
     marker = format_claim_marker(lease)
-    winner = _post_and_arbitrate(project, issue, session, _marker_comment(marker, note), gh, clock)
+    winner = _post_and_arbitrate(
+        project, issue, session, _marker_comment(marker, note), gh, clock, retract_on_error=True
+    )
     if winner is None:
         return ClaimResult(
             False,
@@ -1516,15 +1588,14 @@ def claim(
     try:
         late = open_prs_for_issue(project, issue, gh)
     except Exception:
-        # best effort: the read failure is what matters
-        with contextlib.suppress(Exception):
-            _retract(
-                project,
-                issue,
-                session,
-                "The open pull requests could not be re-read after claiming; retracting.",
-                gh,
-            )
+        # the read failure is what matters; the retraction is retried (bounded), never raised
+        _retract_on_failure(
+            project,
+            issue,
+            session,
+            "The open pull requests could not be re-read after claiming; retracting.",
+            gh,
+        )
         raise
     if late:
         urls = ", ".join(str(p.get("url") or f"#{p.get('number')}") for p in late)
@@ -1550,31 +1621,33 @@ def claim(
             snapshot = _assignment_snapshot(project, issue, assignee, gh)
         _edit(project, issue, gh, *flags)
     except Exception:
-        if assignee and not inherited:
-            lease = replace(
-                lease,
-                owns_assignee=_confirm_own_assignment(
-                    project, issue, session, assignee, snapshot, now, gh
-                ),
-            )
         # The marker already made the lease authoritative, but the caller is about to fail and
-        # nothing downstream will release it: retract so the issue is not blocked for the TTL.
-        try:
-            _comment(
-                project,
-                issue,
-                _marker_comment(
-                    format_release_marker(session),
-                    "Label/assignee bookkeeping failed; retracting the claim.",
-                ),
-                gh,
-            )
-            _sync_label(project, issue, gh, now)
-            # This claim's own assignment, seconds old: nobody can have re-added it yet.
-            if _drop_owned_assignee(project, issue, lease, gh, now, check_history=False):
-                _record_cleanup(project, issue, lease, gh)
-        except Exception:  # noqa: BLE001 -- best effort; the original failure is what matters
-            pass
+        # nothing downstream will release it: retract FIRST (bounded retry, Codex 4241327872),
+        # so the issue is not blocked for the TTL whatever the cleanup below does.
+        retracted = _retract_on_failure(
+            project,
+            issue,
+            session,
+            "Label/assignee bookkeeping failed; retracting the claim.",
+            gh,
+        )
+        if assignee and not inherited:
+            try:
+                owned = _confirm_own_assignment(
+                    project, issue, session, assignee, snapshot, now, gh
+                )
+            except Exception:  # noqa: BLE001 -- unknown: the lease never removes the login
+                owned = False
+            lease = replace(lease, owns_assignee=owned)
+        # Unretracted, the lease is still live: its label and assignee stay with it.
+        if retracted:
+            try:
+                _sync_label(project, issue, gh, now)
+                # This claim's own assignment, seconds old: nobody can have re-added it yet.
+                if _drop_owned_assignee(project, issue, lease, gh, now, check_history=False):
+                    _record_cleanup(project, issue, lease, gh)
+            except Exception:  # noqa: BLE001 -- best effort; the original failure matters
+                pass
         raise
     if (
         assignee

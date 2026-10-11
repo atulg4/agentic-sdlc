@@ -3061,3 +3061,168 @@ def test_a_renewal_expiry_is_computed_when_it_is_posted():
     gh.posted_at = clock["now"]
     lease = renew(PROJECT, 7, session="s1", ttl_minutes=30, gh=gh, clock=lambda: clock["now"])
     assert lease.expires == NOW + timedelta(minutes=40)
+
+
+# Codex 4241327872: a claim that fails after posting its marker must not leave a live lease the
+# failing caller never releases. Every failure after the post -- the arbitration re-read, the
+# open-PR re-check and the label bookkeeping -- retracts the marker, retried up to
+# RETRACT_ATTEMPTS times, and the ORIGINAL failure is what the caller sees.
+class _Faults:
+    """Wraps a FakeGh: after the first claim marker is posted, the next `reads` thread re-reads
+    fail; the first `retract_failures` release-marker POSTs fail (without posting)."""
+
+    def __init__(self, gh, *, reads=0, retract_failures=0, lose_post_answer=False):
+        self.gh = gh
+        self.reads = reads
+        self.retract_failures = retract_failures
+        self.lose_post_answer = lose_post_answer
+        self.posted = False
+        self.retract_attempts = 0
+
+    def __call__(self, args, input=None):
+        args = tuple(args)
+        posting = args[:3] == ("api", "-X", "POST") and args[3].endswith("/comments")
+        body = json.loads(input or "{}").get("body", "") if posting else ""
+        if posting and "forge-release" in body:
+            self.retract_attempts += 1
+            if self.retract_failures:
+                self.retract_failures -= 1
+                raise RuntimeError("gh: Server Error (HTTP 502) on retraction")
+        if posting and "forge-claim" in body and not self.posted:
+            self.posted = True
+            answer = self.gh(args, input)
+            if self.lose_post_answer:
+                raise RuntimeError("gh: connection reset after the POST")
+            return answer
+        reading = args[0] == "api" and args[1].split("?")[0].endswith("/issues/7/comments")
+        if self.posted and reading and "-X" not in args and self.reads:
+            self.reads -= 1
+            raise RuntimeError("gh: Server Error (HTTP 502) on re-read")
+        return self.gh(args, input)
+
+
+@pytest.fixture
+def no_retract_pause(monkeypatch):
+    import agentic_sdlc.leases as leases
+
+    pauses: list[float] = []
+    monkeypatch.setattr(leases, "_sleep", pauses.append)
+    return pauses
+
+
+@pytest.mark.parametrize("retract_failures", [0, 2])
+def test_a_claim_whose_arbitration_read_fails_retracts_its_marker(
+    no_retract_pause, retract_failures
+):
+    gh = FakeGh().issue(7)
+    faults = _Faults(gh, reads=1, retract_failures=retract_failures)
+    with pytest.raises(RuntimeError, match="on re-read"):
+        _claim(faults)
+    assert faults.retract_attempts == retract_failures + 1
+    assert len(no_retract_pause) == retract_failures  # a pause before each retry only
+    assert "forge-release session=s1" in gh.issues[7]["comments"][-1]["body"]
+    assert current_lease(PROJECT, 7, gh, NOW) is None  # no live lease left behind
+
+
+def test_a_claim_whose_post_answer_is_lost_retracts_the_marker_that_landed(no_retract_pause):
+    gh = FakeGh().issue(7)
+    faults = _Faults(gh, lose_post_answer=True)
+    with pytest.raises(RuntimeError, match="connection reset"):
+        _claim(faults)
+    assert current_lease(PROJECT, 7, gh, NOW) is None
+
+
+def test_a_retraction_that_fails_every_attempt_is_bounded_and_keeps_the_original_error(
+    no_retract_pause,
+):
+    from agentic_sdlc.leases import RETRACT_ATTEMPTS
+
+    gh = FakeGh().issue(7)
+    faults = _Faults(gh, reads=1, retract_failures=99)
+    with pytest.raises(RuntimeError, match="on re-read"):  # not the retraction's error
+        _claim(faults)
+    assert faults.retract_attempts == RETRACT_ATTEMPTS == 3
+    assert len(no_retract_pause) == RETRACT_ATTEMPTS - 1
+
+
+def test_an_unreadable_pr_recheck_retries_the_retraction(no_retract_pause):
+    gh = FakeGh().issue(7)
+    faults = _Faults(gh, retract_failures=1)
+
+    def flaky(args, input=None):
+        if faults.posted and args[:2] == ["api", "graphql"] and "pullRequests(" in args[3]:
+            raise RuntimeError("gh: Server Error (HTTP 502) on PR re-check")
+        return faults(args, input)
+
+    with pytest.raises(RuntimeError, match="PR re-check"):
+        claim(PROJECT, 7, agent="me", session="s1", branch="b", ttl_minutes=60, gh=flaky, now=NOW)
+    assert faults.retract_attempts == 2
+    assert current_lease(PROJECT, 7, gh, NOW) is None
+    assert IN_PROGRESS_LABEL not in [lbl["name"] for lbl in gh.issues[7]["labels"]]
+
+
+def test_failed_label_bookkeeping_retries_the_retraction(no_retract_pause):
+    gh = FakeGh().issue(7)
+    faults = _Faults(gh, retract_failures=2)
+
+    def failing_label(args, input=None):
+        if tuple(args[:2]) == ("issue", "edit") and "--add-label" in args:
+            raise RuntimeError("gh: label edit failed")
+        return faults(args, input)
+
+    with pytest.raises(RuntimeError, match="label edit failed"):
+        claim(
+            PROJECT,
+            7,
+            agent="me",
+            session="s1",
+            branch="b",
+            gh=failing_label,
+            now=NOW,
+            assignee="nobody",
+        )
+    assert faults.retract_attempts == 3
+    assert current_lease(PROJECT, 7, gh, NOW) is None
+    assert _logins(gh) == []
+
+
+def test_failed_label_bookkeeping_retracts_even_when_the_ownership_check_raises(
+    no_retract_pause, monkeypatch
+):
+    import agentic_sdlc.leases as leases
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("ownership check exploded")
+
+    monkeypatch.setattr(leases, "_confirm_own_assignment", boom)
+    gh = FakeGh().issue(7)
+    real = gh.__call__
+
+    def failing_assignee(args, input=None):
+        if tuple(args[:2]) == ("issue", "edit") and "--add-assignee" in args:
+            raise RuntimeError("invalid assignee")
+        return real(args, input=input)
+
+    with pytest.raises(RuntimeError, match="invalid assignee"):
+        claim(
+            PROJECT,
+            7,
+            agent="me",
+            session="s1",
+            branch="b",
+            gh=failing_assignee,
+            now=NOW,
+            assignee="nobody",
+        )
+    assert current_lease(PROJECT, 7, gh, NOW) is None
+
+
+def test_a_renewal_whose_arbitration_read_fails_keeps_the_lease(no_retract_pause):
+    # the session already held the lease: retracting the renewal would end that lease too
+    mine = format_claim_marker(Lease(7, "me", "s1", "b", NOW + timedelta(minutes=5)))
+    gh = FakeGh().issue(7, labels=[IN_PROGRESS_LABEL], comments=[mine])
+    faults = _Faults(gh, reads=1)
+    with pytest.raises(RuntimeError, match="on re-read"):
+        renew(PROJECT, 7, session="s1", ttl_minutes=60, gh=faults, now=NOW)
+    assert faults.retract_attempts == 0
+    assert current_lease(PROJECT, 7, gh, NOW).session == "s1"

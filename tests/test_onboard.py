@@ -7483,7 +7483,10 @@ def test_labeler_authorization_fails_on_unreadable_permissions(
         assert "authorized=" not in output  # nothing is decided: the job fails
         assert "::error::" in done.stdout
     else:
-        expected = f"authorized={authorized}\napprover=alice\napproved_at={_epoch(EVENT_AT)}"
+        at = _epoch(EVENT_AT)
+        expected = (
+            f"authorized={authorized}\napprover=alice\napproved_at={at}\napproved_latest_at={at}"
+        )
         assert output.strip() == expected
 
 
@@ -9671,7 +9674,13 @@ def test_auto_implement_passes_the_verified_approver(tmp_path, events, approver)
         {"writer": WRITE, "maintainer": WRITE, "triager": TRIAGE},
     )
     assert done.returncode == 0, done.stderr
-    assert out == {"authorized": "true", "approver": approver, "approved_at": str(_epoch(EVENT_AT))}
+    at = str(_epoch(EVENT_AT))
+    assert out == {
+        "authorized": "true",
+        "approver": approver,
+        "approved_at": at,
+        "approved_latest_at": at,
+    }
 
 
 @pytest.mark.parametrize(
@@ -11593,7 +11602,8 @@ def _run_dedupe(tmp_path, comments_script, approved_at):
     assert job["needs"] == "preflight"
     assert job["if"] == "needs.preflight.outputs.authorized == 'true'"
     step = job["steps"][0]
-    assert step["env"]["APPROVED_AT"] == "${{ needs.preflight.outputs.approved_at }}"
+    # Codex 4241327876: dedupe reads the NEWEST latest label application, not the earliest.
+    assert step["env"]["APPROVED_AT"] == "${{ needs.preflight.outputs.approved_latest_at }}"
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     (bin_dir / "gh").write_text(
@@ -11664,6 +11674,64 @@ def test_auto_plan_dedupe_fails_closed(tmp_path, script, approved_at):
     assert "fresh=" not in output and "::error::" in done.stdout
 
 
+# Codex 4241327876: the preflight outputs the EARLIEST latest label application (`approved_at`,
+# for the content-staleness check: an edit must precede every label) AND the NEWEST
+# (`approved_latest_at`, for dedupe: a plan covers the approval only if it follows every current
+# label application). Re-applying ONE planning label after a plan must therefore plan again.
+def test_auto_plan_reapplying_one_label_after_a_plan_plans_again(tmp_path):
+    doc = yaml.safe_load(render_onboarding(spec())[".github/workflows/agent-auto-plan.yml"])
+    assert doc["jobs"]["preflight"]["outputs"]["approved_latest_at"] == (
+        "${{ steps.authorize.outputs.approved_latest_at }}"
+    )
+    step = next(s for s in doc["jobs"]["preflight"]["steps"] if s.get("id") == "authorize")
+    labels = json.loads(step["env"]["REQUIRED_LABELS"])
+    assert len(labels) >= 2
+    for sub in ("authorize", "dedupe", "dedupe-min"):
+        (tmp_path / sub).mkdir()
+    rows = [
+        {
+            "event": "labeled",
+            "label": {"name": name},
+            "actor": {"login": "writer"},
+            "created_at": _minute(minute),
+        }
+        for minute, name in enumerate(labels, start=1)
+    ]
+    plan_minute = len(labels) + 1  # the plan of the first approval
+    rows += [
+        {
+            "event": "unlabeled",
+            "label": {"name": labels[0]},
+            "actor": {"login": "writer"},
+            "created_at": _minute(plan_minute + 1),
+        },
+        {
+            "event": "labeled",
+            "label": {"name": labels[0]},
+            "actor": {"login": "writer"},
+            "created_at": _minute(plan_minute + 2),
+        },
+    ]
+    done, out = _run_approval(
+        tmp_path / "authorize",
+        "agent-auto-plan.yml",
+        f"printf '%s' '{json.dumps(rows)}'; exit 0",
+        {"writer": WRITE},
+    )
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    assert out["authorized"] == "true"
+    # the other label's older application stays the earliest; the re-applied one is the newest
+    assert out["approved_at"] == str(_epoch(_minute(2)))
+    assert out["approved_latest_at"] == str(_epoch(_minute(plan_minute + 2)))
+    plan = f"printf '%s' '{json.dumps([_comment('github-actions[bot]', PLAN_BODY, plan_minute)])}'"
+    done, output = _run_dedupe(tmp_path / "dedupe", plan, out["approved_latest_at"])
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    assert output.strip() == "fresh=true"
+    # the earliest time alone would have read the old plan as covering the new approval
+    done, output = _run_dedupe(tmp_path / "dedupe-min", plan, out["approved_at"])
+    assert output.strip() == "fresh=false"
+
+
 # Codex 4241196636: an issue with an invalid body must not starve the cloud routine's queue: step
 # 1 never selects a `claude-blocked` issue, and step 2 blocks it AND releases its lease.
 def test_cloud_routine_retires_an_invalid_issue_instead_of_starving_the_queue():
@@ -11677,6 +11745,8 @@ def test_cloud_routine_retires_an_invalid_issue_instead_of_starving_the_queue():
     command = re.search(r"`(gh issue list [^`]*)`", step1).group(1)
     argv = shlex.split(command)
     assert argv[:6] == ["gh", "issue", "list", "--repo", "owner/comic", "--state"]
+    # Codex 4241327879: not the default 30 -- skipped issues stay in the search
+    assert argv[argv.index("--limit") + 1] == "1000"
     terms = shlex.split(argv[argv.index("--search") + 1])
     assert terms == [
         "label:it's ready",
@@ -11690,6 +11760,32 @@ def test_cloud_routine_retires_an_invalid_issue_instead_of_starving_the_queue():
     release = step2.index("sdlcctl release --project owner/comic --issue <n>")
     assert release > step2.index("claude-blocked") and "--session <run id>" in step2
     assert "go back to step 1" in step2 and "stop." not in step2
+
+
+# Codex 4241327879: an issue that is leased elsewhere or fails authorization stays in the search
+# (only `claude-blocked` leaves it), so the routine lists well past the default 30 and works
+# through the whole list in order instead of stopping at the first skip.
+def test_cloud_routine_works_through_every_listed_candidate():
+    import shlex
+
+    from agentic_sdlc.onboard import ROUTINE_CANDIDATE_LIMIT
+
+    files = render_onboarding(spec(implementer="cloud-routine", runs_on=("ubuntu-latest",)))
+    doc = files["docs/forge/cloud-implementer.md"]
+    step1 = doc[doc.index("1. List open issues") : doc.index("1a. Authorize")]
+    argv = shlex.split(re.search(r"`(gh issue list [^`]*)`", step1).group(1))
+    assert ROUTINE_CANDIDATE_LIMIT == 1000
+    assert argv.count("--limit") == 1 and argv[argv.index("--limit") + 1] == "1000"
+    flat = " ".join(step1.split())
+    assert "Work through it IN ORDER" in flat and "do not list again" in flat
+    assert "never ends the run while candidates remain" in flat
+    assert "Take the oldest one; if none, stop." not in flat
+    # every skip in steps 1a/1b moves on to the next candidate rather than stopping
+    skips = doc[doc.index("1a. Authorize") : doc.index("2. Validate the issue body")]
+    assert " ".join(skips.split()).count("take the next issue") == 2
+    assert "skip that issue and take the next one" in " ".join(skips.split())
+    step2 = doc[doc.index("2. Validate the issue body") : doc.index("3. On a new branch")]
+    assert "next candidate of the step 1 list" in " ".join(step2.split())
 
 
 # Codex 4241196640: in cloud-routine mode the routine pushes `forge/issue-<N>` with the owner's
