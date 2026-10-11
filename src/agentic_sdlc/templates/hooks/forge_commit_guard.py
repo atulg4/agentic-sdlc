@@ -114,6 +114,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import stat
 import subprocess
 import sys
@@ -126,6 +127,10 @@ PROJECT = "PROJECT_ID"
 # is unknown (guarded). The SessionStart hook allows 60s for its own reads.
 GH_TIMEOUT = 30
 GIT_TIMEOUT = 15
+# Codex 4242373515: the whole run is bounded below the handler's `timeout` (300s, written by
+# `sdlcctl onboard`), so the guard reaches its own verdict -- exit 2 -- before Claude Code would
+# cancel it; and any failure of its own (an exception, the deadline) blocks, never passes.
+GUARD_DEADLINE = 240
 ISSUE_BRANCH = re.compile(r"(?:^|/)issue-(\d+)(?:$|[^0-9])")
 # A marker is the WHOLE first line of a comment, as leases.py writes and reads it; a comment with
 # marker syntax elsewhere, or more than one marker, carries none (same rule as leases._marker).
@@ -3554,5 +3559,33 @@ def main() -> int:
     return code
 
 
+class GuardDeadline(Exception):
+    """GUARD_DEADLINE passed before the guard reached a verdict."""
+
+
+def _deadline(_signum: int, _frame: object) -> None:
+    raise GuardDeadline(f"no verdict within {GUARD_DEADLINE}s")
+
+
+def run() -> int:
+    """`main`, failing CLOSED: an exception or the deadline is exit 2 (Codex 4242373515). An
+    uncaught exception would exit 1, which Claude Code treats as a non-blocking error."""
+    if hasattr(signal, "SIGALRM"):
+        signal.signal(signal.SIGALRM, _deadline)
+        signal.alarm(GUARD_DEADLINE)
+    try:
+        return main()
+    except Exception as exc:  # any failure blocks
+        print(
+            f"Forge commit guard failed ({type(exc).__name__}: {exc}); blocking this call. "
+            "Re-run it, or check .claude/hooks/forge_commit_guard.py.",
+            file=sys.stderr,
+        )
+        return 2
+    finally:
+        if hasattr(signal, "SIGALRM"):
+            signal.alarm(0)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run())

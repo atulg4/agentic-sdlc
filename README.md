@@ -118,7 +118,10 @@ head must be the one GitHub reports -- over every commit it pushes, run with a t
 and, LAST before pushing, ONE final gate -- `check-request --expect-digest <digest>
 --authorize-labels` -- that judges a single snapshot of the issue (request unedited, still open,
 dependencies still closed, each approval label last applied by a writer after the last edit)
-and re-reads the issue and its history to require them unchanged. Every `gh` and git those gates run gets an
+and re-reads the issue, its history and every dependency to require them unchanged. A fresh
+cloud environment has no `sdlcctl`: the document's "Environment setup script" installs it from
+the platform repository at the workflows' pinned commit, and step 0 of the prompt stops the run
+unless `sdlcctl --version` prints that commit. Every `gh` and git those gates run gets an
 allowlisted environment (no `LD_*`/`DYLD_*`, a fixed PATH, a fresh empty `GH_CONFIG_DIR`, no
 `SSL_CERT_FILE`/`SSL_CERT_DIR`; the token comes from `GH_TOKEN`/`GITHUB_TOKEN` or `gh auth
 token`): an egress proxy set in `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` is still used, but its CA

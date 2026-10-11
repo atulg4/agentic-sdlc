@@ -271,6 +271,11 @@ class FakeGh:
             "state": "open",
         }
         self.states = states or {}
+        #: dependency number -> its update time; `on_dep_read[n]` runs right after the n-th read
+        #: of any dependency is answered
+        self.dep_updated: dict[int, str] = {}
+        self.dep_reads = 0
+        self.on_dep_read: dict[int, object] = {}
         self.calls: list[list[str]] = []
 
     def __call__(self, args, input=None):
@@ -287,8 +292,19 @@ class FakeGh:
             raise state
         if state is None:
             raise OnboardError("gh api failed: Not Found (HTTP 404)")
-        assert args[2:] == ["--jq", ".state"]
-        return f"{state}\n"
+        assert args[2:] == []
+        answer = json.dumps(
+            {
+                "number": number,
+                "state": state,
+                "updated_at": self.dep_updated.get(number, "2026-01-01T00:00:00Z"),
+            }
+        )
+        self.dep_reads += 1
+        change = self.on_dep_read.get(self.dep_reads)
+        if change is not None:
+            change(self)
+        return answer
 
 
 def _check_request(monkeypatch, policy_file, gh, tmp_path=None, project=PROJECT):
@@ -1343,6 +1359,38 @@ def test_final_gate_refuses_a_reopened_dependency(monkeypatch, policy_file, caps
     gh = HistoryGh(body, states={3: "open"})
     assert _final_gate(monkeypatch, policy_file, gh, digest) == cli.DEPENDENCY_OPEN
     assert "WAITING: #7" in capsys.readouterr().err
+
+
+def test_final_gate_refuses_a_dependency_reopened_between_its_reads(
+    monkeypatch, policy_file, capsys
+):
+    """Codex 4242373526: the dependencies are part of the stable snapshot. #3 is closed when the
+    first snapshot is judged and reopened before the re-read: refused, never "stable"."""
+    body = VALID.format(deps="- #3")
+    digest = cli.request_digest("Do the thing", body)
+    gh = HistoryGh(body, states={3: "closed"})
+
+    def reopen(gh):
+        gh.states[3] = "open"
+        gh.dep_updated[3] = "2026-01-01T01:00:00Z"
+
+    gh.on_dep_read[1] = reopen
+    assert _final_gate(monkeypatch, policy_file, gh, digest) == cli.DEPENDENCY_OPEN
+    err = capsys.readouterr().err
+    assert "changed while it was checked (dependencies)" in err and "WAITING: #7" in err
+
+
+def test_final_gate_rejudges_a_dependency_reopened_and_closed_between_its_reads(
+    monkeypatch, policy_file
+):
+    """Reopened and closed again between the reads: the state matches, the update time does
+    not, so the snapshot is judged afresh rather than called stable."""
+    body = VALID.format(deps="- #3")
+    digest = cli.request_digest("Do the thing", body)
+    gh = HistoryGh(body, states={3: "closed"})
+    gh.on_dep_read[1] = lambda gh: gh.dep_updated.update({3: "2026-01-01T01:00:00Z"})
+    assert _final_gate(monkeypatch, policy_file, gh, digest) == 0
+    assert gh.reads == 4 and gh.dep_reads == 4
 
 
 def test_final_gate_refuses_a_closed_issue_and_fails_closed_on_an_unreadable_history(

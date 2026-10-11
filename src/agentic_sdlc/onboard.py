@@ -1072,6 +1072,18 @@ def _routine_search(spec: OnboardSpec) -> str:
 ROUTINE_CANDIDATE_LIMIT = 1000
 
 
+def cloud_routine_setup_script(spec: OnboardSpec) -> str:
+    """The cloud routine environment's setup script (Codex 4242373521): `sdlcctl` from the
+    platform repository at the pinned commit (`platform_ref`, a full SHA), the same source and
+    ref the Actions workflows check out."""
+    source = f"git+https://github.com/{spec.platform_repository}@{spec.platform_ref}"
+    return (
+        "python3 -m pip install --user --disable-pip-version-check "
+        + shlex.quote(f"agentic-sdlc @ {source}")
+        + "\n"
+    )
+
+
 def render_cloud_routine_md(spec: OnboardSpec) -> str:
     search = shlex.quote(_routine_search(spec))
     lease = f"--project {spec.project_id} --issue <n> --session <run id>"
@@ -1091,6 +1103,11 @@ def render_cloud_routine_md(spec: OnboardSpec) -> str:
         f" --label {shlex.quote(HUMAN_REVIEW_LABEL)}"
     )
     prompt = f"""Repository: {spec.project_id}. Every run:
+0. Run `sdlcctl --version`. It must print `commit {spec.platform_ref}` -- the platform commit
+   this document was generated for, installed by the environment's setup script (see
+   "Environment setup script" in docs/forge/cloud-implementer.md). If `sdlcctl` is missing or
+   names any other commit, STOP: claim nothing, touch no issue, and report that the routine
+   environment's setup script is missing or stale (Codex 4242373521).
 1. List open issues that carry ALL of: {_md_code(spec.ready_label)}, {_md_code(HUMAN_REVIEW_LABEL)},
    {_md_code(IMPLEMENTATION_LABEL)}
    and do NOT carry {_md_code(BLOCKED_LABEL)}, and have no open PR referencing them:
@@ -1222,14 +1239,30 @@ there is no gap between two separate checks for them to land in.
 Keep `lease_ttl_minutes` longer than the longest stage. An issue whose body is not a valid
 work request is labelled {_md_code(BLOCKED_LABEL)} and its lease released; step 1 never
 selects a blocked issue.
+## Environment setup script
+
+A fresh cloud environment has no `sdlcctl`, and every gate below is an `sdlcctl` command. Paste
+this into the setup script of the routine's cloud environment (claude.ai: the environment's
+settings); it installs the platform at exactly the commit this repository's workflows pin:
+
+{_md_block(cloud_routine_setup_script(spec).splitlines())}
+
+`--user` installs `sdlcctl` into `~/.local/bin`, which must be on the routine's PATH. If
+`{spec.platform_repository}` is private, the environment needs read access to it. Step 0 of the
+prompt checks the install (`sdlcctl --version` must print `commit {spec.platform_ref}`) and
+stops the run before anything is claimed when it does not.
+
+## Routine prompt
+
 Suggested routine prompt (create it with the `schedule` skill or the claude.ai routines UI):
 
 {_md_block(prompt.splitlines())}
 
-Once the routine is scheduled, record it: `sdlcctl confirm-cloud-routine` (sets
-`[automation] {CLOUD_ROUTINE_CONFIRMED} = true` in agentic-sdlc.toml). `sdlcctl doctor` cannot
-see claude.ai routines and reports NOT READY until then; `onboard --force` drops the
-confirmation, so re-check the routine against this document and confirm again.
+Once the routine is scheduled AND its environment runs the setup script above, record it:
+`sdlcctl confirm-cloud-routine` (sets `[automation] {CLOUD_ROUTINE_CONFIRMED} = true` in
+agentic-sdlc.toml). `sdlcctl doctor` cannot see claude.ai routines or their environments and
+reports NOT READY until then; `onboard --force` drops the confirmation (it may move the pin), so
+re-check the routine and its setup script against this document and confirm again.
 
 Required GitHub state (created by `sdlcctl onboard --apply`): the three labels, the
 `{RULESET_NAME}` ruleset requiring the `{REQUIRED_CHECK}` check and review-thread resolution.
@@ -1315,13 +1348,15 @@ def cloud_routine_check(policy_doc: object) -> Check:
             CLOUD_ROUTINE_CHECK,
             True,
             f"owner-confirmed ([automation] {CLOUD_ROUTINE_CONFIRMED} = true); doctor cannot see "
-            "claude.ai routines, so keep it matching docs/forge/cloud-implementer.md",
+            "claude.ai routines, so keep it and its environment setup script matching "
+            "docs/forge/cloud-implementer.md",
         )
     return Check(
         CLOUD_ROUTINE_CHECK,
         False,
         "no scheduled implementer routine can be verified from here, and none is confirmed → "
         "create the routine on claude.ai from the prompt in docs/forge/cloud-implementer.md, "
+        "give its environment the setup script there (it installs the pinned `sdlcctl`), "
         "then record it with `sdlcctl confirm-cloud-routine` (sets [automation] "
         f"{CLOUD_ROUTINE_CONFIRMED} = true in agentic-sdlc.toml)",
         manual=True,
@@ -1746,10 +1781,8 @@ def render_hooks(spec: OnboardSpec) -> dict[str, str]:
     """Claude Code hooks: fetch-and-report at session start; block commits without a lease."""
     settings = {
         "hooks": {
-            "SessionStart": [{"hooks": [forge_hook_entry(HOOK_SCRIPTS["SessionStart"])]}],
-            "PreToolUse": [
-                {"matcher": "Bash", "hooks": [forge_hook_entry(HOOK_SCRIPTS["PreToolUse"])]}
-            ],
+            "SessionStart": [{"hooks": [forge_hook_entry("SessionStart")]}],
+            "PreToolUse": [{"matcher": "Bash", "hooks": [forge_hook_entry("PreToolUse")]}],
         }
     }
     # The placeholders sit in Python string literals ("PROJECT_ID"): substitute the whole
@@ -6302,16 +6335,44 @@ HOOK_SCRIPTS = {
     "PreToolUse": ".claude/hooks/forge_commit_guard.py",
 }
 _HOOK_INTERPRETERS = {"python3", "python"}
+#: How a Forge handler may name its script's directory. Only the project-anchored forms count
+#: for `doctor` (Codex 4242373510: a bare relative path is resolved against whatever directory
+#: the session's shell is in, so a `cd` broke every Bash call); "" is still RECOGNISED, so a
+#: forced re-onboard replaces an old relative copy instead of keeping it beside the new one.
 _HOOK_DIR_PREFIXES = ("", "$CLAUDE_PROJECT_DIR/", "${CLAUDE_PROJECT_DIR}/")
+#: The directory placeholder Claude Code expands in a hook command: the project root the
+#: session started in (code.claude.com/docs/en/hooks; double-quoted in a shell-form command).
+HOOK_PROJECT_DIR = "${CLAUDE_PROJECT_DIR}"
+#: The commit guard's handler `timeout`, in seconds. The guard bounds its own run below it
+#: (`GUARD_DEADLINE` in forge_commit_guard.py), and with `onFailure: "block"` a timeout blocks.
+GUARD_HOOK_TIMEOUT = 300
+#: What follows the guard's script in its command: any failure to run it -- no python3, a
+#: missing file, a crash past its own handler -- becomes exit 2, which blocks on every Claude
+#: Code version, including those that predate `onFailure`.
+_GUARD_FAIL_CLOSED = ("||", "exit", "2")
 
 
-def forge_hook_entry(script: str) -> dict[str, str]:
-    """THE hook handler `onboard` writes for a Forge script, and the only shape `doctor` accepts
-    for one: exactly these keys. Any other handler field changes how it runs -- `async` runs it
-    in the background, where it can no longer block (or report) anything; `timeout` lets the
-    tool call through when it fires; `once` stops it after one run -- so a Forge handler that
-    carries one is not the hook onboard installed."""
-    return {"type": "command", "command": f"python3 {script}"}
+def forge_hook_entry(event: str) -> dict[str, object]:
+    """THE hook handler `onboard` writes for the Forge script of `event` (`HOOK_SCRIPTS`), and
+    the only shape `doctor` accepts for one. The script is named under the project root
+    (`HOOK_PROJECT_DIR`), never relative to the session's working directory (Codex 4242373510).
+    The commit guard fails CLOSED (Codex 4242373515): `onFailure: "block"` (Claude Code's
+    documented handler field: a command that cannot start, an exit other than 0 or 2, a timeout
+    or invalid output blocks the tool call instead of letting it through), an explicit
+    `timeout` above the guard's own deadline, and `|| exit 2` for clients without `onFailure`.
+    Any other handler field changes how it runs -- `async` runs it in the background, where it
+    can no longer block (or report) anything; `once` stops it after one run -- so a Forge
+    handler that carries one is not the hook onboard installed."""
+    script = HOOK_SCRIPTS[event]
+    command = f'python3 "{HOOK_PROJECT_DIR}/{script}"'
+    if event != "PreToolUse":
+        return {"type": "command", "command": command}
+    return {
+        "type": "command",
+        "command": f"{command} {' '.join(_GUARD_FAIL_CLOSED)}",
+        "timeout": GUARD_HOOK_TIMEOUT,
+        "onFailure": "block",
+    }
 
 
 #: The keys of the hook GROUP that holds a Forge handler (`matcher` is checked by
@@ -6319,19 +6380,28 @@ def forge_hook_entry(script: str) -> dict[str, str]:
 _FORGE_HOOK_GROUP_KEYS = frozenset({"matcher", "hooks"})
 
 
-def _hook_runs(entry: object, script: str) -> bool:
-    """A hook handler that runs `python3 <script>` (optionally under $CLAUDE_PROJECT_DIR)."""
+def _hook_argv(entry: object, script: str) -> list[str] | None:
+    """The argv of a hook handler that runs `python3 <script>` (optionally under
+    $CLAUDE_PROJECT_DIR, optionally followed by `|| exit 2`), else None."""
     if not isinstance(entry, dict) or entry.get("type") != "command":
-        return False
+        return None
     try:
         argv = shlex.split(str(entry.get("command", "")))
     except ValueError:
-        return False
-    return (
-        len(argv) == 2
+        return None
+    if (
+        len(argv) >= 2
         and argv[0] in _HOOK_INTERPRETERS
         and argv[1] in {prefix + script for prefix in _HOOK_DIR_PREFIXES}
-    )
+        and tuple(argv[2:]) in {(), _GUARD_FAIL_CLOSED}
+    ):
+        return argv
+    return None
+
+
+def _hook_runs(entry: object, script: str) -> bool:
+    """A hook handler that runs `python3 <script>` in any spelling `_hook_argv` recognises."""
+    return _hook_argv(entry, script) is not None
 
 
 def _matcher_covers(matcher: object, tool: str | None) -> bool:
@@ -6349,14 +6419,28 @@ def _matcher_covers(matcher: object, tool: str | None) -> bool:
         return False
 
 
-def _forge_entry_deviation(group: dict, entry: dict, script: str) -> str:
+def _forge_entry_deviation(group: dict, entry: dict, event: str) -> str:
     """How a handler that runs a Forge script differs from `forge_hook_entry` ('' = it does
-    not): any extra handler or group field. Only the command's spelling may vary (`_hook_runs`:
-    `python`, a $CLAUDE_PROJECT_DIR prefix)."""
-    want = forge_hook_entry(script)
-    extra = sorted(str(k) for k in set(entry) - set(want))
-    extra += sorted(f"group {k}" for k in set(group) - _FORGE_HOOK_GROUP_KEYS)
-    return ", ".join(extra)
+    not): any extra, missing or different handler field, an extra group field, a script not
+    anchored at the project root, or (the guard) no `|| exit 2`. Only the command's spelling
+    may vary (`python`, `$CLAUDE_PROJECT_DIR` with or without braces or quotes)."""
+    want = forge_hook_entry(event)
+    script = HOOK_SCRIPTS[event]
+    found = []
+    for key in sorted(set(entry) | set(want)):
+        if key in ("type", "command"):
+            continue
+        if key not in want:
+            found.append(str(key))
+        elif entry.get(key) != want[key]:
+            found.append(f"{key} not {json.dumps(want[key])}")
+    found += sorted(f"group {k}" for k in set(group) - _FORGE_HOOK_GROUP_KEYS)
+    argv = _hook_argv(entry, script) or []
+    if argv[1:2] == [script]:
+        found.append(f"a path relative to the working directory (not {HOOK_PROJECT_DIR})")
+    if tuple(argv[2:]) != tuple(shlex.split(str(want["command"]))[2:]):
+        found.append("`|| exit 2`" if event == "PreToolUse" else "trailing words")
+    return ", ".join(found)
 
 
 def hook_problems(settings_path: Path) -> list[str]:
@@ -6387,13 +6471,14 @@ def hook_problems(settings_path: Path) -> list[str]:
             for entry in entries:
                 if not _hook_runs(entry, script):
                     continue
-                deviation = _forge_entry_deviation(group, entry, script)
+                deviation = _forge_entry_deviation(group, entry, event)
                 if deviation:
                     # Wherever it sits: an `async` guard never blocks, even beside a good one.
                     problems.append(
-                        f".claude/settings.json {event} hook running python3 {script} carries "
-                        f"fields onboard does not write ({deviation}); it must be exactly the "
-                        "generated synchronous handler (an `async` hook cannot block)"
+                        f".claude/settings.json {event} hook running python3 {script} has "
+                        f"what onboard does not write ({deviation}); it must be exactly the "
+                        "generated handler (an `async` hook cannot block; re-run `sdlcctl "
+                        "onboard --force`)"
                     )
                     continue
                 if _matcher_covers(group.get("matcher"), tool):
@@ -6593,22 +6678,36 @@ def _routine_doc_masked(text: str) -> str:
     return _ROUTINE_CI_RUNNER.sub("runs on `<tunable>`", text)
 
 
+def installed_platform_pin(base: Path, platform_repository: str) -> str | None:
+    """The commit the installed managed workflows pin the platform to (the first caller that
+    names one), or None. The cloud routine doc names it too (its setup script and step 0)."""
+    for name in MANAGED_WORKFLOWS + MANAGED_IMPLEMENT_WORKFLOWS:
+        path = base / ".github/workflows" / name
+        doc = _workflow_doc(path) if path.is_file() else None
+        pin = _caller_pin(doc, platform_repository) if doc is not None else None
+        if pin:
+            return pin
+    return None
+
+
 def rendered_managed_files(
     policy_doc: dict,
     project_id: str,
     platform_repository: str,
     *,
     cloud: bool,
+    platform_ref: str | None = None,
 ) -> tuple[dict[str, str], list[str]]:
     """({path: rendered text}, problems) for every non-workflow Forge-managed file `onboard`
     writes, rendered from the repository's own policy (ready label, default branch, caps, gate
-    commands). A file that cannot be rendered is a problem, never silently skipped."""
+    commands) and `platform_ref`, the pin of the installed workflows (the routine doc names it).
+    A file that cannot be rendered is a problem, never silently skipped."""
     project = policy_doc.get("project") if isinstance(policy_doc.get("project"), dict) else {}
     caps = policy_doc.get("policy") if isinstance(policy_doc.get("policy"), dict) else {}
     fields = dict(
         project_id=project_id,
         platform_repository=platform_repository,
-        platform_ref="0" * 40,
+        platform_ref=platform_ref or "0" * 40,
         default_branch=str(project.get("default_branch") or "main"),
         ready_label=_policy_ready_label(policy_doc),
         implementer="cloud-routine" if cloud else "claude",
@@ -6668,7 +6767,11 @@ def managed_file_drift(
     "required files present"; `.claude/settings.json` is checked structurally (`hook_problems`)
     and the routing registries semantically (the routing check), since both are tunable."""
     rendered, problems = rendered_managed_files(
-        policy_doc, project_id, platform_repository, cloud=cloud
+        policy_doc,
+        project_id,
+        platform_repository,
+        cloud=cloud,
+        platform_ref=installed_platform_pin(base, platform_repository),
     )
     for relative in rendered:
         path = base / relative
@@ -7701,7 +7804,13 @@ def doctor(
     # The remote copies are also compared with their rendered form directly (not only with
     # this checkout), so a disabled hook on the default branch fails even if it was never pulled.
     remote_rendered = (
-        rendered_managed_files(policy_doc, project_id, platform_repository, cloud=cloud)[0]
+        rendered_managed_files(
+            policy_doc,
+            project_id,
+            platform_repository,
+            cloud=cloud,
+            platform_ref=installed_platform_pin(base, platform_repository),
+        )[0]
         if policy is not None
         else {}
     )
