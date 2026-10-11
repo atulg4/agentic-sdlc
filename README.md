@@ -166,6 +166,11 @@ the marker (a release marker) and the claim fails naming the PR. The lease's exp
 from the clock immediately before its marker is posted, and arbitration re-reads the clock
 (Codex 4241196647): a marker that has already expired by then (slow reads, a short
 `lease_ttl_minutes`) is retracted and the claim fails, so a reported claim is always live.
+A fresh claim that FAILS after posting its marker -- the post's answer lost, the arbitration
+re-read, the PR re-check or the label/assignee bookkeeping failing -- retracts the marker before
+the error is raised (Codex 4241327872), retrying the retraction up to 3 times; only a GitHub that
+refuses all three leaves the marker live until its TTL (logged). A failed renewal is not
+retracted: the session held the lease before it.
 Expired leases can be taken over (the takeover is commented). Markers count only when posted by
 a user whose repository permission (read per run from the collaborator permission API) is
 write, maintain or admin, by `github-actions[bot]`, or by the Forge Publisher App's bot (a

@@ -970,14 +970,28 @@ def _routine_search(spec: OnboardSpec) -> str:
     return " ".join([*terms, f"-label:{json.dumps(BLOCKED_LABEL)}", "sort:created-asc"])
 
 
+#: How many candidates step 1 of the cloud routine lists (Codex 4241327879): `gh issue list`
+#: returns 30 by default, and an issue that is leased elsewhere or fails authorization is
+#: skipped WITHOUT leaving the search (only `claude-blocked` does), so 30 such issues at the head
+#: of the queue would starve every run. 1000 is also the most results GitHub's issue search
+#: returns for one query; a backlog of more than 1000 approved candidates is out of scope (the
+#: rest are reached as the oldest ones are implemented or retired).
+ROUTINE_CANDIDATE_LIMIT = 1000
+
+
 def render_cloud_routine_md(spec: OnboardSpec) -> str:
     search = shlex.quote(_routine_search(spec))
     prompt = f"""Repository: {spec.project_id}. Every run:
 1. List open issues that carry ALL of: {_md_code(spec.ready_label)}, {_md_code(HUMAN_REVIEW_LABEL)},
    {_md_code(IMPLEMENTATION_LABEL)}
    and do NOT carry {_md_code(BLOCKED_LABEL)}, and have no open PR referencing them:
-   `gh issue list --repo {spec.project_id} --state open --search {search}`.
-   Take the oldest one; if none, stop.
+   `gh issue list --repo {spec.project_id} --state open --limit {ROUTINE_CANDIDATE_LIMIT}
+    --search {search}`.
+   This is the candidate list, oldest first; if it is empty, stop. Work through it IN ORDER,
+   starting with the oldest: whenever a step below says "take the next issue", move on to the
+   next candidate of THIS list (do not list again), and stop only when one issue has been
+   claimed and handled or the list is exhausted -- a skipped issue (not authorized,
+   unverifiable, or leased by another agent) never ends the run while candidates remain.
 1a. Authorize the approval before claiming (labels alone are no authority: Triage users can
    apply them):
    `sdlcctl authorize-labeler --project {spec.project_id} --issue <n>
@@ -997,7 +1011,7 @@ def render_cloud_routine_md(spec: OnboardSpec) -> str:
    Non-Goals, Dependencies). If not, retire it so it cannot starve the queue (Codex
    4241196636): comment what is missing, add label {_md_code(BLOCKED_LABEL)} (step 1 skips
    it from then on), then `sdlcctl release --project {spec.project_id} --issue <n>
-   --session <run id>`; then go back to step 1 for the next issue.
+   --session <run id>`; then go back to step 1a with the next candidate of the step 1 list.
 3. On a new branch `forge/issue-<n>`, implement the smallest change that satisfies the acceptance
    criteria, tests first. Never touch `forbidden_paths` from agentic-sdlc.toml; stay within
    max_changed_files={spec.max_changed_files} and max_diff_lines={spec.max_diff_lines}.
