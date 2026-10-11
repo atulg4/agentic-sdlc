@@ -10946,7 +10946,7 @@ def test_auto_plan_label_removal_cancels_planning_and_restoring_it_restarts_plan
     for `labeled`), and `dedupe` keeps the later one from planning twice."""
     rendered = render_onboarding(spec())[".github/workflows/agent-auto-plan.yml"]
     doc = yaml.safe_load(rendered)
-    assert doc[True]["issues"]["types"] == ["labeled", "unlabeled", "edited"]
+    assert doc[True]["issues"]["types"] == ["labeled", "unlabeled", "edited", "closed"]
     group, cancel = doc["concurrency"]["group"], doc["concurrency"]["cancel-in-progress"]
     condition = doc["jobs"]["preflight"]["if"]
     labels = ["claude-ready", "human-review-required"]
@@ -10964,6 +10964,15 @@ def test_auto_plan_label_removal_cancels_planning_and_restoring_it_restarts_plan
     assert _actions_expr(group, "edited", None, labels) == shared
     assert _actions_expr(cancel, "edited", None, labels) is True
     assert _actions_expr(condition, "edited", None, labels) is False
+    # Codex 4242925431: closing the issue cancels planning, and the `closed` run starts
+    # nothing even though a closed issue keeps its planning labels
+    assert _actions_expr(group, "closed", None, labels) == shared
+    assert _actions_expr(cancel, "closed", None, labels) is True
+    assert _actions_expr(condition, "closed", None, labels) is False
+    # the jobs that do work need `preflight`, which the `closed` run skips
+    for job_name in ("dedupe", "plan"):
+        needs = doc["jobs"][job_name]["needs"]
+        assert "preflight" in ([needs] if isinstance(needs, str) else needs), job_name
     # implementation approval stops planning; other labels are in groups of their own
     assert _actions_expr(condition, "labeled", "claude-ready", [*labels, IMPLEMENTATION_LABEL]) is (
         False
@@ -10984,11 +10993,11 @@ def test_doctor_requires_the_label_removal_cancellation(tmp_path, name):
         # Codex 4241196649: an edit must cancel too
         "cancel-in-progress: ${{ github.event.action == 'unlabeled' }}",
     ]
-    if name == "agent-auto-implement.yml":  # Codex 4242753923: and closing the issue
-        weaker.append(
-            "cancel-in-progress: "
-            "${{ github.event.action == 'unlabeled' || github.event.action == 'edited' }}"
-        )
+    # and closing the issue (implementation: Codex 4242753923; planning: Codex 4242925431)
+    weaker.append(
+        "cancel-in-progress: "
+        "${{ github.event.action == 'unlabeled' || github.event.action == 'edited' }}"
+    )
     for weak in weaker:
         weakened = text.replace(original, weak)
         assert weakened != text
@@ -10996,10 +11005,18 @@ def test_doctor_requires_the_label_removal_cancellation(tmp_path, name):
         failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
         detail = failed["managed workflows match the generated templates"].detail
         assert name in detail and "concurrency" in detail
+    # a `closed` event that does not join the issue's group cancels nothing (Codex 4242925431)
+    joined = "github.event.action == 'edited' ||\n    github.event.action == 'closed') &&"
+    assert joined in text
+    path.write_text(text.replace(joined, "github.event.action == 'edited') &&"))
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert name in failed["managed workflows match the generated templates"].detail
     types_line = re.search(r"types: \[[^\]]*\]", text).group(0)
-    weaker_types = ["types: [labeled]", "types: [labeled, unlabeled]"]
-    if name == "agent-auto-implement.yml":
-        weaker_types.append("types: [labeled, unlabeled, edited]")
+    weaker_types = [
+        "types: [labeled]",
+        "types: [labeled, unlabeled]",
+        "types: [labeled, unlabeled, edited]",
+    ]
     for types in weaker_types:
         path.write_text(text.replace(types_line, types))
         failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
@@ -13121,6 +13138,73 @@ def test_the_default_hook_interpreter_is_the_vetted_system_python():
         pytest.skip(f"{SYSTEM_PYTHON} is not root-owned here")
     assert trusted_hook_python() == SYSTEM_PYTHON
     assert trusted_hook_python(SYSTEM_PYTHON) == SYSTEM_PYTHON
+
+
+# ---- Codex 4242925452: a root-owned executable is not enough; it must BE a recent CPython
+
+
+def _fake_interpreter(tmp_path, name, answer):
+    """A program that answers the probe the way `answer` says (`{nonce}` is the nonce)."""
+    fake = tmp_path / name
+    body = answer.replace("{nonce}", '"$4"')  # argv: -I -c <code> <nonce>
+    fake.write_text(f"#!/bin/sh\necho {body}\n")
+    fake.chmod(0o755)
+    return str(fake)
+
+
+def test_the_hook_interpreter_is_probed_not_just_owned(tmp_path, monkeypatch):
+    from agentic_sdlc import onboard as module
+    from agentic_sdlc import trusted_exec
+
+    # /bin/true is root-owned and exits 0 without running anything: refused
+    true = "/bin/true" if os.path.exists("/bin/true") else "/usr/bin/true"
+    assert "not a Python interpreter" in module.hook_python_problem(true)
+    with pytest.raises(OnboardError, match="not a Python interpreter"):
+        module.trusted_hook_python(true)
+    # pretend the fakes are root-owned, so only the probe decides
+    monkeypatch.setattr(trusted_exec, "candidate_reason", lambda _path: None)
+    old = _fake_interpreter(tmp_path, "python3.9", "{nonce} cpython 3 9")
+    assert "3.9; the hooks need 3.11 or newer" in module.hook_python_problem(old)
+    other = _fake_interpreter(tmp_path, "pypy3", "{nonce} pypy 3 11")
+    assert "is pypy, not cpython" in module.hook_python_problem(other)
+    static = _fake_interpreter(tmp_path, "static", "fixed cpython 3 12")  # ignores the nonce
+    assert "not a Python interpreter" in module.hook_python_problem(static)
+    good = _fake_interpreter(tmp_path, "python3", "{nonce} cpython 3 12")
+    assert module.hook_python_problem(good) == ""
+    failing = tmp_path / "failing"
+    failing.write_text("#!/bin/sh\nexit 3\n")
+    failing.chmod(0o755)
+    assert "exit 3" in module.hook_python_problem(str(failing))
+    monkeypatch.setattr(module, "HOOK_PYTHON_CANDIDATES", (true, old))
+    with pytest.raises(OnboardError, match="no trusted interpreter"):
+        module.trusted_hook_python()
+    repo = _repo(tmp_path)
+    with pytest.raises(OnboardError, match="hook interpreter"):
+        write_onboarding(repo, spec(hook_python=old))
+    assert not (repo / ".claude").exists()
+
+
+def test_doctor_rejects_a_hook_handler_running_a_root_owned_non_python(tmp_path):
+    from agentic_sdlc.onboard import forge_hook_entry, hook_problems
+
+    true = "/bin/true" if os.path.exists("/bin/true") else "/usr/bin/true"
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    path = repo / ".claude/settings.json"
+    settings = json.loads(path.read_text())
+    digest = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"].split()[-4]
+    settings["hooks"]["PreToolUse"][0]["hooks"] = [forge_hook_entry("PreToolUse", digest, true)]
+    path.write_text(json.dumps(settings))
+    problems = " ".join(hook_problems(path))
+    assert "untrusted interpreter" in problems and "not a Python interpreter" in problems
+
+
+def test_the_hook_python_minimum_is_the_packages_requires_python():
+    from agentic_sdlc.onboard import HOOK_PYTHON_MIN_VERSION
+
+    pyproject = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text())
+    floor = pyproject["project"]["requires-python"]
+    assert floor == ">=" + ".".join(map(str, HOOK_PYTHON_MIN_VERSION))
 
 
 # ---- Codex 4242753917: lease markers trust the exact Publisher bot

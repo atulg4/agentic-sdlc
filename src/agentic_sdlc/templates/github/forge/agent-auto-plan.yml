@@ -2,7 +2,7 @@ name: Automatic planning
 
 on:
   issues:
-    types: [labeled, unlabeled, edited]
+    types: [labeled, unlabeled, edited, closed]
 
 permissions: {}
 
@@ -16,10 +16,14 @@ permissions: {}
 # them) get a group of their own, so they never cancel the work. Codex 4241196649: an approval
 # covers the title and body it saw, so an `edited` event joins the group and cancels too (and
 # starts nothing itself); a later run is authorized only once the labels are re-applied after
-# the edit.
+# the edit. Codex 4242925431: closing the issue withdraws the request, so a `closed` event joins
+# the group and cancels too (a closed issue's labels stay on it, but `preflight` runs only on
+# `labeled`, so the `closed` run itself starts nothing).
 concurrency:
   group: AUTO_CONCURRENCY_GROUP
-  cancel-in-progress: ${{ github.event.action == 'unlabeled' || github.event.action == 'edited' }}
+  cancel-in-progress: >-
+    ${{ github.event.action == 'unlabeled' || github.event.action == 'edited' ||
+    github.event.action == 'closed' }}
 
 jobs:
   # Anyone may open the work-request issue template, which applies the planning labels itself.

@@ -192,7 +192,11 @@ write, maintain or admin, by `github-actions[bot]`, or by the Forge Publisher Ap
 EXACTLY -- the policy's `[automation] publisher_bot_login` (`sdlcctl onboard
 --publisher-bot-login <app-slug>[bot]`, which with `--apply` also sets the
 `FORGE_LEASE_BOT_LOGINS` repository variable), or `FORGE_LEASE_BOT_LOGINS` in the environment,
-which takes precedence. With neither, no App bot's markers count (fail closed; in Actions mode
+which takes precedence. A lease command run with no policy file at hand (no `--config`, no
+`./agentic-sdlc.toml`) and no variable reads the policy committed on the default branch through
+the trusted `gh`; `claim` and `renew` exit 2 when it cannot be read, and `release` still
+releases its own session's claims whoever posted them, so the failure-cleanup job's release in an
+empty workspace frees the issue. With neither, no App bot's markers count (fail closed; in Actions mode
 the Publisher App's own claims are then ignored, and doctor fails until the login is set);
 `author_association` is not trusted (a read-only member comments as
 MEMBER) and an unreadable permission is untrusted. An expiry is capped at post time + 7 days, so
@@ -209,7 +213,8 @@ tool name, a Bash call without a string command); only a payload shown to be ano
 unread.
 
 The hooks run a Python interpreter `onboard` vetted (`/usr/bin/python3`, else `/bin/python3`, or
-`--hook-python`: a file only root can replace) by absolute path, isolated (`-I`), under a fixed
+`--hook-python`: a file only root can replace that, run with `-I -c`, answers as CPython 3.11 or
+newer -- a root-owned `/bin/true` would exit 0 without guarding) by absolute path, isolated (`-I`), under a fixed
 PATH -- never `python3` looked up on the session's PATH, where a planted copy could stand in for
 the guard -- and each handler pins its script's SHA-256, refusing (exit 2) to run a modified copy.
 **Trust boundary:** these hooks are a guardrail against mistakes and casual misuse, not a
