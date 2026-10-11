@@ -121,7 +121,8 @@ beside every other key and hook (unparseable settings are refused, never overwri
 
 `agent-auto-plan.yml` authorizes before it schedules anything on your runners. Anyone who can open
 an issue can use the work-request template, and the template applies the planning labels itself;
-so its `preflight` job runs on `ubuntu-latest` (GitHub-hosted, NOT tunable), asks
+so its `preflight` job runs on `ubuntu-latest` (GitHub-hosted, NOT tunable, `permissions:
+contents: read, issues: read` -- the label events need `issues: read` in a private repository), asks
 `GET repos/{owner}/{repo}/collaborators/{login}/permission` with `GITHUB_TOKEN` whether the
 labeler (`github.event.sender`), `github.actor` AND whoever applied the ready label most recently
 (read from the issue's label events, every page) have write, maintain or admin, and the reusable

@@ -144,9 +144,11 @@ the pre-existing assignee, never one the lease owns.
 
 `claim` exits 2, changing nothing, when another live lease or an open PR for the issue exists
 (a PR that closes the issue, from any repository, or one from a same-repository branch named
-`issue-N`; a fork's identically named branch does not count). Every open PR is read, page by
-page to the last cursor; a page that cannot be read refuses the claim rather than reading as
-"no PR";
+`issue-N`; a fork's identically named branch does not count), or when the issue's timeline
+links an open same-repository PR to it -- linked by hand in the Development sidebar (`connected`
+and not `disconnected` since) or cross-referencing it. Every open PR and every timeline page is
+read to the last page; a page that cannot be read, or a manual link whose PR cannot be
+identified, refuses the claim rather than reading as "no PR";
 expired leases can be taken over (the takeover is commented). Markers count only when posted by
 a user whose repository permission (read per run from the collaborator permission API) is
 write, maintain or admin, by `github-actions[bot]`, or by the Forge Publisher App's bot (a

@@ -1,7 +1,11 @@
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # Codex 4240028941: naming any permission sets the rest to none, and listing the issue's
+    # label events needs `issues: read` in a private repository (the collaborator-permission
+    # reads need only the implicit metadata scope). Nothing broader.
     permissions:
       contents: read
+      issues: read
     outputs:
       authorized: ${{ steps.authorize.outputs.authorized }}
       approver: ${{ steps.authorize.outputs.approver }}
