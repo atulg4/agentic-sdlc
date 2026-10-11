@@ -7,14 +7,20 @@ repository root. `cd sub && make test`, `VAR=x pytest` and `true && false` (whic
 here what they mean in CI (Codex 4243193109: tokenizing the line and executing the first word
 let `true && false` pass and turned `VAR=x cmd` into a missing program). What differs from CI is
 only the environment: an allowlist, never the runner's credentials or control files.
+
+The interpreter must be CI's too (Codex 4243659485): before any gate runs, the `python3` on the
+gate environment's PATH is asked its version, and a major.minor other than the policy's
+`[ci] python_version` (what ci.yml's setup-python installs) fails closed. Unset: a warning.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
+import sys
 import time
 import tomllib
 from pathlib import Path
@@ -73,15 +79,84 @@ _FORBIDDEN_ENVIRONMENT = {
 }
 
 
-def _load(path: str | Path) -> tuple[dict[str, str], dict[str, Any]]:
+def _load(path: str | Path) -> tuple[dict[str, str], dict[str, Any], str | None]:
+    """The policy's `[commands]`, `[verification]` and `[ci] python_version` (None: unset)."""
     with Path(path).open("rb") as handle:
         document = tomllib.load(handle)
     raw_commands = document.get("commands", {})
     verification = document.get("verification", {})
+    ci = document.get("ci", {})
     if not isinstance(raw_commands, dict) or not isinstance(verification, dict):
         raise GateError("commands and verification must be TOML tables")
+    if not isinstance(ci, dict):
+        raise GateError("ci must be a TOML table")
     commands = {name: value for name, value in raw_commands.items() if isinstance(value, str)}
-    return commands, verification
+    python_version = ci.get("python_version")
+    if python_version is not None and (
+        not isinstance(python_version, str) or not _PYTHON_VERSION.fullmatch(python_version)
+    ):
+        raise GateError("ci.python_version must look like 3.12 or 3.12.4")
+    return commands, verification, python_version
+
+
+#: `[ci] python_version`'s shape (onboard writes and doctor checks the same one).
+_PYTHON_VERSION = re.compile(r"^\d+\.\d+(?:\.\d+)?$")
+#: Printed by the gate interpreter, run isolated (`-I`): nothing of the repository is imported.
+_VERSION_PROBE = "import sys; print('%d.%d.%d' % sys.version_info[:3])"
+
+
+def gate_python_version(environment: dict[str, str], root: Path) -> tuple[str, str]:
+    """(path, `X.Y.Z`) of the `python3` the gates run: the first on the gate environment's PATH,
+    asked for its version in that same environment. GateError when there is none or it does not
+    answer as a Python."""
+    found = shutil.which("python3", path=environment.get("PATH", os.defpath))
+    if not found:
+        raise GateError("no python3 on the verification gates' PATH")
+    try:
+        probe = subprocess.run(
+            [found, "-I", "-c", _VERSION_PROBE],
+            cwd=root,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise GateError(f"{found} could not be run to read its version: {error}") from error
+    version = probe.stdout.strip()
+    if probe.returncode != 0 or not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        raise GateError(f"{found} did not report a Python version (exit {probe.returncode})")
+    return found, version
+
+
+def check_gate_python(
+    python_version: str | None, environment: dict[str, str], root: Path
+) -> str | None:
+    """Fail closed (GateError) when the `python3` the gates will run is not the policy's
+    `[ci] python_version` (major.minor) -- the interpreter the repository's own ci.yml installs
+    with setup-python (Codex 4243659485): gates verified under another Python prove nothing about
+    what CI runs. Returns a warning, instead, when the policy sets no version."""
+    if python_version is None:
+        try:
+            found, version = gate_python_version(environment, root)
+        except GateError as error:
+            return f"[ci] python_version is not set ({error})"
+        return (
+            f"[ci] python_version is not set; the gates run under {found} (Python {version}), "
+            "which nothing checks against the interpreter CI installs"
+        )
+    found, version = gate_python_version(environment, root)
+    wanted = python_version.split(".")[:2]
+    if version.split(".")[:2] != wanted:
+        raise GateError(
+            f"the verification gates would run under {found} (Python {version}), but the "
+            f"policy's [ci] python_version is {python_version}: install Python "
+            f"{'.'.join(wanted)} (actions/setup-python) before run-gates, or change "
+            "[ci] python_version"
+        )
+    return None
 
 
 def _environment(verification: dict[str, Any]) -> dict[str, str]:
@@ -117,7 +192,7 @@ def run_gates(
     config: str | Path,
     repository: str | Path,
 ) -> dict[str, Any]:
-    commands, verification = _load(config)
+    commands, verification, python_version = _load(config)
     names = verification.get("gates", list(commands))
     allowed_exit_codes = verification.get("allowed_exit_codes", {})
     timeouts = verification.get("timeout_seconds", {})
@@ -129,6 +204,9 @@ def run_gates(
 
     results = []
     root = Path(repository)
+    warning = check_gate_python(python_version, environment, root)
+    if warning:
+        print(f"::warning::{warning}", file=sys.stderr, flush=True)
     for name in names:
         command = commands.get(name)
         if command is None:

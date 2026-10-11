@@ -260,37 +260,18 @@ def _project_id_problem(value: object) -> str:
     )
 
 
-def _git_rejects_branch(name: str) -> bool:
-    """Does the installed git refuse `name` as a branch name? False when git cannot be run (the
-    rules above are then the whole check)."""
-    try:
-        proc = subprocess.run(
-            ["git", "check-ref-format", "--branch", name],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return proc.returncode != 0
-
-
 def _branch_problem(value: object) -> str:
     """A branch name: renderable and a valid Git branch name by `git check-ref-format --branch`'s
-    rules (and by the installed git, when there is one: both must accept it), minus only the
-    characters a downstream sink cannot carry (`policy.branch_name_problem`, which the policy
-    loader applies too). Codex 4242545214: `release+next`, `feature@two` are valid."""
-    problem = _str_problem(value)
-    if problem:
-        return problem
-    name = str(value)
-    problem = branch_name_problem(name)
-    if problem:
-        return problem
-    if _git_rejects_branch(name):
-        return "is not a valid Git branch name (git check-ref-format --branch refuses it)"
-    return ""
+    rules, minus only the characters a downstream sink cannot carry (`policy.branch_name_problem`,
+    which the policy loader applies too). Codex 4242545214: `release+next`, `feature@two` are
+    valid.
+
+    In process only (Codex 4243659475): this no longer also asks the installed git, which ran a
+    bare `git` from PATH with the caller's whole environment (GH_TOKEN included) -- a planted one
+    could read the token. `policy.git_branch_format_problem` implements git's rules itself, and
+    tests/test_onboard.py checks it against the real `git check-ref-format --branch` over a
+    generated corpus of names."""
+    return _str_problem(value) or branch_name_problem(str(value))
 
 
 def _bot_login_field_problem(value: object) -> str:
