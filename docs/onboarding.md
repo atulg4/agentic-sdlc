@@ -203,6 +203,12 @@ both in the checkout and on the default branch:
 | `.forge/executors.json`, `.forge/routing-policy.json` | semantically: loaded and routed on |
 | `agentic-sdlc.toml` | the policy itself: loaded and checked against the repository |
 
+Every one of them must be a regular file reached without a link: doctor applies the same
+`lstat` rule `onboard` writes under, so the path and every parent component must not be a
+symlink -- not even one to an identical file elsewhere in the checkout, whose target is an
+unmanaged path a later patch could change -- or "required files present" (and, for the routing
+registries, the routing check) fails.
+
 Every policy field `onboard` writes from its options -- `[project] id`/`default_branch`,
 `[automation] ready_label`, `[commands]` `setup`/`quality`/`test`, `[ci] python_version`,
 `[policy] forbidden_paths`/`protected_paths`/`max_changed_files`/`max_diff_lines` -- is checked by
@@ -320,7 +326,14 @@ through a link). `onboard --force` rewrites the policy and drops the confirmatio
   in a command that mentions PATH anywhere (`export PATH=/tmp/bin:$PATH; git fetch origin`,
   `read PATH`, zsh's `path=(...)`, `hash -p`) or sets an `LD_*`/`DYLD_*`/`SSH_ASKPASS*` variable
   needs the lease, and so does every read-only subcommand while PATH holds a relative entry
-  (`.`, an empty entry). Every
+  (`.`, an empty entry) -- or a WRITABLE absolute entry searched before (or at) a program the
+  command may launch: `git` itself when named bare, the pager (`less`, or the configured one),
+  `man` for `git help`, and for `fetch`/`remote show` `ssh` and the remote/credential helpers git
+  runs by name (git's exec path is searched first and must not be writable either; a missing
+  entry counts as writable when its nearest existing ancestor is). A command can drop an `ssh`
+  there without mentioning PATH. On a machine where such a directory is writable -- running as
+  root, a user-owned `~/.local/bin` or Homebrew prefix ahead of the system git -- every
+  allowlisted git on an unleased issue branch therefore needs the lease. Every
   GitHub lookup is bounded at 30s and every local git call at 15s: a lookup that times out
   refuses instead of hanging the session. A branch
   change earlier in the same command re-targets the git after it: `git switch forge/issue-7 &&
@@ -351,8 +364,10 @@ through a link). `onboard --force` rewrites the policy and drops the confirmatio
   workflow not yet pushed; an unreadable set is a manual TODO), always as EXACT names: job
   names; for a matrix job one context per literal combination -- `name (v1, v2, ...)`, the axes'
   values in axis order then the values an `include` adds, minus `exclude`d ones -- or exactly
-  the expanded name when the name itself holds `matrix.*` expressions (a matrix doctor cannot
-  enumerate reports nothing; no `name (` prefix is ever accepted); and for a reusable call `caller / callee-job` for each job of the callee as fetched (a local callee, or
+  the expanded name when the name itself holds `matrix.*` expressions, once PER COMBINATION (a
+  name that omits an axis, `test-${{ matrix.os }}` over two Python versions, is two jobs
+  reporting `test-ubuntu`: two producers, so a required `test-ubuntu` is ambiguous) (a matrix
+  doctor cannot enumerate reports nothing; no `name (` prefix is ever accepted); and for a reusable call `caller / callee-job` for each job of the callee as fetched (a local callee, or
   a platform callee at its pinned SHA, recursively); an unresolvable callee reports nothing, so
   `plan / anything` is never assumed. `onboard --apply` still changes only the repository's own
   ruleset.

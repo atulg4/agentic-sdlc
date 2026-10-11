@@ -25,7 +25,10 @@ commands are configuration), an environment assignment other than GIT_DIR/GIT_WO
 on it (or a GIT_*/PAGER/EDITOR/SSH_ASKPASS*/LD_* assignment anywhere in the command, or any
 mention of PATH there: git runs `ssh` from it), `--output`, or an argument holding `$`, a
 backtick or a brace expansion. A relative PATH entry (`.`, an empty entry) guards every
-allowlisted subcommand: what it runs depends on the directory.
+allowlisted subcommand: what it runs depends on the directory. So does a WRITABLE absolute
+entry searched before (or at) a program the command may launch -- git itself, the pager, `man`,
+and for fetch/remote `ssh` and the helpers git runs by name, with git's exec path searched
+first (Codex 4240952107, see `_writable_path_reason`): a command can drop its own `ssh` there.
 
 An allowlisted subcommand is read-only only while git runs nothing configured OUTSIDE the
 command (Codex 4239667542): `diff.external`, a textconv / diff / filter driver, a non-trivial
@@ -1159,7 +1162,9 @@ def _commit_targets(argv: list[str], depth: int = 0, cwd: str | None = None) -> 
             refs = _configured_fetch_refs(_where(cwd, chdirs), target[0], unsafe)
             if refs:
                 return target + [_with_ref(target[0], ref) for ref in refs]
-        reason = _helper_reason(word, rest, _where(cwd, chdirs), target[0])
+        reason = _helper_reason(
+            word, rest, _where(cwd, chdirs), target[0], bare_git="/" not in words[0]
+        )
         if reason:  # Codex 4239667542: configuration can make it run a program
             _HELPER_NOTES[reason] = None
             return target
@@ -1692,10 +1697,13 @@ def _read_config(where: str, target: Target) -> dict[str, list[str]] | None:
     return config
 
 
-def _helper_reason(sub: str, args: list[str], where: str, target: Target) -> str | None:
+def _helper_reason(
+    sub: str, args: list[str], where: str, target: Target, *, bare_git: bool = True
+) -> str | None:
     """Why the allowlisted `git SUB ARGS` may still run a program configured outside the
     command (Codex 4239667542), or None when it provably does not. Fail closed: configuration
-    or a hooks directory that cannot be read is a reason."""
+    or a hooks directory that cannot be read is a reason. `bare_git`: the command runs `git` by
+    its bare name, so the shell finds git itself on PATH (`_writable_path_reason`)."""
     names = HELPER_ENV + PAGER_ENV + (NETWORK_ENV if _contacts_remote(sub, args) else ())
     for name in names:
         value = os.environ.get(name, "").strip()
@@ -1709,6 +1717,9 @@ def _helper_reason(sub: str, args: list[str], where: str, target: Target) -> str
         return "git configuration could not be read"
     found = _config_reason(sub, args, config)
     if found:
+        return found
+    found = _writable_path_reason(sub, args, where, target, config, bare_git)
+    if found:  # Codex 4240952107: a program dropped where PATH finds it first
         return found
     code, out = _git_in(where, target, "rev-parse", "--git-path", "hooks")
     lines = out.splitlines()
@@ -1745,6 +1756,113 @@ def _relative_path_entry() -> str | None:
     for entry in path.split(os.pathsep):
         if not os.path.isabs(entry):
             return entry
+    return None
+
+
+# ---- Writable PATH entries (Codex 4240952107). An absolute PATH entry is not proof that the
+# program found through it is the one installed there: when a directory the search reaches
+# BEFORE (or at) the real program is writable by this user, a command can drop an executable
+# named `ssh` there -- `cp x ~/.local/bin/ssh && git fetch origin` never mentions PATH -- and
+# git runs it. So every PATH-resolved program an allowlisted command may launch is resolved the
+# way it would be, and the command needs the lease when a directory searched up to and including
+# the one it resolves in (every entry when it resolves nowhere: a new file there would be found)
+# is writable -- `os.access(W_OK)`, or for a missing entry its nearest existing ancestor -- or
+# the resolved file itself is. The programs: `git` itself when the command names it bare (the
+# shell resolves it), the pager (`less` by default, plus the first word of every
+# GIT_PAGER/PAGER/`core.pager`/`pager.*` value; any allowlisted command may page under `git -p`),
+# `man` for `git help`, and for a command that contacts a remote `ssh` and the helpers git runs
+# by name (`git-remote-http(s)`/`ftp(s)`, `git-upload-pack`, the `cache`/`store` credential
+# helpers). Git searches its exec path (`git --exec-path`) before PATH for every program it runs,
+# so that directory is checked first for those; an exec path that cannot be read is a reason.
+# How the file got there does not matter, which is why this is sound without tracking writes.
+# The cost: on a machine where such a directory IS writable (running as root; a user-owned
+# `~/.local/bin` or Homebrew prefix ahead of the system git) every allowlisted git command on an
+# unleased issue branch needs the lease.
+NETWORK_PROGRAMS = (
+    "ssh",
+    "git-remote-http",
+    "git-remote-https",
+    "git-remote-ftp",
+    "git-remote-ftps",
+    "git-upload-pack",
+    "git-credential-cache",
+    "git-credential-cache--daemon",
+    "git-credential-store",
+)
+DEFAULT_PAGER = "less"
+
+
+def _dir_writable(directory: str) -> bool:
+    """Can this user create a file in `directory` -- or, when it does not exist, create it (its
+    nearest existing ancestor is writable)? A path that is not a directory cannot hold one."""
+    current = os.path.abspath(directory)
+    while not os.path.lexists(current):
+        parent = os.path.dirname(current)
+        if parent == current:
+            return False
+        current = parent
+    return os.path.isdir(current) and os.access(current, os.W_OK)
+
+
+def _first_writable(name: str, entries: list[tuple[str, str]]) -> str | None:
+    """Walk `entries` ((label, directory) in search order) as an exec search for `name` does:
+    the first directory reached that is writable, or the resolved file when it is writable, as
+    a reason; None once `name` resolves to a file nobody can replace or nothing is writable."""
+    for label, directory in entries:
+        if _dir_writable(directory):
+            return f"writable {label} {directory} precedes {name}"
+        candidate = os.path.join(directory, name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            if os.access(candidate, os.W_OK):
+                return f"{name} resolves to the writable file {candidate}"
+            return None
+    return None
+
+
+def _pager_programs(config: dict[str, list[str]]) -> list[str]:
+    """The bare program names git may start as a pager: the default and the first word of every
+    configured or exported pager value (a boolean `pager.<cmd>` names no program)."""
+    values = [os.environ.get(name, "") for name in PAGER_ENV]
+    for key, entries in config.items():
+        if PAGER_KEYS.match(key):
+            values += [
+                v for v in entries if key == "core.pager" or v.strip().lower() not in GIT_BOOLEANS
+            ]
+    names = [DEFAULT_PAGER]
+    for value in values:
+        words = value.split()
+        if words and "/" not in words[0] and words[0] not in names:
+            names.append(words[0])
+    return names
+
+
+def _writable_path_reason(
+    sub: str,
+    args: list[str],
+    where: str,
+    target: Target,
+    config: dict[str, list[str]],
+    bare_git: bool,
+) -> str | None:
+    """Why a PATH-resolved program the allowlisted `git SUB ARGS` may launch could be one this
+    session placed (see the block comment above), or None."""
+    path = [("PATH entry", entry) for entry in os.environ.get("PATH", "").split(os.pathsep)]
+    if bare_git:
+        found = _first_writable("git", path)
+        if found:
+            return found
+    code, out = _git_in(where, target, "--exec-path")
+    exec_path = out.strip()
+    if code != 0 or not exec_path or "\n" in exec_path or not os.path.isabs(exec_path):
+        return "git's exec path could not be read"
+    searched = [("git exec path", exec_path), *path]
+    names = _pager_programs(config) + (["man"] if sub == "help" else [])
+    if _contacts_remote(sub, args):
+        names += list(NETWORK_PROGRAMS)
+    for name in names:
+        found = _first_writable(name, searched)
+        if found:
+            return found
     return None
 
 

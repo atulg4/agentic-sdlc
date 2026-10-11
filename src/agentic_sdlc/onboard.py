@@ -2651,14 +2651,17 @@ def _matrix_combinations(matrix: object) -> list[dict] | None:
 
 def _matrix_job_names(name: str, strategy: object) -> list[str] | None:
     """Every name a job named with `${{ matrix.* }}` expressions reports, over a finite literal
-    matrix; None when the name holds any other expression or the matrix is not literal."""
+    matrix -- ONE PER COMBINATION, duplicates kept: `test-${{ matrix.os }}` over one OS and two
+    Python versions is two jobs both reporting `test-ubuntu`, i.e. two producers of that context
+    (`ambiguous_context`). None when the name holds any other expression or the matrix is not
+    literal."""
     if "${{" in _MATRIX_REF.sub("", name):
         return None
     matrix = strategy.get("matrix") if isinstance(strategy, dict) else None
     combos = _matrix_combinations(matrix)
     if not combos:
         return None
-    names: set[str] = set()
+    names: list[str] = []  # one per combination: a name two combinations share is two jobs
     for combo in combos:
         parts: dict[str, str] = {}
         for key in _MATRIX_REF.findall(name):
@@ -2666,7 +2669,7 @@ def _matrix_job_names(name: str, strategy: object) -> list[str] | None:
             if rendered is None:
                 return None
             parts[key] = rendered
-        names.add(_MATRIX_REF.sub(lambda m, parts=parts: parts[m.group(1)], name))
+        names.append(_MATRIX_REF.sub(lambda m, parts=parts: parts[m.group(1)], name))
     return sorted(names)
 
 
@@ -2798,12 +2801,12 @@ def _job_context_names(job_id: str, job: dict) -> list[str]:
     matrix = strategy.get("matrix") if isinstance(strategy, dict) else None
     if not matrix:
         return [name]
-    names: set[str] = set()
+    names: list[str] = []  # one per combination, duplicates kept (each is its own job)
     for combo in _matrix_combinations(matrix) or ():
         values = [_matrix_scalar(value) for value in combo.values()]
         if not combo or any(value is None for value in values):
             return []
-        names.add(f"{name} ({', '.join(str(v) for v in values)})")
+        names.append(f"{name} ({', '.join(str(v) for v in values)})")
     return sorted(names)
 
 
@@ -6266,7 +6269,7 @@ def managed_file_drift(
     )
     for relative in rendered:
         path = base / relative
-        if path.is_file():
+        if _regular_file_problem(base, relative) is None:  # else "required files present" fails
             problem = managed_file_problem(relative, path.read_bytes(), rendered)
             if problem:
                 problems.append(problem)
@@ -6354,20 +6357,19 @@ def implementation_mode(toml_path: Path, actions_callers: Sequence[str]) -> tupl
 
 
 def _regular_file_problem(base: Path, relative: str) -> str | None:
-    """Why `relative` is not a regular file inside the checkout `base` (None when it is): a
-    directory, a dangling symlink or one resolving outside the repository is not the file."""
-    path = base / relative
-    try:
-        resolved = path.resolve(strict=path.is_symlink())
-    except (OSError, RuntimeError):
-        return f"{relative} (dangling symlink)"
-    if not resolved.is_relative_to(base):
-        return f"{relative} (resolves outside the repository)"
-    if not path.exists():
+    """Why `relative` is not a regular file inside the checkout `base` (None when it is), by the
+    same `lstat` rule `write_onboarding` writes under (`_managed_path_state`): the path and every
+    parent component must not be a symlink -- even one resolving to an identical file elsewhere
+    in the checkout, since that target is an unmanaged path a later patch may change (Codex
+    4240952121) -- every parent must be a directory and the leaf a regular file."""
+    state = _managed_path_state(base, relative)
+    if state == "file":
+        return None
+    if state == "absent":
         return relative
-    if not path.is_file():
+    if state == "exists but is not a regular file":
         return f"{relative} (not a regular file)"
-    return None
+    return f"{relative} ({state}; a managed path is never followed through a link)"
 
 
 def _generated_workflows(
@@ -6640,7 +6642,7 @@ def doctor(
         or "route" in agents.values()
         or bool(agent_problems)
     )
-    missing_routing = [f for f in routing_files if not (base / f).exists()]
+    missing_routing = [p for f in routing_files if (p := _regular_file_problem(base, f))]
     if routed and missing_routing:
         add(
             Check(

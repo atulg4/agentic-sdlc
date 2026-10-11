@@ -5223,7 +5223,7 @@ def test_doctor_requires_required_managed_paths_to_be_regular_files(tmp_path):
     outside.write_text(render_onboarding(spec())[".claude/hooks/forge_commit_guard.py"])
     guard.symlink_to(outside)
     failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh()))
-    assert "(resolves outside the repository)" in failed["required files present"].detail
+    assert "forge_commit_guard.py is a symlink" in failed["required files present"].detail
 
 
 def test_doctor_requires_required_managed_paths_to_be_files_on_the_default_branch(tmp_path):
@@ -10955,3 +10955,203 @@ def test_two_jobs_of_one_workflow_with_the_same_name_are_two_producers(tmp_path)
     (workflows / "dup.yml").write_text("on: pull_request\n" + _TEST_JOB)
     inactive = workflow_check_contexts(tmp_path, "main", inactive=frozenset({"dup.yml"}))
     assert inactive.pull_request_producers["test"] == ("ci.yml", "ci.yml")
+
+
+# ---- Codex 4240952099: a matrix name that omits an axis renders the SAME name for several
+# combinations; each combination is its own job, so each is a producer of that context.
+
+
+def test_matrix_combinations_sharing_a_rendered_name_are_separate_producers(tmp_path):
+    from agentic_sdlc.onboard import ambiguous_context, workflow_check_contexts
+
+    workflows = tmp_path / ".github/workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "ci.yml").write_text(
+        "on: pull_request\njobs:\n"
+        "  test:\n    name: test-${{ matrix.os }}\n    runs-on: ubuntu-latest\n"
+        "    strategy:\n      matrix:\n        os: [ubuntu]\n        python: ['3.11', '3.12']\n"
+        "    steps: [{run: 'true'}]\n"
+    )
+    produced = workflow_check_contexts(tmp_path, "main")
+    assert "test-ubuntu" in produced.pull_request
+    assert produced.pull_request_producers["test-ubuntu"] == ("ci.yml", "ci.yml")
+    why = ambiguous_context("test-ubuntu", produced) or ""
+    assert "2 jobs on pull_request (ci.yml, ci.yml)" in why
+
+    # every axis in the name: one producer per distinct context, nothing ambiguous
+    (workflows / "ci.yml").write_text(
+        "on: pull_request\njobs:\n"
+        "  test:\n    name: test-${{ matrix.os }}-${{ matrix.python }}\n"
+        "    runs-on: ubuntu-latest\n"
+        "    strategy:\n      matrix:\n        os: [ubuntu]\n        python: ['3.11', '3.12']\n"
+        "    steps: [{run: 'true'}]\n"
+    )
+    distinct = workflow_check_contexts(tmp_path, "main")
+    assert ambiguous_context("test-ubuntu-3.11", distinct) is None
+    assert distinct.pull_request_producers["test-ubuntu-3.12"] == ("ci.yml",)
+
+
+# ---- Codex 4240952121: doctor never follows a managed path through a link, even to an
+# identical file inside the checkout (the target is an unmanaged path a patch may change).
+
+
+@pytest.mark.parametrize(
+    "managed",
+    [
+        ".claude/hooks/forge_commit_guard.py",
+        "agentic-sdlc.toml",
+        "AGENTS.md",
+        ".github/workflows/ci.yml",
+    ],
+)
+def test_doctor_rejects_in_repository_symlinks_for_managed_files(tmp_path, managed):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    assert doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh(), remote=False).ok
+    path = repo / managed
+    target = repo / "tools" / path.name
+    target.parent.mkdir(exist_ok=True)
+    target.write_bytes(path.read_bytes())  # identical content, unprotected location
+    path.unlink()
+    path.symlink_to(target)
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh(), remote=False)
+    assert not report.ok and "NOT READY" in report.render()
+    detail = _failed(report)["required files present"].detail
+    assert f"{managed} is a symlink" in detail
+
+
+def test_doctor_rejects_a_symlinked_parent_of_managed_files(tmp_path):
+    import shutil
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    hooks = repo / ".claude/hooks"
+    shutil.copytree(hooks, repo / "tools/hooks")
+    shutil.rmtree(hooks)
+    hooks.symlink_to(repo / "tools/hooks")
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh(), remote=False)
+    assert not report.ok
+    assert ".claude/hooks is a symlink" in _failed(report)["required files present"].detail
+
+
+# ---- Codex 4240952107: a WRITABLE absolute PATH entry searched before the program git runs
+# lets a command drop its own `ssh` (or pager, or git) there without ever mentioning PATH.
+
+
+def _system_dir(tmp_path, monkeypatch, names=("ssh", "less", "man")):
+    """A PATH directory holding the real git and stub `names`, which the test makes read-only
+    (the suite's `os.access` reports every other directory under tmp_path as writable)."""
+    import shutil
+
+    system = tmp_path / "system"
+    system.mkdir()
+    (system / "git").symlink_to(shutil.which("git"))
+    for name in names:
+        stub = system / name
+        stub.write_text("#!/bin/sh\nexit 0\n")
+        stub.chmod(0o755)
+    read_only = {str(system), *(str(system / n) for n in names)}
+    access = os.access
+
+    def fake(path, mode, *args, **kwargs):
+        if mode & os.W_OK and not isinstance(path, int) and os.fspath(path) in read_only:
+            return False
+        return access(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "access", fake)
+    return system
+
+
+def test_commit_guard_writable_path_entry_before_ssh_guards_fetch(helper_repo, monkeypatch):
+    guard, repo, _ = helper_repo
+    system = _system_dir(repo.parent, monkeypatch)
+    drop = repo.parent / "drop"
+    drop.mkdir()
+    # Every program resolves in the read-only directory before the writable one: still allowed.
+    monkeypatch.setenv("PATH", f"{system}{os.pathsep}{drop}")
+    for command in ("git fetch origin", "git remote show origin", "git status", "git log"):
+        assert not guard.is_git_commit(command, cwd=str(repo)), command
+        assert _guarded_decision(guard, repo, command) == (0, "")
+    # The writable directory first: `cp evil drop/ssh && git fetch origin` would run that ssh.
+    monkeypatch.setenv("PATH", f"{drop}{os.pathsep}{system}")
+    for command in ("git fetch origin", "cp evil drop/ssh && git fetch origin", "git status"):
+        assert guard.is_git_commit(command, cwd=str(repo)), command
+        code, message = _guarded_decision(guard, repo, command)
+        assert code == 2 and "no live lease exists" in message, message
+        assert f"writable PATH entry {drop} precedes" in message, message
+    lease = {"session": "s1", "agent": "a", "expires": None}
+    assert _guarded_decision(guard, repo, "git fetch origin", lease) == (0, "")
+
+
+def test_commit_guard_writable_entry_matters_only_for_programs_it_precedes(
+    helper_repo, monkeypatch
+):
+    guard, repo, _ = helper_repo
+    system = _system_dir(repo.parent, monkeypatch, names=("less", "man"))  # no ssh installed
+    drop = repo.parent / "drop"
+    drop.mkdir()
+    monkeypatch.setenv("PATH", f"{system}{os.pathsep}{drop}")
+    # git and the pager resolve before `drop`: a read-only local command stays allowed ...
+    assert _guarded_decision(guard, repo, "git log --oneline") == (0, "")
+    # ... but `ssh` resolves nowhere, so a file created in `drop` would be the one git runs.
+    code, message = _guarded_decision(guard, repo, "git fetch origin")
+    assert code == 2 and f"writable PATH entry {drop} precedes ssh" in message, message
+
+
+def test_commit_guard_missing_path_entry_under_a_writable_parent_guards(helper_repo, monkeypatch):
+    guard, repo, _ = helper_repo
+    system = _system_dir(repo.parent, monkeypatch)
+    missing = repo.parent / "later" / "bin"  # `mkdir -p later/bin && cp evil later/bin/ssh`
+    monkeypatch.setenv("PATH", f"{missing}{os.pathsep}{system}")
+    code, message = _guarded_decision(guard, repo, "git fetch origin")
+    assert code == 2 and f"writable PATH entry {missing} precedes" in message, message
+
+
+def test_commit_guard_writable_resolved_program_guards(helper_repo, monkeypatch):
+    guard, repo, _ = helper_repo
+    system = _system_dir(repo.parent, monkeypatch, names=("less", "man"))
+    ssh = system / "ssh"  # in the read-only directory, but the file itself is writable
+    ssh.write_text("#!/bin/sh\nexit 0\n")
+    ssh.chmod(0o755)
+    monkeypatch.setenv("PATH", str(system))
+    assert _guarded_decision(guard, repo, "git status") == (0, "")
+    code, message = _guarded_decision(guard, repo, "git fetch origin")
+    assert code == 2 and f"ssh resolves to the writable file {ssh}" in message, message
+
+
+def test_commit_guard_writable_git_exec_path_guards(helper_repo, monkeypatch):
+    """Git searches its exec path before PATH for every program it runs."""
+    guard, repo, _ = helper_repo
+    system = _system_dir(repo.parent, monkeypatch)
+    monkeypatch.setenv("PATH", str(system))
+    assert _guarded_decision(guard, repo, "git fetch origin") == (0, "")
+    exec_dir = repo.parent / "git-core"
+    exec_dir.mkdir()
+    real = guard._git_in
+
+    def git_in(where, target, *args):
+        if args == ("--exec-path",):
+            return 0, f"{exec_dir}\n"
+        return real(where, target, *args)
+
+    monkeypatch.setattr(guard, "_git_in", git_in)
+    code, message = _guarded_decision(guard, repo, "git fetch origin")
+    assert code == 2 and f"writable git exec path {exec_dir} precedes" in message, message
+    unreadable = {("--exec-path",): (-1, "")}
+    monkeypatch.setattr(guard, "_git_in", lambda w, t, *a: unreadable.get(a) or real(w, t, *a))
+    code, message = _guarded_decision(guard, repo, "git status")
+    assert code == 2 and "exec path could not be read" in message, message
+
+
+def test_commit_guard_configured_pager_found_after_a_writable_entry_guards(
+    helper_repo, monkeypatch
+):
+    guard, repo, git = helper_repo
+    system = _system_dir(repo.parent, monkeypatch)
+    drop = repo.parent / "drop"
+    drop.mkdir()
+    monkeypatch.setenv("PATH", f"{system}{os.pathsep}{drop}")
+    assert _guarded_decision(guard, repo, "git log") == (0, "")
+    git("config", "core.pager", "more")  # a plain pager, but `more` resolves only past `drop`
+    code, message = _guarded_decision(guard, repo, "git log")
+    assert code == 2 and f"writable PATH entry {drop} precedes more" in message, message
