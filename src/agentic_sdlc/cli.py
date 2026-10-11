@@ -7,7 +7,6 @@ import base64
 import hashlib
 import json
 import math
-import os
 import re
 import shlex
 import sys
@@ -1300,31 +1299,56 @@ def _committed_lease_policy(project: str) -> ProjectPolicy | None:
         raise LeaseError(f"the committed policy {where} cannot be read ({exc})") from exc
 
 
+def _check_lease_policy_project(policy: ProjectPolicy, project: str | None, source: str) -> None:
+    """Refuse a lease policy that is not `project`'s (Codex 4243076063): its TTL and Publisher
+    bot belong to another repository, so leasing `project` with them would trust the wrong App
+    bot. GitHub repository names compare case-insensitively (`owner/Repo` is `owner/repo`)."""
+    if project is None:
+        return
+    if policy.provider != "github" or policy.project_id.casefold() != project.casefold():
+        raise LeaseError(
+            f"{source} is not {project}'s policy (provider {policy.provider!r}, project "
+            f"{policy.project_id!r}); not leasing with it"
+        )
+
+
 def _lease_policy(
     args: argparse.Namespace, *, committed_unreadable_ok: bool = False
 ) -> ProjectPolicy | None:
     """The policy `--config` names (which must be readable), else -- only when `--config` was
-    omitted -- ./agentic-sdlc.toml if it exists, else (FORGE_LEASE_BOT_LOGINS unset) the
-    policy committed on the repository's default branch (`_committed_lease_policy`, Codex
-    4242925440), else None. Its `[automation] publisher_bot_login` becomes the Publisher bot
-    whose lease markers count in this process (FORGE_LEASE_BOT_LOGINS still wins; with
-    neither, no App bot does -- Codex 4242753917).
+    omitted -- ./agentic-sdlc.toml if it exists, else the policy committed on the repository's
+    default branch (`_committed_lease_policy`, Codex 4242925440), else None. Its
+    `[automation] publisher_bot_login` becomes the Publisher bot whose lease markers count in
+    this process (FORGE_LEASE_BOT_LOGINS still wins; with neither, no App bot does -- Codex
+    4242753917). FORGE_LEASE_BOT_LOGINS overrides only the bot: the committed policy is read
+    even when it is set, for its TTL (Codex 4243076065).
 
-    A committed policy that cannot be read is an error (LeaseError: exit 2) -- unless
-    `committed_unreadable_ok`, for `release`, which then proceeds trusting no App bot and
-    says so: `release` settles its own session's claims whoever posted them
-    (`leases.release`), so an unknown Publisher bot cannot make it skip one."""
+    A policy whose project or provider is not `--project`'s is an error (LeaseError: exit 2,
+    Codex 4243076063) before any lease call. A committed policy that cannot be read, or is
+    another project's, is an error too -- unless `committed_unreadable_ok`, for `release`,
+    which then proceeds trusting no App bot and says so: `release` settles its own session's
+    claims whoever posted them (`leases.release`), so an unknown Publisher bot cannot make it
+    skip one."""
+    project = getattr(args, "project", None)
     policy = _explicit_lease_policy(args)
-    if policy is None and args.config is None:
+    if policy is not None:
+        _check_lease_policy_project(policy, project, f"--config {args.config}")
+    elif args.config is None:
         config = Path("agentic-sdlc.toml")
         if config.exists():
             policy = load_policy(config)
-        elif not os.environ.get(LEASE_BOT_LOGINS_ENV) and getattr(args, "project", None):
+            _check_lease_policy_project(policy, project, f"./{config}")
+        elif project:
             try:
-                policy = _committed_lease_policy(args.project)
+                policy = _committed_lease_policy(project)
+                if policy is not None:
+                    _check_lease_policy_project(
+                        policy, project, f"the committed {COMMITTED_POLICY_PATH}"
+                    )
             except LeaseError as exc:
                 if not committed_unreadable_ok:
                     raise
+                policy = None
                 _status(f"WARNING: {exc}; trusting no Publisher App bot for this release")
     use_policy_bot_logins(policy.publisher_bot_login if policy is not None else "")
     return policy
@@ -1968,9 +1992,10 @@ def build_parser() -> argparse.ArgumentParser:
             "--config",
             help="the policy file for lease_ttl_minutes and publisher_bot_login; given "
             "explicitly, it must be readable (exit 2 otherwise). Omitted: ./agentic-sdlc.toml "
-            "if it exists, else (FORGE_LEASE_BOT_LOGINS unset) the agentic-sdlc.toml committed "
-            "on the default branch (unreadable: exit 2; `release` warns and still releases "
-            "its own session's claims), else the defaults",
+            "if it exists, else the agentic-sdlc.toml committed on the default branch "
+            "(unreadable: exit 2; `release` warns and still releases its own session's "
+            "claims), else the defaults. A policy for another project is refused (exit 2); "
+            "FORGE_LEASE_BOT_LOGINS overrides only its publisher_bot_login",
         )
         parser.add_argument("--ttl-minutes", type=int)
         parser.add_argument("--output")

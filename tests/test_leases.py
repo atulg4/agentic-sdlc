@@ -3634,10 +3634,154 @@ def test_the_committed_policy_supplies_bot_and_ttl(tmp_path, monkeypatch):
         gh.committed_policy = "version = [\n"  # committed but unparseable: an error
         with pytest.raises(LeaseError, match="committed policy"):
             cli._lease_ttl(args)
-        # FORGE_LEASE_BOT_LOGINS set: no read at all
-        gh.calls.clear()
-        monkeypatch.setenv(leases.LEASE_BOT_LOGINS_ENV, _APP)
-        assert cli._lease_ttl(args) == 240 and gh.calls == []
+        # Codex 4243076065: FORGE_LEASE_BOT_LOGINS overrides only the bot; the committed
+        # policy is still read for its TTL
+        gh.committed_policy = _APP_POLICY + "lease_ttl_minutes = 33\n"
+        monkeypatch.setenv(leases.LEASE_BOT_LOGINS_ENV, "other[bot]")
+        assert cli._lease_ttl(args) == 33
+        assert leases.configured_bot_logins() == "other[bot]"
+        assert any("contents/" in " ".join(c) for c in gh.calls)
+        gh.committed_policy = "version = [\n"  # and an unreadable one is still an error
+        with pytest.raises(LeaseError, match="committed policy"):
+            cli._lease_ttl(args)
+    finally:
+        leases.use_policy_bot_logins("")
+
+
+@pytest.mark.parametrize("subcommand", ["claim", "renew", "claims"])
+def test_the_env_bot_override_still_fails_closed_on_an_unreadable_committed_policy(
+    subcommand, tmp_path, monkeypatch, capsys
+):
+    """Codex 4243076065: with FORGE_LEASE_BOT_LOGINS set the committed policy is still read,
+    and claim/renew/claims still refuse (exit 2) when it cannot be."""
+    from agentic_sdlc import cli, leases
+
+    monkeypatch.setenv(leases.LEASE_BOT_LOGINS_ENV, _APP)
+    monkeypatch.chdir(tmp_path)
+    gh = _app_claimed(datetime.now(UTC), "s1")
+    gh.committed_policy = RuntimeError("gh: Resource not accessible by integration (HTTP 403)")
+    monkeypatch.setattr(cli, "run_gh", gh)
+    argv = {
+        "claim": ["claim", "--agent", "me", "--branch", "b"],
+        "renew": ["renew"],
+        "claims": ["claims"],
+    }[subcommand] + ["--project", PROJECT]
+    if subcommand != "claims":
+        argv += ["--issue", "7", "--session", "s1"]
+    before = len(gh.issues[7]["comments"])
+    try:
+        assert cli.main(argv) == 2
+        assert "committed policy" in capsys.readouterr().err
+        assert len(gh.issues[7]["comments"]) == before
+    finally:
+        leases.use_policy_bot_logins("")
+
+
+def test_release_with_the_env_bot_warns_on_an_unreadable_committed_policy(
+    tmp_path, monkeypatch, capsys
+):
+    from agentic_sdlc import cli, leases
+
+    monkeypatch.setenv(leases.LEASE_BOT_LOGINS_ENV, _APP)
+    monkeypatch.chdir(tmp_path)
+    gh = _app_claimed(datetime.now(UTC), "s1")
+    gh.committed_policy = RuntimeError("gh: Resource not accessible by integration (HTTP 403)")
+    monkeypatch.setattr(cli, "run_gh", gh)
+    try:
+        argv = ["release", "--project", PROJECT, "--issue", "7", "--session", "s1"]
+        assert cli.main(argv) == 0
+        assert "WARNING" in capsys.readouterr().err
+        assert len(_released(gh, "s1")) == 1
+    finally:
+        leases.use_policy_bot_logins("")
+
+
+# ---------------------------------------------------------------- Codex 4243076063
+# A lease policy that is another project's (or another provider's) is refused before any
+# lease call: its TTL and Publisher bot are not this repository's.
+
+_FOREIGN_POLICIES = {
+    "other project": (
+        'version = 1\n[project]\nid = "owner/other"\n'
+        '[automation]\npublisher_bot_login = "evil[bot]"\n'
+    ),
+    "gitlab": (
+        f'version = 1\n[project]\nid = "{PROJECT}"\nprovider = "gitlab"\n'
+        '[automation]\npublisher_bot_login = "evil[bot]"\n'
+    ),
+}
+
+
+@pytest.mark.parametrize("where", ["explicit", "local"])
+@pytest.mark.parametrize("foreign", sorted(_FOREIGN_POLICIES))
+@pytest.mark.parametrize("subcommand", ["claim", "renew", "release", "claims"])
+def test_a_local_policy_for_another_project_is_refused_before_any_github_call(
+    subcommand, foreign, where, tmp_path, monkeypatch, capsys
+):
+    from agentic_sdlc import cli, leases
+
+    if subcommand == "claims" and where == "explicit":
+        pytest.skip("claims takes no --config")
+    monkeypatch.delenv(leases.LEASE_BOT_LOGINS_ENV, raising=False)
+    monkeypatch.chdir(tmp_path)
+    policy = tmp_path / ("named.toml" if where == "explicit" else "agentic-sdlc.toml")
+    policy.write_text(_FOREIGN_POLICIES[foreign])
+    gh = _app_claimed(datetime.now(UTC), "s1")
+    monkeypatch.setattr(cli, "run_gh", gh)
+    argv = {
+        "claim": ["claim", "--agent", "me", "--branch", "b"],
+        "renew": ["renew"],
+        "release": ["release"],
+        "claims": ["claims"],
+    }[subcommand] + ["--project", PROJECT]
+    if subcommand != "claims":
+        argv += ["--issue", "7", "--session", "s1"]
+    if where == "explicit":
+        argv += ["--config", str(policy)]
+    try:
+        assert cli.main(argv) == 2
+        assert "not leasing with it" in capsys.readouterr().err
+        assert gh.calls == []
+    finally:
+        leases.use_policy_bot_logins("")
+
+
+def test_a_committed_policy_for_another_project_is_refused_but_release_still_releases(
+    tmp_path, monkeypatch, capsys
+):
+    from agentic_sdlc import cli, leases
+
+    monkeypatch.delenv(leases.LEASE_BOT_LOGINS_ENV, raising=False)
+    monkeypatch.chdir(tmp_path)
+    gh = _app_claimed(datetime.now(UTC), "s1")
+    gh.committed_policy = _FOREIGN_POLICIES["other project"]
+    monkeypatch.setattr(cli, "run_gh", gh)
+    base = ["--project", PROJECT, "--issue", "7", "--session", "s1"]
+    try:
+        before = len(gh.issues[7]["comments"])
+        assert cli.main(["claim", "--agent", "me", "--branch", "b", *base]) == 2
+        assert "not leasing with it" in capsys.readouterr().err
+        assert len(gh.issues[7]["comments"]) == before
+        assert cli.main(["release", *base]) == 0
+        assert "WARNING" in capsys.readouterr().err
+        assert leases.configured_bot_logins() == ""  # the foreign bot is not trusted
+        assert len(_released(gh, "s1")) == 1
+    finally:
+        leases.use_policy_bot_logins("")
+
+
+def test_the_policy_project_compares_case_insensitively(tmp_path, monkeypatch):
+    import argparse
+
+    from agentic_sdlc import cli, leases
+
+    monkeypatch.delenv(leases.LEASE_BOT_LOGINS_ENV, raising=False)
+    policy = tmp_path / "p.toml"
+    policy.write_text(_APP_POLICY.replace(PROJECT, PROJECT.upper()) + "lease_ttl_minutes = 12\n")
+    try:
+        args = argparse.Namespace(ttl_minutes=None, config=str(policy), project=PROJECT)
+        assert cli._lease_ttl(args) == 12
+        assert leases.configured_bot_logins() == _APP
     finally:
         leases.use_policy_bot_logins("")
 
