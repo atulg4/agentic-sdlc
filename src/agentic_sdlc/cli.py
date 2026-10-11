@@ -29,7 +29,13 @@ from .executors import (
     route_executor,
 )
 from .gates import GateError, run_gates, write_report
-from .git_diff import GitDiffError, collect_commit_diff, collect_git_diff
+from .git_diff import (
+    GitDiffError,
+    collect_commit_diff,
+    collect_git_diff,
+    committed_path,
+    read_committed_file,
+)
 from .infra_recovery import (
     FailureClass,
     InfraRecoveryError,
@@ -77,7 +83,13 @@ from .onboard import (
     write_onboarding,
 )
 from .orchestration import OrchestrationError, Orchestrator
-from .policy import evaluate_diff, evaluate_task, load_policy, load_policy_bytes
+from .policy import (
+    ProjectPolicy,
+    evaluate_diff,
+    evaluate_task,
+    load_policy,
+    load_policy_bytes,
+)
 from .project_registry import (
     ProjectRegistryError,
     read_optional_project_registry,
@@ -290,13 +302,19 @@ def _check_diff(args: argparse.Namespace) -> int:
     """The diff policy (`evaluate_diff`, as `inspect-diff` applies it on the Actions path) over
     the COMMITTED change `--head` brings onto `--base` -- what a push of `--head` publishes
     (Codex 4241434509: the cloud routine runs it right before pushing). Exit 0 only when the
-    policy allows it and something changed; 2 otherwise, the reasons on stderr."""
+    policy allows it and something changed; 2 otherwise, the reasons on stderr.
+
+    The policy is the one COMMITTED on `--base` (Codex 4241614590), never the working-tree file:
+    the agent being checked could loosen an uncommitted copy (drop `.github/**`, raise the caps)
+    and the push would publish the forbidden commit without that edit. The baseline forbidden
+    paths apply whatever the base policy lists (`load_policy_bytes`)."""
+    policy = _committed_policy(args.repository, args.base, args.config)
     snapshot = collect_commit_diff(args.repository, args.base, args.head)
     decision = evaluate_diff(
         snapshot.paths,
         snapshot.added_lines,
         snapshot.deleted_lines,
-        load_policy(args.config),
+        policy,
         patch_bytes=len(snapshot.patch),
     )
     document = decision.as_dict()
@@ -320,9 +338,33 @@ def _check_diff(args: argparse.Namespace) -> int:
     return 2
 
 
+def _committed_policy(repository: str, base: str, config: str) -> ProjectPolicy:
+    """The policy file `config` (a path inside `repository`, relative to its top level) as the
+    commit `base` holds it. Missing or unparseable: an error (exit 2), never a looser policy."""
+    path = committed_path(repository, config)
+    raw = read_committed_file(repository, base, path)
+    try:
+        return load_policy_bytes(raw)
+    except (ValueError, TypeError, UnicodeDecodeError) as exc:
+        raise ValueError(f"the policy {path} committed on {base} is not usable: {exc}") from exc
+
+
 #: `check-request` exit codes beside 0 (ready) and 2 (could not be verified).
 REQUEST_INVALID = 3
 DEPENDENCY_OPEN = 4
+#: The title or body differs from the content digest given with `--expect-digest`.
+REQUEST_CHANGED = 5
+#: The issue is no longer open.
+ISSUE_CLOSED = 6
+
+
+def request_digest(title: str, body: str) -> str:
+    """The content digest of a work request: its title and body exactly as GitHub returns them
+    (labels excluded -- they are authorized separately). `check-request` prints it; passed back
+    with `--expect-digest` it proves the request is still the one the work was built from
+    (Codex 4241614582)."""
+    canonical = json.dumps([title, body], ensure_ascii=False, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _check_request(args: argparse.Namespace) -> int:
@@ -330,18 +372,50 @@ def _check_request(args: argparse.Namespace) -> int:
     4241434511)? Its body is parsed by the same validator (`parse_task`) and judged by the same
     policy (`evaluate_task`, mode implement) as `prepare-request`, and every dependency it names
     must be CLOSED, as the Actions "Require every dependency issue to be closed" step requires.
-    Exit 0: ready. 3: not a valid or eligible request. 4: a dependency is still open. 2 (an
-    error): anything that could not be read -- never "no dependencies"."""
+    Exit 0: ready. 3: not a valid or eligible request. 4: a dependency is still open. 5: the
+    title or body is not the content `--expect-digest` names (it was edited: Codex 4241614582).
+    6: the issue is not open. 2 (an error): anything that could not be read -- never "no
+    dependencies". It prints the request's content digest on every run that reads the issue.
+    With `--base`, the policy is the one committed there in `--repository`, not the working-tree
+    file the agent could loosen (Codex 4241614590)."""
     document = json.loads(run_gh(["api", f"repos/{args.project}/issues/{args.issue}"]) or "null")
     if not isinstance(document, dict) or "pull_request" in document:
         raise ValueError(f"#{args.issue} is not a readable issue of {args.project}")
-    policy = load_policy(args.config)
+    if args.base:
+        policy = _committed_policy(args.repository, args.base, args.config)
+    else:
+        policy = load_policy(args.config)
     if policy.provider != "github":
         raise ValueError("policy provider is not github")
     if policy.project_id != args.project:
         raise ValueError("policy project ID does not match --project")
+    state = document.get("state")
+    if state not in ("open", "closed"):
+        raise ValueError(f"#{args.issue}: unreadable state {state!r}")
     title, body, labels = _request_fields("github", document)
-    result: dict[str, Any] = {"issue": args.issue, "ready": False, "dependencies": []}
+    digest = request_digest(title, body)
+    result: dict[str, Any] = {
+        "issue": args.issue,
+        "ready": False,
+        "dependencies": [],
+        "contentDigest": digest,
+    }
+    _status(f"content digest: {digest}")
+    if state != "open":
+        result["reasons"] = [f"issue #{args.issue} is {state}"]
+        _write(result, args.output)
+        _status(f"CLOSED: #{args.issue} is {state}")
+        return ISSUE_CLOSED
+    if args.expect_digest is not None and args.expect_digest != digest:
+        result["reasons"] = [
+            f"the title or body changed: expected {args.expect_digest}, now {digest}"
+        ]
+        _write(result, args.output)
+        _status(
+            f"CHANGED: #{args.issue}: the title or body is not the request the work was built "
+            f"from (expected {args.expect_digest}, now {digest})"
+        )
+        return REQUEST_CHANGED
     try:
         task = parse_task(title, body, labels)
     except TaskSpecError as exc:
@@ -1149,7 +1223,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="apply the diff policy to the committed change HEAD brings onto --base; "
         "exit 0 only if it passes (2: rejected, empty or unreadable)",
     )
-    check_diff.add_argument("--config", default="agentic-sdlc.toml")
+    check_diff.add_argument(
+        "--config",
+        default="agentic-sdlc.toml",
+        help="the policy file's path in the repository (relative to its top level); it is read "
+        "as committed on --base, never from the working tree",
+    )
     check_diff.add_argument("--repository", default=".")
     check_diff.add_argument(
         "--base", required=True, help="the branch the change targets, e.g. origin/main"
@@ -1160,12 +1239,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     check_request = commands.add_parser(
         "check-request",
-        help="exit 0 only if the issue is a valid work request whose dependencies are all "
-        "closed (3: invalid request, 4: a dependency is open, 2: could not verify)",
+        help="exit 0 only if the issue is an open, valid work request whose dependencies are "
+        "all closed (3: invalid request, 4: a dependency is open, 5: content changed from "
+        "--expect-digest, 6: issue not open, 2: could not verify)",
     )
     check_request.add_argument("--project", required=True, help="owner/name on GitHub")
     check_request.add_argument("--issue", type=int, required=True)
-    check_request.add_argument("--config", default="agentic-sdlc.toml")
+    check_request.add_argument(
+        "--config",
+        default="agentic-sdlc.toml",
+        help="the policy file; with --base, its path in --repository as committed there",
+    )
+    check_request.add_argument(
+        "--base", help="read the policy as committed on this revision, e.g. origin/main"
+    )
+    check_request.add_argument("--repository", default=".")
+    check_request.add_argument(
+        "--expect-digest",
+        help="the content digest an earlier check-request printed; exit 5 if the title or "
+        "body no longer matches it",
+    )
     check_request.add_argument("--output")
     check_request.set_defaults(handler=_check_request)
 

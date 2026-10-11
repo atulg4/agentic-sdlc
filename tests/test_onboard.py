@@ -12174,14 +12174,19 @@ def test_cloud_routine_renews_its_lease_and_verifies_it_before_pushing():
     authorize = prompt.index("4b. Re-authorize right before publishing")
     diff = prompt.index("4c. Check the diff policy")
     renew_3 = prompt.index("4d. Verify the lease immediately before pushing")
+    final_request = prompt.index("4e. Re-check the request last")
     push = prompt.index("5. Push the checked commit")
-    assert implement < renew_1 < verify < renew_2 < authorize < diff < renew_3 < push
+    assert implement < renew_1 < verify < renew_2 < authorize < diff < renew_3 < final_request
+    assert final_request < push
     step3a = _step(prompt, "3a. Renew the lease", "4. Run each")
     assert renew in step3a
     assert "On any non-zero exit STOP: do NOT push or open a PR" in step3a
-    step4d = _step(prompt, "4d. Verify the lease", "5. Push the checked commit")
+    step4d = _step(prompt, "4d. Verify the lease", "4e. Re-check the request")
     assert "run the step 3a renew command once more" in step4d
     assert "do NOT push or open a PR" in step4d
+    # Codex 4241614587: a renewal is also a state check
+    assert "fails once the issue has been closed" in step3a
+    assert "fails if the issue was closed meanwhile" in step4d
 
 
 # Codex 4241434511: the routine parses the request with the Actions path's validator and
@@ -12201,7 +12206,11 @@ def test_cloud_routine_checks_the_request_and_its_dependencies_before_implementi
         "<n>",
         "--config",
         "agentic-sdlc.toml",
+        "--base",
+        "origin/main",
     ]
+    assert "`git fetch origin main`, then" in step
+    assert "keep that value as <digest>" in step
     assert "Exit 0: continue" in step
     assert "Exit 3: not a valid work request" in step and "add label `claude-blocked`" in step
     assert "Exit 4: a dependency issue is still open" in step and "do NOT block it" in step
@@ -12233,3 +12242,49 @@ def test_cloud_routine_pushes_a_run_specific_branch():
         assert re.fullmatch(r"forge/issue-\d+-\d+", sample)
         # the commit guard and the lease PR heuristic both still read the issue number from it
         assert re.search(r"(?:^|/)issue-(\d+)(?:$|[^0-9])", sample)
+
+
+# Codex 4241614596 / 4241614582: the request is checked again as the very last step before the
+# push -- dependencies still closed, issue still open, title and body the ones step 2 checked
+# (an edit followed by re-applied labels passes re-authorization, not this).
+def test_cloud_routine_rechecks_the_request_with_its_digest_right_before_pushing():
+    import shlex
+
+    prompt = _routine_prompt(default_branch="trunk")
+    step = _step(prompt, "4e. Re-check the request last", "5. Push the checked commit")
+    command = re.search(r"`(sdlcctl check-request [^`]*)`", step).group(1)
+    assert shlex.split(command) == [
+        "sdlcctl",
+        "check-request",
+        "--project",
+        "owner/comic",
+        "--issue",
+        "<n>",
+        "--config",
+        "agentic-sdlc.toml",
+        "--base",
+        "origin/trunk",
+        "--expect-digest",
+        "<digest>",
+    ]
+    first = re.search(r"`(sdlcctl check-request [^`]*)`", prompt).group(1)
+    assert command == first + " --expect-digest <digest>"  # the step 2 command, plus the digest
+    assert "Proceed to step 5 ONLY on exit 0" in step
+    assert "On any other exit do NOT push or open a PR" in step and "sdlcctl release" in step
+    assert "Exit 5 means the title or body changed since step 2" in step
+    order = [
+        prompt.index("2. Check the request"),
+        prompt.index("4c. Check the diff policy"),
+        prompt.index("4d. Verify the lease"),
+        prompt.index("4e. Re-check the request last"),
+        prompt.index("5. Push the checked commit"),
+        prompt.index("git push origin HEAD:refs/heads/<branch>"),
+    ]
+    assert order == sorted(order)
+    from agentic_sdlc.cli import ISSUE_CLOSED, REQUEST_CHANGED, build_parser
+
+    assert (REQUEST_CHANGED, ISSUE_CLOSED) == (5, 6)  # the exit codes the prompt names
+    argv = ["7" if word == "<n>" else word for word in shlex.split(command)[1:]]
+    args = build_parser().parse_args(argv)
+    assert args.command == "check-request" and args.expect_digest == "<digest>"
+    assert args.base == "origin/trunk"

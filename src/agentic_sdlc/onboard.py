@@ -984,6 +984,11 @@ def render_cloud_routine_md(spec: OnboardSpec) -> str:
     lease = f"--project {spec.project_id} --issue <n> --session <run id>"
     release = f"`sdlcctl release {lease}`"
     renew = f"`sdlcctl renew {lease} --config agentic-sdlc.toml`"
+    base = f"origin/{spec.default_branch}"
+    check_request = (
+        f"sdlcctl check-request --project {spec.project_id} --issue <n> "
+        f"--config agentic-sdlc.toml --base {base}"
+    )
     prompt = f"""Repository: {spec.project_id}. Every run:
 1. List open issues that carry ALL of: {_md_code(spec.ready_label)}, {_md_code(HUMAN_REVIEW_LABEL)},
    {_md_code(IMPLEMENTATION_LABEL)}
@@ -1015,15 +1020,18 @@ def render_cloud_routine_md(spec: OnboardSpec) -> str:
     --session <run id> --branch <branch>`.
    If the claim is refused (exit 2), skip that issue and take the next one.
 2. Check the request deterministically (the same validator and dependency rule as the Actions
-   implement path: Codex 4241434511):
-   `sdlcctl check-request --project {spec.project_id} --issue <n> --config agentic-sdlc.toml`.
-   Exit 0: continue. Exit 3: not a valid work request -- retire it so it cannot starve the
-   queue (Codex 4241196636): comment the reason it printed, add label {_md_code(BLOCKED_LABEL)}
-   (step 1 skips it from then on), then {release}; then go back to step 1a with the next
-   candidate of the step 1 list. Exit 4: a dependency issue is still open -- {release} (do
-   NOT block it: it becomes ready once its dependencies close) and go back to step 1a with the
-   next candidate. Any other exit: it could not be verified -- {release} and go back to step 1a
-   with the next candidate.
+   implement path: Codex 4241434511), with the policy as committed on the default branch
+   (Codex 4241614590): `git fetch origin {spec.default_branch}`, then
+   `{check_request}`.
+   It prints `content digest: sha256:...`; keep that value as <digest> -- it names the request
+   exactly as checked here, and step 4e refuses to publish if the title or body changes after
+   this (Codex 4241614582). Exit 0: continue. Exit 3: not a valid work request -- retire it
+   so it cannot starve the queue (Codex 4241196636): comment the reason it printed,
+   add label {_md_code(BLOCKED_LABEL)} (step 1 skips it from then on), then {release}; then go
+   back to step 1a with the next candidate of the step 1 list. Exit 4: a dependency issue is
+   still open -- {release} (do NOT block it: it becomes ready once its dependencies close)
+   and go back to step 1a with the next candidate. Any other exit: it could not be verified
+   -- {release} and go back to step 1a with the next candidate.
 3. `git fetch origin {spec.default_branch}` and create branch <branch> from
    `origin/{spec.default_branch}`. Implement the smallest change that satisfies the acceptance
    criteria, tests first, and commit it. Never touch `forbidden_paths` from agentic-sdlc.toml;
@@ -1033,7 +1041,8 @@ def render_cloud_routine_md(spec: OnboardSpec) -> str:
    {renew}.
    It succeeds ONLY while this run still holds a live lease. On any non-zero exit STOP: do NOT
    push or open a PR -- another agent may own the issue now; run {release} (it refuses if
-   another session holds the lease, which is fine) and end the run.
+   another session holds the lease, which is fine) and end the run. It also fails once the
+   issue has been closed (Codex 4241614587): every renewal re-reads the issue's state.
 4. Run each, in order; all must pass:
    {spec.setup_command}
    {spec.quality_command}
@@ -1047,11 +1056,21 @@ def render_cloud_routine_md(spec: OnboardSpec) -> str:
    `evaluate_diff` the Actions path applies -- forbidden paths, file, line and byte caps). Commit
    everything first; then `git fetch origin {spec.default_branch}` and
    `sdlcctl check-diff --config agentic-sdlc.toml --base origin/{spec.default_branch}`.
-   It diffs the committed HEAD against its merge base with the default branch. On any non-zero
-   exit do NOT push or open a PR: comment the reasons it printed on the issue, {release},
-   and stop. Make no commit after this check.
-4d. Verify the lease immediately before pushing: run the step 3a renew command once more. On
-   any non-zero exit do NOT push or open a PR; stop as in step 3a.
+   It diffs the committed HEAD against its merge base with the default branch, under the
+   policy committed on origin/{spec.default_branch} (never your working-tree copy: Codex
+   4241614590). On any non-zero exit do NOT push or open a PR: comment the reasons it printed
+   on the issue, {release}, and stop. Make no commit after this check.
+4d. Verify the lease immediately before pushing: run the step 3a renew command once more (it
+   fails if the issue was closed meanwhile). On any non-zero exit do NOT push or open a PR;
+   stop as in step 3a.
+4e. Re-check the request last, immediately before pushing (Codex 4241614596, 4241614582: a
+   dependency may have been reopened, the issue closed, or the request edited and re-approved
+   while you worked):
+   `{check_request} --expect-digest <digest>`.
+   Proceed to step 5 ONLY on exit 0. On any other exit do NOT push or open a PR: {release}
+   and stop. Exit 5 means the title or body changed since step 2: comment (once) that the
+   request changed while it was being implemented and a later run will start over from the
+   new text. Exit 4: a dependency was reopened. Exit 6: the issue is no longer open.
 5. Push the checked commit at once -- `git push origin HEAD:refs/heads/<branch>`, never
    forced -- and
    open a DRAFT pull request titled "<issue title> (#<n>)" with a summary
@@ -1078,9 +1097,14 @@ push. The Actions path's other deterministic gates are commands too, and the rou
 on their exit codes: `sdlcctl check-request` parses the issue with the same work-request
 validator and policy as `prepare-request` and requires every dependency issue to be closed;
 `sdlcctl check-diff` applies the same diff policy as `inspect-diff` (forbidden paths and the
-patch caps) to exactly the commit about to be pushed; and `sdlcctl renew` -- after
+patch caps) to exactly the commit about to be pushed, under the policy COMMITTED on the default
+branch (an uncommitted, loosened `agentic-sdlc.toml` changes nothing), running a git only root
+can replace (never a `git` from a writable PATH entry); `sdlcctl renew` -- after
 implementation, after verification and immediately before pushing -- keeps the lease alive and
-fails unless this run still holds it, so the routine never pushes over another agent's lease.
+fails unless this run still holds it and the issue is still open, so the routine never pushes
+over another agent's lease or for a closed issue; and right before the push `check-request`
+runs once more with the content digest it printed in step 2, so a reopened dependency, a
+closed issue or an edited request (even one whose labels were re-applied) stops the push.
 Keep `lease_ttl_minutes` longer than the longest stage. An issue whose body is not a valid
 work request is labelled {_md_code(BLOCKED_LABEL)} and its lease released; step 1 never
 selects a blocked issue.

@@ -4,6 +4,9 @@ pushing (4241434509) and `check-request` before implementing (4241434511)."""
 from __future__ import annotations
 
 import json
+import os
+import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -22,13 +25,16 @@ def _git(repository: Path, *arguments: str) -> str:
     ).stdout.strip()
 
 
-def _repo(tmp_path: Path) -> Path:
+def _repo(tmp_path: Path, policy_file: Path) -> Path:
+    """A repository whose `main` commits `policy_file` as its agentic-sdlc.toml (check-diff reads
+    the policy committed on --base: Codex 4241614590), with the issue branch checked out."""
     repository = tmp_path / "repo"
     repository.mkdir()
     _git(repository, "init", "-q", "-b", "main")
     _git(repository, "config", "user.email", "test@example.com")
     _git(repository, "config", "user.name", "Test")
     (repository / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (repository / "agentic-sdlc.toml").write_bytes(policy_file.read_bytes())
     _git(repository, "add", "--", ".")
     _git(repository, "commit", "-qm", "base")
     _git(repository, "switch", "-q", "-c", "forge/issue-7")
@@ -45,11 +51,12 @@ def _commit(repository: Path, files: dict[str, str], message: str = "change") ->
 
 
 def _check_diff(repository: Path, policy_file: Path, *extra: str) -> int:
+    """`policy_file` is committed on main by `_repo`; check-diff reads it from there."""
     return cli.main(
         [
             "check-diff",
             "--config",
-            str(policy_file),
+            "agentic-sdlc.toml",
             "--repository",
             str(repository),
             "--base",
@@ -63,7 +70,7 @@ def _check_diff(repository: Path, policy_file: Path, *extra: str) -> int:
 
 
 def test_check_diff_passes_a_committed_change_within_policy(tmp_path, policy_file, capsys):
-    repository = _repo(tmp_path)
+    repository = _repo(tmp_path, policy_file)
     _commit(repository, {"module.py": "VALUE = 2\n"})
     out = tmp_path / "decision.json"
     assert _check_diff(repository, policy_file, "--output", str(out)) == 0
@@ -73,7 +80,7 @@ def test_check_diff_passes_a_committed_change_within_policy(tmp_path, policy_fil
 
 
 def test_check_diff_refuses_a_forbidden_path(tmp_path, policy_file, capsys):
-    repository = _repo(tmp_path)
+    repository = _repo(tmp_path, policy_file)
     _commit(repository, {".github/workflows/x.yml": "on: push\n"})
     assert _check_diff(repository, policy_file) == 2
     err = capsys.readouterr().err
@@ -81,19 +88,19 @@ def test_check_diff_refuses_a_forbidden_path(tmp_path, policy_file, capsys):
 
 
 def test_check_diff_refuses_a_change_over_the_caps(tmp_path, policy_file, capsys):
-    repository = _repo(tmp_path)
+    repository = _repo(tmp_path, policy_file)
     _commit(repository, {f"f{i}.py": "x = 1\n" for i in range(4)})  # max_changed_files = 3
     assert _check_diff(repository, policy_file) == 2
     assert "changed-file cap exceeded: 4 > 3" in capsys.readouterr().err
     (tmp_path / "lines").mkdir()
-    repository = _repo(tmp_path / "lines")
+    repository = _repo(tmp_path / "lines", policy_file)
     _commit(repository, {"big.py": "x = 1\n" * 101})  # max_diff_lines = 100
     assert _check_diff(repository, policy_file) == 2
     assert "diff-line cap exceeded" in capsys.readouterr().err
 
 
 def test_check_diff_refuses_an_empty_change(tmp_path, policy_file, capsys):
-    repository = _repo(tmp_path)
+    repository = _repo(tmp_path, policy_file)
     (repository / "module.py").write_text("VALUE = 3\n")  # uncommitted: not pushed
     assert _check_diff(repository, policy_file) == 2
     assert "no files changed" in capsys.readouterr().err
@@ -102,7 +109,7 @@ def test_check_diff_refuses_an_empty_change(tmp_path, policy_file, capsys):
 def test_check_diff_judges_the_commit_not_the_working_tree(tmp_path, policy_file):
     """An uncommitted edit can neither hide a committed forbidden change nor add one that the
     push does not carry."""
-    repository = _repo(tmp_path)
+    repository = _repo(tmp_path, policy_file)
     _commit(repository, {"module.py": "VALUE = 2\n", ".github/workflows/x.yml": "on: push\n"})
     (repository / ".github/workflows/x.yml").unlink()  # gone from the tree, still committed
     assert _check_diff(repository, policy_file) == 2
@@ -121,7 +128,7 @@ def test_check_diff_judges_the_commit_not_the_working_tree(tmp_path, policy_file
 
 def test_check_diff_compares_with_the_merge_base(tmp_path, policy_file):
     """Changes the default branch gained after the fork are not the change being pushed."""
-    repository = _repo(tmp_path)
+    repository = _repo(tmp_path, policy_file)
     _commit(repository, {"module.py": "VALUE = 2\n"})
     _git(repository, "switch", "-q", "main")
     _commit(repository, {".github/workflows/ci.yml": "on: push\n", "other.py": "y = 1\n"})
@@ -133,15 +140,15 @@ def test_check_diff_compares_with_the_merge_base(tmp_path, policy_file):
 
 @pytest.mark.parametrize("base", ["--output=/tmp/x", "-p", "no-such-ref"])
 def test_check_diff_refuses_an_unusable_base(tmp_path, policy_file, base, capsys):
-    repository = _repo(tmp_path)
+    repository = _repo(tmp_path, policy_file)
     _commit(repository, {"module.py": "VALUE = 2\n"})
-    argv = ["check-diff", "--config", str(policy_file), "--repository", str(repository)]
+    argv = ["check-diff", "--repository", str(repository)]
     assert cli.main([*argv, f"--base={base}"]) == 2
     assert "ERROR" in capsys.readouterr().err
 
 
 def test_check_diff_runs_no_external_diff_or_textconv(tmp_path, policy_file):
-    repository = _repo(tmp_path)
+    repository = _repo(tmp_path, policy_file)
     marker = tmp_path / "ran"
     program = tmp_path / "evil"
     program.write_text(f'#!/bin/sh\ntouch {marker}\ncat "$1" 2>/dev/null\n')
@@ -157,7 +164,7 @@ def test_check_diff_runs_no_external_diff_or_textconv(tmp_path, policy_file):
 def test_check_diff_ignores_replace_refs(tmp_path, policy_file, capsys):
     """A `refs/replace/*` object must not stand in for the commit a push publishes (Codex
     4241532610): with HEAD replaced by a benign commit, check-diff still judges the original."""
-    repository = _repo(tmp_path)
+    repository = _repo(tmp_path, policy_file)
     _commit(repository, {".github/workflows/x.yml": "on: push\n"})
     forbidden = _git(repository, "rev-parse", "HEAD")
     _git(repository, "switch", "-q", "-c", "decoy", "main")
@@ -173,7 +180,7 @@ def test_check_diff_ignores_replace_refs(tmp_path, policy_file, capsys):
 
 def test_check_diff_ignores_grafts(tmp_path, policy_file, capsys):
     """A graft that re-parents HEAD onto itself hides its change the same way."""
-    repository = _repo(tmp_path)
+    repository = _repo(tmp_path, policy_file)
     _commit(repository, {".github/workflows/x.yml": "on: push\n"})
     head = _git(repository, "rev-parse", "HEAD")
     grafts = repository / ".git" / "info" / "grafts"
@@ -317,3 +324,227 @@ def test_check_request_errors_when_nothing_can_be_read(monkeypatch, policy_file,
     assert _check_request(monkeypatch, policy_file, gh, project="other/repo") == 2
     missing = tmp_path / "absent.toml"
     assert _check_request(monkeypatch, missing, FakeGh(VALID.format(deps="None"))) == 2
+
+
+# ------------------------------------------- check-diff runs a trusted git (Codex 4241614592)
+
+FAKE_GIT = """#!/bin/sh
+# A planted git: fabricates a benign diff for any `diff`, delegates everything else.
+touch "{marker}"
+for a in "$@"; do
+  case "$a" in
+    diff)
+      case "$*" in
+        *--name-status*) printf 'M\\000module.py\\000' ;;
+        *--numstat*) printf '1\\t1\\tmodule.py\\000' ;;
+        *) printf 'diff --git a/module.py b/module.py\\n' ;;
+      esac
+      exit 0 ;;
+  esac
+done
+exec {real} "$@"
+"""
+
+
+def _plant_git(tmp_path: Path, monkeypatch) -> Path:
+    """Put a fabricating `git` in a writable directory at the head of PATH; return its marker."""
+    real = shutil.which("git")
+    assert real
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    marker = tmp_path / "planted-git-ran"
+    fake = bin_dir / "git"
+    fake.write_text(FAKE_GIT.format(marker=marker, real=real), encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    return marker
+
+
+def test_check_diff_never_runs_a_git_planted_on_path(tmp_path, policy_file, monkeypatch, capsys):
+    repository = _repo(tmp_path, policy_file)
+    _commit(repository, {".github/workflows/x.yml": "on: push\n"})
+    marker = _plant_git(tmp_path, monkeypatch)
+    # the trap: a PATH lookup finds the planted git, which reports a benign change
+    shown = subprocess.run(
+        ["git", "diff", "--name-status", "-z", "main", "HEAD"],
+        cwd=repository,
+        capture_output=True,
+        check=True,
+    ).stdout
+    assert shown == b"M\0module.py\0" and marker.exists()
+    marker.unlink()
+    assert _check_diff(repository, policy_file) == 2
+    assert "forbidden paths changed: .github/workflows/x.yml" in capsys.readouterr().err
+    assert not marker.exists()  # never executed
+    # inspect-diff (the Actions path) collects its diff through the same trusted git
+    inspect = [
+        "inspect-diff", "--config", str(policy_file), "--repository", str(repository),
+        "--base", "main", "--patch-output", str(tmp_path / "p"),
+        "--paths-output", str(tmp_path / "n"), "--decision-output", str(tmp_path / "d"),
+    ]  # fmt: skip
+    cli.main(inspect)
+    assert not marker.exists()
+
+
+def test_check_diff_fails_closed_without_a_trusted_git(tmp_path, policy_file, monkeypatch, capsys):
+    from agentic_sdlc import trusted_git
+
+    repository = _repo(tmp_path, policy_file)
+    _commit(repository, {"module.py": "VALUE = 2\n"})
+    marker = _plant_git(tmp_path, monkeypatch)
+    monkeypatch.setenv("PATH", str(tmp_path / "bin"))  # only the planted one is on PATH
+    monkeypatch.setattr(trusted_git, "SYSTEM_GIT_PATHS", ())
+    assert _check_diff(repository, policy_file) == 2
+    assert "no trusted git executable" in capsys.readouterr().err
+    assert not marker.exists()
+
+
+def test_an_explicit_git_override_is_vetted_too(tmp_path, policy_file, monkeypatch, capsys):
+    repository = _repo(tmp_path, policy_file)
+    _commit(repository, {".github/workflows/x.yml": "on: push\n"})
+    marker = _plant_git(tmp_path, monkeypatch)
+    monkeypatch.setenv("AGENTIC_SDLC_GIT", str(tmp_path / "bin" / "git"))
+    assert _check_diff(repository, policy_file) == 2
+    assert "AGENTIC_SDLC_GIT" in capsys.readouterr().err
+    assert not marker.exists()
+
+
+def test_trusted_git_vets_the_file_and_every_directory_above_it(tmp_path):
+    from agentic_sdlc.trusted_git import git_candidate_reason, trusted_git
+
+    system = trusted_git()
+    assert git_candidate_reason(system) is None
+    planted = tmp_path / "git"
+    planted.write_text("#!/bin/sh\n", encoding="utf-8")
+    planted.chmod(0o755)
+    assert git_candidate_reason(str(planted)) is not None  # under a writable / non-root tree
+    link = tmp_path / "link-to-git"
+    link.symlink_to(system)  # the real git, but reached through a writable directory
+    assert "link-to-git" in (git_candidate_reason(str(link)) or "")
+    assert git_candidate_reason("git") is not None  # never a relative name
+
+
+# ------------------------------------ check-diff reads the committed policy (Codex 4241614590)
+
+
+def _loosen(path: Path, **values: str) -> None:
+    text = path.read_text(encoding="utf-8")
+    for key, value in values.items():
+        text = re.sub(rf"(?m)^{key} = .*$", f"{key} = {value}", text)
+    path.write_text(text, encoding="utf-8")
+
+
+def test_check_diff_ignores_a_loosened_uncommitted_policy(tmp_path, policy_file, capsys):
+    repository = _repo(tmp_path, policy_file)
+    _commit(repository, {f"f{i}.py": "x = 1\n" for i in range(4)})  # max_changed_files = 3
+    _loosen(repository / "agentic-sdlc.toml", max_changed_files="100")  # working tree only
+    assert _check_diff(repository, policy_file) == 2
+    assert "changed-file cap exceeded: 4 > 3" in capsys.readouterr().err
+    _git(repository, "add", "agentic-sdlc.toml")  # staged, still not committed
+    assert _check_diff(repository, policy_file) == 2
+    # committing it on the branch publishes a forbidden change, and the base policy still rules
+    _git(repository, "commit", "-qm", "loosen")
+    assert _check_diff(repository, policy_file) == 2
+    err = capsys.readouterr().err
+    assert "forbidden paths changed: agentic-sdlc.toml" in err
+    assert "changed-file cap exceeded" in err
+
+
+def test_check_diff_ignores_an_uncommitted_forbidden_paths_edit(tmp_path, policy_file, capsys):
+    _loosen(policy_file, forbidden_paths='["vault/**"]')
+    repository = _repo(tmp_path, policy_file)
+    _commit(repository, {"vault/key.txt": "k\n"})
+    _loosen(repository / "agentic-sdlc.toml", forbidden_paths="[]")
+    assert _check_diff(repository, policy_file) == 2
+    assert "forbidden paths changed: vault/key.txt" in capsys.readouterr().err
+
+
+def test_check_diff_fails_closed_on_a_missing_or_broken_base_policy(tmp_path, policy_file, capsys):
+    repository = _repo(tmp_path, policy_file)
+    _commit(repository, {"module.py": "VALUE = 2\n"})
+    argv = ["check-diff", "--repository", str(repository), "--base", "main"]
+    assert cli.main([*argv, "--config", "absent.toml"]) == 2
+    assert "absent.toml could not be read from main" in capsys.readouterr().err
+    assert cli.main([*argv, "--config", "../outside.toml"]) == 2
+    assert cli.main([*argv, "--config", str(tmp_path / "elsewhere.toml")]) == 2
+    # the working tree's copy is valid, but main's is not: main's decides
+    (tmp_path / "broken").mkdir()
+    broken = tmp_path / "broken" / "agentic-sdlc.toml"
+    broken.write_text("version = 2\n", encoding="utf-8")
+    repository = _repo(tmp_path / "broken", broken)
+    (repository / "agentic-sdlc.toml").write_bytes(policy_file.read_bytes())
+    _commit(repository, {"module.py": "VALUE = 2\n"})
+    assert _check_diff(repository, policy_file) == 2
+    assert "is not usable" in capsys.readouterr().err
+
+
+def test_check_diff_accepts_the_policy_path_absolute_inside_the_repository(tmp_path, policy_file):
+    repository = _repo(tmp_path, policy_file)
+    _commit(repository, {"module.py": "VALUE = 2\n"})
+    argv = ["check-diff", "--repository", str(repository), "--base", "main"]
+    assert cli.main([*argv, "--config", str(repository / "agentic-sdlc.toml")]) == 0
+
+
+# ----------------------- check-request: content digest, state, committed policy (Codex 5483344896)
+
+
+def test_check_request_prints_the_content_digest(monkeypatch, policy_file, tmp_path, capsys):
+    gh = FakeGh(VALID.format(deps="None"))
+    assert _check_request(monkeypatch, policy_file, gh, tmp_path) == 0
+    digest = cli.request_digest("Do the thing", VALID.format(deps="None"))
+    assert digest.startswith("sha256:") and len(digest) == len("sha256:") + 64
+    assert f"content digest: {digest}" in capsys.readouterr().err
+    assert json.loads((tmp_path / "request.json").read_text())["contentDigest"] == digest
+
+
+def _expect(monkeypatch, policy_file, gh, digest):
+    monkeypatch.setattr(cli, "run_gh", gh)
+    argv = ["check-request", "--project", PROJECT, "--issue", "7", "--config", str(policy_file)]
+    return cli.main([*argv, "--expect-digest", digest])
+
+
+def test_check_request_refuses_a_request_edited_since_its_digest(monkeypatch, policy_file, capsys):
+    """Codex 4241614582: an edit followed by re-applied labels re-authorizes, so the final check
+    compares the content itself with what step 2 checked."""
+    body = VALID.format(deps="None")
+    digest = cli.request_digest("Do the thing", body)
+    assert _expect(monkeypatch, policy_file, FakeGh(body), digest) == 0
+    edited = FakeGh(body.replace("Do the thing.", "Do another thing."))
+    assert _expect(monkeypatch, policy_file, edited, digest) == cli.REQUEST_CHANGED == 5
+    assert "CHANGED: #7" in capsys.readouterr().err
+    retitled = FakeGh(body)
+    retitled.issue["title"] = "Do the thing, differently"
+    assert _expect(monkeypatch, policy_file, retitled, digest) == 5
+    relabelled = FakeGh(body, labels=[*LABELS, "extra"])  # labels are authorized separately
+    assert _expect(monkeypatch, policy_file, relabelled, digest) == 0
+    assert _expect(monkeypatch, policy_file, FakeGh(body), "sha256:not-a-digest") == 5
+
+
+def test_check_request_refuses_a_closed_issue(monkeypatch, policy_file, capsys):
+    gh = FakeGh(VALID.format(deps="None"))
+    gh.issue["state"] = "closed"
+    assert _check_request(monkeypatch, policy_file, gh) == cli.ISSUE_CLOSED == 6
+    assert "CLOSED: #7 is closed" in capsys.readouterr().err
+    gh.issue["state"] = None
+    assert _check_request(monkeypatch, policy_file, gh) == 2
+
+
+def test_check_request_reopened_dependency_stops_the_final_check(monkeypatch, policy_file):
+    """Codex 4241614596: the pre-push re-run sees a dependency reopened after step 2."""
+    body = VALID.format(deps="- #3")
+    digest = cli.request_digest("Do the thing", body)
+    assert _expect(monkeypatch, policy_file, FakeGh(body, states={3: "closed"}), digest) == 0
+    assert _expect(monkeypatch, policy_file, FakeGh(body, states={3: "open"}), digest) == 4
+
+
+def test_check_request_with_base_reads_the_committed_policy(
+    monkeypatch, policy_file, tmp_path, capsys
+):
+    repository = _repo(tmp_path, policy_file)
+    _loosen(repository / "agentic-sdlc.toml", forbidden_task_patterns="[]")  # uncommitted
+    gh = FakeGh("Place a live trade now.\n\n" + VALID.format(deps="None"))
+    monkeypatch.setattr(cli, "run_gh", gh)
+    argv = ["check-request", "--project", PROJECT, "--issue", "7", "--repository", str(repository)]
+    assert cli.main([*argv, "--config", str(repository / "agentic-sdlc.toml")]) == 0  # the trap
+    assert cli.main([*argv, "--config", "agentic-sdlc.toml", "--base", "main"]) == 3
+    assert cli.main([*argv, "--config", "absent.toml", "--base", "main"]) == 2

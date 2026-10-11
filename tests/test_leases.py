@@ -3282,3 +3282,52 @@ def test_cli_renew_fails_unless_this_session_holds_a_live_lease(holder, monkeypa
     assert cli.main(argv) == 2
     assert "ERROR" in capsys.readouterr().err
     assert not any(c[:3] == ("api", "-X", "POST") for c in gh.calls)  # nothing posted
+
+
+# Codex 4241614587: every renewal is also a state check -- an issue closed after the claim (while
+# the routine implements or verifies) stops the renewal steps before the push.
+def test_renew_refuses_a_closed_issue_without_posting():
+    mine = format_claim_marker(Lease(7, "me", "s1", "b", NOW + timedelta(minutes=5)))
+    gh = FakeGh().issue(7, labels=[IN_PROGRESS_LABEL], comments=[mine])
+    gh.issues[7]["state"] = "closed"
+    with pytest.raises(LeaseError, match="is closed; not renewing"):
+        renew(PROJECT, 7, session="s1", ttl_minutes=60, gh=gh, now=NOW)
+    assert not any(c[:3] == ("api", "-X", "POST") for c in gh.calls)
+
+
+@pytest.mark.parametrize(
+    "answer", [RuntimeError("gh: HTTP 502"), "null", "not json", {"state": None}, {"pr": 1}]
+)
+def test_renew_refuses_when_the_issue_state_cannot_be_read(answer):
+    mine = format_claim_marker(Lease(7, "me", "s1", "b", NOW + timedelta(minutes=5)))
+    gh = FakeGh().issue(7, labels=[IN_PROGRESS_LABEL], comments=[mine])
+    issue_path = f"repos/{PROJECT}/issues/7"
+
+    def faulty(args, input=None):
+        if tuple(args) == ("api", issue_path):
+            if isinstance(answer, Exception):
+                raise answer
+            if answer == {"pr": 1}:
+                return json.dumps({"state": "open", "pull_request": {"url": "x"}})
+            return answer if isinstance(answer, str) else json.dumps(answer)
+        return gh(args, input)
+
+    with pytest.raises(LeaseError):
+        renew(PROJECT, 7, session="s1", ttl_minutes=60, gh=faulty, now=NOW)
+    assert not any(c[:3] == ("api", "-X", "POST") for c in gh.calls)
+
+
+def test_cli_renew_fails_once_the_issue_is_closed(monkeypatch, capsys):
+    from agentic_sdlc import cli
+
+    wall = datetime.now(UTC)
+    gh = FakeGh().issue(7, labels=[IN_PROGRESS_LABEL])
+    gh.posted_at = wall
+    lease = Lease(7, "me", "s1", "b", wall + timedelta(hours=1))
+    gh.issues[7]["comments"].append(_comment_row(1, format_claim_marker(lease), wall.isoformat()))
+    monkeypatch.setattr(cli, "run_gh", gh)
+    argv = ["renew", "--project", PROJECT, "--issue", "7", "--session", "s1"]
+    assert cli.main([*argv, "--ttl-minutes", "60"]) == 0  # open: renews
+    gh.issues[7]["state"] = "closed"
+    assert cli.main([*argv, "--ttl-minutes", "60"]) == 2
+    assert "is closed; not renewing" in capsys.readouterr().err
