@@ -215,6 +215,11 @@ Every policy field `onboard` writes from its options -- `[project] id`/`default_
 ONE validator (`POLICY_FIELDS` in `onboard.py`) on both sides: `onboard` refuses a value it
 rejects, and `doctor` fails a policy holding one ("policy values are ones onboard accepts"). So
 `--setup ""` is refused up front instead of writing a profile doctor then calls not ready.
+The generated `forbidden_paths` baseline (`BASE_FORBIDDEN`: workflows, the policy, `.forge/**`,
+`.claude/**`, agent docs, CODEOWNERS, secrets, databases and media) must also survive in the
+EFFECTIVE policy (`load_policy`): a hand edit or merge that drops any entry fails "policy keeps
+every generated forbidden path", naming it (Codex 4241050285). Project-specific entries may be
+removed; `protected_paths` has no generated baseline.
 
 A difference fails "managed files match the generated files" (or, on the default branch,
 "managed files are on the default branch"); re-run `sdlcctl onboard --force`.
@@ -297,7 +302,14 @@ through a link). `onboard --force` rewrites the policy and drops the confirmatio
 - **Runners** are resolved with the same resolver as the public-repository check (local reusable
   workflows followed). A matching self-hosted runner whose `os` is Windows does not count; a
   `runs-on: {group: ...}` target fails, because runner-group membership cannot be verified
-  through the repository API.
+  through the repository API. `doctor --local` runs every runner rule that needs no API too
+  (Codex 4241050282): resolvable targets, Unix/Linux, the `ubuntu-slim` job-time limit, and
+  hosted-label recognition ("runner labels are recognised"), reading each Forge platform call
+  by its `runs_on` input (default `ubuntu-latest`) since the callee is not fetched. Locally a
+  standard GitHub-hosted label or a set naming `self-hosted` passes (whether a runner is
+  registered and online is checked only remotely); a hosted-runner-shaped label GitHub does not
+  host (`ubuntu-99.04`, `macos-99`) without `self-hosted` fails; a larger hosted runner or a
+  custom label set without `self-hosted` is a TODO only remote `doctor` can clear.
 - **Claude Code hooks** are read from the parsed `.claude/settings.json`: a `SessionStart` group
   firing on startup that runs `python3 .claude/hooks/forge_session_start.py`, and a `PreToolUse`
   group whose matcher covers `Bash` running `python3 .claude/hooks/forge_commit_guard.py`. Each
@@ -423,7 +435,14 @@ through a link). `onboard --force` rewrites the policy and drops the confirmatio
   whose code also selects a repository) has an unresolved repository and is refused, whatever
   lease the session holds. Plain `git`, a literal path to it (`/usr/bin/git`) and the wrappers
   the guard parses (`env`, `command`, `exec`, `nice`, `time`, `timeout`, `sudo`, ...) keep their
-  `-C`/`--git-dir`/`GIT_DIR` selectors and are checked against the repository they name.
+  `-C`/`--git-dir`/`GIT_DIR` selectors and are checked against the repository they name. A
+  path-qualified git (`/usr/bin/git`, `./git`, `~/bin/git`, `bin/git`) must be the SAME file as
+  the git a non-writable PATH lookup finds, or a known system git (`/usr/bin/git`, `/bin/git`,
+  `/usr/local/bin/git`, `/opt/homebrew/bin/git`), with neither the file nor any directory
+  traversed to reach it writable by the user (Codex 4241050279); anything else -- a `git`
+  script the session wrote, a link from a writable directory -- is unresolved and refused on
+  every branch, read-only subcommands included. Where those directories are writable (running
+  as root, a user-owned Homebrew prefix) spell it plain `git`.
 - The commit guard reads the shell script files a command runs (Codex 4240526381): `bash x.sh`,
   `sh -e x.sh`, `bash < x.sh`, `source x.sh`, `. x.sh`, and `./x.sh` run directly (a `.sh`/`.bash`
   path, or one whose `#!` line names a shell), and a bare command name that PATH resolves to

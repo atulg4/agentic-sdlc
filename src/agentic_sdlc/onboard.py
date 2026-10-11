@@ -123,6 +123,7 @@ BASE_FORBIDDEN = (
     # case-insensitively (`LOGO.PNG`). SVG is text source, reviewed like code: not listed.
     *(pattern for ext in MEDIA_EXTENSIONS for pattern in (f"*.{ext}", f"**/*.{ext}")),
 )
+FORBIDDEN_BASELINE_CHECK = "policy keeps every generated forbidden path"
 BASE_FORBIDDEN_TASKS = (
     r"\bdeploy\b.{0,40}\bprod",
     r"\b(?:print|return|expose|retrieve)\b.{0,40}\b(?:credential|password|secret|token)",
@@ -6418,6 +6419,159 @@ def _generated_workflows(
     return docs
 
 
+def _runner_target_checks(
+    base: Path,
+    callers: Sequence[Path],
+    platform_repository: str,
+    load_callee: CalleeLoader | None,
+    add: Callable[[Check], None],
+) -> tuple[dict[str, set[str]], RunnerTarget | None, set[str] | None]:
+    """The runner checks that need no GitHub API (Codex 4241050282: `doctor --local` runs them
+    too): every job of every caller -- reusable calls followed, platform calls through
+    `load_callee` -- and ci.yml's `test` job must target Unix (Linux for the Forge workflows),
+    resolvable labels whose hard job-time limit fits the workloads. Returns the remaining label
+    targets (availability is then checked against the repository's runners, remote only), ci.yml's
+    target and its labels."""
+    all_targets: dict[str, RunnerTarget] = {}
+    for caller in callers:
+        all_targets.update(
+            _job_runner_targets(base, caller, platform_repository, load_callee=load_callee)
+        )
+    ci_target = _ci_runs_on(base)
+    ci_labels = ci_target if isinstance(ci_target, set) else None
+    unprovable = {w: why for w, why in all_targets.items() if isinstance(why, str)}
+    label_targets = {w: t for w, t in all_targets.items() if isinstance(t, set)}
+    # (ci.yml's own runner check below reports a Windows CI target.)
+    on_windows = {where: lbls for where, lbls in label_targets.items() if _windows_labels(lbls)}
+    if on_windows:
+        add(
+            Check(
+                "workflows target Unix runners",
+                False,
+                WINDOWS_UNSUPPORTED
+                + ": "
+                + "; ".join(f"{w} {sorted(lbls)}" for w, lbls in sorted(on_windows.items())),
+            )
+        )
+    # Every Forge plan/implement workflow is Linux-only (reusable-implement.yml installs
+    # bubblewrap with apt-get, reusable-plan.yml hashes with GNU sha256sum), in both modes: each
+    # job of every caller, and the runner each hands a platform workflow. Only ci.yml (checked
+    # below) may run on macOS.
+    off_linux = {
+        where: lbls
+        for where, lbls in label_targets.items()
+        if where not in on_windows and not _linux_labels(lbls)
+    }
+    if off_linux:
+        add(
+            Check(
+                "Forge workflows run on Linux runners",
+                False,
+                LINUX_RUNNER_REQUIRED
+                + ": "
+                + "; ".join(f"{w} {sorted(lbls)}" for w, lbls in sorted(off_linux.items())),
+            )
+        )
+    if unprovable:
+        add(
+            Check(
+                "workflow runner targets are verifiable",
+                False,
+                "; ".join(f"{w}: {why}" for w, why in sorted(unprovable.items())),
+            )
+        )
+    # Windows targets are reported above, not as a runner to register.
+    targets = {w: lbls for w, lbls in label_targets.items() if w not in on_windows}
+    # ubuntu-slim kills a job at 15 minutes (Codex 4239397966): a failure, not a runner to
+    # register. ci.yml's own check below reports its test job.
+    too_short = {w: lbls for w, lbls in targets.items() if _short_job_labels(lbls)}
+    if too_short:
+        add(
+            Check(
+                "runners allow the workflows' job timeouts",
+                False,
+                SHORT_JOB_UNSUPPORTED
+                + ": "
+                + "; ".join(f"{w} {sorted(lbls)}" for w, lbls in sorted(too_short.items())),
+            )
+        )
+    targets = {w: lbls for w, lbls in targets.items() if w not in too_short}
+    return targets, ci_target, ci_labels
+
+
+#: A hosted-runner-shaped label (`ubuntu-99.04`, `macos-99`, `windows-2099`): GitHub assigns
+#: these names to its own images, so one GITHUB_HOSTED_LABELS does not list is a typo or an
+#: image that does not exist (or no longer does) -- its job queues forever -- unless the set
+#: also says `self-hosted`.
+_HOSTED_LABEL_SHAPE = re.compile(r"(?i)(?:ubuntu|macos|windows)-[a-z0-9.-]+")
+LOCAL_RUNNER_CHECK = "runner labels are recognised (availability is checked remotely)"
+#: How `doctor --local` models a Forge platform reusable workflow it cannot fetch: the contract
+#: every one of them declares -- a `runs_on` input (JSON, default "ubuntu-latest") that every
+#: job runs on. The real callee at its pin is read in remote mode.
+_LOCAL_PLATFORM_CALLEE = {
+    "on": {
+        "workflow_call": {"inputs": {"runs_on": {"type": "string", "default": '"ubuntu-latest"'}}}
+    },
+    "jobs": {"every-job": {"runs-on": "${{ fromJSON(inputs.runs_on) }}"}},
+}
+
+
+def local_runner_label_check(
+    targets: dict[str, set[str]], ci_labels: set[str] | None
+) -> Check | None:
+    """`doctor --local`'s stand-in for the runner-availability checks: no runner list can be read,
+    so a label set passes only when GitHub hosts it as a standard image or it names
+    `self-hosted` (registration is confirmed by remote doctor). A hosted-runner-shaped label
+    GitHub does not host fails (Codex 4241050282); a larger hosted runner or a custom label
+    set without `self-hosted` is a TODO only remote doctor can clear."""
+    every = dict(targets)
+    if (
+        ci_labels is not None
+        and not _windows_labels(ci_labels)
+        and not _short_job_labels(ci_labels)
+    ):
+        every["ci.yml:test"] = ci_labels
+    unknown: list[str] = []
+    unverified: list[str] = []
+    for where, labels in sorted(every.items()):
+        names = {str(x) for x in labels}
+        if _standard_hosted(names):
+            continue
+        self_hosted = "self-hosted" in {x.lower() for x in names}
+        bogus = sorted(
+            x for x in names if _HOSTED_LABEL_SHAPE.fullmatch(x) and x not in GITHUB_HOSTED_LABELS
+        )
+        if bogus and not self_hosted:
+            unknown.append(f"{where} {sorted(names)} ({', '.join(bogus)})")
+        elif not self_hosted:
+            unverified.append(f"{where} {sorted(names)}")
+    if not every:
+        return None
+    if unknown:
+        return Check(
+            LOCAL_RUNNER_CHECK,
+            False,
+            "not a GitHub-hosted runner label (a job targeting it queues forever): "
+            + "; ".join(unknown)
+            + " → use a current label such as ubuntu-latest, or add `self-hosted` for a runner of "
+            "your own",
+        )
+    if unverified:
+        return Check(
+            LOCAL_RUNNER_CHECK,
+            False,
+            "a larger hosted runner or custom runner labels, which only `sdlcctl doctor` (not "
+            "--local) can match against this repository's runners: " + "; ".join(unverified),
+            manual=True,
+        )
+    return Check(
+        LOCAL_RUNNER_CHECK,
+        True,
+        "standard GitHub-hosted labels or `self-hosted` sets (registration is checked by remote "
+        "doctor)",
+    )
+
+
 def doctor(
     root: str | Path,
     project_id: str,
@@ -6620,6 +6774,26 @@ def doctor(
                 "; ".join(fields)
                 if fields
                 else "provider github, approval labels, implementer and routing paths",
+            )
+        )
+        # Codex 4241050285: the forbidden paths onboarding installs are the control plane
+        # (workflows, the policy, .forge registries, .claude hooks, agent docs) plus secrets,
+        # databases and media. A hand edit or merge that drops one makes that path writable to
+        # every Forge patch, so each must survive into the EFFECTIVE (load_policy) list.
+        # protected_paths has no generated baseline (only what the onboarding spec names).
+        missing = [p for p in BASE_FORBIDDEN if p not in policy.forbidden_paths]
+        add(
+            Check(
+                FORBIDDEN_BASELINE_CHECK,
+                not missing,
+                (
+                    "agentic-sdlc.toml [policy] forbidden_paths no longer contains "
+                    + ", ".join(missing)
+                    + " → restore them (re-run onboard, or add them back by hand): without "
+                    "them Forge patches may change those files"
+                )
+                if missing
+                else f"all {len(BASE_FORBIDDEN)} generated forbidden_paths entries are enforced",
             )
         )
     if policy_doc:
@@ -6875,6 +7049,32 @@ def doctor(
             add(cloud_routine_check(policy_doc))
         if policy is not None:
             add(planner_check(policy_doc))
+        # Codex 4241050282: the runner targets are in the local workflow files (drift masks them
+        # as tunable), so their syntax, hosted labels, Linux and timeout rules are checked here
+        # too; only whether a runner is registered and online needs the API.
+        local_targets, local_ci, local_ci_labels = _runner_target_checks(
+            base, callers, platform_repository, lambda name, sha: _LOCAL_PLATFORM_CALLEE, add
+        )
+        if isinstance(local_ci, str):
+            add(Check("ci.yml test job runs on an available runner", False, local_ci))
+        elif local_ci_labels is not None and (
+            _windows_labels(local_ci_labels) or _short_job_labels(local_ci_labels)
+        ):
+            add(
+                Check(
+                    "ci.yml test job runs on an available runner",
+                    False,
+                    f"labels {sorted(local_ci_labels)}: "
+                    + (
+                        WINDOWS_UNSUPPORTED
+                        if _windows_labels(local_ci_labels)
+                        else SHORT_JOB_UNSUPPORTED
+                    ),
+                )
+            )
+        label_check = local_runner_label_check(local_targets, local_ci_labels)
+        if label_check is not None:
+            add(label_check)
         return rep
 
     # --- platform reachable at that pin, and its reusable workflows accept the generated calls
@@ -7674,70 +7874,9 @@ def doctor(
     # into their own jobs, pinned platform calls through the callee fetched at that SHA;
     # anything it cannot prove (a runner group, an expression, a third-party workflow, an
     # unreadable callee) is a str reason.
-    all_targets: dict[str, RunnerTarget] = {}
-    for caller in callers:
-        all_targets.update(
-            _job_runner_targets(base, caller, platform_repository, load_callee=load_callee)
-        )
-    ci_target = _ci_runs_on(base)
-    ci_labels = ci_target if isinstance(ci_target, set) else None
-    unprovable = {w: why for w, why in all_targets.items() if isinstance(why, str)}
-    label_targets = {w: t for w, t in all_targets.items() if isinstance(t, set)}
-    # (ci.yml's own runner check below reports a Windows CI target.)
-    on_windows = {where: lbls for where, lbls in label_targets.items() if _windows_labels(lbls)}
-    if on_windows:
-        add(
-            Check(
-                "workflows target Unix runners",
-                False,
-                WINDOWS_UNSUPPORTED
-                + ": "
-                + "; ".join(f"{w} {sorted(lbls)}" for w, lbls in sorted(on_windows.items())),
-            )
-        )
-    # Every Forge plan/implement workflow is Linux-only (reusable-implement.yml installs
-    # bubblewrap with apt-get, reusable-plan.yml hashes with GNU sha256sum), in both modes: each
-    # job of every caller, and the runner each hands a platform workflow. Only ci.yml (checked
-    # below) may run on macOS.
-    off_linux = {
-        where: lbls
-        for where, lbls in label_targets.items()
-        if where not in on_windows and not _linux_labels(lbls)
-    }
-    if off_linux:
-        add(
-            Check(
-                "Forge workflows run on Linux runners",
-                False,
-                LINUX_RUNNER_REQUIRED
-                + ": "
-                + "; ".join(f"{w} {sorted(lbls)}" for w, lbls in sorted(off_linux.items())),
-            )
-        )
-    if unprovable:
-        add(
-            Check(
-                "workflow runner targets are verifiable",
-                False,
-                "; ".join(f"{w}: {why}" for w, why in sorted(unprovable.items())),
-            )
-        )
-    # Windows targets are reported above, not as a runner to register.
-    targets = {w: lbls for w, lbls in label_targets.items() if w not in on_windows}
-    # ubuntu-slim kills a job at 15 minutes (Codex 4239397966): a failure, not a runner to
-    # register. ci.yml's own check below reports its test job.
-    too_short = {w: lbls for w, lbls in targets.items() if _short_job_labels(lbls)}
-    if too_short:
-        add(
-            Check(
-                "runners allow the workflows' job timeouts",
-                False,
-                SHORT_JOB_UNSUPPORTED
-                + ": "
-                + "; ".join(f"{w} {sorted(lbls)}" for w, lbls in sorted(too_short.items())),
-            )
-        )
-    targets = {w: lbls for w, lbls in targets.items() if w not in too_short}
+    targets, ci_target, ci_labels = _runner_target_checks(
+        base, callers, platform_repository, load_callee, add
+    )
     need_runners = any(not _standard_hosted(t) for t in [*targets.values(), ci_labels or set()])
     runner_rows = (
         _paged_items(gh, f"repos/{project_id}/actions/runners", "runners") if need_runners else []
