@@ -4986,10 +4986,9 @@ def test_ready_label_accepts_distinct_names(label):
         "a\\b",
     ],
 )
-def test_default_branch_must_be_a_valid_git_branch_name(branch, monkeypatch):
+def test_default_branch_must_be_a_valid_git_branch_name(branch):
     from agentic_sdlc import onboard
 
-    monkeypatch.setattr(onboard, "_git_rejects_branch", lambda name: False)  # the rules alone
     assert onboard.policy_field_problem("default branch", branch)
     with pytest.raises(OnboardError):
         spec(default_branch=branch)
@@ -5002,12 +5001,82 @@ def test_default_branch_accepts_valid_git_branch_names(branch):
     assert policy_field_problem("default branch", branch) == ""
 
 
-def test_default_branch_also_requires_the_installed_git_to_agree(monkeypatch):
+def _git_check_ref_format_branch_rejects(names):
+    """What the real `git check-ref-format --branch` says about each name (True = refuses), run
+    outside any repository so `@{-N}` cannot expand. Skips when no git is installed."""
+    import shutil
+    import subprocess
+
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("git is not installed")
+    env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1"}
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_CEILING_DIRECTORIES"] = "/"
+    return {
+        name: subprocess.run(
+            [git, "check-ref-format", "--branch", name],
+            capture_output=True,
+            env=env,
+            cwd="/",
+            check=False,
+        ).returncode
+        != 0
+        for name in names
+    }
+
+
+def _branch_corpus():
+    import random
+
+    pieces = list("ab./-@{}~^:?*[\\ +!&;'\"$`\u00e9\x7f\x01\t") + [
+        ".lock",
+        "..",
+        "@{",
+        "//",
+        "HEAD",
+        "refs/heads/",
+        "-",
+        "@",
+        "/.",
+        ".lock/",
+    ]
+    rng = random.Random(4243659475)
+    corpus = {"".join(rng.choice(pieces) for _ in range(rng.randint(1, 6))) for _ in range(1500)}
+    corpus.update(GIT_VALID_BRANCHES)
+    corpus.update(["main", "HEAD", "@", "@{-1}", "a.lock", "a/.b", "a/b.", "-x", "a..b", "/a"])
+    return sorted(corpus)
+
+
+def test_branch_rules_agree_with_the_real_git_check_ref_format():
+    """Codex 4243659475: onboard no longer runs `git check-ref-format` (a bare `git` with the
+    caller's whole environment), so the in-process rules must BE git's: every name in a generated
+    corpus gets the same verdict from `policy.git_branch_format_problem` as from the real git."""
+    from agentic_sdlc.policy import git_branch_format_problem
+
+    corpus = _branch_corpus()
+    git = _git_check_ref_format_branch_rejects(corpus)
+    disagree = [n for n in corpus if bool(git_branch_format_problem(n)) != git[n]]
+    assert disagree == []
+    # and the corpus exercises both verdicts
+    assert any(git.values()) and not all(git.values())
+
+
+def test_branch_validation_runs_no_program(monkeypatch):
+    """Codex 4243659475: validating a default branch starts no subprocess at all."""
+    import subprocess
+
     from agentic_sdlc import onboard
 
-    monkeypatch.setattr(onboard, "_git_rejects_branch", lambda name: name == "trunk")
-    assert "check-ref-format" in onboard.policy_field_problem("default branch", "trunk")
-    assert onboard.policy_field_problem("default branch", "main") == ""
+    def refuse(*args, **kwargs):
+        raise AssertionError(f"subprocess started: {args!r}")
+
+    monkeypatch.setattr(subprocess, "run", refuse)
+    monkeypatch.setattr(subprocess, "Popen", refuse)
+    monkeypatch.setenv("GH_TOKEN", "secret-token")
+    assert onboard.policy_field_problem("default branch", "release+next") == ""
+    assert onboard.policy_field_problem("default branch", "a..b")
+    assert not hasattr(onboard, "_git_rejects_branch")
 
 
 # Codex 4205654942: a private platform must admit the consumer as a reusable-workflow caller.

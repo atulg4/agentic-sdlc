@@ -147,3 +147,76 @@ def test_a_gate_runs_as_one_shell_line(tmp_path: Path) -> None:
     assert Path(command[0]).name in {"bash", "sh"}
     with pytest.raises(GateError, match="single line"):
         _single(tmp_path, "true\nfalse")
+
+
+# Codex 4243659485: the gates must run under the interpreter CI installs ([ci] python_version).
+
+
+def _python_config(path: Path, python_version: str | None) -> Path:
+    ci = f'[ci]\npython_version = "{python_version}"\n\n' if python_version else ""
+    path.write_text(
+        ci + '[commands]\ntest = "true"\n\n[verification]\ngates = ["test"]\n',
+        encoding="utf-8",
+    )
+    return path
+
+
+def _fake_python3(directory: Path, version: str) -> None:
+    directory.mkdir()
+    script = directory / "python3"
+    script.write_text(f"#!/bin/sh\necho {version}\n", encoding="utf-8")
+    script.chmod(0o755)
+
+
+def test_gates_run_when_python3_matches_ci_python_version(monkeypatch, tmp_path: Path) -> None:
+    _fake_python3(tmp_path / "bin", "3.12.7")
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:/usr/bin:/bin")
+    report = run_gates(_python_config(tmp_path / "policy.toml", "3.12"), tmp_path)
+    assert report["passed"] is True
+
+
+def test_gates_fail_closed_when_python3_is_another_version(monkeypatch, tmp_path: Path) -> None:
+    _fake_python3(tmp_path / "bin", "3.11.9")
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:/usr/bin:/bin")
+    marker = tmp_path / "ran"
+    config = tmp_path / "policy.toml"
+    config.write_text(
+        '[ci]\npython_version = "3.12.4"\n\n'
+        f'[commands]\ntest = "touch {marker}"\n\n[verification]\ngates = ["test"]\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(GateError, match=r"Python 3\.11\.9.*python_version is 3\.12\.4"):
+        run_gates(config, tmp_path)
+    assert not marker.exists()  # no gate ran
+
+
+def test_gates_fail_closed_without_python3_when_a_version_is_required(
+    monkeypatch, tmp_path: Path
+) -> None:
+    (tmp_path / "empty").mkdir()
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    with pytest.raises(GateError, match="no python3"):
+        run_gates(_python_config(tmp_path / "policy.toml", "3.12"), tmp_path)
+
+
+def test_gates_only_warn_when_ci_python_version_is_unset(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    _fake_python3(tmp_path / "bin", "3.9.1")
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:/usr/bin:/bin")
+    report = run_gates(_python_config(tmp_path / "policy.toml", None), tmp_path)
+    assert report["passed"] is True
+    assert "python_version is not set" in capsys.readouterr().err
+
+
+def test_gates_reject_a_malformed_ci_python_version(tmp_path: Path) -> None:
+    with pytest.raises(GateError, match="python_version"):
+        run_gates(_python_config(tmp_path / "policy.toml", "latest"), tmp_path)
+
+
+def test_the_real_interpreter_is_probed(tmp_path: Path) -> None:
+    from agentic_sdlc.gates import gate_python_version
+
+    found, version = gate_python_version({"PATH": f"{Path(sys.executable).parent}"}, tmp_path)
+    assert version.split(".")[:2] == [str(sys.version_info[0]), str(sys.version_info[1])]
+    assert Path(found).name == "python3"
