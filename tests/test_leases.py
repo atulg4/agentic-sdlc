@@ -82,6 +82,9 @@ class FakeGh:
         self.events: dict[int, list[dict]] = {}  # issue events (assigned, ...)
         self.timeline: dict[int, list[dict]] = {}  # issue timeline (connected, cross-referenced)
         self.link_subjects: dict[str, dict | None] = {}  # connected/disconnected node -> subject
+        # (owner/name, number) -> another repository's PR answer (dict, raw text or exception);
+        # unknown ones answer NOT_FOUND
+        self.external_prs: dict[tuple[str, int], object] = {}
 
     def issue(self, number, labels=(), assignees=(), comments=()):
         self.issues[number] = {
@@ -188,6 +191,17 @@ class FakeGh:
             ids = [a.split("=", 1)[1] for a in args if a.startswith("ids[]=")]
             nodes = [{"subject": self.link_subjects.get(i)} for i in ids]
             return json.dumps({"data": {"nodes": nodes}})
+        if args[:2] == ("api", "graphql") and "pullRequest(number:" in args[3]:
+            values = dict(a.split("=", 1) for a in args[4:] if "=" in a)
+            key = (f"{values['owner']}/{values['name']}", int(values["number"]))
+            answer = self.external_prs.get(key)
+            if isinstance(answer, Exception):
+                raise answer
+            if isinstance(answer, str):
+                return answer
+            if answer is None:
+                return json.dumps({"data": {"repository": None}, "errors": [{"type": "NOT_FOUND"}]})
+            return json.dumps(answer)
         if args[:2] == ("api", "graphql"):
             return json.dumps(_open_prs_page(self.prs, args))
         if args[:2] == ("label", "create"):
@@ -2323,7 +2337,7 @@ def test_a_cross_reference_falls_back_to_the_repository_url():
     "event",
     [
         _xref(62, state="closed"),
-        _xref(62, repo="other/repo"),
+        _xref(62, repo="other/repo", state="closed"),  # closed: never even read
         _xref(62, pull=False),  # mentioned from an issue
         {"event": "commented", "body": "see #7"},
     ],
@@ -2520,3 +2534,106 @@ def test_cli_authorize_labeler_exit_codes(tmp_path, monkeypatch):
     assert ["api", f"repos/{PROJECT}/collaborators/bot%5Bbot%5D/permission"] in calls
     monkeypatch.setattr(cli, "run_gh", _labeler_gh(OSError("down"), perms))
     assert cli.main(base) == 2  # unverifiable: an error, never "authorized"
+
+
+# ---------------------------------------------------------------- Codex 4240306505
+# GitHub closes an issue from a PR in ANOTHER repository (`Fixes owner/repo#7`). That PR is not in
+# this repository's open-PR inventory, so its timeline cross-reference is resolved: an open PR
+# whose closingIssuesReferences name this issue is durable work; an unreadable one fails closed.
+
+
+def _external(state="OPEN", closes=(("owner/repo", 7),), more=False, number=80):
+    return {
+        "data": {
+            "repository": {
+                "pullRequest": {
+                    "state": state,
+                    "url": f"https://x/other/pr/{number}",
+                    "title": "external",
+                    "closingIssuesReferences": {
+                        "pageInfo": {"hasNextPage": more},
+                        "nodes": [
+                            {"number": n, "repository": {"nameWithOwner": repo}}
+                            for repo, n in closes
+                        ],
+                    },
+                }
+            }
+        }
+    }
+
+
+@pytest.mark.parametrize("target", ["owner/repo", "OWNER/Repo"])
+def test_an_open_pr_of_another_repository_that_closes_the_issue_blocks(target):
+    gh = FakeGh().issue(7)
+    gh.timeline[7] = [_xref(80, repo="other/repo"), _xref(80, repo="Other/Repo")]
+    gh.external_prs[("other/repo", 80)] = _external(closes=(("x/y", 7), (target, 7)))
+    result = _claim(gh)
+    assert not result.ok and "other/pr/80" in result.reason
+    assert not any(c[:3] == ("api", "-X", "POST") for c in gh.calls)
+    reads = [c for c in gh.calls if c[:2] == ("api", "graphql") and "pullRequest(number:" in c[3]]
+    assert len(reads) == 1 and "-F" in reads[0] and "number=80" in reads[0]
+
+
+def test_an_external_pr_and_a_same_numbered_local_pr_are_both_reported():
+    from agentic_sdlc.leases import open_prs_for_issue
+
+    gh = FakeGh().issue(7)
+    gh.timeline[7] = [_xref(80), _xref(80, repo="other/repo")]
+    gh.external_prs[("other/repo", 80)] = _external()
+    hits = open_prs_for_issue(PROJECT, 7, gh)
+    assert sorted(h["url"] for h in hits) == ["https://x/other/pr/80", "https://x/pr/80"]
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        _external(closes=(("owner/repo", 8),)),  # another issue of this repository
+        _external(closes=(("other/repo", 7),)),  # issue 7 of its own repository
+        _external(closes=()),  # only mentions the issue
+        _external(state="MERGED"),  # merged since the timeline was read
+        _external(state="CLOSED"),
+    ],
+)
+def test_an_external_pr_that_does_not_close_the_issue_does_not_block(answer):
+    gh = FakeGh().issue(7)
+    gh.timeline[7] = [_xref(81, repo="other/repo")]
+    gh.external_prs[("other/repo", 81)] = answer
+    result = _claim(gh)
+    assert result.ok, result.reason
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        None,  # NOT_FOUND: an inaccessible or deleted repository
+        RuntimeError("gh: HTTP 502"),
+        "not json",
+        {"errors": [{"message": "x"}]},
+        {"data": {"repository": {"pullRequest": None}}},
+        _external(more=True),  # more closing issues than one page
+        {"data": {"repository": {"pullRequest": {"state": "OPEN"}}}},
+        {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "state": "OPEN",
+                        "closingIssuesReferences": {
+                            "pageInfo": {"hasNextPage": False},
+                            "nodes": [{"number": 7}],
+                        },
+                    }
+                }
+            }
+        },
+    ],
+)
+def test_an_unreadable_external_cross_reference_fails_closed_naming_the_pr(answer):
+    gh = FakeGh().issue(7)
+    gh.timeline[7] = [_xref(82, repo="other/repo")]
+    gh.external_prs[("other/repo", 82)] = answer
+    with pytest.raises(LeaseError) as raised:
+        _claim(gh)
+    message = str(raised.value)
+    assert "other/repo#82" in message and "no override" in message
+    assert not any(c[:3] == ("api", "-X", "POST") for c in gh.calls)

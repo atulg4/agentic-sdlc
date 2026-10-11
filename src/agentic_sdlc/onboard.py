@@ -796,7 +796,7 @@ provider = "github"
 default_branch = {_toml_str(spec.default_branch)}
 
 [agents]
-planner = "codex"
+planner = {_toml_str(GENERATED_PLANNER)}
 implementer = {_toml_str(implementer)}
 reviewer = "codex"
 # Where implementation runs: "actions" (agent-implement.yml / agent-auto-implement.yml) or
@@ -844,8 +844,9 @@ def render_agents_md(spec: OnboardSpec) -> str:
 ## Authority
 
 The repository owner defines product intent and remains the final merge authority.
-Codex is the primary architect, planner, and independent reviewer. The routed implementer
-(or Claude Code) may implement an explicitly approved work request only.
+Claude Code is the planner: the plan workflows (`agent-plan.yml`, `agent-auto-plan.yml`) run it
+through the platform's `reusable-plan.yml`. Codex is the independent reviewer. The configured
+implementer may implement an explicitly approved work request only.
 
 ## Required Workflow
 
@@ -964,6 +965,64 @@ CI (`.github/workflows/ci.yml`) provides the `{REQUIRED_CHECK}` check and runs o
 # drops the confirmation: re-check the routine against the new document and confirm again.
 CLOUD_ROUTINE_CHECK = "cloud implementer routine is scheduled"
 CLOUD_ROUTINE_CONFIRMED = "cloud_routine_confirmed"
+
+
+# ---- Planner identity (Codex 4240306502). Every generated plan caller invokes the platform's
+# reusable-plan.yml, whose plan job runs Claude Code (anthropics/claude-code-action), so the
+# policy records the planner as "claude" -- the `[agents]` spelling used for Claude everywhere
+# (`implementer = "claude"`). Nothing in the platform enforces planner != implementer; a Claude
+# implementer therefore also reads "claude", which is simply accurate.
+GENERATED_PLANNER = "claude"
+PLANNER_CHECK = "policy planner matches the plan workflow"
+#: The `[agents]` identity behind each AI action a plan workflow can run (owner/repo of `uses:`).
+PLAN_AGENT_ACTIONS = {
+    "anthropics/claude-code-action": "claude",
+    "openai/codex-action": "codex",
+}
+
+
+def plan_workflow_agents(doc: object) -> set[str]:
+    """The `[agents]` identities of the AI actions `doc` (a parsed workflow) runs in any step.
+    Non-mapping jobs and steps are skipped: they run nothing."""
+    jobs = doc.get("jobs") if isinstance(doc, dict) else None
+    found: set[str] = set()
+    for job in jobs.values() if isinstance(jobs, dict) else ():
+        steps = job.get("steps") if isinstance(job, dict) else None
+        for step in steps if isinstance(steps, list) else ():
+            uses = step.get("uses") if isinstance(step, dict) else None
+            action = str(uses or "").strip().split("@", 1)[0].lower()
+            if action in PLAN_AGENT_ACTIONS:
+                found.add(PLAN_AGENT_ACTIONS[action])
+    return found
+
+
+def planner_check(policy_doc: object, plan_doc: object = None) -> Check:
+    """`[agents] planner` must name the agent the plan workflow actually runs: the agent found
+    in `plan_doc` (reusable-plan.yml as fetched at the pin) when given, else the one the
+    generated callers invoke (GENERATED_PLANNER)."""
+    agents = policy_doc.get("agents") if isinstance(policy_doc, dict) else None
+    planner = agents.get("planner") if isinstance(agents, dict) else None
+    if plan_doc is None:
+        runs, where = {GENERATED_PLANNER}, "the generated plan callers' reusable-plan.yml"
+    else:
+        runs, where = plan_workflow_agents(plan_doc), "reusable-plan.yml at the pinned ref"
+    if not runs:
+        return Check(
+            PLANNER_CHECK,
+            False,
+            f"{where} runs no known agent action ({', '.join(sorted(PLAN_AGENT_ACTIONS))}), so "
+            f"[agents] planner = {planner!r} cannot be verified",
+        )
+    if planner in runs:
+        return Check(PLANNER_CHECK, True, f"[agents] planner = {planner!r} ({where})")
+    return Check(
+        PLANNER_CHECK,
+        False,
+        f"[agents] planner = {planner!r}, but {where} runs "
+        + " and ".join(repr(a) for a in sorted(runs))
+        + f" → set planner = {sorted(runs)[0]!r} in agentic-sdlc.toml (or re-run "
+        "`sdlcctl onboard --force`)",
+    )
 
 
 def cloud_routine_check(policy_doc: object) -> Check:
@@ -4100,7 +4159,8 @@ def _preflight_requirements(callers: Sequence[Path]) -> tuple[set[str], set[str]
     secrets: set[str] = set()
     variables: set[str] = set()
     for caller in callers:
-        for step in (_workflow_jobs(caller).get("preflight") or {}).get("steps") or []:
+        steps = (_workflow_jobs(caller).get("preflight") or {}).get("steps")
+        for step in steps if isinstance(steps, list) else ():
             if not isinstance(step, dict):
                 continue
             # The parsed commands, not the text: a comment or an echo checks nothing. Any
@@ -4727,7 +4787,7 @@ def reusable_workflow_limit_problems(
         others: set[str] = set()
         jobs = doc.get("jobs") if isinstance(doc, dict) else None
         for job in jobs.values() if isinstance(jobs, dict) else ():
-            uses = str((job or {}).get("uses", "") if isinstance(job, dict) else "").strip()
+            uses = str((job.get("uses") or "") if isinstance(job, dict) else "").strip()
             if uses and not any(uses.split("@")[0].endswith(f"/{c}") for c, _ in roots):
                 others.add(uses)
         count = len(graph.reachable(roots)) + len(others)
@@ -5865,10 +5925,14 @@ def _first_difference(want: object, have: object, path: str = "") -> str | None:
 
 
 def _caller_pin(doc: dict, platform_repository: str) -> str | None:
-    """The SHA the caller's first platform reusable-workflow call is pinned to."""
-    jobs = doc.get("jobs")
+    """The SHA the caller's first platform reusable-workflow call is pinned to. A job that is not
+    a mapping (null, a scalar, a list: a botched merge) calls nothing and is skipped, as in
+    `_workflow_jobs()`; the drift check reports it (Codex 4240306501)."""
+    jobs = doc.get("jobs") if isinstance(doc, dict) else None
     for job in jobs.values() if isinstance(jobs, dict) else ():
-        found = _REMOTE_REUSABLE.fullmatch(str((job or {}).get("uses", "")).strip())
+        if not isinstance(job, dict):
+            continue
+        found = _REMOTE_REUSABLE.fullmatch(str(job.get("uses") or "").strip())
         if found and found.group(1) == platform_repository and _SHA.fullmatch(found.group(3)):
             return found.group(3)
     return None
@@ -6635,6 +6699,12 @@ def doctor(
             )
         )
     if not remote:
+        # Codex 4240306498: the routine confirmation is local policy state, not a GitHub API
+        # check, so `--local` must not report an unconfirmed cloud-routine repo READY.
+        if cloud:
+            add(cloud_routine_check(policy_doc))
+        if policy is not None:
+            add(planner_check(policy_doc))
         return rep
 
     # --- platform reachable at that pin, and its reusable workflows accept the generated calls
@@ -6664,8 +6734,10 @@ def doctor(
         for label, doc in caller_docs:
             jobs = doc.get("jobs") if isinstance(doc, dict) else None
             for job_name, job in jobs.items() if isinstance(jobs, dict) else ():
-                found = _REMOTE_REUSABLE.fullmatch(str((job or {}).get("uses", "")).strip())
-                if isinstance(job, dict) and found and found.group(1) == platform_repository:
+                if not isinstance(job, dict):
+                    continue  # not a call; the drift and runner checks report the job
+                found = _REMOTE_REUSABLE.fullmatch(str(job.get("uses") or "").strip())
+                if found and found.group(1) == platform_repository:
                     calls.append((f"{label}:{job_name}", job, found.group(2)))
                     if found.group(2) not in probes:
                         probes.append(found.group(2))
@@ -6695,6 +6767,9 @@ def doctor(
                 callees[name] = yaml.safe_load(raw.decode("utf-8", "replace"))
             except yaml.YAMLError:
                 callees[name] = None
+        if policy is not None:
+            fetched_plan = callees.get("reusable-plan.yml")
+            add(planner_check(policy_doc, fetched_plan if isinstance(fetched_plan, dict) else None))
         add(
             Check(
                 "platform ref reachable (reusable workflows exist at pin)",
@@ -6778,6 +6853,8 @@ def doctor(
         )
     else:
         load_callee = platform_callee_loader(gh, platform_repository, {})
+        if policy is not None:
+            add(planner_check(policy_doc))
 
     # --- a private platform must also admit this repository as a caller (Actions access)
     if repo_info is None:

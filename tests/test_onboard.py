@@ -715,6 +715,11 @@ def test_cli_onboard_and_doctor_local(tmp_path, monkeypatch, capsys):
     result = json.loads(out.read_text())
     assert result["platform_ref"] == SHA and "agentic-sdlc.toml" in result["written"]
     assert (repo / "docs/forge/cloud-implementer.md").exists()
+    # Codex 4240306498: NOT READY under --local until the owner confirms the routine
+    capsys.readouterr()
+    assert main(["doctor", "--destination", str(repo), "--local"]) == 2
+    assert "sdlcctl confirm-cloud-routine" in capsys.readouterr().out
+    assert main(["confirm-cloud-routine", "--destination", str(repo)]) == 0
     assert main(["doctor", "--destination", str(repo), "--local"]) == 0
     assert "READY" in capsys.readouterr().out
     # second run without --force refuses to clobber
@@ -848,6 +853,53 @@ def test_commit_guard_matches_a_lease_only_on_the_exact_session_id(tmp_path):
     assert guard.payload_session({"session_id": 1}) == ""
 
 
+_BAD_HOOK_PAYLOADS = [
+    pytest.param("", id="empty"),
+    pytest.param('{"tool_name": "Bash", "tool_input": {"command": "git com', id="truncated"),
+    pytest.param("not json", id="not-json"),
+    pytest.param("[]", id="list"),
+    pytest.param('"Bash"', id="string"),
+    pytest.param("null", id="null"),
+    pytest.param("{}", id="no-tool"),
+    pytest.param('{"tool_name": 7}', id="tool-not-string"),
+    pytest.param('{"tool_name": "Bash"}', id="bash-no-input"),
+    pytest.param('{"tool_name": "Bash", "tool_input": "git commit"}', id="input-not-object"),
+    pytest.param('{"tool_name": "Bash", "tool_input": {}}', id="bash-no-command"),
+    pytest.param('{"tool_name": "Bash", "tool_input": {"command": ["git"]}}', id="command-list"),
+    pytest.param(
+        '{"tool_name": "Bash", "tool_input": {"command": "git commit"}, "cwd": 3}', id="cwd-int"
+    ),
+]
+
+
+@pytest.mark.parametrize("stdin", _BAD_HOOK_PAYLOADS)
+def test_commit_guard_blocks_a_payload_it_cannot_read(tmp_path, monkeypatch, capsys, stdin):
+    """Codex 4240306495: a malformed hook payload used to exit 0 (allow) before any analysis,
+    so an unguarded git command could run on an issue branch. It now blocks with a reason."""
+    import io
+
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    monkeypatch.setattr(guard, "lease_for", lambda n: None)
+    monkeypatch.setattr(guard.sys, "stdin", io.StringIO(stdin))
+    assert guard.main() == 2
+    err = capsys.readouterr().err
+    assert "Forge guard: the PreToolUse hook payload" in err and "fail closed" in err
+
+
+def test_commit_guard_lets_another_tool_through_unread(tmp_path, monkeypatch, capsys):
+    import io
+
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    for payload in (
+        {"tool_name": "Edit", "tool_input": {"file_path": "x"}},
+        {"tool_name": "Read", "tool_input": "anything"},
+        {"tool_name": "Bash", "session_id": "s1", "tool_input": {"command": "ls"}},
+    ):
+        monkeypatch.setattr(guard.sys, "stdin", io.StringIO(json.dumps(payload)))
+        assert guard.main() == 0
+    assert capsys.readouterr().err == ""
+
+
 @pytest.mark.parametrize("session_field", _NO_SESSION)
 def test_session_start_claims_no_lease_without_a_usable_session_id(
     tmp_path, monkeypatch, session_field
@@ -867,7 +919,7 @@ def test_session_start_claims_no_lease_without_a_usable_session_id(
     leases = {5: {"session": "123"}}
 
     def run(cmd):
-        return json.dumps(issues) if cmd[:3] == ["gh", "issue", "list"] else ""
+        return json.dumps(issues) if _is_issue_page(cmd) else ""
 
     monkeypatch.setattr(start, "run", run)
     monkeypatch.setattr(start, "_lease_lookup", lambda: leases.get)
@@ -1295,6 +1347,11 @@ def test_commit_guard_does_not_let_a_lapsed_session_regain_seniority(tmp_path, m
     assert guard.lease_for(7)["session"] == "new"
 
 
+def _is_issue_page(cmd) -> bool:
+    """A session-start read of one page of the open in-progress issues (REST)."""
+    return cmd[:2] == ["gh", "api"] and "/issues?state=open&labels=in-progress" in cmd[2]
+
+
 def _guard_module(tmp_path, name):
     import importlib.util
 
@@ -1505,7 +1562,7 @@ def test_session_start_reports_its_own_lease_apart_from_other_agents(tmp_path, m
     assert stale == []
 
     def run(cmd):
-        return json.dumps(issues) if cmd[:3] == ["gh", "issue", "list"] else ""
+        return json.dumps(issues) if _is_issue_page(cmd) else ""
 
     monkeypatch.setattr(start, "run", run)
     monkeypatch.setattr(start, "_lease_lookup", lambda: leases.get)
@@ -1524,11 +1581,100 @@ def test_session_start_lists_every_in_progress_issue_not_the_default_30(tmp_path
 
     start = _guard_module(tmp_path, "forge_session_start")
     calls = []
-    monkeypatch.setattr(start, "run", lambda cmd: calls.append(cmd) or "")
+    monkeypatch.setattr(start, "run", lambda cmd: calls.append(cmd) or "[]")
     monkeypatch.setattr(start.sys, "stdin", io.StringIO("{}"))
     assert start.main() == 0
-    listing = next(c for c in calls if c[:3] == ["gh", "issue", "list"])
-    assert "--limit" in listing and int(listing[listing.index("--limit") + 1]) >= 1000
+    listing = next(c for c in calls if _is_issue_page(c))
+    assert "per_page=100" in listing[2] and "page=1" in listing[2]
+
+
+def _issue_rows(first: int, count: int) -> list:
+    return [{"number": n, "title": f"t{n}", "assignees": []} for n in range(first, first + count)]
+
+
+def _run_session_start(start, monkeypatch, pages, leases=None):
+    """Run main() with the in-progress listing served from `pages` (page number -> JSON text or
+    None); returns (stdout, the page numbers requested)."""
+    import io
+
+    asked = []
+
+    def run(cmd):
+        if _is_issue_page(cmd):
+            page = int(cmd[2].rsplit("page=", 1)[1])
+            asked.append(page)
+            return pages(page)
+        return ""
+
+    monkeypatch.setattr(start, "run", run)
+    monkeypatch.setattr(start, "_lease_lookup", lambda: (leases or {}).get)
+    monkeypatch.setattr(start.sys, "stdin", io.StringIO(json.dumps({"session_id": "me"})))
+    out = io.StringIO()
+    monkeypatch.setattr(start.sys, "stdout", out)
+    assert start.main() == 0
+    return out.getvalue(), asked
+
+
+def test_session_start_paginates_past_a_thousand_leases(tmp_path, monkeypatch):
+    """Codex 4240306503: `gh issue list --limit 1000` silently dropped every lease past the
+    1000th. The REST listing is read page by page until a short page; PRs are skipped."""
+    start = _guard_module(tmp_path, "forge_session_start")
+    rows = {p: _issue_rows(1 + (p - 1) * 100, 100) for p in range(1, 12)}
+    rows[12] = _issue_rows(1101, 7) + [{"number": 9999, "title": "pr", "pull_request": {}}]
+    leases = {n: {"session": "other"} for n in range(1, 1108)}
+    text, asked = _run_session_start(
+        start, monkeypatch, lambda p: json.dumps(rows.get(p, [])), leases
+    )
+    assert asked == list(range(1, 13))
+    others = text.split("other agents (do NOT work on these):\n")[1].split("[Forge]")[0]
+    assert "#1107 t1107" in others and "#1001 t1001" in others and "#9999" not in others
+    assert "INCOMPLETE" not in text and "lease inventory unavailable" not in text
+
+
+@pytest.mark.parametrize("failure", ["unreadable", "cap"])
+def test_session_start_says_the_lease_inventory_is_incomplete(tmp_path, monkeypatch, failure):
+    """Codex 4240306503: a later page that cannot be read, or the page cap reached with pages
+    still full, is reported as an INCOMPLETE inventory -- never as the whole list."""
+    start = _guard_module(tmp_path, "forge_session_start")
+    if failure == "unreadable":
+
+        def pages(p):
+            return json.dumps(_issue_rows(1 + (p - 1) * 100, 100)) if p == 1 else None
+
+    else:
+
+        def pages(p):
+            return json.dumps(_issue_rows(1 + (p - 1) * 100, 100))
+
+    leases = {n: {"session": "other"} for n in range(1, 100 * start.ISSUE_PAGE_CAP + 1)}
+    text, asked = _run_session_start(start, monkeypatch, pages, leases)
+    every_page = list(range(1, start.ISSUE_PAGE_CAP + 1))
+    assert asked == ([1, 2] if failure == "unreadable" else every_page)
+    assert "lease inventory INCOMPLETE" in text and "sdlcctl claims" in text
+    others = text.split("other agents (do NOT work on these):\n")[1].split("[Forge]")[0]
+    assert "#1 t1" in others and "INCOMPLETE" in others and "  none" not in others
+
+
+@pytest.mark.parametrize("stdin", ["", "not json", "[1, 2]", '"text"', "null", '{"session_id"'])
+def test_session_start_reports_an_unreadable_payload_without_failing(tmp_path, monkeypatch, stdin):
+    """A SessionStart payload that is not a JSON object never blocks or crashes the session; it
+    is reported, and no lease is taken as this session's."""
+    import io
+
+    start = _guard_module(tmp_path, "forge_session_start")
+    monkeypatch.setattr(
+        start,
+        "run",
+        lambda cmd: json.dumps(_issue_rows(5, 1)) if _is_issue_page(cmd) else "",
+    )
+    monkeypatch.setattr(start, "_lease_lookup", lambda: {5: {"session": ""}}.get)
+    monkeypatch.setattr(start.sys, "stdin", io.StringIO(stdin))
+    out = io.StringIO()
+    monkeypatch.setattr(start.sys, "stdout", out)
+    assert start.main() == 0
+    text = out.getvalue()
+    assert "could not read the SessionStart hook payload" in text
+    assert "Your current lease" not in text and "#5 t5" in text
 
 
 @pytest.mark.parametrize("fetch_ok", [True, False])
@@ -1547,7 +1693,7 @@ def test_session_start_warns_when_origin_cannot_be_fetched(tmp_path, monkeypatch
             return "3"
         if cmd[:2] == ["git", "log"]:
             return "abc1234 cached commit"
-        return "[]" if cmd[:3] == ["gh", "issue", "list"] else ""
+        return "[]" if _is_issue_page(cmd) else ""
 
     monkeypatch.setattr(start, "run", run)
     monkeypatch.setattr(start, "_lease_lookup", lambda: {}.get)
@@ -4358,6 +4504,13 @@ def test_onboard_rejects_or_doctor_is_green(tmp_path, field, value, implementer)
         return
     repo = _repo(tmp_path)
     write_onboarding(repo, built)
+    if built.implementer == "cloud-routine":
+        # Codex 4240306498: an unconfirmed routine is NOT READY under --local too
+        from agentic_sdlc.onboard import confirm_cloud_routine
+
+        report = doctor(repo, built.project_id, "owner/agentic-sdlc", FakeGh(), remote=False)
+        assert set(_failed(report)) == {"cloud implementer routine is scheduled"}
+        confirm_cloud_routine(repo)
     report = doctor(repo, built.project_id, "owner/agentic-sdlc", FakeGh(), remote=False)
     assert report.ok, report.render()
 
@@ -4701,9 +4854,7 @@ def test_session_start_lists_an_unreadable_lease_as_held(tmp_path, monkeypatch):
     live, stale, mine = start.classify_leased(issues, lambda n: {"unavailable": True})
     assert [x.split()[0] for x in live] == ["#4"] and "treat as held" in live[0]
     assert stale == [] and mine == []
-    monkeypatch.setattr(
-        start, "run", lambda cmd: json.dumps(issues) if cmd[:3] == ["gh", "issue", "list"] else ""
-    )
+    monkeypatch.setattr(start, "run", lambda cmd: json.dumps(issues) if _is_issue_page(cmd) else "")
     monkeypatch.setattr(start, "_lease_lookup", lambda: lambda n: {"unavailable": True})
     monkeypatch.setattr(start.sys, "stdin", io.StringIO("{}"))
     out = io.StringIO()
@@ -9591,3 +9742,163 @@ def test_remote_workflow_set_skips_symlinks_and_directories():
     _remote_workflows(gh, {"ci.yml": "on: push\njobs: {}\n"})
     remote, why = remote_workflow_files(gh, "owner/comic", "main")
     assert remote is not None and set(remote) == {"ci.yml"}, why
+
+
+# ---------------------------------------------------------------- Codex 4240306498
+
+
+def test_doctor_local_reports_an_unconfirmed_cloud_routine_not_ready(tmp_path):
+    """Codex 4240306498: `doctor --local` returned before the routine-confirmation check, so a
+    fresh cloud-routine repo with no confirmed worker read READY. The confirmation is local
+    policy state: it is checked in local mode too."""
+    from agentic_sdlc.onboard import confirm_cloud_routine
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(implementer="cloud-routine", runs_on=("ubuntu-latest",)))
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    failed = _failed(report)
+    assert set(failed) == {"cloud implementer routine is scheduled"}, report.render()
+    assert failed["cloud implementer routine is scheduled"].manual and not report.ok
+    confirm_cloud_routine(repo)
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    assert report.ok, report.render()
+    # an Actions-mode repo has no routine to confirm
+    other = _repo(tmp_path / "actions")
+    write_onboarding(other, spec())
+    local = doctor(other, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    assert all(c.name != "cloud implementer routine is scheduled" for c in local.checks)
+
+
+# ---------------------------------------------------------------- Codex 4240306502
+
+PLANNER_CHECK_NAME = "policy planner matches the plan workflow"
+
+
+@pytest.mark.parametrize("implementer", ["route", "claude", "codex", "cloud-routine"])
+def test_generated_policy_and_guides_name_claude_as_the_planner(implementer):
+    """Codex 4240306502: every generated plan caller runs the platform's reusable-plan.yml, whose
+    plan job runs Claude Code -- the policy and the agent guides must say so, not Codex."""
+    files = render_onboarding(spec(implementer=implementer))
+    policy = tomllib.loads(files["agentic-sdlc.toml"])
+    assert policy["agents"]["planner"] == "claude"
+    assert policy["agents"]["reviewer"] == "codex"
+    guide = files["AGENTS.md"]
+    assert "Claude Code is the planner" in guide and "Codex is the independent reviewer" in guide
+    assert "Codex is the primary architect, planner" not in guide
+    plan = yaml.safe_load((PLATFORM_WORKFLOWS / "reusable-plan.yml").read_text())
+    from agentic_sdlc.onboard import plan_workflow_agents
+
+    assert plan_workflow_agents(plan) == {"claude"}
+
+
+def test_doctor_fails_a_planner_that_does_not_match_the_plan_workflow(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    assert report.checks and PLANNER_CHECK_NAME not in _failed(report)
+    assert any(c.name == PLANNER_CHECK_NAME for c in report.checks)
+    toml = repo / "agentic-sdlc.toml"
+    toml.write_text(toml.read_text().replace('planner = "claude"', 'planner = "codex"'))
+    for remote in (False, True):
+        gh = _healthy_gh() if remote else FakeGh()
+        report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh, remote=remote)
+        failed = _failed(report)
+        assert PLANNER_CHECK_NAME in failed and not report.ok, report.render()
+        assert "planner = 'codex'" in failed[PLANNER_CHECK_NAME].detail
+        assert "'claude'" in failed[PLANNER_CHECK_NAME].detail
+
+
+def test_doctor_reads_the_planner_from_the_plan_workflow_at_the_pin(tmp_path):
+    """Online, the planner is compared with the reusable-plan.yml actually fetched at the pin."""
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    text = (PLATFORM_WORKFLOWS / "reusable-plan.yml").read_text()
+    swapped = re.sub(r"anthropics/claude-code-action@\S+", "openai/codex-action@" + SHA, text)
+    assert swapped != text
+    gh = _healthy_gh()
+    gh.answers[PLATFORM_CONTENTS + ".github/workflows/reusable-plan.yml"] = _blob(swapped.encode())
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))
+    assert PLANNER_CHECK_NAME in failed
+    assert "runs 'codex'" in failed[PLANNER_CHECK_NAME].detail
+    assert "at the pinned ref" in failed[PLANNER_CHECK_NAME].detail
+
+
+# ---------------------------------------------------------------- Codex 4240306501
+
+
+def _break_workflow(repo: Path, name: str, mutate) -> None:
+    path = repo / ".github/workflows" / name
+    doc = yaml.safe_load(path.read_text())
+    mutate(doc)
+    path.write_text(yaml.safe_dump(doc))
+
+
+def _first_job(doc: dict) -> str:
+    return next(iter(doc["jobs"]))
+
+
+def _set_job(value):
+    def mutate(doc):
+        doc["jobs"][_first_job(doc)] = value
+
+    return mutate
+
+
+def _set_job_field(field, value):
+    def mutate(doc):
+        for job in doc["jobs"].values():
+            job[field] = value
+
+    return mutate
+
+
+def _set_steps_items(value):
+    def mutate(doc):
+        for job in doc["jobs"].values():
+            if isinstance(job.get("steps"), list) and job["steps"]:
+                job["steps"][0] = value
+
+    return mutate
+
+
+_MALFORMED = [
+    pytest.param(_set_job(None), id="job-null"),
+    pytest.param(_set_job("x"), id="job-string"),
+    pytest.param(_set_job(7), id="job-int"),
+    pytest.param(_set_job(["a"]), id="job-list"),
+    pytest.param(_set_job_field("steps", "x"), id="steps-string"),
+    pytest.param(_set_job_field("steps", 7), id="steps-int"),
+    pytest.param(_set_job_field("steps", None), id="steps-null"),
+    pytest.param(_set_steps_items(None), id="step-null"),
+    pytest.param(_set_steps_items("x"), id="step-string"),
+    pytest.param(_set_job_field("with", "x"), id="with-string"),
+    pytest.param(_set_job_field("secrets", 7), id="secrets-int"),
+]
+
+
+@pytest.mark.parametrize("remote", [False, True])
+@pytest.mark.parametrize("name", ["agent-plan.yml", "agent-implement.yml", "ci.yml"])
+@pytest.mark.parametrize("mutate", _MALFORMED)
+def test_doctor_completes_not_ready_on_scalar_or_null_jobs_and_steps(
+    tmp_path, remote, name, mutate
+):
+    """Codex 4240306501: a scalar/null job crashed the workflow pin extraction with an
+    AttributeError before doctor could report anything. Every malformed job, step list, step,
+    `with:` or `secrets:` is now a FAIL: doctor completes and the repo is NOT READY."""
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    _break_workflow(repo, name, mutate)
+    gh = _healthy_gh() if remote else FakeGh()
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh, remote=remote)
+    assert not report.ok, report.render()
+    report.render()  # renders without a traceback too
+
+
+def test_caller_pin_skips_non_mapping_jobs():
+    from agentic_sdlc.onboard import _caller_pin
+
+    call = {"uses": f"owner/agentic-sdlc/.github/workflows/reusable-plan.yml@{SHA}"}
+    doc = {"jobs": {"a": None, "b": "x", "c": 7, "d": ["a"], "e": call}}
+    assert _caller_pin(doc, "owner/agentic-sdlc") == SHA
+    assert _caller_pin({"jobs": {"a": "x"}}, "owner/agentic-sdlc") is None
+    assert _caller_pin({"jobs": "x"}, "owner/agentic-sdlc") is None
