@@ -228,3 +228,40 @@ def test_the_claim_step_trusts_the_scaffolded_publisher_bot(tmp_path: Path, monk
         assert leases.trusted_bot("consumer-publisher[bot]")
     finally:
         leases.use_policy_bot_logins("")
+
+
+@pytest.mark.parametrize("branch", ["a..b", ".topic", "foo.lock", "team/.hidden", "x/", "a b"])
+def test_scaffold_refuses_a_branch_the_policy_loader_rejects(tmp_path: Path, branch: str) -> None:
+    """Codex 4243550478: scaffold applies `policy.branch_name_problem`, so it cannot write a
+    policy every later load refuses, and refuses before writing anything."""
+    repository = _repository(tmp_path)
+    with pytest.raises(ScaffoldError, match="default branch"):
+        scaffold_project(
+            repository,
+            provider="github",
+            project_id="owner/consumer",
+            platform_repository="owner/agentic-sdlc",
+            platform_ref="b" * 40,
+            default_branch=branch,
+        )
+    assert not (repository / "agentic-sdlc.toml").exists()
+    assert not (repository / ".github").exists()
+
+
+@pytest.mark.parametrize("branch", ["main", "release+next", "feature@two", "release/2026.10"])
+def test_scaffold_accepts_every_branch_the_policy_loader_accepts(
+    tmp_path: Path, branch: str
+) -> None:
+    from agentic_sdlc.policy import load_policy
+
+    repository = _repository(tmp_path)
+    scaffold_project(
+        repository,
+        provider="github",
+        project_id="owner/consumer",
+        platform_repository="owner/agentic-sdlc",
+        platform_ref="b" * 40,
+        default_branch=branch,
+    )
+    policy = load_policy(repository / "agentic-sdlc.toml")
+    assert policy.default_branch == branch

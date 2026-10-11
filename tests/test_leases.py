@@ -3844,6 +3844,47 @@ def test_renew_refuses_when_the_open_pr_inventory_cannot_be_read():
     assert not any(c[:3] == ("api", "-X", "POST") for c in gh.calls)
 
 
+# Codex 4243550483: `claim` by the session that holds the live lease renews it, and that path
+# runs the same open-PR inventory check `renew` does, refusing the same way before posting.
+@pytest.mark.parametrize("how", ["closing-reference", "linked", "cross-referenced"])
+def test_claim_renewal_refuses_once_the_issue_has_an_open_pr(how):
+    mine = format_claim_marker(Lease(7, "me", "s1", "b", NOW + timedelta(minutes=5)))
+    gh = FakeGh().issue(7, labels=[IN_PROGRESS_LABEL], comments=[mine])
+    if how == "closing-reference":
+        gh.prs = [{"number": 20, "url": "https://x/pr/20", "body": "Fixes #7", "title": "t"}]
+    elif how == "linked":
+        gh.timeline[7] = [_link_event("connected", "CE_1")]
+        gh.link_subjects["CE_1"] = _pr_subject(20, repo=PROJECT)
+    else:
+        gh.timeline[7] = [_xref(20, repo=PROJECT)]
+    result = claim(PROJECT, 7, agent="me", session="s1", branch="b", ttl_minutes=60, gh=gh, now=NOW)
+    assert not result.ok and not result.renewed
+    assert "already has an open pull request" in result.reason
+    assert "not renewing" in result.reason
+    with pytest.raises(LeaseError) as caught:
+        renew(PROJECT, 7, session="s1", ttl_minutes=60, gh=gh, now=NOW)
+    assert str(caught.value) == result.reason
+    assert not any(c[:3] == ("api", "-X", "POST") for c in gh.calls)
+    assert len(gh.issues[7]["comments"]) == 1
+
+
+def test_claim_renewal_refuses_when_the_open_pr_inventory_cannot_be_read():
+    mine = format_claim_marker(Lease(7, "me", "s1", "b", NOW + timedelta(minutes=5)))
+    gh = FakeGh().issue(7, labels=[IN_PROGRESS_LABEL], comments=[mine])
+
+    def faulty(args, input=None):
+        if tuple(args[:2]) == ("api", "graphql") and "pullRequests" in " ".join(args):
+            raise RuntimeError("gh: HTTP 502")
+        return gh(args, input)
+
+    result = claim(
+        PROJECT, 7, agent="me", session="s1", branch="b", ttl_minutes=60, gh=faulty, now=NOW
+    )
+    assert not result.ok and "open pull requests could not be read" in result.reason
+    assert not any(c[:3] == ("api", "-X", "POST") for c in gh.calls)
+    assert len(gh.issues[7]["comments"]) == 1
+
+
 # ---------------------------------------------------------------- Codex 4243386515
 # "No committed policy" is GitHub's 404 ANSWER, never a "404" in the message: a repository or
 # default branch literally named `404` echoes it in every request path, so a 403, 5xx or timeout
