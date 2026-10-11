@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 
 from .leases import publisher_bot_login_problem
+from .policy import branch_name_problem
 
 
 class ScaffoldError(ValueError):
@@ -142,8 +143,12 @@ def scaffold_project(
         raise ScaffoldError("project identifiers must use namespace/name format")
     if not _SHA.fullmatch(platform_ref):
         raise ScaffoldError("platform ref must be an immutable 40-character commit SHA")
-    if not re.fullmatch(r"[A-Za-z0-9._/-]+", default_branch):
-        raise ScaffoldError("default branch contains unsupported characters")
+    # The same rule the policy loader applies (Codex 4243550478): a name the old character-class
+    # check let through (`a..b`, `.topic`, `foo.lock`) scaffolded a policy every later load
+    # rejected, and names the loader accepts (`release+next`) were refused here.
+    problem = branch_name_problem(default_branch)
+    if problem:
+        raise ScaffoldError(f"default branch {problem}")
     if automation_level not in {1, 2, 3}:
         raise ScaffoldError("automation level must be 1, 2, or 3")
     if publisher_bot_login:

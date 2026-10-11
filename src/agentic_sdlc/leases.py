@@ -1522,6 +1522,14 @@ def claim(
                     f"on {existing.branch} until {_iso(existing.expires)}"
                 ),
             )
+        # A claim that renews this session's live lease is a renewal and checks what `renew`
+        # checks (Codex 4243550483): the issue is open (read above) and has no open pull
+        # request -- the same inventory, refused the same way, an unreadable one included --
+        # before anything is posted.
+        try:
+            _require_no_open_pr(project, issue, gh)
+        except LeaseError as exc:
+            return ClaimResult(False, existing, reason=str(exc))
         # A renewal keeps the assignment bookkeeping of the lease it extends.
         lease = replace(
             lease,
