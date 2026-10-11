@@ -140,7 +140,9 @@ status line (`claimed #12 …`, the `claims` table, a refusal) goes to stderr, s
 (assignees, marker authors, bot logins): `--assignee alice` on an issue assigned to `Alice` is
 the pre-existing assignee, never one the lease owns.
 
-`claim` exits 2, changing nothing, when another live lease or an open PR for the issue exists;
+`claim` exits 2, changing nothing, when another live lease or an open PR for the issue exists
+(a PR that closes the issue, from any repository, or one from a same-repository branch named
+`issue-N`; a fork's identically named branch does not count);
 expired leases can be taken over (the takeover is commented). Markers count only when posted by
 a user whose repository permission (read per run from the collaborator permission API) is
 write, maintain or admin, by `github-actions[bot]`, or by the Forge Publisher App's bot (a

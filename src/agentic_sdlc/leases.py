@@ -622,7 +622,8 @@ def open_prs_for_issue(project: str, issue: int, gh: GhRunner) -> list[dict]:
                 "--limit",
                 "1000",
                 "--json",
-                "number,url,body,title,headRefName",
+                "number,url,body,title,headRefName,"
+                "headRepository,headRepositoryOwner,isCrossRepository",
             ]
         )
         or "[]"
@@ -636,10 +637,33 @@ def open_prs_for_issue(project: str, issue: int, gh: GhRunner) -> list[dict]:
             if repo and repo.lower() != project.lower():
                 continue  # a closing reference into another repository
             refs.add(int(m.group("num")))
-        head = pr.get("headRefName") or ""
-        if issue in refs or re.search(rf"(^|[/-])issue-{issue}($|[^0-9])", head):
+        # Codex 4239667540: the branch-name heuristic only for a PR whose head lives in THIS
+        # repository -- a fork can open a PR from `forge/issue-7` and must not block every
+        # claimant of issue 7. An explicit closing reference counts from any PR, as before.
+        head = pr.get("headRefName")
+        by_branch = (
+            isinstance(head, str)
+            and _same_repository_pr(pr, project)
+            and re.search(rf"(^|[/-])issue-{issue}($|[^0-9])", head) is not None
+        )
+        if issue in refs or by_branch:
             hits.append(pr)
     return hits
+
+
+def _same_repository_pr(pr: object, project: str) -> bool:
+    """True only for a PR whose head branch lives in `project` itself (the commit guard's
+    `_same_repository_pr`): `isCrossRepository` exactly false and the head repository's
+    owner/name equal to `project`, case-insensitively. Missing or malformed fields prove nothing."""
+    if not isinstance(pr, dict) or pr.get("isCrossRepository") is not False:
+        return False
+    repo, owner = pr.get("headRepository"), pr.get("headRepositoryOwner")
+    if not isinstance(repo, dict) or not isinstance(owner, dict):
+        return False
+    name, login = repo.get("name"), owner.get("login")
+    if not isinstance(name, str) or not isinstance(login, str) or not name or not login:
+        return False
+    return f"{login}/{name}".lower() == project.lower()
 
 
 # ---------------------------------------------------------------- GitHub writes

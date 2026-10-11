@@ -22,6 +22,20 @@ commands are configuration), an environment assignment other than GIT_DIR/GIT_WO
 on it (or a GIT_*/PAGER/EDITOR assignment anywhere in the command), `--output`, or an argument
 holding `$`, a backtick or a brace expansion.
 
+An allowlisted subcommand is read-only only while git runs nothing configured OUTSIDE the
+command (Codex 4239667542): `diff.external`, a textconv / diff / filter driver, a non-trivial
+`core.pager`/`pager.*`, a `core.fsmonitor` hook, a signature program for a command that verifies
+signatures, an initialized submodule, a hook git runs on its own (reference-transaction,
+post-index-change, pre-auto-gc), and for fetch/remote the ssh/askpass/credential/proxy helpers
+and remote helpers named by a remote URL -- in any configuration scope git reads (includes
+resolved by git itself) or in GIT_EXTERNAL_DIFF/GIT_EXEC_PATH/GIT_PAGER/PAGER/GIT_SSH*/
+*ASKPASS/GIT_PROXY_COMMAND -- see `_helper_reason`. Then it goes to the lease check like any
+other git, and so does one whose configuration cannot be read, or one passing `--ext-diff`,
+`--textconv` or `--filters`.
+
+Every lookup is bounded (GH_TIMEOUT for GitHub, GIT_TIMEOUT for local git): a lookup that times
+out is unavailable and refuses, never hangs the session (Codex 4239667544).
+
 Indirect execution is guarded the same way: any other program that receives `git` as a word
 (`xargs git`, `xargs -a f git`, `find -exec git`, `parallel git`, `eval git ...`,
 `python -c "...'git'..."`), `xargs`/`parallel`/`find` handing work to a shell, and a shell reading
@@ -66,6 +80,11 @@ import sys
 from datetime import UTC, datetime, timedelta
 
 PROJECT = "PROJECT_ID"
+# Codex 4239667544: the hook runs synchronously before every Bash call, so no lookup may hang
+# it. A GitHub read past GH_TIMEOUT is UNAVAILABLE (refuses); a local git call past GIT_TIMEOUT
+# is unknown (guarded). The SessionStart hook allows 60s for its own reads.
+GH_TIMEOUT = 30
+GIT_TIMEOUT = 15
 ISSUE_BRANCH = re.compile(r"(?:^|/)issue-(\d+)(?:$|[^0-9])")
 # A marker is the WHOLE first line of a comment, as leases.py writes and reads it; a comment with
 # marker syntax elsewhere, or more than one marker, carries none (same rule as leases._marker).
@@ -245,6 +264,58 @@ CONFIG_WRITE = frozenset(
 )
 TAG_WRITE = frozenset({"--delete", "--annotate", "--sign", "--local-user", "--force"})
 TAG_WRITE |= {"--message", "--file", "--create-reflog", "--no-sign", "--edit"}
+# Options that make an allowlisted subcommand run configured programs (Codex 4239667542).
+HELPER_OPTS = frozenset({"--ext-diff", "--textconv", "--filters"})
+
+
+# ---- Configured helpers (Codex 4239667542). An allowlisted subcommand is read-only for the
+# branch's history only while git runs nothing configured outside the command line: a
+# `diff.external` or textconv program could commit or push on its own. `_helper_reason` reads the
+# configuration git itself would use (`git config --list --includes`, every scope, includes
+# resolved by git), the hook's environment and the hooks directory, and names the first thing
+# that can run a program; then the command needs the lease like any other git. Unreadable
+# configuration is a reason too (fail closed). Plain `less`/`more`/`cat` pagers, boolean
+# `pager.<cmd>`/`core.fsmonitor`, git-lfs's canonical filters and the built-in `cache`/`store`
+# credential helpers run nothing that writes history and do not count.
+HELPER_KEYS = re.compile(
+    r"^(?:diff\.external|diff\..+\.(?:textconv|command)|filter\..+\.(?:clean|smudge|process)"
+    r"|submodule\..+\..+)$"
+)
+# `git help` launches a manual viewer or browser, which these name.
+HELP_KEYS = re.compile(
+    r"^(?:man\..+\.(?:cmd|path)|man\.viewer|browser\..+\.(?:cmd|path)|web\.browser"
+    r"|help\.browser|help\.format)$"
+)
+PAGER_KEYS = re.compile(r"^(?:core\.pager|pager\..+)$")
+SIGNATURE_KEYS = re.compile(r"^gpg\.(?:.+\.)?program$")
+NETWORK_KEYS = re.compile(
+    r"^(?:core\.(?:sshcommand|askpass|gitproxy|alternaterefscommand)|credential\.(?:.+\.)?helper"
+    r"|remote\..+\.(?:uploadpack|vcs))$"
+)
+URL_VALUE_KEYS = re.compile(r"^remote\..+\.(?:url|pushurl)$")
+URL_BASE_KEYS = re.compile(r"^url\.(.+)\.(?:insteadof|pushinsteadof)$")
+SAFE_PAGER = re.compile(r"^(?:(?:/usr)?/bin/)?(?:less|more|cat)(?:\s+-[A-Za-z0-9=-]*)*$")
+GIT_BOOLEANS = frozenset({"", "true", "false", "yes", "no", "on", "off", "1", "0"})
+SAFE_CREDENTIAL = re.compile(r"^(?:cache|store)(?:\s+--[a-z-]+(?:=\S+)?)*$")
+# What `git lfs install` (also with --skip-smudge) writes: exactly these, nothing appended.
+LFS_FILTERS = {
+    "filter.lfs.clean": re.compile(r"^git-lfs clean -- %f$"),
+    "filter.lfs.smudge": re.compile(r"^git-lfs smudge(?: --skip)? -- %f$"),
+    "filter.lfs.process": re.compile(r"^git-lfs filter-process(?: --skip)?$"),
+}
+SAFE_URL_SCHEMES = frozenset({"http", "https", "ssh", "git", "file", "git+ssh", "ssh+git"})
+HELPER_ENV = ("GIT_EXTERNAL_DIFF", "GIT_EXEC_PATH")
+PAGER_ENV = ("GIT_PAGER", "PAGER")
+NETWORK_ENV = ("GIT_SSH", "GIT_SSH_COMMAND", "GIT_ASKPASS", "SSH_ASKPASS", "GIT_PROXY_COMMAND")
+# Hooks git runs by itself during an allowlisted command: fetch updates remote-tracking refs and
+# may auto-gc; status/diff may rewrite the index.
+READ_ONLY_HOOKS = ("reference-transaction", "post-index-change", "pre-auto-gc")
+
+
+def _contacts_remote(sub: str, args: list[str]) -> bool:
+    """`git fetch`, and `git remote show` without `-n`: the only allowlisted forms that reach a
+    remote, and so run the transport's helpers (ssh, askpass, credential, remote helpers)."""
+    return sub == "fetch" or (sub == "remote" and "show" in args and "-n" not in args)
 
 
 def _short_cluster(arg: str) -> str:
@@ -260,6 +331,8 @@ def _read_only(sub: str, args: list[str]) -> bool:
         return False
     if any(a == "--output" or a.startswith("--output=") for a in args):
         return False  # log/diff/show write a file of git's choosing (a ref, a hook)
+    if any(a in HELPER_OPTS for a in args):
+        return False  # Codex 4239667542: asks git to run configured diff/textconv/filter programs
     if sub in READ_ONLY_ANY:
         return True
     if sub not in READ_ONLY_SHAPED:
@@ -530,6 +603,10 @@ def _commit_targets(argv: list[str], depth: int = 0, cwd: str | None = None) -> 
             # checked-out branch (`git push origin HEAD:forge/issue-7` from main).
             refs = _named_refs(word, rest, _where(cwd, chdirs), target[0], unsafe)
             return target + [_with_ref(target[0], ref) for ref in refs]
+        reason = _helper_reason(word, rest, _where(cwd, chdirs), target[0])
+        if reason:  # Codex 4239667542: configuration can make it run a program
+            _HELPER_NOTES[reason] = None
+            return target
         return []
     return []  # `git`, `git --version`: no subcommand
 
@@ -762,6 +839,7 @@ def _raw_unproven(command: str, depth: int = 0) -> bool:
 # The new branch REPLACES the old one only for an invocation in the same repository joined to the
 # switch by `&&` alone (the switch then certainly succeeded); otherwise both are checked.
 UNKNOWN_BRANCH = "\0unknown-branch"
+BRANCH_TIMEOUT = "\0branch-timeout"  # git did not report the branch within GIT_TIMEOUT
 _BRANCH_KEY = "\0branch"  # a Target env entry carrying the branch HEAD was moved to
 # Git subcommands that never move HEAD to another branch (the read-only ones never do either).
 SWITCH_FREE = frozenset(
@@ -873,21 +951,164 @@ def _ref_free_fanout(words: list[str]) -> bool:
 
 
 def _git_config(where: str, target: Target, *args: str) -> tuple[int, str]:
-    """`git config ARGS` in the repository `target` acts on: (exit code, stdout); 128 when git
-    could not be run at all. Exit 1 is git's "no such key"."""
+    """`git config ARGS` in the repository `target` acts on: (exit code, stdout); -1 when git
+    could not be run at all or did not answer within GIT_TIMEOUT. Exit 1 is git's "no such
+    key"."""
+    return _git_in(where, target, "config", *args)
+
+
+def _git_in(where: str, target: Target, *args: str) -> tuple[int, str]:
+    """`git ARGS` in the repository `target` acts on: (exit code, stdout); -1 when git could
+    not be run at all or did not answer within GIT_TIMEOUT (Codex 4239667544)."""
     _, opts, env = target
     clean = {key: value for key, value in env if not key.startswith("\0")}
     try:
         proc = subprocess.run(
-            ["git", *opts, "config", *args],
+            ["git", *opts, *args],
             cwd=where,
             env={**os.environ, **clean} if clean else None,
             capture_output=True,
             text=True,
+            timeout=GIT_TIMEOUT,
         )
-    except OSError:
-        return 128, ""
+    except (OSError, subprocess.TimeoutExpired):
+        return -1, ""
     return proc.returncode, proc.stdout
+
+
+def _safe_url(url: str) -> bool:
+    """A URL git fetches from without a remote helper program: http(s)/ssh/git/file, an
+    scp-like `host:path` or a local path. `<transport>::...` and any other `<scheme>://` run
+    `git-remote-<name>` (`ext::` runs an arbitrary command)."""
+    url = url.strip()
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*::", url):
+        return False
+    scheme = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*)://", url)
+    return scheme is None or scheme.group(1).lower() in SAFE_URL_SCHEMES
+
+
+def _signature_wanted(args: list[str], config: dict[str, list[str]]) -> bool:
+    """Does the command verify signatures (and so run the gpg/ssh signature program)?"""
+    if any(a == "--show-signature" or "%G" in a or "%(signature" in a for a in args):
+        return True
+    return any(
+        value.strip().lower() in ("true", "yes", "on", "1")
+        for value in config.get("log.showsignature", [])
+    )
+
+
+def _config_reason(sub: str, args: list[str], config: dict[str, list[str]]) -> str | None:
+    """The first configuration entry that makes `git SUB ARGS` run a program, or None."""
+    network = _contacts_remote(sub, args)
+    signatures = _signature_wanted(args, config)
+    for key, values in config.items():
+        for value in values:
+            stripped = value.strip()
+            if HELPER_KEYS.match(key):
+                lfs = LFS_FILTERS.get(key)
+                if lfs is not None and lfs.match(stripped):
+                    continue
+                return f"{key}={stripped}"
+            if PAGER_KEYS.match(key):
+                if key != "core.pager" and stripped.lower() in GIT_BOOLEANS:
+                    continue
+                if not stripped or SAFE_PAGER.match(stripped):
+                    continue
+                return f"{key}={stripped}"
+            if key == "core.fsmonitor" and stripped.lower() not in GIT_BOOLEANS:
+                return f"{key}={stripped}"
+            if sub == "help" and HELP_KEYS.match(key) and stripped.lower() not in ("man", ""):
+                return f"{key}={stripped}"
+            if signatures and SIGNATURE_KEYS.match(key) and stripped:
+                return f"{key}={stripped}"
+            if "ext::" in key.lower() or stripped.lower().startswith("ext::"):
+                return f"{key}={stripped}"
+            if not network:
+                continue
+            if NETWORK_KEYS.match(key) and stripped:
+                if key.endswith(".helper") and SAFE_CREDENTIAL.match(stripped):
+                    continue
+                return f"{key}={stripped}"
+            if URL_VALUE_KEYS.match(key) and not _safe_url(stripped):
+                return f"{key}={stripped}"
+            base = URL_BASE_KEYS.match(key)
+            if base and not _safe_url(base.group(1)):
+                return f"{key}={stripped}"
+    return None
+
+
+def _read_config(where: str, target: Target) -> dict[str, list[str]] | None:
+    """Every configuration entry git would use for `target` (all scopes, includes resolved by
+    git, GIT_CONFIG_* honoured), by key with section and variable names lowercased (they are
+    case-insensitive; subsections are not); None when it cannot be read."""
+    code, out = _git_config(where, target, "--list", "--includes", "-z")
+    if code != 0:
+        return None
+    config: dict[str, list[str]] = {}
+    for entry in out.split("\0"):
+        if not entry:
+            continue
+        key, _, value = entry.partition("\n")
+        section, dot, rest = key.partition(".")
+        name, _, var = rest.rpartition(".")
+        # section and variable names are case-insensitive, subsections are not
+        lowered = f"{section.lower()}{dot}{name}{'.' if name else ''}{var.lower()}"
+        config.setdefault(lowered, []).append(value)
+    return config
+
+
+def _helper_reason(sub: str, args: list[str], where: str, target: Target) -> str | None:
+    """Why the allowlisted `git SUB ARGS` may still run a program configured outside the
+    command (Codex 4239667542), or None when it provably does not. Fail closed: configuration
+    or a hooks directory that cannot be read is a reason."""
+    names = HELPER_ENV + PAGER_ENV + (NETWORK_ENV if _contacts_remote(sub, args) else ())
+    for name in names:
+        value = os.environ.get(name, "").strip()
+        if value and not (name in PAGER_ENV and SAFE_PAGER.match(value)):
+            return f"{name}={value} in the environment"
+    config = _read_config(where, target)
+    if config is None:
+        return "git configuration could not be read"
+    found = _config_reason(sub, args, config)
+    if found:
+        return found
+    code, out = _git_in(where, target, "rev-parse", "--git-path", "hooks")
+    lines = out.splitlines()
+    if code == -1 or (code == 0 and (len(lines) != 1 or not lines[0].strip())):
+        return "the hooks directory could not be read"
+    if code != 0:
+        return None  # no repository there: the command itself fails before any hook could run
+    base = where  # a relative answer is relative to where `-C` options lead
+    opts, index = list(target[1]), 0
+    while index < len(opts):
+        if opts[index] in GIT_REPO_OPTS and index + 1 < len(opts):
+            if opts[index] == "-C":
+                base = os.path.join(base, os.path.expanduser(opts[index + 1]))
+            index += 2
+        else:
+            index += 1  # `--git-dir=...`, `--work-tree=...`
+    hooks = os.path.join(base, lines[0].strip())
+    for hook in READ_ONLY_HOOKS:
+        if os.path.lexists(os.path.join(hooks, hook)):
+            return f"hook {os.path.join(hooks, hook)}"
+    code, out = _git_in(where, target, "rev-parse", "--show-toplevel")
+    if code == 0 and out.strip() and os.path.lexists(os.path.join(out.strip(), ".gitmodules")):
+        return "submodules (.gitmodules): git recurses into their own configuration"
+    return None
+
+
+# Reasons `_helper_reason` gave in the current check, for the refusal message.
+_HELPER_NOTES: dict[str, None] = {}
+
+
+def _helper_note() -> str:
+    if not _HELPER_NOTES:
+        return ""
+    return (
+        " This git command is otherwise read-only, but git can run a program configured "
+        f"outside the command ({'; '.join(_HELPER_NOTES)}), so it needs the lease too: remove "
+        "that configuration, or claim the issue."
+    )
 
 
 def _named_refs(
@@ -1201,9 +1422,10 @@ def _branch_exists(branch: str, where: str, target: Target) -> bool:
             env={**os.environ, **_real_env(dict(env))} if env else None,
             capture_output=True,
             check=True,
+            timeout=GIT_TIMEOUT,
         )
-    except (OSError, subprocess.CalledProcessError):
-        return False
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return False  # not provably a plain switch: the command stays guarded
     return True
 
 
@@ -1366,6 +1588,8 @@ def commit_targets(command: str, depth: int = 0, cwd: str | None = None) -> list
     change before it (`git switch X && git commit`, see UNKNOWN_BRANCH). Deny by default: any
     git invocation not proven read-only, and anything that runs git or a shell indirectly, is
     one; an assembled program or subcommand is one with an unknown repository."""
+    if depth == 0:
+        _HELPER_NOTES.clear()
     found: list[Target] = []
     cds: list[str] = []
     state = None  # the branch change in effect: None, UNKNOWN_BRANCH or (location, X, replace)
@@ -1495,7 +1719,10 @@ def current_branch(
             capture_output=True,
             text=True,
             check=True,
+            timeout=GIT_TIMEOUT,
         ).stdout.strip()
+    except subprocess.TimeoutExpired:
+        return BRANCH_TIMEOUT  # unknown, not "no branch": refuses (Codex 4239667544)
     except (OSError, subprocess.CalledProcessError):
         return ""
 
@@ -1558,7 +1785,10 @@ def repo_permission(login: str) -> str | None:
             capture_output=True,
             text=True,
             check=False,
+            timeout=GH_TIMEOUT,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise LeaseUnavailable(f"permission read timed out after {GH_TIMEOUT}s") from exc
     except OSError as exc:
         raise LeaseUnavailable(f"gh unavailable: {exc}") from exc
     if proc.returncode != 0:
@@ -1642,9 +1872,15 @@ def lease_for(issue: int) -> dict | None:
             capture_output=True,
             text=True,
             check=True,
+            timeout=GH_TIMEOUT,
         ).stdout
         pages = json.loads(out or "null")
-    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
+    except (
+        OSError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        json.JSONDecodeError,
+    ):
         return UNAVAILABLE
     # --slurp wraps the pages in one outer array. Any other shape -- a page that is not a list,
     # an item that is not an object -- is an unreadable lease history, never an empty one.
@@ -1696,9 +1932,15 @@ def open_pr_for(branch: str) -> bool | None:
             capture_output=True,
             text=True,
             check=True,
+            timeout=GH_TIMEOUT,
         ).stdout
         prs = json.loads(out or "[]")
-    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
+    except (
+        OSError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        json.JSONDecodeError,
+    ):
         return None
     if not isinstance(prs, list):
         return None
@@ -1744,6 +1986,11 @@ def _decide_branch(payload: dict, branch: str, lease_lookup, pr_lookup) -> tuple
             "issue lease. Run the branch change and the git command as SEPARATE commands so the "
             "guard can check the branch the second one acts on."
         )
+    if branch == BRANCH_TIMEOUT:
+        return 2, (
+            f"Forge guard: git did not report the checked-out branch within {GIT_TIMEOUT}s, so "
+            "the lease this command needs cannot be checked. Retry once git responds."
+        )
     m = ISSUE_BRANCH.search(branch or "")
     if not m:
         return 0, ""
@@ -1755,7 +2002,7 @@ def _decide_branch(payload: dict, branch: str, lease_lookup, pr_lookup) -> tuple
             f"Forge guard: the lease of issue #{issue} could not be read from GitHub "
             "(authentication, network or API failure). Lease inventory unavailable -- do not "
             "commit issue work until it can be checked; retry once `gh` works."
-        )
+        ) + _helper_note()
     has_pr = pr_lookup(branch) if lease is None else False
     if lease is None and has_pr:
         return 0, ""  # follow-up commits to an open PR need no lease
@@ -1765,19 +2012,19 @@ def _decide_branch(payload: dict, branch: str, lease_lookup, pr_lookup) -> tuple
             "its open PRs could not be read from GitHub (no PR could be confirmed). Claim it: "
             f"sdlcctl claim --project {PROJECT} --issue {issue} --agent claude-code "
             f"--session {session or '<session_id>'} --branch {branch}"
-        )
+        ) + _helper_note()
     if lease is None:
         return 2, (
             f"Forge guard: branch '{branch}' targets issue #{issue} but no live lease exists. "
             f"Claim it first: sdlcctl claim --project {PROJECT} --issue {issue} "
             f"--agent claude-code --session {session or '<session_id>'} --branch {branch}"
-        )
+        ) + _helper_note()
     if session and lease.get("session") != session:
         return 2, (
             f"Forge guard: issue #{issue} is leased by agent={lease.get('agent')} "
             f"session={lease.get('session')} until {lease['expires'].isoformat()}. "
             "Do not commit to it; pick another issue or wait for the lease to expire."
-        )
+        ) + _helper_note()
     return 0, ""
 
 

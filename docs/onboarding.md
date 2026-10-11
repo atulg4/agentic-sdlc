@@ -105,7 +105,7 @@ The only tunable knobs, each validated by its own check instead:
 
 | Knob | Validated by |
 |---|---|
-| every job's `runs-on` (except `agent-auto-plan.yml:preflight` and `agent-auto-implement.yml:authorize`, below), and a reusable call's `with.runs_on` | the runner checks (hosted label or an online runner; Linux for implementation) |
+| every job's `runs-on` (except `agent-auto-plan.yml:preflight`, `agent-auto-implement.yml:authorize` and both files' `authorization_failed`, below), and a reusable call's `with.runs_on` | the runner checks (hosted label or an online runner; Linux for implementation) |
 | `with.route_budget_usd` on a reusable call (may be added) | "implement callers pass a readable route_budget_usd" |
 | the `if:` of `agent-auto-plan.yml:preflight` and `agent-auto-implement.yml:authorize` | must be exactly the generated condition for the POLICY's labels |
 | the platform pin (`uses: ...@<sha>`, `with.platform_ref`) | the template is rendered at the caller's own pin; "workflows pin the platform to a commit SHA" requires one SHA on the platform repository |
@@ -130,6 +130,16 @@ identical collaborator-permission check, and every job that can reach your runne
 and runs only when `needs.authorize.outputs.authorized == 'true'`. Toggling a label without write
 access therefore never schedules anything on a self-hosted runner. (`agent-implement.yml` is
 `workflow_dispatch` only and has no `authorize` job.)
+
+A permission check that cannot get a definitive answer (rate limit, 5xx, network) after its
+retries FAILS the authorization job rather than reading as "unauthorized". Every job after it is
+then skipped, so both automatic callers carry one more job, `authorization_failed`
+(`ubuntu-latest`, NOT tunable, `permissions: issues: write` only): it runs only when
+`preflight`/`authorize` finished as `failure` or `cancelled`, and comments on the issue that the
+labeler's authority could not be verified, with the run link, so the label event is not consumed
+in silence. A definitive "unauthorized" (the job succeeds with `authorized=false`) posts nothing.
+`notify_failure` keeps its `authorized == 'true'` gate: it runs on your runners, which an
+unverified labeler must never reach.
 
 ### Other managed files
 
@@ -226,7 +236,17 @@ something that runs differently.
   listing forms of `branch`/`tag`/`remote`/`config`/`stash`, `fetch` without a refspec or
   `--update-head-ok`, help, version, cat-file, for-each-ref, name-rev, merge-base, check-ignore,
   check-attr). Aliases, `git-<name>` programs, `-c`/`--config-env`, and anything that runs git or
-  a shell indirectly (`xargs git`, `find -exec git`, `... | sh`) need the lease too. A branch
+  a shell indirectly (`xargs git`, `find -exec git`, `... | sh`) need the lease too. So does a
+  read-only subcommand whenever git could run a program configured outside the command --
+  `diff.external`, a textconv/diff/filter driver (git-lfs's canonical filters excepted), a pager
+  other than plain `less`/`more`/`cat`, a `core.fsmonitor` hook, a signature program for
+  `--show-signature`, an initialized submodule or `.gitmodules`, a reference-transaction /
+  post-index-change / pre-auto-gc hook, and for `fetch`/`remote` an ssh/askpass/credential/proxy
+  helper or a remote URL that needs a remote helper -- in any config scope or include, or in
+  `GIT_EXTERNAL_DIFF`/`GIT_EXEC_PATH`/`GIT_PAGER`/`PAGER`/`GIT_SSH*`/`*ASKPASS`; when that
+  configuration cannot be read; and with `--ext-diff`, `--textconv` or `--filters`. Every
+  GitHub lookup is bounded at 30s and every local git call at 15s: a lookup that times out
+  refuses instead of hanging the session. A branch
   change earlier in the same command re-targets the git after it: `git switch forge/issue-7 &&
   git commit` is checked against issue 7, `git switch main && git commit` against main (a plain
   switch to an existing branch needs no lease); a change whose destination is not literal
