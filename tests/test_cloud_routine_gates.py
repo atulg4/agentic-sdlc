@@ -1138,3 +1138,231 @@ def test_check_diff_requires_the_policy_of_the_project_it_verified(
     argv = ["check-diff", "--project", other, "--repository", str(repository), "--base", "main"]
     assert cli.main(argv) == 2
     assert "is not someone/else's" in capsys.readouterr().err
+
+
+# ------------- the routine's ONE final gate: check-request --authorize-labels (Codex 4242264478)
+
+#: The approval set the policy fixture names (implementation, ready, human-review).
+APPROVAL = ["implementation-approved", "agent-ready", "human-review-required"]
+
+
+def _stamp(minute: int) -> str:
+    return f"2026-01-01T00:{minute:02d}:00Z"
+
+
+class HistoryGh(FakeGh):
+    """A FakeGh whose issue also has an update time, a label history, a body-edit time and
+    labelers with permissions -- what `authorize-labeler` reads. `on_read[n]` runs right after
+    the n-th read (1-based) of the event history is answered, i.e. once the n-th snapshot (the
+    issue, then its history) is complete: the change lands between it and the next read.
+    `reads` counts the reads of the issue itself."""
+
+    def __init__(self, body: str, **kwargs):
+        super().__init__(body, **kwargs)
+        self.issue["updated_at"] = _stamp(10)
+        self.events: list[dict] = []
+        self.edited_at: str | None = None
+        self.permissions = {"maintainer": "write", "triager": "triage"}
+        self.reads = 0
+        self.history_reads = 0
+        #: `before_read[n]` runs just before the n-th read of the issue is answered
+        self.before_read: dict[int, object] = {}
+        self.on_read: dict[int, object] = {}
+        self.clock = 10
+        for label in APPROVAL:
+            self.label("labeled", label, "maintainer")
+
+    def tick(self) -> str:
+        self.clock += 1
+        self.issue["updated_at"] = _stamp(self.clock)
+        return _stamp(self.clock)
+
+    def label(self, kind: str, name: str, login: str) -> None:
+        at = self.tick()
+        self.events.append(
+            {
+                "id": len(self.events) + 1,
+                "event": kind,
+                "label": {"name": name},
+                "actor": {"login": login},
+                "created_at": at,
+            }
+        )
+
+    def edit(self, body: str) -> None:
+        self.issue["body"] = body
+        self.edited_at = self.tick()
+
+    def __call__(self, args, input=None):
+        args = list(args)
+        if github_answer(args) is not None:
+            return github_answer(args)
+        if args[1] == "graphql":
+            self.calls.append(args)
+            node = {"lastEditedAt": self.edited_at, "userContentEdits": {"nodes": []}}
+            return json.dumps({"data": {"repository": {"issue": node}}})
+        if "/events" in args[1]:
+            self.calls.append(args)
+            answer = json.dumps([list(self.events)])
+            self.history_reads += 1
+            change = self.on_read.get(self.history_reads)
+            if change is not None:
+                change(self)
+            return answer
+        if "/collaborators/" in args[1]:
+            self.calls.append(args)
+            login = args[1].split("/collaborators/")[1].split("/")[0]
+            return json.dumps({"permission": self.permissions[login]})
+        if args[1].endswith("/issues/7"):
+            self.reads += 1
+            change = self.before_read.get(self.reads)
+            if change is not None:
+                change(self)
+        return super().__call__(args, input)
+
+
+def _final_gate(monkeypatch, policy_file, gh, digest, tmp_path=None):
+    monkeypatch.setattr(cli, "run_gh", gh)
+    argv = ["check-request", "--project", PROJECT, "--issue", "7", "--config", str(policy_file)]
+    argv += ["--expect-digest", digest, "--authorize-labels"]
+    if tmp_path is not None:
+        argv += ["--output", str(tmp_path / "gate.json")]
+    return cli.main(argv)
+
+
+def _edit_and_reapprove(gh: HistoryGh) -> None:
+    """A maintainer edits the request, then removes and re-applies every approval label: the
+    labeler rule alone is satisfied again, the request is not the one implemented."""
+    gh.edit(gh.issue["body"].replace("Do the thing.", "Do another thing."))
+    for label in APPROVAL:
+        gh.label("unlabeled", label, "maintainer")
+        gh.label("labeled", label, "maintainer")
+
+
+def test_final_gate_passes_a_stable_authorized_request(monkeypatch, policy_file, tmp_path, capsys):
+    body = VALID.format(deps="- #3")
+    gh = HistoryGh(body, states={3: "closed"})
+    digest = cli.request_digest("Do the thing", body)
+    assert _final_gate(monkeypatch, policy_file, gh, digest, tmp_path) == 0
+    assert gh.reads == 2  # judged once, then re-read and found unchanged
+    result = json.loads((tmp_path / "gate.json").read_text())
+    assert result["ready"] is True and result["authorization"]["authorized"] is True
+    assert result["stable"] == {"updatedAt": gh.issue["updated_at"], "attempts": 1}
+    assert "stable across two reads" in capsys.readouterr().err
+
+
+def test_the_old_two_command_gate_passes_an_edit_and_reapply_between_them(monkeypatch, policy_file):
+    """The hole (Codex 4242264478): `check-request --expect-digest` then `authorize-labeler` as
+    two commands. An edit plus a label re-apply landing between them passes both."""
+    body = VALID.format(deps="None")
+    gh = HistoryGh(body)
+    digest = cli.request_digest("Do the thing", body)
+    assert _expect(monkeypatch, policy_file, gh, digest) == 0
+    _edit_and_reapprove(gh)
+    assert (
+        cli.main(
+            ["authorize-labeler", "--project", PROJECT, "--issue", "7"]
+            + [arg for label in APPROVAL for arg in ("--label", label)]
+        )
+        == 0
+    )
+    # the one gate sees it whenever it lands
+    assert _final_gate(monkeypatch, policy_file, gh, digest) == cli.REQUEST_CHANGED
+
+
+def test_final_gate_refuses_an_edit_and_reapply_between_its_reads(
+    monkeypatch, policy_file, tmp_path, capsys
+):
+    body = VALID.format(deps="None")
+    gh = HistoryGh(body)
+    gh.before_read[2] = _edit_and_reapprove  # after the snapshot was judged, as it is re-read
+    digest = cli.request_digest("Do the thing", body)
+    assert _final_gate(monkeypatch, policy_file, gh, digest, tmp_path) == cli.REQUEST_CHANGED
+    assert gh.reads == 2  # a changed title or body is never retried
+    result = json.loads((tmp_path / "gate.json").read_text())
+    assert result["ready"] is False
+    assert {"content digest", "updated_at", "events"} <= set(result["changedWhileChecking"])
+    assert "CHANGED: #7: the title or body changed while it was checked" in capsys.readouterr().err
+
+
+def test_final_gate_refuses_an_edit_made_after_the_labels(monkeypatch, policy_file, capsys):
+    """An edit that keeps the digest (say, reverted) but post-dates the approval is unapproved
+    content history: the labeler rule refuses it, with no separate command to skip."""
+    body = VALID.format(deps="None")
+    gh = HistoryGh(body)
+    gh.edit(body)  # edited after every label was applied, to the same text
+    digest = cli.request_digest("Do the thing", body)
+    assert _final_gate(monkeypatch, policy_file, gh, digest) == cli.LABELS_NOT_AUTHORIZED == 7
+    assert "NOT AUTHORIZED: #7" in capsys.readouterr().err
+
+
+def test_final_gate_refuses_a_label_reapplied_by_a_non_writer_between_reads(
+    monkeypatch, policy_file, capsys
+):
+    """A change that leaves the content alone is judged afresh -- and refused on the new
+    snapshot."""
+    body = VALID.format(deps="None")
+    gh = HistoryGh(body)
+
+    def triage(gh):
+        gh.label("unlabeled", "agent-ready", "maintainer")
+        gh.label("labeled", "agent-ready", "triager")
+
+    gh.on_read[1] = triage
+    digest = cli.request_digest("Do the thing", body)
+    assert _final_gate(monkeypatch, policy_file, gh, digest) == cli.LABELS_NOT_AUTHORIZED
+    assert gh.reads == 3  # read, re-read (changed), judged afresh
+    assert "triager applied 'agent-ready' without repository write authority" in (
+        capsys.readouterr().err
+    )
+
+
+def test_final_gate_rejudges_a_benign_change_and_passes_once_stable(monkeypatch, policy_file):
+    body = VALID.format(deps="None")
+    gh = HistoryGh(body)
+    gh.on_read[1] = lambda gh: gh.tick()  # e.g. a comment: only the update time moves
+    digest = cli.request_digest("Do the thing", body)
+    assert _final_gate(monkeypatch, policy_file, gh, digest) == 0
+    assert gh.reads == 4
+
+
+def test_final_gate_gives_up_on_an_issue_that_keeps_changing(monkeypatch, policy_file, capsys):
+    body = VALID.format(deps="None")
+    gh = HistoryGh(body)
+    for read in range(1, 2 * cli.CHECK_REQUEST_ATTEMPTS + 1):
+        gh.on_read[read] = lambda gh: gh.tick()
+    digest = cli.request_digest("Do the thing", body)
+    assert _final_gate(monkeypatch, policy_file, gh, digest) == cli.REQUEST_UNSTABLE == 8
+    assert gh.reads == 2 * cli.CHECK_REQUEST_ATTEMPTS
+    assert "UNSTABLE: #7" in capsys.readouterr().err
+
+
+def test_final_gate_refuses_a_reopened_dependency(monkeypatch, policy_file, capsys):
+    body = VALID.format(deps="- #3")
+    digest = cli.request_digest("Do the thing", body)
+    gh = HistoryGh(body, states={3: "open"})
+    assert _final_gate(monkeypatch, policy_file, gh, digest) == cli.DEPENDENCY_OPEN
+    assert "WAITING: #7" in capsys.readouterr().err
+
+
+def test_final_gate_refuses_a_closed_issue_and_fails_closed_on_an_unreadable_history(
+    monkeypatch, policy_file
+):
+    body = VALID.format(deps="None")
+    digest = cli.request_digest("Do the thing", body)
+    closed = HistoryGh(body)
+    closed.on_read[1] = lambda gh: gh.issue.update(state="closed")
+    assert _final_gate(monkeypatch, policy_file, closed, digest) == cli.ISSUE_CLOSED
+    no_time = HistoryGh(body)
+    del no_time.issue["updated_at"]
+    assert _final_gate(monkeypatch, policy_file, no_time, digest) == 2
+    unreadable = HistoryGh(body)
+    unreadable.permissions["maintainer"] = OnboardError("gh api failed: HTTP 502")
+    assert _final_gate(monkeypatch, policy_file, unreadable, digest) == 2
+
+
+def test_label_needs_authorize_labels(monkeypatch, policy_file):
+    gh = HistoryGh(VALID.format(deps="None"))
+    monkeypatch.setattr(cli, "run_gh", gh)
+    argv = ["check-request", "--project", PROJECT, "--issue", "7", "--config", str(policy_file)]
+    assert cli.main([*argv, "--label", "agent-ready"]) == 2

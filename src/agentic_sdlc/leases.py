@@ -2105,27 +2105,46 @@ def _last_content_edit(
     return latest
 
 
-def authorize_labeler(
-    project: str, issue: int, labels: str | Sequence[str], gh: GhRunner
-) -> LabelerAuthorization:
-    """Did someone with write/maintain/admin apply EACH of `labels` (the approval set; a single
-    label is a set of one) to `issue` most recently (see above)? The verdict's `label`/`labeler`
-    are the FIRST label's (the approval label) and its latest applier. Returns the verdict;
-    raises LeaseError when it cannot be verified."""
-    wanted = [labels] if isinstance(labels, str) else list(labels)
-    if not wanted or not all(isinstance(name, str) and name.strip() for name in wanted):
-        raise LeaseError("authorize-labeler needs at least one label name; not authorizing")
-    keys = list(dict.fromkeys(name.casefold() for name in wanted))  # case-insensitive on GitHub
-    spelled = {name.casefold(): name for name in reversed(wanted)}
-    approval = wanted[0]
+def issue_events(project: str, issue: int, gh: GhRunner) -> list[dict]:
+    """Every event of `issue` (labeled, unlabeled, renamed, ...), oldest first; unreadable raises
+    LeaseError. `check-request --authorize-labels` reads it once and hands the same list to
+    `authorize_labeler`, so the labels are judged on the snapshot it then re-reads."""
     try:
-        events = _issue_events(project, issue, gh)
+        return _issue_events(project, issue, gh)
     except LeaseError:
         raise
     except Exception as exc:  # noqa: BLE001 -- unreadable history never authorizes
         raise LeaseError(
             f"cannot read the events of issue #{issue} ({str(exc).strip()[:200]}); not authorizing"
         ) from exc
+
+
+def issue_event_keys(events: list[dict]) -> list[str]:
+    """The identities of `events`, in order: two reads of an issue's history are the same
+    history only if these are equal."""
+    return [_event_key(event) for event in events]
+
+
+def authorize_labeler(
+    project: str,
+    issue: int,
+    labels: str | Sequence[str],
+    gh: GhRunner,
+    events: list[dict] | None = None,
+) -> LabelerAuthorization:
+    """Did someone with write/maintain/admin apply EACH of `labels` (the approval set; a single
+    label is a set of one) to `issue` most recently (see above)? The verdict's `label`/`labeler`
+    are the FIRST label's (the approval label) and its latest applier. `events`, when given, is
+    the issue's history as already read (`issue_events`), judged instead of reading it again.
+    Returns the verdict; raises LeaseError when it cannot be verified."""
+    wanted = [labels] if isinstance(labels, str) else list(labels)
+    if not wanted or not all(isinstance(name, str) and name.strip() for name in wanted):
+        raise LeaseError("authorize-labeler needs at least one label name; not authorizing")
+    keys = list(dict.fromkeys(name.casefold() for name in wanted))  # case-insensitive on GitHub
+    spelled = {name.casefold(): name for name in reversed(wanted)}
+    approval = wanted[0]
+    if events is None:
+        events = issue_events(project, issue, gh)
     latest: dict[str, dict] = {}
     for event in events:
         if event.get("event") not in ("labeled", "unlabeled"):

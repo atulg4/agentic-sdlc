@@ -115,8 +115,10 @@ access -- before claiming, gates on `sdlcctl check-request` (valid request, depe
 closed), renews its lease between stages (a renewal fails once the issue is closed) and
 runs `sdlcctl check-diff --project` (the diff policy committed on the default branch -- whose
 head must be the one GitHub reports -- over every commit it pushes, run with a trusted git),
-`check-request --expect-digest` (dependencies still closed, request unedited) and, LAST,
-`authorize-labeler` again before pushing. Every `gh` and git those gates run gets an
+and, LAST before pushing, ONE final gate -- `check-request --expect-digest <digest>
+--authorize-labels` -- that judges a single snapshot of the issue (request unedited, still open,
+dependencies still closed, each approval label last applied by a writer after the last edit)
+and re-reads the issue and its history to require them unchanged. Every `gh` and git those gates run gets an
 allowlisted environment (no `LD_*`/`DYLD_*`, a fixed PATH, a fresh empty `GH_CONFIG_DIR`, no
 `SSL_CERT_FILE`/`SSL_CERT_DIR`; the token comes from `GH_TOKEN`/`GITHUB_TOKEN` or `gh auth
 token`): an egress proxy set in `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` is still used, but its CA

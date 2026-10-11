@@ -58,6 +58,8 @@ from .leases import (
     authorize_labeler,
     claim,
     claim_inventory,
+    issue_event_keys,
+    issue_events,
     release,
     render_claims,
     renew,
@@ -440,29 +442,50 @@ def request_digest(title: str, body: str) -> str:
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _check_request(args: argparse.Namespace) -> int:
-    """Is GitHub issue `--issue` a work request the Actions implement path would run (Codex
-    4241434511)? Its body is parsed by the same validator (`parse_task`) and judged by the same
-    policy (`evaluate_task`, mode implement) as `prepare-request`, and every dependency it names
-    must be CLOSED, as the Actions "Require every dependency issue to be closed" step requires.
-    Exit 0: ready. 3: not a valid or eligible request. 4: a dependency is still open. 5: the
-    title or body is not the content `--expect-digest` names (it was edited: Codex 4241614582).
-    6: the issue is not open. 2 (an error): anything that could not be read -- never "no
-    dependencies". It prints the request's content digest on every run that reads the issue.
-    With `--base`, the policy is the one committed there in `--repository`, not the working-tree
-    file the agent could loosen (Codex 4241614590)."""
-    document = json.loads(run_gh(["api", f"repos/{args.project}/issues/{args.issue}"]) or "null")
+#: `check-request --authorize-labels`: a label of the approval set was not last applied by a
+#: writer, was removed, or the issue was edited after it was applied.
+LABELS_NOT_AUTHORIZED = 7
+#: `check-request --authorize-labels`: the issue (its labels, history or update time) kept changing
+#: while it was checked, so no single snapshot passed every check.
+REQUEST_UNSTABLE = 8
+#: How many fresh snapshots `check-request --authorize-labels` judges before giving up on an issue
+#: that changes under it (a changed title or body is never retried: it fails at once).
+CHECK_REQUEST_ATTEMPTS = 3
+
+
+def _read_issue(project: str, issue: int) -> dict[str, Any]:
+    document = json.loads(run_gh(["api", f"repos/{project}/issues/{issue}"]) or "null")
     if not isinstance(document, dict) or "pull_request" in document:
-        raise ValueError(f"#{args.issue} is not a readable issue of {args.project}")
-    if args.base:
-        base = _verified_base(args.repository, args.project, args.base)
-        policy = _committed_policy(args.repository, base, args.config, args.base)
-    else:
-        policy = load_policy(args.config)
-    if policy.provider != "github":
-        raise ValueError("policy provider is not github")
-    if policy.project_id != args.project:
-        raise ValueError("policy project ID does not match --project")
+        raise ValueError(f"#{issue} is not a readable issue of {project}")
+    return document
+
+
+def _issue_snapshot(document: dict[str, Any], events: list[dict]) -> dict[str, Any]:
+    """What must not move between the two reads of `check-request --authorize-labels`: the
+    issue's update time, state, content digest, current labels and its whole event history."""
+    title, body, labels = _request_fields("github", document)
+    updated = document.get("updated_at")
+    if not isinstance(updated, str) or not updated:
+        raise ValueError(f"#{document.get('number')}: no readable updated_at; not concluding")
+    return {
+        "updated_at": updated,
+        "state": document.get("state"),
+        "content digest": request_digest(title, body),
+        "labels": sorted(name.casefold() for name in labels),
+        "events": issue_event_keys(events),
+    }
+
+
+def _judge_request(
+    args: argparse.Namespace,
+    policy: ProjectPolicy,
+    document: dict[str, Any],
+    events: list[dict] | None,
+    approval_labels: list[str],
+) -> tuple[int, dict[str, Any], str]:
+    """One snapshot of the issue (`document`, and with `--authorize-labels` its `events`) judged
+    by every check-request rule: (exit code, result document, status line). Nothing here reads
+    the issue itself again; only the dependencies and the labelers' permissions are read."""
     state = document.get("state")
     if state not in ("open", "closed"):
         raise ValueError(f"#{args.issue}: unreadable state {state!r}")
@@ -477,33 +500,33 @@ def _check_request(args: argparse.Namespace) -> int:
     _status(f"content digest: {digest}")
     if state != "open":
         result["reasons"] = [f"issue #{args.issue} is {state}"]
-        _write(result, args.output)
-        _status(f"CLOSED: #{args.issue} is {state}")
-        return ISSUE_CLOSED
+        return ISSUE_CLOSED, result, f"CLOSED: #{args.issue} is {state}"
     if args.expect_digest is not None and args.expect_digest != digest:
         result["reasons"] = [
             f"the title or body changed: expected {args.expect_digest}, now {digest}"
         ]
-        _write(result, args.output)
-        _status(
+        return (
+            REQUEST_CHANGED,
+            result,
             f"CHANGED: #{args.issue}: the title or body is not the request the work was built "
-            f"from (expected {args.expect_digest}, now {digest})"
+            f"from (expected {args.expect_digest}, now {digest})",
         )
-        return REQUEST_CHANGED
     try:
         task = parse_task(title, body, labels)
     except TaskSpecError as exc:
         result["reasons"] = [f"not a valid work request: {exc}"]
-        _write(result, args.output)
-        _status(f"INVALID: #{args.issue}: {exc}")
-        return REQUEST_INVALID
+        return REQUEST_INVALID, result, f"INVALID: #{args.issue}: {exc}"
     decision = evaluate_task(task, policy, "implement")
     result["dependencies"] = list(task.dependencies)
     if not decision.allowed:
         result["reasons"] = list(decision.reasons)
-        _write(result, args.output)
-        _status(f"INVALID: #{args.issue}: " + "; ".join(decision.reasons))
-        return REQUEST_INVALID
+        return REQUEST_INVALID, result, f"INVALID: #{args.issue}: " + "; ".join(decision.reasons)
+    if events is not None:
+        verdict = authorize_labeler(args.project, args.issue, approval_labels, run_gh, events)
+        result["authorization"] = verdict.as_dict()
+        if not verdict.authorized:
+            result["reasons"] = [verdict.reason]
+            return LABELS_NOT_AUTHORIZED, result, f"NOT AUTHORIZED: #{args.issue}: {verdict.reason}"
     still_open = []
     for dependency in task.dependencies:
         state = run_gh(
@@ -517,13 +540,89 @@ def _check_request(args: argparse.Namespace) -> int:
         listed = ", ".join(f"#{n}" for n in still_open)
         result["reasons"] = [f"dependency issue(s) not closed: {listed}"]
         result["openDependencies"] = still_open
-        _write(result, args.output)
-        _status(f"WAITING: #{args.issue}: dependency issue(s) not closed: {listed}")
-        return DEPENDENCY_OPEN
+        return (
+            DEPENDENCY_OPEN,
+            result,
+            f"WAITING: #{args.issue}: dependency issue(s) not closed: {listed}",
+        )
     result.update(ready=True, reasons=list(decision.reasons))
+    what = "a valid work request with every dependency closed"
+    if events is not None:
+        what += " and every approval label last applied by a writer after the last edit"
+    return 0, result, f"ready: #{args.issue} is {what}"
+
+
+def _check_request(args: argparse.Namespace) -> int:
+    """Is GitHub issue `--issue` a work request the Actions implement path would run (Codex
+    4241434511)? Its body is parsed by the same validator (`parse_task`) and judged by the same
+    policy (`evaluate_task`, mode implement) as `prepare-request`, and every dependency it names
+    must be CLOSED, as the Actions "Require every dependency issue to be closed" step requires.
+    Exit 0: ready. 3: not a valid or eligible request. 4: a dependency is still open. 5: the
+    title or body is not the content `--expect-digest` names (it was edited: Codex 4241614582).
+    6: the issue is not open. 2 (an error): anything that could not be read -- never "no
+    dependencies". It prints the request's content digest on every run that reads the issue.
+    With `--base`, the policy is the one committed there in `--repository`, not the working-tree
+    file the agent could loosen (Codex 4241614590).
+
+    With `--authorize-labels` it is the routine's ONE final gate (Codex 4242264478: a separate
+    digest check and labeler check let an edit plus a label re-apply, or a reopened dependency,
+    land between them and pass both). It reads the issue and its event history once, judges
+    that one snapshot by every rule above AND by `authorize-labeler`'s (exit 7: a label of the
+    approval set not last applied by a writer, removed, or applied before the last edit), then
+    reads the issue and its history again: the update time, state, content digest, labels and
+    events must all be unchanged, or the snapshot is stale. A changed title or body fails at
+    once (exit 5); any other change is judged afresh from a new snapshot, at most
+    `CHECK_REQUEST_ATTEMPTS` times, then exit 8 (it would not hold still)."""
+    authorizing = bool(args.authorize_labels)
+    if args.label and not authorizing:
+        raise ValueError("--label only applies with --authorize-labels")
+    if args.base:
+        base = _verified_base(args.repository, args.project, args.base)
+        policy = _committed_policy(args.repository, base, args.config, args.base)
+    else:
+        policy = load_policy(args.config)
+    if policy.provider != "github":
+        raise ValueError("policy provider is not github")
+    if policy.project_id != args.project:
+        raise ValueError("policy project ID does not match --project")
+    approval_labels = list(args.label or []) or [
+        policy.implementation_label,
+        policy.ready_label,
+        policy.human_review_label,
+    ]
+    for attempt in range(1, CHECK_REQUEST_ATTEMPTS + 1):
+        document = _read_issue(args.project, args.issue)
+        events = issue_events(args.project, args.issue, run_gh) if authorizing else None
+        code, result, message = _judge_request(args, policy, document, events, approval_labels)
+        if code != 0 or events is None:
+            break
+        before = _issue_snapshot(document, events)
+        again = _read_issue(args.project, args.issue)
+        after = _issue_snapshot(again, issue_events(args.project, args.issue, run_gh))
+        if before == after:
+            result["stable"] = {"updatedAt": after["updated_at"], "attempts": attempt}
+            message += f" (stable across two reads at {after['updated_at']})"
+            break
+        moved = [key for key in before if before[key] != after[key]]
+        _status(f"#{args.issue} changed while it was checked ({', '.join(moved)})")
+        result.update(ready=False, changedWhileChecking=moved)
+        if before["content digest"] != after["content digest"]:
+            code = REQUEST_CHANGED
+            result["contentDigest"] = after["content digest"]
+            result["reasons"] = [
+                f"the title or body changed while it was checked: now {after['content digest']}"
+            ]
+            message = f"CHANGED: #{args.issue}: the title or body changed while it was checked"
+            break
+        code = REQUEST_UNSTABLE
+        result["reasons"] = [f"the issue changed while it was checked: {', '.join(moved)}"]
+        message = (
+            f"UNSTABLE: #{args.issue} changed during each of {CHECK_REQUEST_ATTEMPTS} checks "
+            f"({', '.join(moved)}); not concluding"
+        )
     _write(result, args.output)
-    _status(f"ready: #{args.issue} is a valid work request with every dependency closed")
-    return 0
+    _status(message)
+    return code
 
 
 def _create_manifest(args: argparse.Namespace) -> int:
@@ -1323,7 +1422,8 @@ def build_parser() -> argparse.ArgumentParser:
         "check-request",
         help="exit 0 only if the issue is an open, valid work request whose dependencies are "
         "all closed (3: invalid request, 4: a dependency is open, 5: content changed from "
-        "--expect-digest, 6: issue not open, 2: could not verify)",
+        "--expect-digest, 6: issue not open, 7: approval labels not authorized and 8: issue "
+        "kept changing (both with --authorize-labels), 2: could not verify)",
     )
     check_request.add_argument("--project", required=True, help="owner/name on GitHub")
     check_request.add_argument("--issue", type=int, required=True)
@@ -1342,6 +1442,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--expect-digest",
         help="the content digest an earlier check-request printed; exit 5 if the title or "
         "body no longer matches it",
+    )
+    check_request.add_argument(
+        "--authorize-labels",
+        action="store_true",
+        help="also require what authorize-labeler requires (exit 7 if not), all judged on one "
+        "snapshot of the issue that a second read must find unchanged (exit 8 if it kept "
+        "changing; exit 5 if its title or body changed): the routine's one final gate",
+    )
+    check_request.add_argument(
+        "--label",
+        action="append",
+        help="with --authorize-labels: a label of the approval set (repeat for each; the first "
+        "is the approval label); default: the implementation, ready and human-review labels "
+        "of the policy (as committed on --base when given)",
     )
     check_request.add_argument("--output")
     check_request.set_defaults(handler=_check_request)

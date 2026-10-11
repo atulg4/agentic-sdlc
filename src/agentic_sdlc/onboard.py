@@ -1085,6 +1085,11 @@ def render_cloud_routine_md(spec: OnboardSpec) -> str:
     check_diff = (
         f"sdlcctl check-diff --project {spec.project_id} --config agentic-sdlc.toml --base {base}"
     )
+    final_gate = (
+        f"{check_request} --expect-digest <digest> --authorize-labels"
+        f" --label {shlex.quote(IMPLEMENTATION_LABEL)} --label {shlex.quote(spec.ready_label)}"
+        f" --label {shlex.quote(HUMAN_REVIEW_LABEL)}"
+    )
     prompt = f"""Repository: {spec.project_id}. Every run:
 1. List open issues that carry ALL of: {_md_code(spec.ready_label)}, {_md_code(HUMAN_REVIEW_LABEL)},
    {_md_code(IMPLEMENTATION_LABEL)}
@@ -1157,19 +1162,20 @@ def render_cloud_routine_md(spec: OnboardSpec) -> str:
    check.
 4c. Verify the lease: run the step 3a renew command once more (it fails if the issue was closed
    meanwhile). On any non-zero exit do NOT push or open a PR; stop as in step 3a.
-4d. Re-check the request (Codex 4241614596, 4241614582: a dependency may have been reopened,
-   the issue closed, or the request edited and re-approved while you worked):
-   `{check_request} --expect-digest <digest>`.
-   Continue ONLY on exit 0. On any other exit do NOT push or open a PR: {release}
-   and stop. Exit 5 means the title or body changed since step 2: comment (once) that the
-   request changed while it was being implemented and a later run will start over from the
-   new text. Exit 4: a dependency was reopened. Exit 6: the issue is no longer open.
-4e. Re-authorize LAST, immediately before pushing (Codex 4240628982, 4241839918: the labels may
-   have been removed and re-applied, or applied by someone without write access, while you
-   worked -- even during the checks above): run the step 1a command again. Proceed to step 5
-   ONLY on exit 0. On anything else do NOT push or open a PR: {release}, and on exit 3 comment
-   (once) that a maintainer must re-apply the labels; then stop. Run nothing between this
-   check and the push.
+4d. The final gate, LAST, immediately before pushing -- ONE command that decides everything
+   from one snapshot of the issue (Codex 4242264478: two separate checks let an edit plus a
+   label re-apply, or a reopened dependency, land between them and pass both):
+   `{final_gate}`.
+   It re-checks the request (Codex 4241614596, 4241614582: a dependency reopened, the issue
+   closed, the request edited) and re-authorizes the approval labels as step 1a does (Codex
+   4240628982, 4241839918: labels removed and re-applied, or applied by someone without write
+   access, while you worked), then reads the issue and its history again and requires them
+   unchanged. Proceed to step 5 ONLY on exit 0, and run nothing between this check and the
+   push. On any other exit do NOT push or open a PR: {release} and stop. Exit 5 means the
+   title or body changed since step 2: comment (once) that the request changed while it was
+   being implemented and a later run will start over from the new text. Exit 7: comment (once)
+   that a maintainer must review it and re-apply the labels. Exit 4: a dependency was reopened.
+   Exit 6: the issue is no longer open. Exit 8: the issue kept changing while it was checked.
 5. Push the checked commit at once -- `git push origin HEAD:refs/heads/<branch>`, never
    forced -- and
    open a DRAFT pull request titled "<issue title> (#<n>)" with a summary
@@ -1190,12 +1196,10 @@ definitive write/maintain/admin permission for whoever applied EACH label of the
 a writer approved (a 404 is unauthorized; any other failure is unverifiable and the issue is
 skipped) -- and requires the issue's title and body to have been last edited BEFORE each of
 those labels was last applied, so an edit after approval is never implemented unapproved (an
-edit time that cannot be read is unverifiable). It runs it AGAIN as the LAST gate,
-immediately before pushing and after every other check, so a label removed and re-applied, or
-the issue edited, while the routine worked -- even while it ran the other checks -- stops the
-push. The Actions path's other deterministic gates are commands too, and the routine is gated
-on their exit codes: `sdlcctl check-request` parses the issue with the same work-request
-validator and policy as `prepare-request` and requires every dependency issue to be closed;
+edit time that cannot be read is unverifiable). The Actions path's other deterministic gates
+are commands too, and the routine is gated on their exit codes: `sdlcctl check-request`
+parses the issue with the same work-request validator and policy as `prepare-request` and
+requires every dependency issue to be closed;
 `sdlcctl check-diff` applies the same diff policy as `inspect-diff` (forbidden paths and the
 patch caps) to exactly what is about to be pushed -- every path any commit of the series
 touches, not only the end state -- under the policy COMMITTED on the default branch (an
@@ -1205,10 +1209,16 @@ can replace (never a `git` from a writable PATH entry) in an environment of its 
 `sdlcctl renew` -- after implementation, after verification and immediately before pushing --
 keeps the lease alive and
 fails unless this run still holds it and the issue is still open, so the routine never pushes
-over another agent's lease or for a closed issue; and before the final authorization
-`check-request` runs once more with the content digest it printed in step 2, so a reopened
-dependency, a closed issue or an edited request (even one whose labels were re-applied) stops
-the push.
+over another agent's lease or for a closed issue. The LAST gate, immediately before pushing
+and with nothing run between it and the push, is ONE command:
+`check-request --expect-digest <digest from step 2> --authorize-labels`. It reads the issue and
+its label history once and judges that single snapshot by every rule -- issue open, title and
+body unchanged since step 2, a valid request, every dependency closed, and each approval label
+last applied by a writer after the last edit -- then reads the issue and its history again and
+requires the update time, state, content, labels and events unchanged (a changed title or body
+fails at once; any other change is judged afresh, a bounded number of times). So an edit plus
+a label re-apply, a reopened dependency or a closed issue at any point before the push stops it:
+there is no gap between two separate checks for them to land in.
 Keep `lease_ttl_minutes` longer than the longest stage. An issue whose body is not a valid
 work request is labelled {_md_code(BLOCKED_LABEL)} and its lease released; step 1 never
 selects a blocked issue.
