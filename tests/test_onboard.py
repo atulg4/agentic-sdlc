@@ -589,6 +589,16 @@ def test_doctor_in_cloud_routine_mode_needs_no_runner_app_or_publisher_secret(tm
     gh.answers["api repos/owner/comic/actions/runners"] = _pages("runners", [])
     gh.answers["api /user/installations"] = _installs()
     report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    # Codex 4239868034: nothing here can see the claude.ai routine -- an owner TODO until the
+    # owner records it, never READY on a document alone
+    failed = _failed(report)
+    assert set(failed) == {"cloud implementer routine is scheduled"}, report.render()
+    assert failed["cloud implementer routine is scheduled"].manual
+    assert "sdlcctl confirm-cloud-routine" in report.render() and not report.ok
+    from agentic_sdlc.onboard import confirm_cloud_routine
+
+    confirm_cloud_routine(repo)
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
     assert report.ok, report.render()
 
 
@@ -823,6 +833,7 @@ def test_doctor_flags_a_policy_branch_that_is_not_the_repo_default(tmp_path):
     gh = _healthy_gh()
     gh.answers["api repos/owner/comic"] = json.dumps(
         {
+            "full_name": "owner/comic",
             "default_branch": "master",
             "visibility": "private",
             "allow_forking": False,
@@ -1936,7 +1947,13 @@ def test_doctor_accepts_a_public_repository_onboarded_with_hosted_ci(tmp_path):
     write_onboarding(repo, spec(fork_exposed=True))
     gh = _healthy_gh()
     gh.answers["api repos/owner/comic"] = json.dumps(
-        {"default_branch": "main", "visibility": "public", "private": False, "has_issues": True}
+        {
+            "full_name": "owner/comic",
+            "default_branch": "main",
+            "visibility": "public",
+            "private": False,
+            "has_issues": True,
+        }
     )
     report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
     assert report.ok, report.render()
@@ -2067,6 +2084,7 @@ def test_doctor_accepts_self_hosted_pr_jobs_when_fork_workflows_are_proven_off(t
     gh.answers = {key: '{"run_workflows_from_fork_pull_requests": false}', **gh.answers}
     gh.answers["api repos/owner/comic"] = json.dumps(
         {
+            "full_name": "owner/comic",
             "default_branch": "main",
             "visibility": "internal",
             "allow_forking": True,
@@ -5253,10 +5271,14 @@ def test_canonical_project_id_takes_githubs_spelling_of_the_same_repository():
 
     gh = FakeGh({"api repos/OWNER/Comic": json.dumps({"full_name": "owner/comic"})})
     assert canonical_project_id("OWNER/Comic", gh) == "owner/comic"
+    # Codex 4239868019: a rename/transfer redirect answers with the CURRENT name, which is what
+    # every run passes as $GITHUB_REPOSITORY: that is the canonical id, not the stale slug
     renamed = FakeGh({"api repos/owner/old": json.dumps({"full_name": "owner/new"})})
-    assert canonical_project_id("owner/old", renamed) == "owner/old"  # doctor reports it
+    assert canonical_project_id("owner/old", renamed) == "owner/new"
+    moved = FakeGh({"api repos/owner/comic": json.dumps({"full_name": "neworg/Comic"})})
+    assert canonical_project_id("owner/comic", moved) == "neworg/Comic"
     # Unreadable is never a guess: --apply would write the id into the policy and configure by it.
-    for answer in ("not json", "", OnboardError("gh: HTTP 502"), "[]"):
+    for answer in ("not json", "", OnboardError("gh: HTTP 502"), "[]", "{}", '{"full_name": 7}'):
         with pytest.raises(OnboardError, match="could not read owner/comic"):
             canonical_project_id("owner/comic", FakeGh({"api repos/owner/comic": answer}))
 
@@ -8462,3 +8484,268 @@ def test_forced_onboard_refuses_unmergeable_settings(tmp_path, content):
     with pytest.raises(OnboardError, match="settings.json"):
         write_onboarding(repo, spec(), force=True)
     assert path.read_text() == content
+
+
+# Codex 4239868022: a repository selector the shell expands cannot be probed; the probe failed
+# and the failure read as "no branch", so the command reached an unleased issue checkout.
+@pytest.mark.parametrize(
+    "command",
+    [
+        'DIR=../wt; git -C "$DIR" commit -m x',
+        'git -C "$DIR" commit -m x',
+        "git -C $DIR commit -m x",
+        'git --git-dir="$X/.git" commit -m x',
+        "git --git-dir=$X commit -m x",
+        'git --git-dir "$X" commit -m x',
+        'git --work-tree="$W" commit -m x',
+        'GIT_DIR="$DIR/.git" git commit -m x',
+        "GIT_WORK_TREE=$W git commit -m x",
+        'env GIT_DIR="$DIR/.git" git commit -m x',
+        'git -C "$(pwd)/../wt" commit -m x',
+        "git -C `pwd`/../wt commit -m x",
+        "git -C ../w* commit -m x",
+        "git -C ../w{t,x} commit -m x",
+        "git --git-dir=~/wt/.git commit -m x",
+        'git -C "~/wt" commit -m x',
+        'env -C "$DIR" git commit -m x',
+        'git -C "$DIR" push origin HEAD',
+        'git -C "$DIR" fetch origin main:main',
+    ],
+)
+def test_commit_guard_refuses_repository_selectors_it_cannot_resolve(
+    tmp_path, monkeypatch, command
+):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    repo = _branch_flow_repo(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    code, message = _flow_code(guard, command, repo, leased=(7, 9))  # every lease held
+    assert code == 2 and "selects its repository through text the shell" in message, command
+
+
+def test_commit_guard_cd_to_an_expansion_still_refuses(tmp_path):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    repo = _branch_flow_repo(tmp_path)
+    for command in ('cd "$DIR" && git commit -m x', "cd $(dirname $F) && git commit -m x"):
+        assert _flow_code(guard, command, repo, leased=(7, 9))[0] == 2, command
+
+
+def test_commit_guard_resolves_literal_repository_selectors(tmp_path, monkeypatch):
+    """Literal selectors keep working -- a leading `~` the shell expands is resolved as the shell
+    would -- and lead to the issue checkout's lease."""
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    repo = _branch_flow_repo(tmp_path)  # tmp/wt is on forge/issue-9
+    monkeypatch.setenv("HOME", str(tmp_path))
+    for command in (
+        "git -C ../wt commit -m x",
+        f"git -C {tmp_path / 'wt'} commit -m x",
+        "git -C ~/wt commit -m x",
+        "git --git-dir ~/wt/.git --work-tree ~/wt commit -m x",
+        "GIT_DIR=~/wt/.git git commit -m x",
+        "cd ../wt && git commit -m x",
+        "cd ~/wt && git commit -m x",
+    ):
+        code, message = _flow_code(guard, command, repo)
+        assert code == 2 and "issue #9" in message, command
+        assert _flow_code(guard, command, repo, leased=(9,))[0] == 0, command
+    assert _flow_code(guard, "git commit -m x", repo)[0] == 0  # plain commit on main
+
+
+def test_commit_guard_branch_lookup_failures_refuse(tmp_path, monkeypatch):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    repo = _branch_flow_repo(tmp_path)
+    # a directory that does not exist (yet): unknown, not "no branch"
+    code, message = _flow_code(guard, "git -C ../nope commit -m x", repo, leased=(7, 9))
+    assert code == 2 and "could not report the branch" in message
+    assert guard.current_branch(str(tmp_path / "nope")) == guard.BRANCH_UNKNOWN
+    # a repository with no commits yet still reports its (unborn) branch
+    unborn = tmp_path / "unborn"
+    unborn.mkdir()
+    _git(unborn, "init", "-q", "-b", "forge/issue-7")
+    assert guard.current_branch(str(unborn)) == "forge/issue-7"
+    assert _flow_code(guard, "git commit -m x", unborn)[0] == 2
+    assert _flow_code(guard, "git commit -m x", unborn, leased=(7,))[0] == 0
+    # no repository at all: nothing to protect, `git clone` / `git init` keep working
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    assert guard.current_branch(str(plain)) == ""
+    assert _flow_code(guard, "git clone https://example.com/x.git", plain)[0] == 0
+    assert _flow_code(guard, "git init -q", plain)[0] == 0
+
+    # any other failure (an untrusted repository, a corrupt HEAD, ...) is unknown
+    import subprocess
+
+    def failing(args, **kwargs):
+        return subprocess.CompletedProcess(args, 128, stdout="", stderr="fatal: dubious ownership")
+
+    monkeypatch.setattr(guard.subprocess, "run", failing)
+    assert guard.current_branch(str(repo)) == guard.BRANCH_UNKNOWN
+
+    def missing(args, **kwargs):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(guard.subprocess, "run", missing)
+    assert guard.current_branch(str(repo)) == guard.BRANCH_UNKNOWN
+
+
+# Codex 4239868024: `git fetch` without command-line refspecs fetches what `remote.*.fetch` says,
+# and that may write a local issue branch.
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git fetch",
+        "git fetch origin",
+        "git fetch --all",
+        "git fetch --prune origin",
+        "git fetch --multiple origin other",
+        "git fetch origin main",
+        "git pull",
+        "git pull origin main",
+    ],
+)
+def test_commit_guard_fetch_checks_configured_destinations(tmp_path, command):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    repo = _branch_flow_repo(tmp_path)
+    _git(repo, "remote", "add", "origin", str(tmp_path / "wt"))
+    _git(
+        repo, "config", "--add", "remote.origin.fetch", "+refs/heads/main:refs/heads/forge/issue-7"
+    )
+    code, message = _flow_code(guard, command, repo)
+    assert code == 2 and "issue #7" in message, command
+    assert _flow_code(guard, command, repo, leased=(7,))[0] == 0, command
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        "+refs/heads/*:refs/heads/*",
+        "+refs/*:refs/*",
+        "+refs/heads/*:forge/*",
+        "refs/heads/main:HEAD",
+    ],
+)
+def test_commit_guard_fetch_with_unknowable_configured_destinations_refuses(tmp_path, spec):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    repo = _branch_flow_repo(tmp_path)
+    _git(repo, "remote", "add", "other", str(tmp_path / "wt"))
+    _git(repo, "config", "--replace-all", "remote.other.fetch", spec)
+    for command in ("git fetch", "git fetch other", "git fetch --all --prune"):
+        code, message = _flow_code(guard, command, repo, leased=(7, 9))
+        assert code == 2 and "cannot be known before it runs" in message, (spec, command)
+
+
+def test_commit_guard_fetch_with_standard_refspecs_stays_read_only(tmp_path, monkeypatch):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    repo = _branch_flow_repo(tmp_path)
+    _git(repo, "remote", "add", "origin", str(tmp_path / "wt"))
+    _git(repo, "config", "--add", "remote.origin.fetch", "+refs/tags/*:refs/tags/*")
+    _git(repo, "config", "--add", "remote.origin.fetch", "^refs/heads/forge/issue-7")
+    _git(repo, "config", "--add", "remote.origin.fetch", "refs/heads/main")
+    wt = tmp_path / "wt"  # on forge/issue-9: a read-only fetch needs no lease there either
+    _git(wt, "remote", "add", "origin", str(repo))
+    for command in ("git fetch", "git fetch origin", "git fetch --all --prune", "git fetch -p"):
+        assert _flow_code(guard, command, repo)[0] == 0, command
+        assert _flow_code(guard, command, wt)[0] == 0, command
+    # unreadable configuration is unknown, never "no destinations"
+    assert guard._configured_fetch_refs(str(repo), ((), (), ()), False) == []
+    monkeypatch.setattr(guard, "_read_config", lambda where, target: None)
+    assert guard._configured_fetch_refs(str(repo), ((), (), ()), False) == [guard.UNKNOWN_REF]
+    assert guard._configured_fetch_refs(str(repo), ((), (), ()), True) == [guard.UNKNOWN_REF]
+    assert _flow_code(guard, "git fetch origin", repo)[0] == 2
+
+
+# Codex 4239868019: GET repos/{id} follows a rename/transfer and answers the NEW full_name, which
+# is what every run passes as $GITHUB_REPOSITORY.
+def test_doctor_fails_a_policy_id_that_github_answers_under_a_new_name(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(project_id="owner/old"))
+    gh = _healthy_gh()
+    info = json.loads(gh.answers["api repos/owner/comic"])
+    gh.answers = {
+        f"api repos/owner/old{key[len('api repos/owner/comic') :]}"
+        if key.startswith("api repos/owner/comic")
+        else key: value
+        for key, value in gh.answers.items()
+    }
+    gh.answers["api repos/owner/old"] = json.dumps({**info, "full_name": "owner/new"})
+    report = doctor(repo, "owner/old", "owner/agentic-sdlc", gh)
+    check = next(c for c in report.checks if c.name == "policy project id matches the repository")
+    assert not check.ok and not check.manual and not report.ok
+    assert "renamed or transferred" in check.detail and '[project].id = "owner/new"' in check.detail
+    # unread, or an answer without a full_name: unverified, never a pass
+    gh.answers["api repos/owner/old"] = json.dumps(
+        {k: v for k, v in info.items() if k != "full_name"}
+    )
+    report = doctor(repo, "owner/old", "owner/agentic-sdlc", gh)
+    check = next(c for c in report.checks if c.name == "policy project id matches the repository")
+    assert not check.ok and check.manual and "unverified" in check.detail
+
+
+def test_cli_onboard_apply_writes_and_reports_the_new_name_of_a_renamed_repository(
+    tmp_path, monkeypatch, capsys
+):
+    from agentic_sdlc import cli
+    from agentic_sdlc.onboard import DoctorReport
+
+    monkeypatch.setattr(cli, "canonical_project_id", lambda project: "owner/new")
+    monkeypatch.setattr(cli, "apply_repo_settings", lambda spec, **k: {})
+    monkeypatch.setattr(cli, "doctor", lambda *a, **k: DoctorReport())
+    repo = _repo(tmp_path)
+    args = ["onboard", "--visibility", "private", "--destination", str(repo)]
+    args += ["--project-id", "owner/old"]
+    args += ["--platform-repository", "owner/agentic-sdlc", "--platform-ref", SHA]
+    args += ["--test", "pytest -q", "--default-branch", "main", "--apply"]
+    assert cli.main([*args, "--output", str(tmp_path / "o.json")]) == 0
+    assert 'id = "owner/new"' in (repo / "agentic-sdlc.toml").read_text()
+    assert json.loads((tmp_path / "o.json").read_text())["project_id"] == "owner/new"
+    assert "owner/old as owner/new (renamed or transferred)" in capsys.readouterr().err
+
+
+# Codex 4239868034: a cloud-routine repository is READY only once the owner records the routine.
+def test_confirm_cloud_routine_records_an_explicit_owner_confirmation(tmp_path, capsys):
+    import tomllib
+
+    from agentic_sdlc import cli
+    from agentic_sdlc.onboard import cloud_routine_check, confirm_cloud_routine
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(implementer="cloud-routine", runs_on=("ubuntu-latest",)))
+    policy = repo / "agentic-sdlc.toml"
+    before = policy.read_text()
+    assert "cloud_routine_confirmed" not in before  # onboarding never confirms on its own
+    assert not cloud_routine_check(tomllib.loads(before)).ok
+    assert cloud_routine_check(tomllib.loads(before)).manual
+    doc = (repo / "docs/forge/cloud-implementer.md").read_text()
+    assert "sdlcctl confirm-cloud-routine" in doc
+    assert cli.main(["confirm-cloud-routine", "--destination", str(repo)]) == 0
+    after = policy.read_text()
+    assert tomllib.loads(after)["automation"]["cloud_routine_confirmed"] is True
+    assert after.replace("cloud_routine_confirmed = true\n", "", 1) == before  # nothing else
+    assert cloud_routine_check(tomllib.loads(after)).ok
+    confirm_cloud_routine(repo)  # idempotent
+    assert policy.read_text() == after
+    # only `true` itself confirms
+    for value in ("false", '"yes"', "1"):
+        policy.write_text(
+            after.replace("cloud_routine_confirmed = true", f"cloud_routine_confirmed = {value}")
+        )
+        assert not cloud_routine_check(tomllib.loads(policy.read_text())).ok, value
+        confirm_cloud_routine(repo)
+        assert policy.read_text() == after, value
+    # an Actions-mode policy has nothing to confirm
+    actions = _repo(tmp_path / "actions")
+    write_onboarding(actions, spec())
+    with pytest.raises(OnboardError, match="not 'cloud-routine'"):
+        confirm_cloud_routine(actions)
+    assert cli.main(["confirm-cloud-routine", "--destination", str(actions)]) == 2
+    assert "cloud_routine_confirmed" not in (actions / "agentic-sdlc.toml").read_text()
+
+
+# Codex 4239868029: the cloud routine authorizes the approval labeler before it claims.
+def test_cloud_routine_prompt_authorizes_the_labeler_before_claiming():
+    files = render_onboarding(spec(implementer="cloud-routine", runs_on=("ubuntu-latest",)))
+    doc = files["docs/forge/cloud-implementer.md"]
+    authorize = doc.index("sdlcctl authorize-labeler --project owner/comic --issue <n>")
+    assert authorize < doc.index("sdlcctl claim --project owner/comic")
+    assert "--label implementation-approved" in doc
+    assert "Proceed ONLY on exit 0" in doc and "do not claim" in doc

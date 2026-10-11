@@ -198,6 +198,23 @@ something that runs differently.
   `cloud-routine`), never inferred from which files exist. A policy written before the field
   existed still passes while its Actions implement callers are installed; without them, add
   `implementation_mode = "cloud-routine"` (or re-run `onboard --force`).
+- **Cloud routine** (`cloud-routine` mode): `onboard` only writes `docs/forge/cloud-implementer.md`
+  with a suggested prompt; the scheduled routine lives on claude.ai, where `doctor` cannot see
+  it. "cloud implementer routine is scheduled" is therefore a manual TODO -- and the repository
+  NOT READY -- until the owner creates the routine and records it with `sdlcctl
+  confirm-cloud-routine` (sets `[automation] cloud_routine_confirmed = true`; only the boolean
+  `true` counts). `onboard --force` rewrites the policy and drops the confirmation: re-check the
+  routine against the regenerated document, then confirm again. The routine prompt runs `sdlcctl
+  authorize-labeler --project owner/repo --issue N` before claiming, the same check the Actions
+  path runs: the most recent application of `implementation-approved` (from the issue's label
+  events) must be by a user with write/maintain/admin -- a 200 carrying that permission; a 404 or
+  a lower role exits 3 (not authorized), and anything unreadable exits 2 (not verified); only
+  exit 0 claims.
+- **Project id**: `[project].id` must equal, exactly, the `full_name` GitHub answers for `GET
+  repos/{id}` -- its spelling, and after a rename or transfer (which the API follows as a
+  redirect) the NEW name, since every run passes that as `$GITHUB_REPOSITORY`. A mismatch fails
+  with the fix; an unreadable answer is a manual TODO. `onboard --apply` writes the `full_name`
+  and says so when it differs from `--project-id`.
 - **CI gates**: the `test` job's steps must equal the template rendered from `[commands]`
   (above); that equality is the guarantee. The checks that follow are defense in depth behind
   it. Each gate must be invoked exactly as `[commands]` states. Only output and fail-fast extras
@@ -241,7 +258,9 @@ something that runs differently.
   log, diff, show, blame, grep, ls-files, ls-tree, rev-parse, describe, shortlog, `reflog show`,
   listing forms of `branch`/`tag`/`remote`/`config`/`stash`, `fetch` without a refspec or
   `--update-head-ok`, help, version, cat-file, for-each-ref, name-rev, merge-base, check-ignore,
-  check-attr). Aliases, `git-<name>` programs, `-c`/`--config-env`, and anything that runs git or
+  check-attr; `fetch` also only while no configured `remote.*.fetch` refspec writes a local
+  branch -- an issue branch there needs its lease, a glob into `refs/heads` or unreadable
+  configuration blocks). Aliases, `git-<name>` programs, `-c`/`--config-env`, and anything that runs git or
   a shell indirectly (`xargs git`, `find -exec git`, `... | sh`) need the lease too. So does a
   read-only subcommand whenever git could run a program configured outside the command --
   `diff.external`, a textconv/diff/filter driver (git-lfs's canonical filters excepted), a pager
@@ -257,7 +276,12 @@ something that runs differently.
   git commit` is checked against issue 7, `git switch main && git commit` against main (a plain
   switch to an existing branch needs no lease); a change whose destination is not literal
   (`git checkout "$B"`, `git checkout -`, an alias, bisect, `source`, `cd "$D"`) blocks any
-  later guarded git in that command -- run the two as separate commands.
+  later guarded git in that command -- run the two as separate commands. The repository a
+  guarded command selects must be resolvable before it runs: `git -C "$DIR"`, `--git-dir=$X`,
+  `--work-tree`, `GIT_DIR=`/`GIT_WORK_TREE=` set to an expansion, `$(...)`, backticks, a glob or
+  an ambiguous `~` are refused (use a literal path; an unquoted leading `~` is resolved), and a
+  branch lookup that fails for any reason other than "not a git repository" (a directory that
+  does not exist yet, an untrusted repository) refuses instead of reading as "no branch".
 - **Publisher App** permissions must be exactly Contents read, Issues write, Pull requests write
   (plus GitHub's mandatory Metadata read); any other grant fails.
 - **Rulesets**: every parameter Forge's ruleset sets is compared (iterated from the payload, not

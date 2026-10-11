@@ -46,6 +46,7 @@ from .leases import (
     DEFAULT_TTL_MINUTES,
     ClaimResult,
     LeaseError,
+    authorize_labeler,
     claim,
     list_claims,
     release,
@@ -60,10 +61,12 @@ from .missions import (
 )
 from .models import RiskLevel
 from .onboard import (
+    IMPLEMENTATION_LABEL,
     OnboardError,
     OnboardSpec,
     apply_repo_settings,
     canonical_project_id,
+    confirm_cloud_routine,
     copy_variables,
     doctor,
     registry_model_vars,
@@ -753,6 +756,14 @@ def _onboard(args: argparse.Namespace) -> int:
     # The policy must name the repository as GitHub spells it ($GITHUB_REPOSITORY, compared
     # exactly by prepare-request); --apply reads it anyway. Offline, doctor checks the spelling.
     project_id = canonical_project_id(args.project_id) if args.apply else args.project_id
+    if project_id.casefold() != args.project_id.casefold():
+        # Codex 4239868019: a renamed or transferred repository is onboarded under its new name.
+        print(
+            f"NOTE: GitHub answers {args.project_id} as {project_id} (renamed or transferred); "
+            f"onboarding as {project_id}, the name every workflow run passes as "
+            "$GITHUB_REPOSITORY.",
+            file=sys.stderr,
+        )
     platform_ref = resolve_platform_ref(args.platform_repository, args.platform_ref)
     default_branch = args.default_branch
     if not default_branch:
@@ -791,6 +802,7 @@ def _onboard(args: argparse.Namespace) -> int:
         assignments[key] = value
     written = write_onboarding(destination, spec, force=args.force)
     result: dict[str, Any] = {
+        "project_id": project_id,
         "platform_ref": platform_ref,
         "written": [str(path.relative_to(destination)) for path in written],
     }
@@ -835,6 +847,12 @@ def _doctor(args: argparse.Namespace) -> int:
     print(report.render())
     _write(report.as_dict(), args.output) if args.output else None
     return 0 if report.ok else 2
+
+
+def _confirm_cloud_routine(args: argparse.Namespace) -> int:
+    path = confirm_cloud_routine(Path(args.destination).resolve())
+    _status(f"recorded in {path}: the cloud implementer routine is scheduled")
+    return 0
 
 
 def _lease_ttl(args: argparse.Namespace) -> int:
@@ -896,6 +914,18 @@ def _release(args: argparse.Namespace) -> int:
     )
     _write({"issue": args.issue, "released": True, "session": args.session}, args.output)
     _status(f"released #{args.issue}")
+    return 0
+
+
+def _authorize_labeler(args: argparse.Namespace) -> int:
+    """Exit 0: the approval label was last applied by a writer. Exit 3: definitively not
+    (unauthorized labeler, or the label was removed). Exit 2 (an error): unverifiable."""
+    verdict = authorize_labeler(args.project, args.issue, args.label, run_gh)
+    _write(verdict.as_dict(), args.output)
+    if not verdict.authorized:
+        _status(f"NOT AUTHORIZED: #{args.issue}: {verdict.reason}")
+        return 3
+    _status(f"authorized #{args.issue}: {verdict.reason}")
     return 0
 
 
@@ -1297,6 +1327,14 @@ def build_parser() -> argparse.ArgumentParser:
     doc.add_argument("--output")
     doc.set_defaults(handler=_doctor)
 
+    confirm = commands.add_parser(
+        "confirm-cloud-routine",
+        help="record that the cloud implementer routine is scheduled on claude.ai "
+        "([automation] cloud_routine_confirmed = true); doctor stays NOT READY until then",
+    )
+    confirm.add_argument("--destination", default=".")
+    confirm.set_defaults(handler=_confirm_cloud_routine)
+
     def _lease_args(parser: argparse.ArgumentParser) -> None:
         parser.add_argument("--project", required=True, help="owner/name on GitHub")
         parser.add_argument("--issue", type=int, required=True)
@@ -1329,6 +1367,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     lease_release.add_argument("--note")
     lease_release.set_defaults(handler=_release)
+
+    authorize = commands.add_parser(
+        "authorize-labeler",
+        help="exit 0 only if a write/maintain/admin user applied the approval label last "
+        "(3: not authorized, 2: could not verify)",
+    )
+    authorize.add_argument("--project", required=True, help="owner/name on GitHub")
+    authorize.add_argument("--issue", type=int, required=True)
+    authorize.add_argument("--label", default=IMPLEMENTATION_LABEL)
+    authorize.add_argument("--output")
+    authorize.set_defaults(handler=_authorize_labeler)
 
     lease_list = commands.add_parser("claims", help="list live and expired leases in a repository")
     lease_list.add_argument("--project", required=True)

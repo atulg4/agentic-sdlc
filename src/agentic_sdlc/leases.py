@@ -1367,3 +1367,111 @@ def render_claims(rows: Sequence[ClaimRow]) -> str:
             f"{r.lease.branch[:28]:28}  {_iso(r.lease.expires)}"
         )
     return "\n".join(lines)
+
+
+# ---- Approval labeler authorization (Codex 4239868029). A user with Triage permission can apply
+# labels without repository write authority, so the labels alone never authorize work: the
+# Actions path runs `_authorize-labeler.yml` before implementing, and a cloud routine runs
+# `sdlcctl authorize-labeler` before claiming. Both require a DEFINITIVE write/maintain/admin
+# answer for whoever applied the approval label most recently: a 200 carrying the permission, or
+# a 404 (no access: unauthorized). Anything else -- the events or the permission unreadable, no
+# `labeled` event, an event without an actor -- is unverifiable and refuses (LeaseError), never
+# reads as authorized.
+
+
+@dataclass(frozen=True)
+class LabelerAuthorization:
+    issue: int
+    label: str
+    labeler: str
+    permission: str | None
+    authorized: bool
+    reason: str
+
+    def as_dict(self) -> dict:
+        return {
+            "issue": self.issue,
+            "label": self.label,
+            "labeler": self.labeler,
+            "permission": self.permission,
+            "authorized": self.authorized,
+            "reason": self.reason,
+        }
+
+
+def labeler_permission(project: str, login: str, gh: GhRunner) -> str | None:
+    """`login`'s repository permission (role_name when it is a write role, else permission);
+    None on a 404 (no access). Any other failure or shape raises LeaseError."""
+    from urllib.parse import quote
+
+    path = f"repos/{project}/collaborators/{quote(login, safe='')}/permission"
+    try:
+        raw = gh(["api", path])
+    except Exception as exc:  # noqa: BLE001 -- only a 404 is an answer
+        if "HTTP 404" in str(exc):
+            return None
+        raise LeaseError(
+            f"cannot read the repository permission of {login!r} "
+            f"({str(exc).strip()[:200] or type(exc).__name__}); not authorizing"
+        ) from exc
+    try:
+        data = json.loads(raw or "null")
+    except ValueError as exc:
+        raise LeaseError(f"unreadable answer from {path}: not JSON") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("permission"), str):
+        raise LeaseError(f"unreadable answer from {path}: no permission in it")
+    for key in ("role_name", "permission"):
+        value = login_key(data.get(key))
+        if value in WRITE_PERMISSIONS:
+            return value
+    return str(data.get("permission") or "") or None
+
+
+def authorize_labeler(project: str, issue: int, label: str, gh: GhRunner) -> LabelerAuthorization:
+    """Did someone with write/maintain/admin apply `label` to `issue` most recently (see above)?
+    Returns the verdict; raises LeaseError when it cannot be verified."""
+    try:
+        events = _issue_events(project, issue, gh)
+    except LeaseError:
+        raise
+    except Exception as exc:  # noqa: BLE001 -- unreadable history never authorizes
+        raise LeaseError(
+            f"cannot read the events of issue #{issue} ({str(exc).strip()[:200]}); not authorizing"
+        ) from exc
+    wanted = label.casefold()  # label names are case-insensitive on GitHub
+    latest: dict | None = None
+    for event in events:
+        if event.get("event") not in ("labeled", "unlabeled"):
+            continue
+        label_obj = event.get("label")
+        name = label_obj.get("name") if isinstance(label_obj, dict) else None
+        if not isinstance(name, str):
+            raise LeaseError(
+                f"issue #{issue}: a label event carries no label name; not authorizing"
+            )
+        if name.casefold() == wanted:
+            latest = event
+    if latest is None:
+        raise LeaseError(f"issue #{issue}: no `labeled` event for {label!r}; not authorizing")
+    if latest.get("event") != "labeled":
+        return LabelerAuthorization(
+            issue, label, "", None, False, f"{label!r} was removed after it was last applied"
+        )
+    actor = latest.get("actor")
+    login = actor.get("login") if isinstance(actor, dict) else None
+    if not isinstance(login, str) or not login.strip():
+        raise LeaseError(f"issue #{issue}: the {label!r} event names no actor; not authorizing")
+    permission = labeler_permission(project, login, gh)
+    if permission is not None and login_key(permission) in WRITE_PERMISSIONS:
+        return LabelerAuthorization(
+            issue, label, login, permission, True, f"{login} has {permission} permission"
+        )
+    return LabelerAuthorization(
+        issue,
+        label,
+        login,
+        permission,
+        False,
+        f"{login} applied {label!r} without repository write authority "
+        f"(permission: {permission or 'none'})",
+    )

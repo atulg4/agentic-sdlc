@@ -2051,3 +2051,134 @@ def test_an_unreadable_open_pr_inventory_is_never_no_pr(answer):
         open_prs_for_issue(PROJECT, 7, broken)
     with pytest.raises(LeaseError):
         claim(PROJECT, 7, agent="me", session="s1", branch="b", gh=broken, now=NOW)
+
+
+# Codex 4239868029: a cloud routine claims only work whose approval label a writer applied.
+def _labeler_gh(events_pages, permissions, calls=None):
+    def gh(args, input=None):
+        if calls is not None:
+            calls.append(list(args))
+        path = args[1]
+        if "/events" in path:
+            assert "--paginate" in args and "--slurp" in args
+            if isinstance(events_pages, Exception):
+                raise events_pages
+            return json.dumps(events_pages)
+        login = path.split("/collaborators/")[1].split("/")[0]
+        answer = permissions[login]
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    return gh
+
+
+def _label_event(kind, label, login, event_id):
+    return {"id": event_id, "event": kind, "label": {"name": label}, "actor": {"login": login}}
+
+
+APPROVAL = "implementation-approved"
+
+
+def test_authorize_labeler_requires_write_authority_from_the_latest_approver():
+    from agentic_sdlc.leases import authorize_labeler
+    from agentic_sdlc.onboard import OnboardError
+
+    write = json.dumps({"permission": "write", "role_name": "write"})
+    maintain = json.dumps({"permission": "write", "role_name": "maintain"})
+    admin = json.dumps({"permission": "admin", "role_name": "admin"})
+    triage = json.dumps({"permission": "read", "role_name": "triage"})
+    perms = {
+        "writer": write,
+        "keeper": maintain,
+        "boss": admin,
+        "triager": triage,
+        "stranger": OnboardError("gh: Not Found (HTTP 404)"),
+    }
+    other = _label_event("labeled", "agent-ready", "writer", 1)
+    for login, ok in (
+        ("writer", True),
+        ("keeper", True),
+        ("boss", True),
+        ("triager", False),
+        ("stranger", False),
+    ):
+        pages = [[other, _label_event("labeled", APPROVAL, login, 2)]]
+        verdict = authorize_labeler(PROJECT, 7, APPROVAL, _labeler_gh(pages, perms))
+        assert verdict.authorized is ok and verdict.labeler == login, login
+    # the MOST RECENT application decides, across pages, whoever applied it before
+    pages = [
+        [_label_event("labeled", APPROVAL, "boss", 1)],
+        [
+            _label_event("unlabeled", APPROVAL, "boss", 2),
+            _label_event("labeled", APPROVAL, "triager", 3),
+        ],
+    ]
+    verdict = authorize_labeler(PROJECT, 7, APPROVAL, _labeler_gh(pages, perms))
+    assert not verdict.authorized and verdict.labeler == "triager"
+    pages = [
+        [_label_event("labeled", APPROVAL, "triager", 1)],
+        [_label_event("labeled", APPROVAL, "writer", 2)],
+    ]
+    assert authorize_labeler(PROJECT, 7, APPROVAL, _labeler_gh(pages, perms)).authorized
+    # label names are case-insensitive; a label removed after it was applied authorizes nothing
+    pages = [[_label_event("labeled", "Implementation-Approved", "writer", 1)]]
+    assert authorize_labeler(PROJECT, 7, APPROVAL, _labeler_gh(pages, perms)).authorized
+    pages = [
+        [
+            _label_event("labeled", APPROVAL, "writer", 1),
+            _label_event("unlabeled", APPROVAL, "x", 2),
+        ]
+    ]
+    assert not authorize_labeler(PROJECT, 7, APPROVAL, _labeler_gh(pages, perms)).authorized
+
+
+@pytest.mark.parametrize(
+    ("pages", "permission"),
+    [
+        (OSError("network down"), None),  # events unreadable
+        ("not pages", None),
+        ([{"event": "labeled"}], None),  # a page that is not a list
+        ([[]], None),  # no labeled event at all
+        ([[{"event": "labeled", "label": {"name": APPROVAL}}]], None),  # no actor
+        ([[{"event": "labeled", "label": None, "actor": {"login": "x"}}]], None),
+        ([[_label_event("labeled", APPROVAL, "writer", 1)]], "HTTP 502"),
+        ([[_label_event("labeled", APPROVAL, "writer", 1)]], "{}"),
+        ([[_label_event("labeled", APPROVAL, "writer", 1)]], "not json"),
+    ],
+)
+def test_authorize_labeler_fails_closed_when_unverifiable(pages, permission):
+    from agentic_sdlc.leases import authorize_labeler
+    from agentic_sdlc.onboard import OnboardError
+
+    answer = (
+        OnboardError(f"gh: Server Error ({permission})") if permission == "HTTP 502" else permission
+    )
+    perms = {"writer": answer if permission else json.dumps({"permission": "write"})}
+    if pages == "not pages":
+        gh = lambda args, input=None: "{}" if "/events" in args[1] else perms["writer"]  # noqa: E731
+    else:
+        gh = _labeler_gh(pages, perms)
+    with pytest.raises(LeaseError, match="not authorizing|unreadable"):
+        authorize_labeler(PROJECT, 7, APPROVAL, gh)
+
+
+def test_cli_authorize_labeler_exit_codes(tmp_path, monkeypatch):
+    from agentic_sdlc import cli
+
+    calls: list[list[str]] = []
+    perms = {
+        "writer": json.dumps({"permission": "write"}),
+        "triager": json.dumps({"permission": "read", "role_name": "triage"}),
+        "bot%5Bbot%5D": json.dumps({"permission": "read"}),
+    }
+    base = ["authorize-labeler", "--project", PROJECT, "--issue", "7"]
+    for login, code in (("writer", 0), ("triager", 3), ("bot[bot]", 3)):
+        pages = [[_label_event("labeled", APPROVAL, login, 1)]]
+        monkeypatch.setattr(cli, "run_gh", _labeler_gh(pages, perms, calls))
+        out = tmp_path / f"{code}.json"
+        assert cli.main([*base, "--output", str(out)]) == code, login
+        assert json.loads(out.read_text())["authorized"] is (code == 0)
+    assert ["api", f"repos/{PROJECT}/collaborators/bot%5Bbot%5D/permission"] in calls
+    monkeypatch.setattr(cli, "run_gh", _labeler_gh(OSError("down"), perms))
+    assert cli.main(base) == 2  # unverifiable: an error, never "authorized"
