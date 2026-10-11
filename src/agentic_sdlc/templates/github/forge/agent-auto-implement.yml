@@ -2,13 +2,21 @@ name: Automatic approved implementation
 
 on:
   issues:
-    types: [labeled]
+    types: [labeled, unlabeled]
 
 permissions: {}
 
+# Codex 4240628982: authorization is read when the run starts, so REMOVING an approval label must
+# stop a run that is already queued or running: otherwise a Triage user could remove a label and
+# re-apply it while a writer-authorized run waits for a runner, and that run would proceed. Every
+# `labeled` event of a triggering label and every `unlabeled` event of a required label share one
+# group per issue; an `unlabeled` run cancels what is in it (and itself starts nothing: its label
+# is gone, so the label condition is false), while `labeled` runs queue as before. Any later run
+# re-authorizes from the label history. Other label events (the lease's `in-progress` label among
+# them) get a group of their own, so they never cancel the work.
 concurrency:
-  group: forge-auto-implement-${{ github.event.issue.number }}
-  cancel-in-progress: false
+  group: AUTO_CONCURRENCY_GROUP
+  cancel-in-progress: ${{ github.event.action == 'unlabeled' }}
 
 jobs:
   # A Triage user can apply the approval labels without write access, so the labeler's write

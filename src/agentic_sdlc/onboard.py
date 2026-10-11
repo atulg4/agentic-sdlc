@@ -770,6 +770,7 @@ def auto_plan_condition(ready: str, human_review: str, implementation: str) -> s
     """The `if:` of agent-auto-plan.yml's `preflight` job. Only the ready label triggers: an issue
     opened with both labels fires one `labeled` run per label, and both would plan."""
     return (
+        "github.event.action == 'labeled' &&\n"
         f"github.event.label.name == {_expr_str(ready)} &&\n"
         "github.event.issue.pull_request == null &&\n"
         f"contains(github.event.issue.labels.*.name, {_expr_str(ready)}) &&\n"
@@ -782,6 +783,7 @@ def auto_implement_condition(ready: str, human_review: str, implementation: str)
     """The `if:` of agent-auto-implement.yml's `authorize` job: any approval label triggers, and
     every one of them must be on the issue, so a ready label alone never starts implementation."""
     return (
+        "github.event.action == 'labeled' &&\n"
         f"(github.event.label.name == {_expr_str(implementation)} ||\n"
         f" github.event.label.name == {_expr_str(ready)} ||\n"
         f" github.event.label.name == {_expr_str(human_review)}) &&\n"
@@ -789,6 +791,25 @@ def auto_implement_condition(ready: str, human_review: str, implementation: str)
         f"contains(github.event.issue.labels.*.name, {_expr_str(implementation)}) &&\n"
         f"contains(github.event.issue.labels.*.name, {_expr_str(ready)}) &&\n"
         f"contains(github.event.issue.labels.*.name, {_expr_str(human_review)})"
+    )
+
+
+def auto_concurrency_group(kind: str, triggers: Sequence[str], required: Sequence[str]) -> str:
+    """The workflow `concurrency.group` of agent-auto-{kind}.yml (Codex 4240628982). A `labeled`
+    event of a label that TRIGGERS the work and an `unlabeled` event of a label the work REQUIRES
+    share one group per issue, so removing an approval label cancels a run that is queued or
+    running (`cancel-in-progress` is true for `unlabeled` runs only); every other label event --
+    the lease's own `in-progress` label included -- gets a group of its own and cancels nothing."""
+
+    def named(labels: Sequence[str]) -> str:
+        return " || ".join(f"github.event.label.name == {_expr_str(label)}" for label in labels)
+
+    return (
+        f"${{{{ ((github.event.action == 'labeled' && ({named(triggers)})) ||\n"
+        f"(github.event.action == 'unlabeled' && ({named(required)}))) &&\n"
+        f"format('forge-auto-{kind}-{{0}}', github.event.issue.number) ||\n"
+        f"format('forge-auto-{kind}-{{0}}-run-{{1}}',\n"
+        "github.event.issue.number, github.run_id) }}"
     )
 
 
@@ -957,9 +978,13 @@ def render_cloud_routine_md(spec: OnboardSpec) -> str:
    {spec.setup_command}
    {spec.quality_command}
    {spec.test_command}
-5. Open a DRAFT pull request titled "<issue title> (#<n>)" with a summary and test plan;
-   link the issue. Then `sdlcctl release` the lease (the open PR now marks the work); on any
-   failure, release it too so another run can retry.
+4a. Re-authorize right before publishing (Codex 4240628982: the labels may have been removed
+   and re-applied while you worked): run the step 1a command again. On anything but exit 0 do
+   NOT push or open a PR: `sdlcctl release` the lease, and on exit 3 comment (once) that a
+   maintainer must re-apply the labels; then stop.
+5. Push the branch and open a DRAFT pull request titled "<issue title> (#<n>)" with a summary
+   and test plan; link the issue. Then `sdlcctl release` the lease (the open PR now marks the
+   work); on any failure, release it too so another run can retry.
    Never merge, approve, deploy, or edit workflows/policy files.
 """
     return f"""# Cloud implementer routine — {spec.project_id}
@@ -973,7 +998,8 @@ definitive write/maintain/admin permission for whoever applied EACH label of the
 ({_md_code(IMPLEMENTATION_LABEL)}, {_md_code(spec.ready_label)},
 {_md_code(HUMAN_REVIEW_LABEL)}) most recently -- so a Triage user cannot complete the set after
 a writer approved (a 404 is unauthorized; any other failure is unverifiable and the issue is
-skipped). Suggested routine prompt (create it with the
+skipped) -- and runs it AGAIN right before pushing, so a label removed and re-applied while
+the routine worked stops the push. Suggested routine prompt (create it with the
 `schedule` skill or the claude.ai routines UI):
 
 {_md_block(prompt.splitlines())}
@@ -1083,12 +1109,25 @@ def cloud_routine_check(policy_doc: object) -> Check:
 def confirm_cloud_routine(root: str | Path) -> Path:
     """Record the owner's confirmation that the cloud implementer routine is scheduled:
     `[automation] cloud_routine_confirmed = true` in `root`/agentic-sdlc.toml (only for a
-    cloud-routine policy). The rest of the file is kept byte for byte."""
-    path = Path(root) / "agentic-sdlc.toml"
+    cloud-routine policy). The rest of the file is kept byte for byte.
+
+    Codex 4240628986: the policy must be a regular file inside `root` -- a symlink anywhere on the
+    way (dangling or not), a non-regular file or a path that resolves outside the repository is
+    refused, exactly as `write_onboarding` refuses its managed paths -- and it is read without
+    following a link and replaced atomically (`_replace_file`), never written through one."""
+    base = Path(root).resolve()
+    path = base / "agentic-sdlc.toml"
+    state = _managed_path_state(base, "agentic-sdlc.toml")
+    if state != "file":
+        raise OnboardError(f"refusing to confirm through {path}: agentic-sdlc.toml {state}")
     try:
-        text = path.read_text(encoding="utf-8")
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise OnboardError(f"refusing to confirm through {path}: not a regular file")
+            text = handle.read().decode("utf-8")
         doc = tomllib.loads(text)
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         raise OnboardError(f"cannot read {path}: {exc}") from exc
     agents = doc.get("agents") if isinstance(doc.get("agents"), dict) else {}
     if agents.get("implementation_mode") != "cloud-routine":
@@ -1121,7 +1160,7 @@ def confirm_cloud_routine(root: str | Path) -> Path:
         raise OnboardError(f"{path}: could not record the confirmation ({exc})") from exc
     if written.get("automation", {}).get(CLOUD_ROUTINE_CONFIRMED) is not True:
         raise OnboardError(f"{path}: could not record the confirmation")  # pragma: no cover
-    path.write_text(updated, encoding="utf-8")
+    _replace_file(path, updated)
     return path
 
 
@@ -1298,6 +1337,7 @@ WORKFLOW_PLACEHOLDERS = (
     "AUTO_IMPLEMENT_IF",
     "APPROVAL_LABEL_VALUE",
     "REQUIRED_LABELS_VALUE",
+    "AUTO_CONCURRENCY_GROUP",
 )
 
 
@@ -1384,6 +1424,19 @@ def _render_workflow(name: str, spec: OnboardSpec, issue_expr: str | None = None
         "PYTHON_VERSION": _yaml_str(spec.python_version),
         "AUTO_PLAN_IF": _yaml_folded(auto_plan_condition(*labels), " " * 6),
         "AUTO_IMPLEMENT_IF": _yaml_folded(auto_implement_condition(*labels), " " * 6),
+        # Codex 4240628982: removing an approval label cancels a queued or running run.
+        "AUTO_CONCURRENCY_GROUP": _yaml_folded(
+            auto_concurrency_group(
+                "plan", [spec.ready_label], [spec.ready_label, HUMAN_REVIEW_LABEL]
+            )
+            if name == "agent-auto-plan.yml"
+            else auto_concurrency_group(
+                "implement",
+                [IMPLEMENTATION_LABEL, spec.ready_label, HUMAN_REVIEW_LABEL],
+                [IMPLEMENTATION_LABEL, spec.ready_label, HUMAN_REVIEW_LABEL],
+            ),
+            " " * 4,
+        ),
         # The label whose most recent applier `_authorize-labeler.yml` authorizes: the ready
         # label for planning (its trigger), implementation approval for implementing.
         "APPROVAL_LABEL_VALUE": _yaml_str(

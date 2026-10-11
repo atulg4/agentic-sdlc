@@ -5,6 +5,7 @@
   # (AUTHORIZE_JOB then SUCCEEDS with authorized=false and nothing is reported): say on the issue
   # that the labeler's authority could not be verified. GitHub-hosted like the authorization
   # itself -- nothing reaches RUNS_ON for an unverified labeler -- with only `issues: write`.
+  # Codex 4240628982: removing an approval label cancels the run, so "cancelled" includes that.
   # Not tunable: doctor requires this job and its runner exactly as generated.
   authorization_failed:
     needs: AUTHORIZE_JOB
@@ -27,5 +28,5 @@
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: Number(process.env.ISSUE_NUMBER),
-              body: `AUTHORIZED_WORK was not started: the labeler's repository write authority could not be verified (the permission check failed or was cancelled; this is not an "unauthorized" answer). Re-run the failed jobs of this run, or remove and re-apply the label. Inspect the run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              body: `AUTHORIZED_WORK was not started: the labeler's repository write authority could not be verified (the permission check failed or was cancelled -- a run is cancelled when an approval label is removed while it is queued or running; this is not an "unauthorized" answer). Re-run the failed jobs of this run, or remove and re-apply the label. Inspect the run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
             });
