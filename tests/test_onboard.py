@@ -508,6 +508,7 @@ def _effective_rules(*extra: dict) -> str:
 
 
 AGENT_BRANCH_RULES = "api repos/owner/comic/rules/branches/agent%2F"
+CLOUD_BRANCH_RULES = "api repos/owner/comic/rules/branches/forge%2F"
 CLASSIC_RULES = "api graphql"
 
 
@@ -527,6 +528,8 @@ def _healthy_gh() -> FakeGh:
             "api repos/owner/comic/rules/branches/main": _effective_rules(),
             # the publisher's agent/... branches: no ruleset targets them
             AGENT_BRANCH_RULES: json.dumps([[]]),
+            # nor the cloud routine's forge/issue-<N> branches (cloud-routine mode)
+            CLOUD_BRANCH_RULES: json.dumps([[]]),
             # ... and no classic branch-protection pattern either
             CLASSIC_RULES: _classic_rules(),
             "api repos/owner/comic/rulesets/11": json.dumps({"id": 11, **ruleset_payload(spec())}),
@@ -1253,8 +1256,9 @@ def test_doctor_requires_the_in_progress_lease_label(tmp_path):
 def test_auto_plan_reports_failures_on_the_issue():
     doc = yaml.safe_load(render_onboarding(spec())[".github/workflows/agent-auto-plan.yml"])
     notify = doc["jobs"]["notify_failure"]
-    assert notify["needs"] == ["plan"] or notify["needs"] == "plan"
+    assert notify["needs"] == ["dedupe", "plan"]
     assert "always()" in notify["if"] and "needs.plan.result == 'failure'" in notify["if"]
+    assert "needs.dedupe.result == 'failure'" in notify["if"]  # unreadable comments: reported
     assert notify["permissions"] == {"issues": "write"}
     step = notify["steps"][0]
     assert step["env"]["ISSUE_NUMBER"] == "${{ github.event.issue.number }}"
@@ -2051,12 +2055,15 @@ def test_doctor_accepts_github_hosted_runner_labels(tmp_path, runs_on):
     assert report.ok, report.render()
 
 
-def test_auto_plan_triggers_on_the_ready_label_only():
+def test_auto_plan_triggers_on_either_planning_label():
+    """Codex 4241196642: either planning label triggers (re-adding a removed one restarts the
+    planning its removal cancelled); both are required. Duplicates: the `dedupe` job."""
     doc = yaml.safe_load(render_onboarding(spec())[".github/workflows/agent-auto-plan.yml"])
     cond = doc["jobs"]["preflight"]["if"]
     assert "github.event.label.name == 'claude-ready'" in cond
-    assert "github.event.label.name == 'human-review-required'" not in cond
+    assert "github.event.label.name == 'human-review-required'" in cond
     assert "contains(github.event.issue.labels.*.name, 'human-review-required')" in cond
+    assert "contains(github.event.issue.labels.*.name, 'claude-ready')" in cond
 
 
 def test_default_claude_executor_routes_a_literal_model(tmp_path):
@@ -2509,7 +2516,7 @@ def test_runner_labels_render_as_yaml_strings():
         want = list(labels) if name.endswith("/ci.yml") else list(agent_labels)
         for job_name, job in (yaml.safe_load(content).get("jobs") or {}).items():
             if (
-                (name.endswith("/agent-auto-plan.yml") and job_name == "preflight")
+                (name.endswith("/agent-auto-plan.yml") and job_name in ("preflight", "dedupe"))
                 or (name.endswith("/agent-auto-implement.yml") and job_name == "authorize")
                 or job_name == "authorization_failed"
             ):
@@ -3395,7 +3402,7 @@ def test_doctor_requires_the_automatic_callers_to_trigger_on_labeled_issues(tmp_
     path = repo / ".github/workflows" / name
     path.write_text(
         path.read_text().replace(
-            "  issues:\n    types: [labeled, unlabeled]\n", "  workflow_dispatch:\n"
+            "  issues:\n    types: [labeled, unlabeled, edited]\n", "  workflow_dispatch:\n"
         )
     )
     failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
@@ -3685,7 +3692,7 @@ def test_doctor_tolerates_only_the_tunable_knobs(tmp_path):
     def runners(doc):
         # not the labeler authorizations nor their failure reporters: GitHub-hosted
         for job_name, job in doc["jobs"].items():
-            hosted = "authorized" in (job.get("outputs") or {})
+            hosted = {"authorized", "fresh"} & set(job.get("outputs") or {})
             if "runs-on" in job and not hosted and job_name != "authorization_failed":
                 job["runs-on"] = "ubuntu-24.04"
             if "runs_on" in (job.get("with") or {}):
@@ -6196,8 +6203,10 @@ def test_auto_plan_authorizes_the_labeler_on_a_hosted_runner_first():
     assert step["env"]["GH_TOKEN"] == "${{ github.token }}"
     assert "collaborators/${encoded}/permission" in step["run"]
     assert "admin|write) ;;" in step["run"]
-    assert plan["needs"] == "preflight"
-    assert plan["if"] == "needs.preflight.outputs.authorized == 'true'"
+    assert plan["needs"] == ["preflight", "dedupe"]
+    assert plan["if"] == (
+        "needs.preflight.outputs.authorized == 'true' && needs.dedupe.outputs.fresh == 'true'"
+    )
     assert plan["uses"].startswith("owner/agentic-sdlc/.github/workflows/reusable-plan.yml@")
     # every job that can reach a self-hosted runner waits on the authorization
     for name, job in doc["jobs"].items():
@@ -7346,14 +7355,40 @@ def test_doctor_fails_closed_when_agent_branch_rulesets_are_unreadable(tmp_path)
 # ---------------------------------------------------------------- Codex 4239269950
 # Only a definitive answer (200 with a permission, or 404) may make the labeler unauthorized; an
 # API failure is retried and then FAILS the job instead of silently consuming the label event.
-def _gh_events_prelude(events_script: str) -> str:
+#: The GraphQL answer for an issue whose body was never edited (Codex 4241196649).
+NEVER_EDITED = json.dumps(
+    {"data": {"repository": {"issue": {"lastEditedAt": None, "userContentEdits": {"nodes": []}}}}}
+)
+#: The time a label event of a fixture without one carries (the issue is never edited after it).
+EVENT_AT = "2026-10-01T00:00:00Z"
+
+
+def _epoch(stamp: str) -> int:
+    from datetime import datetime
+
+    return int(datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp())
+
+
+def _gh_events_prelude(events_script: str, edits_script: str | None = None) -> str:
     """A fake `gh` prelude answering the label-events read with `events_script`'s pages, each
-    filtered through the step's own `--jq` program as `gh api --paginate --jq` does."""
+    filtered through the step's own `--jq` program as `gh api --paginate --jq` does (an event
+    without a `created_at` gets EVENT_AT), and the GraphQL edit-time read with `edits_script`
+    (default: never edited)."""
+    edits = edits_script or f"printf '%s' '{NEVER_EDITED}'"
+    stamp = (
+        'if type == "array" then map(if type == "object" and (has("created_at") | not) '
+        f'then . + {{created_at: "{EVENT_AT}"}} else . end) else . end'
+    )
     return (
         'jqexpr=""; prev=""\n'
         'for a in "$@"; do [ "$prev" = "--jq" ] && jqexpr="$a"; prev="$a"; done\n'
+        'if [ "${1:-}" = api ] && [ "${2:-}" = graphql ]; then\n'
+        f"  {edits}\n"
+        "  exit $?\n"
+        "fi\n"
         'for a in "$@"; do case "$a" in */events*)\n'
         f'  out="$( {events_script} )" || exit $?\n'
+        f"  out=\"$(printf '%s\\n' \"$out\" | jq -c '{stamp}')\" || exit $?\n"
         '  [ -z "$jqexpr" ] && { printf \'%s\\n\' "$out"; exit 0; }\n'
         '  printf \'%s\\n\' "$out" | jq -c "$jqexpr"; exit $? ;;\n'
         "esac; done\n"
@@ -7448,7 +7483,8 @@ def test_labeler_authorization_fails_on_unreadable_permissions(
         assert "authorized=" not in output  # nothing is decided: the job fails
         assert "::error::" in done.stdout
     else:
-        assert output.strip() == f"authorized={authorized}\napprover=alice"
+        expected = f"authorized={authorized}\napprover=alice\napproved_at={_epoch(EVENT_AT)}"
+        assert output.strip() == expected
 
 
 # ---------------------------------------------------------------- Codex 4239269954
@@ -9522,14 +9558,17 @@ def _events_page(*events):
     )
 
 
-def _run_approval(tmp_path, workflow, events_script, permissions, sender="writer"):
+def _run_approval(
+    tmp_path, workflow, events_script, permissions, sender="writer", edits_script=None
+):
     """Run the rendered authorization step with a fake gh answering the label events with
-    `events_script` and each collaborator permission from `permissions` (login -> answer)."""
+    `events_script`, each collaborator permission from `permissions` (login -> answer) and the
+    issue's edit times with `edits_script` (default: never edited)."""
     perm = "".join(
         f'  *"/collaborators/{login}/permission"*) {answer} ;;\n'
         for login, answer in permissions.items()
     )
-    script = _gh_events_prelude(events_script) + (
+    script = _gh_events_prelude(events_script, edits_script) + (
         'for a in "$@"; do case "$a" in\n'
         f"{perm}"
         "  *) continue ;;\n"
@@ -9632,7 +9671,7 @@ def test_auto_implement_passes_the_verified_approver(tmp_path, events, approver)
         {"writer": WRITE, "maintainer": WRITE, "triager": TRIAGE},
     )
     assert done.returncode == 0, done.stderr
-    assert out == {"authorized": "true", "approver": approver}
+    assert out == {"authorized": "true", "approver": approver, "approved_at": str(_epoch(EVENT_AT))}
 
 
 @pytest.mark.parametrize(
@@ -10653,7 +10692,7 @@ APPROVAL_SET = [IMPLEMENTATION_LABEL, "claude-ready", "human-review-required"]
 def test_auto_implement_label_removal_cancels_the_authorized_run():
     rendered = render_onboarding(spec())[".github/workflows/agent-auto-implement.yml"]
     doc = yaml.safe_load(rendered)
-    assert doc[True]["issues"]["types"] == ["labeled", "unlabeled"]
+    assert doc[True]["issues"]["types"] == ["labeled", "unlabeled", "edited"]
     group, cancel = doc["concurrency"]["group"], doc["concurrency"]["cancel-in-progress"]
     condition = doc["jobs"]["authorize"]["if"]
     shared = "forge-auto-implement-7"
@@ -10669,6 +10708,10 @@ def test_auto_implement_label_removal_cancels_the_authorized_run():
         assert _actions_expr(condition, "unlabeled", label, rest) is False
         # even a payload that still lists it never starts work on `unlabeled`
         assert _actions_expr(condition, "unlabeled", label, APPROVAL_SET) is False
+    # Codex 4241196649: editing the title or body cancels too, and starts nothing itself
+    assert _actions_expr(group, "edited", None, APPROVAL_SET) == shared
+    assert _actions_expr(cancel, "edited", None, APPROVAL_SET) is True
+    assert _actions_expr(condition, "edited", None, APPROVAL_SET) is False
     # the lease's own `in-progress` label (and any other) never cancels the work
     for action in ("labeled", "unlabeled"):
         for label in ("in-progress", "bug"):
@@ -10676,24 +10719,37 @@ def test_auto_implement_label_removal_cancels_the_authorized_run():
             assert _actions_expr(condition, action, label, APPROVAL_SET) is False
 
 
-def test_auto_plan_label_removal_cancels_planning_but_a_second_label_does_not():
+def test_auto_plan_label_removal_cancels_planning_and_restoring_it_restarts_planning():
+    """Codex 4241196642: removing either planning label cancels planning, and re-adding it (the
+    other still present) starts it again; the shared group serializes the two `labeled` runs of
+    an issue opened with both labels (neither cancels the other: `cancel-in-progress` is false
+    for `labeled`), and `dedupe` keeps the later one from planning twice."""
     rendered = render_onboarding(spec())[".github/workflows/agent-auto-plan.yml"]
     doc = yaml.safe_load(rendered)
-    assert doc[True]["issues"]["types"] == ["labeled", "unlabeled"]
+    assert doc[True]["issues"]["types"] == ["labeled", "unlabeled", "edited"]
     group, cancel = doc["concurrency"]["group"], doc["concurrency"]["cancel-in-progress"]
     condition = doc["jobs"]["preflight"]["if"]
     labels = ["claude-ready", "human-review-required"]
     shared = "forge-auto-plan-7"
-    assert _actions_expr(group, "labeled", "claude-ready", labels) == shared
-    assert _actions_expr(condition, "labeled", "claude-ready", labels) is True
-    # an issue opened with both labels: the second `labeled` run must not cancel planning
-    assert _actions_expr(group, "labeled", "human-review-required", labels) != shared
     for label in labels:
+        assert _actions_expr(group, "labeled", label, labels) == shared
+        assert _actions_expr(cancel, "labeled", label, labels) is False
+        assert _actions_expr(condition, "labeled", label, labels) is True  # restored: plans
         rest = [other for other in labels if other != label]
+        assert _actions_expr(condition, "labeled", label, [label]) is False  # set incomplete
         assert _actions_expr(group, "unlabeled", label, rest) == shared
         assert _actions_expr(cancel, "unlabeled", label, rest) is True
         assert _actions_expr(condition, "unlabeled", label, rest) is False
+    # Codex 4241196649: an edit cancels planning too
+    assert _actions_expr(group, "edited", None, labels) == shared
+    assert _actions_expr(cancel, "edited", None, labels) is True
+    assert _actions_expr(condition, "edited", None, labels) is False
+    # implementation approval stops planning; other labels are in groups of their own
+    assert _actions_expr(condition, "labeled", "claude-ready", [*labels, IMPLEMENTATION_LABEL]) is (
+        False
+    )
     assert _actions_expr(group, "unlabeled", "in-progress", labels) != shared
+    assert _actions_expr(group, "labeled", "bug", labels) != shared
 
 
 @pytest.mark.parametrize("name", ["agent-auto-plan.yml", "agent-auto-implement.yml"])
@@ -10702,18 +10758,25 @@ def test_doctor_requires_the_label_removal_cancellation(tmp_path, name):
     write_onboarding(repo, spec())
     path = repo / ".github/workflows" / name
     text = path.read_text()
-    weakened = text.replace(
-        "cancel-in-progress: ${{ github.event.action == 'unlabeled' }}",
+    for weak in (
         "cancel-in-progress: false",
-    )
-    assert weakened != text
-    path.write_text(weakened)
-    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
-    detail = failed["managed workflows match the generated templates"].detail
-    assert name in detail and "concurrency" in detail
-    path.write_text(text.replace("types: [labeled, unlabeled]", "types: [labeled]"))
-    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
-    assert name in failed["managed workflows match the generated templates"].detail
+        # Codex 4241196649: an edit must cancel too
+        "cancel-in-progress: ${{ github.event.action == 'unlabeled' }}",
+    ):
+        weakened = text.replace(
+            "cancel-in-progress: "
+            "${{ github.event.action == 'unlabeled' || github.event.action == 'edited' }}",
+            weak,
+        )
+        assert weakened != text
+        path.write_text(weakened)
+        failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+        detail = failed["managed workflows match the generated templates"].detail
+        assert name in detail and "concurrency" in detail
+    for types in ("types: [labeled]", "types: [labeled, unlabeled]"):
+        path.write_text(text.replace("types: [labeled, unlabeled, edited]", types))
+        failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+        assert name in failed["managed workflows match the generated templates"].detail
 
 
 def test_cloud_routine_reauthorizes_right_before_publishing():
@@ -11412,3 +11475,363 @@ def test_local_doctor_checks_ci_and_unresolvable_runner_targets(tmp_path):
     )
     failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
     assert "workflow runner targets are verifiable" in failed
+
+
+# ---------------------------------------------------------------- Codex review 5482912640
+# Codex 4241196649: on the Actions path too, an approval covers the title and body it saw. The
+# title (`renamed` events) and the body (GraphQL lastEditedAt / userContentEdits) must have been
+# last edited before the latest application of EACH label of the set; otherwise the run is
+# unauthorized, and an edit time that cannot be read FAILS the job.
+def _stamped_events(*events) -> str:
+    """Label (and `renamed`) events at minute 1, 2, 3, ... of 2026-10-01."""
+    rows = []
+    for minute, (kind, name, login) in enumerate(events, start=1):
+        row = {"event": kind, "actor": {"login": login}, "created_at": _minute(minute)}
+        if kind != "renamed":
+            row["label"] = {"name": name}
+        rows.append(row)
+    return json.dumps(rows)
+
+
+def _minute(minute: int) -> str:
+    return f"2026-10-01T00:{minute:02d}:00Z"
+
+
+def _edits_raw(answer: dict) -> str:
+    return "printf '%s' '" + json.dumps(answer) + "'"
+
+
+def _edits_answer(last_edited=None, edits=()) -> str:
+    issue = {"lastEditedAt": last_edited, "userContentEdits": {"nodes": list(edits)}}
+    return "printf '%s' '" + json.dumps({"data": {"repository": {"issue": issue}}}) + "'"
+
+
+IMPLEMENT_SET_APPLIED = (
+    ("labeled", "claude-ready", "writer"),
+    ("labeled", "human-review-required", "writer"),
+    ("labeled", "implementation-approved", "writer"),
+)
+
+
+@pytest.mark.parametrize("workflow", ["agent-auto-implement.yml", "agent-auto-plan.yml"])
+@pytest.mark.parametrize(
+    ("extra", "edits", "authorized"),
+    [
+        ((), _edits_answer(), "true"),  # never edited
+        ((), _edits_answer(_minute(0)), "true"),  # edited before every label was applied
+        ((), _edits_answer(_minute(9)), "false"),  # body edited after the approval
+        ((), _edits_answer(_minute(2)), "false"),  # after a prerequisite was applied
+        ((), _edits_answer(None, [{"editedAt": _minute(9)}]), "false"),  # newest edit entry
+        ((("renamed", "", "author"),), _edits_answer(), "false"),  # title edited after
+    ],
+)
+def test_actions_authorization_binds_the_approval_to_the_issue_content(
+    tmp_path, workflow, extra, edits, authorized
+):
+    done, out = _run_approval(
+        tmp_path,
+        workflow,
+        f"printf '%s' '{_stamped_events(*IMPLEMENT_SET_APPLIED, *extra)}'; exit 0",
+        {"writer": WRITE},
+        edits_script=edits,
+    )
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    assert out["authorized"] == authorized, (done.stdout, out)
+    if authorized == "false":
+        assert "was edited after its approval labels were applied" in done.stdout
+        assert "re-apply" in done.stdout
+
+
+@pytest.mark.parametrize(
+    "edits",
+    [
+        'echo "gh: Server Error (HTTP 502)" >&2; exit 1',
+        "printf '%s' 'not json'",
+        'printf \'%s\' \'{"errors": [{"message": "boom"}]}\'',
+        _edits_raw({"data": {"repository": {"issue": {"userContentEdits": {"nodes": []}}}}}),
+        _edits_raw({"data": {"repository": {"issue": {"lastEditedAt": None}}}}),
+        _edits_answer("yesterday"),
+        _edits_answer(None, [{"editedAt": None}]),
+    ],
+)
+def test_actions_authorization_fails_when_the_edit_time_is_unreadable(tmp_path, edits):
+    done, out = _run_approval(
+        tmp_path,
+        "agent-auto-implement.yml",
+        f"printf '%s' '{_stamped_events(*IMPLEMENT_SET_APPLIED)}'; exit 0",
+        {"writer": WRITE},
+        edits_script=edits,
+    )
+    assert done.returncode == 1, (done.stdout, done.stderr)
+    assert "authorized" not in out and "::error::" in done.stdout
+
+
+def test_actions_authorization_fails_when_a_label_time_is_unreadable(tmp_path):
+    rows = json.loads(_stamped_events(*IMPLEMENT_SET_APPLIED))
+    rows[-1]["created_at"] = None
+    done, out = _run_approval(
+        tmp_path,
+        "agent-auto-implement.yml",
+        f"printf '%s' '{json.dumps(rows)}'; exit 0",
+        {"writer": WRITE},
+    )
+    assert done.returncode == 1, (done.stdout, done.stderr)
+    assert "authorized" not in out and "::error::" in done.stdout
+
+
+# Codex 4241196642: duplicate planning is suppressed by the `dedupe` job: a plan comment posted by
+# github-actions[bot] after the approval was last applied means the approval is already planned.
+def _run_dedupe(tmp_path, comments_script, approved_at):
+    import shutil
+    import subprocess
+
+    if not (shutil.which("bash") and shutil.which("jq")):
+        pytest.skip("bash and jq are needed to run the generated dedupe step")
+    doc = yaml.safe_load(render_onboarding(spec())[".github/workflows/agent-auto-plan.yml"])
+    job = doc["jobs"]["dedupe"]
+    assert job["runs-on"] == "ubuntu-latest" and job["permissions"] == {"issues": "read"}
+    assert job["needs"] == "preflight"
+    assert job["if"] == "needs.preflight.outputs.authorized == 'true'"
+    step = job["steps"][0]
+    assert step["env"]["APPROVED_AT"] == "${{ needs.preflight.outputs.approved_at }}"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "gh").write_text(
+        "#!/usr/bin/env bash\n"
+        'jqexpr=""; prev=""\n'
+        'for a in "$@"; do [ "$prev" = "--jq" ] && jqexpr="$a"; prev="$a"; done\n'
+        'case "$*" in *"/issues/7/comments"*) ;; *) echo "unexpected $*" >&2; exit 1 ;; esac\n'
+        f'out="$( {comments_script} )" || exit $?\n'
+        'printf \'%s\\n\' "$out" | jq -r "$jqexpr"\n'
+    )
+    (bin_dir / "sleep").write_text("#!/usr/bin/env bash\nexit 0\n")
+    for tool in ("gh", "sleep"):
+        (bin_dir / tool).chmod(0o755)
+    output = tmp_path / "output"
+    output.write_text("")
+    env = {
+        "PATH": f"{bin_dir}:/usr/bin:/bin",
+        "ISSUE_NUMBER": "7",
+        "APPROVED_AT": str(approved_at),
+        "GITHUB_REPOSITORY": "owner/comic",
+        "GITHUB_OUTPUT": str(output),
+    }
+    done = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", step["run"]],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return done, output.read_text()
+
+
+def _comment(login, body, minute):
+    return {"user": {"login": login}, "body": body, "created_at": _minute(minute)}
+
+
+PLAN_BODY = "## Agentic SDLC plan\n\n1. do it"
+
+
+@pytest.mark.parametrize(
+    ("comments", "fresh"),
+    [
+        ([], "true"),
+        ([_comment("github-actions[bot]", PLAN_BODY, 2)], "true"),  # a plan of an older approval
+        ([_comment("github-actions[bot]", PLAN_BODY, 9)], "false"),  # this approval is planned
+        ([_comment("mallory", PLAN_BODY, 9)], "true"),  # only the platform's own plan counts
+        ([_comment("github-actions[bot]", "Agent planning did not complete", 9)], "true"),
+        ([_comment("github-actions[bot]", None, 9)], "true"),
+    ],
+)
+def test_auto_plan_dedupe_skips_an_already_planned_approval(tmp_path, comments, fresh):
+    script = f"printf '%s' '{json.dumps(comments)}'"
+    done, output = _run_dedupe(tmp_path, script, _epoch(_minute(5)))
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    assert output.strip() == f"fresh={fresh}"
+
+
+@pytest.mark.parametrize(
+    ("script", "approved_at"),
+    [
+        ('echo "gh: Server Error (HTTP 502)" >&2; exit 1', _epoch(_minute(5))),
+        ("printf '%s' '[]'", ""),  # no approval time from the preflight
+    ],
+)
+def test_auto_plan_dedupe_fails_closed(tmp_path, script, approved_at):
+    done, output = _run_dedupe(tmp_path, script, approved_at)
+    assert done.returncode == 1, (done.stdout, done.stderr)
+    assert "fresh=" not in output and "::error::" in done.stdout
+
+
+# Codex 4241196636: an issue with an invalid body must not starve the cloud routine's queue: step
+# 1 never selects a `claude-blocked` issue, and step 2 blocks it AND releases its lease.
+def test_cloud_routine_retires_an_invalid_issue_instead_of_starving_the_queue():
+    import shlex
+
+    files = render_onboarding(
+        spec(implementer="cloud-routine", runs_on=("ubuntu-latest",), ready_label="it's ready")
+    )
+    doc = files["docs/forge/cloud-implementer.md"]
+    step1 = doc[doc.index("1. List open issues") : doc.index("1a. Authorize")]
+    command = re.search(r"`(gh issue list [^`]*)`", step1).group(1)
+    argv = shlex.split(command)
+    assert argv[:6] == ["gh", "issue", "list", "--repo", "owner/comic", "--state"]
+    terms = shlex.split(argv[argv.index("--search") + 1])
+    assert terms == [
+        "label:it's ready",
+        "label:human-review-required",
+        "label:implementation-approved",
+        "-label:claude-blocked",
+        "sort:created-asc",
+    ]
+    step2 = doc[doc.index("2. Validate the issue body") : doc.index("3. On a new branch")]
+    assert "add label `claude-blocked`" in step2
+    release = step2.index("sdlcctl release --project owner/comic --issue <n>")
+    assert release > step2.index("claude-blocked") and "--session <run id>" in step2
+    assert "go back to step 1" in step2 and "stop." not in step2
+
+
+# Codex 4241196640: in cloud-routine mode the routine pushes `forge/issue-<N>` with the owner's
+# credentials; the branch-domain ruleset and classic-protection checks run against that branch
+# and actor (a user: an allowlist or a bypass cannot be matched, so a push restriction is an
+# owner TODO), and anything unreadable is a manual TODO.
+def _cloud_doctor(tmp_path, **answers):
+    from agentic_sdlc.onboard import confirm_cloud_routine
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(implementer="cloud-routine", runs_on=("ubuntu-latest",)))
+    confirm_cloud_routine(repo)
+    gh = _healthy_gh()
+    gh.answers["api repos/owner/comic/actions/secrets"] = _secret_pages("CLAUDE_CODE_OAUTH_TOKEN")
+    gh.answers["api repos/owner/comic/actions/variables"] = _var_pages()
+    gh.answers["api repos/owner/comic/actions/runners"] = _pages("runners", [])
+    gh.answers["api /user/installations"] = _installs()
+    # FakeGh answers by prefix, first match first: the test's answers go in front
+    gh.answers = {**answers, **{k: v for k, v in gh.answers.items() if k not in answers}}
+    return doctor(repo, "owner/comic", "owner/agentic-sdlc", gh), gh
+
+
+def test_doctor_checks_the_cloud_routine_branch_rules(tmp_path):
+    from agentic_sdlc.onboard import CLOUD_BRANCH_RULES_CHECK
+
+    report, gh = _cloud_doctor(tmp_path)
+    assert report.ok, report.render()
+    check = next(c for c in report.checks if c.name == CLOUD_BRANCH_RULES_CHECK)
+    assert check.ok and "forge/issue-${ISSUE_NUMBER}" in check.detail
+    paths = [c[1] for c, _ in gh.calls if "/rules/branches/" in c[1]]
+    assert "repos/owner/comic/rules/branches/forge%2Fissue-1" in paths
+    assert not any("/rules/branches/agent" in p for p in paths)  # no Actions publisher here
+
+
+@pytest.mark.parametrize(
+    ("rule", "needle"),
+    [
+        (_org_rule("creation"), "restricts creating forge/issue-1"),
+        (_org_rule("update"), "restricts updates to forge/issue-1"),
+        (_org_rule("required_signatures"), "requires signed commits"),
+        (_org_rule("pull_request"), "rule 'pull_request' applies to forge/issue-1"),
+        (
+            _org_rule("required_status_checks", required_status_checks=[{"context": "x"}]),
+            "rule 'required_status_checks' applies to forge/issue-1",
+        ),
+        (_pattern_rule("branch_name_pattern", "starts_with", "agent/"), "'forge/issue-1' does not"),
+        (_pattern_rule("commit_message_pattern", "starts_with", "JIRA-"), "commit message"),
+        (_pattern_rule("committer_email_pattern", "ends_with", "@corp"), "committer email"),
+    ],
+)
+def test_doctor_reports_rules_that_can_reject_the_cloud_routine_push(tmp_path, rule, needle):
+    from agentic_sdlc.onboard import CLOUD_BRANCH_RULES_CHECK
+
+    report, _ = _cloud_doctor(tmp_path, **{CLOUD_BRANCH_RULES: json.dumps([[rule]])})
+    failed = _failed(report)
+    assert set(failed) == {CLOUD_BRANCH_RULES_CHECK}, report.render()
+    check = failed[CLOUD_BRANCH_RULES_CHECK]
+    assert check.manual and not report.ok
+    assert needle in check.detail, check.detail
+    if rule["type"] in ("creation", "update"):
+        assert "owner" in check.detail and "forge/**" in check.detail
+
+
+def test_doctor_accepts_rules_compatible_with_the_cloud_routine_push(tmp_path):
+    compatible = [
+        _org_rule("deletion"),
+        _org_rule("non_fast_forward"),
+        _org_rule(
+            "required_status_checks",
+            required_status_checks=[{"context": "x"}],
+            do_not_enforce_on_create=True,
+        ),
+        _pattern_rule("branch_name_pattern", "starts_with", "forge/issue-"),
+    ]
+    report, _ = _cloud_doctor(tmp_path, **{CLOUD_BRANCH_RULES: json.dumps([compatible])})
+    assert report.ok, report.render()
+
+
+@pytest.mark.parametrize(
+    ("rule", "needle"),
+    [
+        (
+            _bpr("forge/**", restrictsPushes=True, pushAllowances={"nodes": []}),
+            "which actor the cloud routine pushes as could not be determined",
+        ),
+        (_bpr("forge/*", requiresCommitSignatures=True), "signed commits"),
+        (_bpr("forge/issue-1*", restrictsPushes=True), "matches some of the cloud routine's"),
+        (_bpr("**", lockBranch=True), "locked branch"),
+    ],
+)
+def test_doctor_reads_classic_protection_on_cloud_routine_branches(tmp_path, rule, needle):
+    from agentic_sdlc.onboard import CLOUD_BRANCH_RULES_CHECK
+
+    report, _ = _cloud_doctor(tmp_path, **{CLASSIC_RULES: _classic_rules(rule)})
+    failed = _failed(report)
+    assert CLOUD_BRANCH_RULES_CHECK in failed, report.render()
+    assert needle in failed[CLOUD_BRANCH_RULES_CHECK].detail
+    assert failed[CLOUD_BRANCH_RULES_CHECK].manual
+
+
+@pytest.mark.parametrize(
+    "answers",
+    [
+        {CLOUD_BRANCH_RULES: OnboardError("gh: Forbidden (HTTP 403)")},
+        {CLASSIC_RULES: OnboardError("gh: boom (HTTP 500)")},
+        {"api repos/owner/comic/rulesets?includes_parents=true": OnboardError("gh: (HTTP 500)")},
+    ],
+)
+def test_doctor_reports_unreadable_cloud_routine_branch_rules_as_todo(tmp_path, answers):
+    from agentic_sdlc.onboard import CLOUD_BRANCH_RULES_CHECK
+
+    report, _ = _cloud_doctor(tmp_path, **answers)
+    check = _failed(report)[CLOUD_BRANCH_RULES_CHECK]
+    assert check.manual and "could not" in check.detail and not report.ok
+
+
+@pytest.mark.parametrize(
+    ("include", "exclude", "ok"),
+    [
+        (["refs/heads/forge/issue-2*"], [], False),  # some issues only
+        (["refs/heads/forge/**"], [], True),  # all alike: judged by the effective rules
+        (["refs/heads/agent/**"], [], True),  # none of them
+    ],
+)
+def test_doctor_requires_rulesets_to_treat_every_cloud_branch_alike(tmp_path, include, exclude, ok):
+    from agentic_sdlc.onboard import CLOUD_BRANCH_RULES_CHECK
+
+    ruleset = _scoped_ruleset(include, exclude)
+    summary = {k: ruleset[k] for k in ("id", "name", "source_type", "source", "target")}
+    summary["enforcement"] = ruleset["enforcement"]
+    report, _ = _cloud_doctor(
+        tmp_path,
+        **{
+            "api repos/owner/comic/rulesets/77": json.dumps(ruleset),
+            "api repos/owner/comic/rulesets?includes_parents=true": json.dumps(
+                [[{"id": 11, "name": RULESET_NAME, "enforcement": "active"}, summary]]
+            ),
+        },
+    )
+    if ok:
+        assert report.ok, report.render()
+    else:
+        check = _failed(report)[CLOUD_BRANCH_RULES_CHECK]
+        assert check.manual and "'org agents'" in check.detail
+        assert "forge/issue-${ISSUE_NUMBER}" in check.detail

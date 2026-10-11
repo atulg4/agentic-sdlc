@@ -111,7 +111,7 @@ The only tunable knobs, each validated by its own check instead:
 
 | Knob | Validated by |
 |---|---|
-| every job's `runs-on` (except `agent-auto-plan.yml:preflight`, `agent-auto-implement.yml:authorize` and both files' `authorization_failed`, below), and a reusable call's `with.runs_on` | the runner checks (hosted label or an online runner; Linux for implementation) |
+| every job's `runs-on` (except `agent-auto-plan.yml:preflight` and `:dedupe`, `agent-auto-implement.yml:authorize` and both files' `authorization_failed`, below), and a reusable call's `with.runs_on` | the runner checks (hosted label or an online runner; Linux for implementation) |
 | `with.route_budget_usd` on a reusable call (may be added) | "implement callers pass a readable route_budget_usd" |
 | the `if:` of `agent-auto-plan.yml:preflight` and `agent-auto-implement.yml:authorize` | must be exactly the generated condition for the POLICY's labels |
 | the platform pin (`uses: ...@<sha>`, `with.platform_ref`) | the template is rendered at the caller's own pin; "workflows pin the platform to a commit SHA" requires one SHA on the platform repository |
@@ -133,9 +133,18 @@ contents: read, issues: read` -- the label events need `issues: read` in a priva
 labeler (`github.event.sender`), `github.actor` AND whoever applied each of the ready and
 human-review labels most recently (read from the issue's label events, every page) have write,
 maintain or admin, and the reusable
-`plan` call runs only `if: needs.preflight.outputs.authorized == 'true'`. An outsider's issue
-therefore never occupies a self-hosted runner; a maintainer who re-applies the ready label starts
-planning. (`agent-plan.yml` is `workflow_dispatch` only, which already requires write access.)
+`plan` call runs only `if: needs.preflight.outputs.authorized == 'true'` (and `dedupe`, below,
+found no plan for the current approval). An outsider's issue therefore never occupies a
+self-hosted runner; a maintainer who re-applies either planning label starts planning (Codex
+4241196642: EITHER planning label's `labeled` event triggers, once both are present, so
+re-adding a `human-review-required` whose removal cancelled planning restarts it). Duplicates
+are suppressed by the `dedupe` job (`ubuntu-latest`, NOT tunable, `permissions: issues: read`):
+it skips planning when a `## Agentic SDLC plan` comment by `github-actions[bot]` is newer than
+the latest application of each planning label (`preflight` outputs that time as
+`approved_at`), so an issue opened with both labels -- two `labeled` runs, serialized by the
+shared concurrency group -- is planned once; comments it cannot read fail it, and
+`notify_failure` reports that. (`agent-plan.yml` is `workflow_dispatch` only, which already
+requires write access.)
 
 `agent-auto-implement.yml` does the same, with the same step (one shared template fragment): a
 user with the Triage role can apply and remove the approval labels without write access, so its
@@ -157,6 +166,17 @@ of the set applied, fail `authorize`; a label removed since it was last applied 
 "unauthorized". (`agent-implement.yml` is
 `workflow_dispatch` only and has no `authorize` job.)
 
+The approval is bound to the issue content it saw (Codex 4241196649): the title (its `renamed`
+events) and the body (GraphQL `issue.lastEditedAt` and the newest `userContentEdits` entry,
+read with `GITHUB_TOKEN`) must have been last edited BEFORE the most recent application of EACH
+label of the set -- planning and implementation alike, and `sdlcctl authorize-labeler` applies
+the same rule. An issue edited at or after that is "unauthorized" (the run's notice says to
+review it and re-apply -- remove and add -- each label); an edit time that cannot be read FAILS
+the authorization job, which `authorization_failed` reports. Both automatic callers also trigger
+on `edited`, which joins the issue's concurrency group with `cancel-in-progress` true (below),
+so an edit cancels an authorized run that is queued or running; the `edited` run itself starts
+nothing.
+
 A permission check that cannot get a definitive answer (rate limit, 5xx, network) after its
 retries FAILS the authorization job rather than reading as "unauthorized". Every job after it is
 then skipped, so both automatic callers carry one more job, `authorization_failed`
@@ -169,16 +189,16 @@ unverified labeler must never reach.
 
 Authorization is read when a run starts, so REMOVING an approval label stops a run that is
 already queued or running (Codex 4240628982): both automatic callers trigger on `issues:
-[labeled, unlabeled]`, and the workflow-level `concurrency` puts every `labeled` event of a
-triggering label and every `unlabeled` event of a required label in one group per issue
-(`forge-auto-implement-<n>` / `forge-auto-plan-<n>`), with `cancel-in-progress` true only for
-the `unlabeled` run. A Triage user who removes a writer's label and re-applies it while the
+[labeled, unlabeled, edited]`, and the workflow-level `concurrency` puts every `labeled` event of
+a triggering label, every `unlabeled` event of a required label and every `edited` event in one
+group per issue (`forge-auto-implement-<n>` / `forge-auto-plan-<n>`), with `cancel-in-progress`
+true only for the `unlabeled` and `edited` runs. A Triage user who removes a writer's label and re-applies it while the
 authorized run waits for a runner therefore cancels that run; the `unlabeled` run itself starts
 nothing (every label condition requires `github.event.action == 'labeled'`), and the re-applied
 label starts a run that re-authorizes from the label history -- and finds the Triage user.
 Every other label event, the lease's own `in-progress` label included, gets a group of its own
-and cancels nothing; for planning, applying `human-review-required` does not cancel the run its
-ready label started. A cancelled run reports like any other: `authorization_failed` (its
+and cancels nothing; for planning, applying the second planning label queues behind the run the
+first one started (a `labeled` run never cancels), and `dedupe` keeps it from planning twice. A cancelled run reports like any other: `authorization_failed` (its
 message says that removing an approval label cancels a run) or `notify_failure`, and the
 reusable workflow's `release_lease_on_failure` releases a lease once `prepare` has succeeded.
 **Residual risk:** cancellation is asynchronous, so steps already executing finish their current
@@ -263,10 +283,26 @@ through a link). `onboard --force` rewrites the policy and drops the confirmatio
   <ready> --label human-review-required` before claiming, the same check the Actions path runs:
   the most recent application of EACH of those labels (from the issue's label events) must be by
   a user with write/maintain/admin -- a 200 carrying that permission; a 404 or a lower role, or a
-  label removed since, exits 3 (not authorized), and anything unreadable exits 2 (not verified);
+  label removed since, or a title or body edited at or after a label of the set was last
+  applied, exits 3 (not authorized), and anything unreadable -- the edit time included -- exits
+  2 (not verified);
   only exit 0 claims, and the prompt runs the same command again right before pushing (exit
   0 only; otherwise it releases the lease and stops). Without `--label` it reads the three labels from `--config` (default
-  `agentic-sdlc.toml`); a policy it cannot read exits 2.
+  `agentic-sdlc.toml`); a policy it cannot read exits 2. Step 1 of the prompt selects issues
+  with a `gh issue list --search` that excludes `claude-blocked`, and an issue whose body is not
+  a valid work request is commented on, labelled `claude-blocked` and its lease released before
+  the routine moves on (Codex 4241196636), so one malformed request cannot starve the queue.
+- **Cloud routine branch rules** (`cloud-routine` mode, Codex 4241196640): the routine pushes
+  `forge/issue-<N>` with the owner's credentials, so "effective rules on the cloud routine's
+  forge/issue-<N> branches allow its push" runs the publisher's branch-domain checks against that
+  namespace: every ruleset's branch targeting is judged over all issue numbers (one that targets
+  some and not others is a manual TODO), classic protection patterns matching it are reported for
+  each requirement (a push/creation allowlist is always a TODO: the pusher is a user, which doctor
+  cannot match), and the effective rules of `forge/issue-1` pass only for rule types that cannot
+  reject a new branch (deletion, non-fast-forward, linear history, tag names, required checks
+  not enforced on creation, a branch-name pattern proven for every issue number). Creation and
+  update restrictions, signatures, commit-metadata patterns (the owner's own message and
+  identity) and anything unknown or unreadable are owner TODOs.
 - **Project id**: `[project].id` must equal, exactly, the `full_name` GitHub answers for `GET
   repos/{id}` -- its spelling, and after a rename or transfer (which the API follows as a
   redirect) the NEW name, since every run passes that as `$GITHUB_REPOSITORY`. A mismatch fails

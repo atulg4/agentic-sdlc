@@ -2,7 +2,7 @@ name: Automatic approved implementation
 
 on:
   issues:
-    types: [labeled, unlabeled]
+    types: [labeled, unlabeled, edited]
 
 permissions: {}
 
@@ -13,10 +13,13 @@ permissions: {}
 # group per issue; an `unlabeled` run cancels what is in it (and itself starts nothing: its label
 # is gone, so the label condition is false), while `labeled` runs queue as before. Any later run
 # re-authorizes from the label history. Other label events (the lease's `in-progress` label among
-# them) get a group of their own, so they never cancel the work.
+# them) get a group of their own, so they never cancel the work. Codex 4241196649: an approval
+# covers the title and body it saw, so an `edited` event joins the group and cancels too (and
+# starts nothing itself); a later run is authorized only once the labels are re-applied after
+# the edit.
 concurrency:
   group: AUTO_CONCURRENCY_GROUP
-  cancel-in-progress: ${{ github.event.action == 'unlabeled' }}
+  cancel-in-progress: ${{ github.event.action == 'unlabeled' || github.event.action == 'edited' }}
 
 jobs:
   # A Triage user can apply the approval labels without write access, so the labeler's write

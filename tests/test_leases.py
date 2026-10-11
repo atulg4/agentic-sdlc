@@ -2423,11 +2423,22 @@ def test_the_existing_signals_still_decide_without_timeline_links():
 
 
 # Codex 4239868029: a cloud routine claims only work whose approval label a writer applied.
-def _labeler_gh(events_pages, permissions, calls=None):
+#: The GraphQL answer for an issue whose body was never edited (Codex 4241196649).
+NEVER_EDITED = json.dumps(
+    {"data": {"repository": {"issue": {"lastEditedAt": None, "userContentEdits": {"nodes": []}}}}}
+)
+
+
+def _labeler_gh(events_pages, permissions, calls=None, edits=NEVER_EDITED):
     def gh(args, input=None):
         if calls is not None:
             calls.append(list(args))
         path = args[1]
+        if path == "graphql":
+            assert "lastEditedAt" in args[3]
+            if isinstance(edits, Exception):
+                raise edits
+            return edits
         if "/events" in path:
             assert "--paginate" in args and "--slurp" in args
             if isinstance(events_pages, Exception):
@@ -2442,8 +2453,18 @@ def _labeler_gh(events_pages, permissions, calls=None):
     return gh
 
 
+def _at(minute: int) -> str:
+    return (NOW + timedelta(minutes=minute)).isoformat().replace("+00:00", "Z")
+
+
 def _label_event(kind, label, login, event_id):
-    return {"id": event_id, "event": kind, "label": {"name": label}, "actor": {"login": login}}
+    return {
+        "id": event_id,
+        "event": kind,
+        "label": {"name": label},
+        "actor": {"login": login},
+        "created_at": _at(event_id),
+    }
 
 
 APPROVAL = "implementation-approved"
@@ -2826,3 +2847,217 @@ def test_claims_inventory_is_incomplete_at_the_comment_page_cap():
     assert not inventory.complete and "page cap reached" in inventory.gaps[0]
     full = claim_inventory(PROJECT, gh, now=NOW, page_cap=3)
     assert full.complete and [r.lease.issue for r in full.rows] == [7]
+
+
+# ---------------------------------------------------------------- Codex review 5482912640
+# Codex 4241196649: an approval is bound to the issue content it saw. A title or body edited at or
+# after the latest application of ANY label of the set leaves the issue unauthorized until the
+# labels are re-applied; an edit time that cannot be read refuses.
+def _edits(last_edited=None, edits=()):
+    issue = {"lastEditedAt": last_edited, "userContentEdits": {"nodes": list(edits)}}
+    return json.dumps({"data": {"repository": {"issue": issue}}})
+
+
+def _approved_set_pages(*extra):
+    return [
+        [
+            _label_event("labeled", "agent-ready", "writer", 1),
+            _label_event("labeled", "human-review-required", "writer", 2),
+            _label_event("labeled", APPROVAL, "writer", 3),
+            *extra,
+        ]
+    ]
+
+
+@pytest.mark.parametrize(
+    ("extra", "edits", "authorized"),
+    [
+        ([], _edits(), True),  # never edited
+        ([], _edits(_at(0)), True),  # body edited before every label was applied
+        ([], _edits(_at(2)), False),  # body edited after a prerequisite, before the approval
+        ([], _edits(_at(5)), False),  # body edited after the whole set was applied
+        ([], _edits(_at(3)), False),  # the same instant as the approval: not proven before it
+        ([], _edits(None, [{"editedAt": _at(9)}]), False),  # the newest edit entry counts too
+        ([{"event": "renamed", "created_at": _at(4), "actor": {"login": "x"}}], _edits(), False),
+        ([{"event": "renamed", "created_at": _at(0), "actor": {"login": "x"}}], _edits(), True),
+    ],
+)
+def test_authorize_labeler_binds_the_approval_to_the_issue_content(extra, edits, authorized):
+    from agentic_sdlc.leases import authorize_labeler
+
+    pages = _approved_set_pages(*extra)
+    verdict = authorize_labeler(
+        PROJECT, 7, APPROVAL_SET, _labeler_gh(pages, WRITE_PERMS, None, edits)
+    )
+    assert verdict.authorized is authorized, verdict.reason
+    if not authorized:
+        assert "edited" in verdict.reason and "re-apply" in verdict.reason
+
+
+def test_authorize_labeler_reapplied_labels_approve_the_edited_content():
+    from agentic_sdlc.leases import authorize_labeler
+
+    pages = _approved_set_pages(
+        *(
+            _label_event(kind, name, "writer", n)
+            for n, (kind, name) in enumerate(
+                [(k, name) for name in APPROVAL_SET for k in ("unlabeled", "labeled")], start=10
+            )
+        )
+    )
+    verdict = authorize_labeler(
+        PROJECT, 7, APPROVAL_SET, _labeler_gh(pages, WRITE_PERMS, None, _edits(_at(5)))
+    )
+    assert verdict.authorized, verdict.reason
+
+
+@pytest.mark.parametrize(
+    "edits",
+    [
+        OSError("network down"),
+        "not json",
+        json.dumps({"errors": [{"message": "boom"}]}),
+        json.dumps({"data": {"repository": {"issue": {"userContentEdits": {"nodes": []}}}}}),
+        json.dumps({"data": {"repository": {"issue": {"lastEditedAt": None}}}}),
+        _edits("yesterday"),
+        _edits(None, [{"editedAt": None}]),
+    ],
+)
+def test_authorize_labeler_fails_closed_when_the_edit_time_is_unreadable(edits):
+    from agentic_sdlc.leases import authorize_labeler
+
+    gh = _labeler_gh(_approved_set_pages(), WRITE_PERMS, None, edits)
+    with pytest.raises(LeaseError, match="not authorizing"):
+        authorize_labeler(PROJECT, 7, APPROVAL_SET, gh)
+    # a label event without a time cannot be ordered against an edit either
+    pages = [[{**_label_event("labeled", APPROVAL, "writer", 1), "created_at": None}]]
+    with pytest.raises(LeaseError, match="not authorizing"):
+        authorize_labeler(PROJECT, 7, APPROVAL, _labeler_gh(pages, WRITE_PERMS))
+    pages = _approved_set_pages({"event": "renamed", "created_at": "", "actor": {"login": "x"}})
+    with pytest.raises(LeaseError, match="not authorizing"):
+        authorize_labeler(PROJECT, 7, APPROVAL_SET, _labeler_gh(pages, WRITE_PERMS))
+
+
+def test_cli_authorize_labeler_refuses_content_edited_after_approval(monkeypatch):
+    from agentic_sdlc import cli
+
+    base = ["authorize-labeler", "--project", PROJECT, "--issue", "7"]
+    labels = [arg for name in APPROVAL_SET for arg in ("--label", name)]
+    gh = _labeler_gh(_approved_set_pages(), WRITE_PERMS, None, _edits(_at(5)))
+    monkeypatch.setattr(cli, "run_gh", gh)
+    assert cli.main([*base, *labels]) == 3
+    monkeypatch.setattr(
+        cli, "run_gh", _labeler_gh(_approved_set_pages(), WRITE_PERMS, None, OSError("x"))
+    )
+    assert cli.main([*base, *labels]) == 2
+
+
+# Codex 4241196645: a pull request opened between the open-PR inventory and the claim marker is
+# found by a second read after winning, and the claim is retracted.
+def _late_pr():
+    return {
+        "number": 70,
+        "url": "https://x/pr/70",
+        "title": "Fix it",
+        "body": "Closes #7",
+        "headRefName": "patch",
+    }
+
+
+def test_a_pull_request_opened_while_claiming_retracts_the_claim():
+    gh = FakeGh().issue(7)
+    gh.before_post = lambda n: gh.prs.append(_late_pr())
+    result = _claim(gh)
+    assert not result.ok and "pr/70" in result.reason and "while" in result.reason
+    assert current_lease(PROJECT, 7, gh, NOW) is None  # the marker was retracted
+    assert IN_PROGRESS_LABEL not in [lbl["name"] for lbl in gh.issues[7]["labels"]]
+    assert "<!-- forge-release" in gh.issues[7]["comments"][-1]["body"]
+
+
+def test_an_unreadable_recheck_of_open_pull_requests_retracts_the_claim():
+    gh = FakeGh().issue(7)
+    posted = {"done": False}
+
+    def flaky(args, input=None):
+        if tuple(args[:3]) == ("api", "-X", "POST"):
+            posted["done"] = True
+        if posted["done"] and args[:2] == ["api", "graphql"] and "pullRequests(" in args[3]:
+            raise RuntimeError("gh: Server Error (HTTP 502)")
+        return gh(args, input)
+
+    with pytest.raises(RuntimeError, match="HTTP 502"):
+        claim(PROJECT, 7, agent="me", session="s1", branch="b", ttl_minutes=60, gh=flaky, now=NOW)
+    assert current_lease(PROJECT, 7, gh, NOW) is None
+    assert IN_PROGRESS_LABEL not in [lbl["name"] for lbl in gh.issues[7]["labels"]]
+
+
+# Codex 4241196647: the TTL starts when the marker is posted, not when the operation began, and
+# arbitration reads a fresh clock: a marker already expired by then is retracted.
+def _slow(gh, clock, *, on_timeline=timedelta(0), on_first_post=timedelta(0)):
+    state = {"posts": 0, "timelines": 0}
+
+    def run(args, input=None):
+        args = list(args)
+        if args[0] == "api" and "/timeline" in args[1]:
+            state["timelines"] += 1
+            if state["timelines"] == 1:  # the acquisition's own reads are the slow ones
+                clock["now"] += on_timeline
+                gh.posted_at = clock["now"]
+        out = gh(args, input)
+        if args[:3] == ["api", "-X", "POST"]:
+            state["posts"] += 1
+            if state["posts"] == 1:
+                clock["now"] += on_first_post
+                gh.posted_at = clock["now"]
+        return out
+
+    return run
+
+
+def test_the_lease_ttl_starts_after_the_acquisition_reads():
+    gh = FakeGh().issue(7)
+    clock = {"now": NOW}
+    slow = _slow(gh, clock, on_timeline=timedelta(minutes=5))
+    result = claim(
+        PROJECT,
+        7,
+        agent="me",
+        session="s1",
+        branch="b",
+        ttl_minutes=3,
+        gh=slow,
+        clock=lambda: clock["now"],
+    )
+    assert result.ok, result.reason
+    assert result.lease.expires == NOW + timedelta(minutes=8)
+    held = current_lease(PROJECT, 7, gh, clock["now"])
+    assert held is not None and held.session == "s1" and held.live(clock["now"])
+
+
+def test_a_claim_expired_before_arbitration_is_retracted():
+    gh = FakeGh().issue(7)
+    clock = {"now": NOW}
+    slow = _slow(gh, clock, on_first_post=timedelta(minutes=5))
+    result = claim(
+        PROJECT,
+        7,
+        agent="me",
+        session="s1",
+        branch="b",
+        ttl_minutes=3,
+        gh=slow,
+        clock=lambda: clock["now"],
+    )
+    assert not result.ok and "no longer live" in result.reason
+    bodies = [c["body"] for c in gh.issues[7]["comments"]]
+    assert bodies[-1].startswith("<!-- forge-release") and "already expired" in bodies[-1]
+    assert IN_PROGRESS_LABEL not in [lbl["name"] for lbl in gh.issues[7]["labels"]]
+
+
+def test_a_renewal_expiry_is_computed_when_it_is_posted():
+    gh = FakeGh().issue(7)
+    assert _claim(gh).ok
+    clock = {"now": NOW + timedelta(minutes=10)}
+    gh.posted_at = clock["now"]
+    lease = renew(PROJECT, 7, session="s1", ttl_minutes=30, gh=gh, clock=lambda: clock["now"])
+    assert lease.expires == NOW + timedelta(minutes=40)
