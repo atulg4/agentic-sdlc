@@ -43,7 +43,15 @@ from .missions import MissionError, load_registry
 from .openai_compatible import PROVIDERS as OPENAI_COMPATIBLE_PROVIDERS
 from .openai_compatible import ROUTED_MIN_CONTEXT_WINDOW
 from .policy import branch_name_problem, load_policy
-from .trusted_exec import UntrustedExecutableError, trusted_gh
+from .trusted_exec import (
+    LOCAL,
+    STRICT,
+    TRUST_MODES,
+    UntrustedExecutableError,
+    agent_context,
+    trust_mode_problem,
+    trusted_gh,
+)
 
 GhRunner = Callable[..., str]  # (args: Sequence[str], input: str | None = None) -> stdout
 
@@ -55,7 +63,25 @@ IMPLEMENTERS = ("route", "claude", "codex", "cloud-routine")
 #: `[agents] implementation_mode` in agentic-sdlc.toml: the single source of truth for whether an
 #: Actions workflow or a Claude Code cloud routine implements approved issues.
 IMPLEMENTATION_MODES = ("actions", "cloud-routine")
-DEFAULT_RUNS_ON = ("self-hosted", "linux", "x64")
+#: Where the Forge jobs run by default (Codex 4243193108): a fresh GitHub-hosted VM per job.
+#: The reusable implement/repair jobs apply a MODEL-PRODUCED patch and run the repository's setup,
+#: quality and test commands on it, and ci.yml runs every pull request's code, the agent's
+#: included; on a persistent self-hosted runner such code could persist into later jobs that
+#: hold model credentials and Publisher App secrets. Self-hosted labels need `--ephemeral-runners`
+#: (`ephemeral_runners`), the owner's acknowledgement that each runner is ephemeral or contained.
+DEFAULT_RUNS_ON = ("ubuntu-latest",)
+#: The owner's acknowledgement that self-hosted runners are ephemeral (one job, then discarded)
+#: or otherwise contained; without it onboard refuses self-hosted labels and doctor warns.
+EPHEMERAL_RUNNERS_FLAG = "--ephemeral-runners"
+SELF_HOSTED_NEEDS_ACK = (
+    "the Forge jobs run model-produced patches and pull-request code (reusable implement/repair "
+    "verify, ci.yml): on a persistent self-hosted runner that code can persist into later jobs "
+    "holding model credentials and Publisher App secrets. Use a GitHub-hosted label (the "
+    f"default, {DEFAULT_RUNS_ON[0]}), or pass {EPHEMERAL_RUNNERS_FLAG} to acknowledge that every "
+    "self-hosted runner is ephemeral (one job, then discarded) or otherwise contained"
+)
+#: GitHub's ceiling on `required_approving_review_count`.
+MAX_REQUIRED_APPROVALS = 10
 #: Where a FORK-EXPOSED repository's CI runs by default (`fork_pull_request_exposure`): every
 #: fork pull request executes its own code in that job, so it must be a fresh GitHub-hosted VM,
 #: never a persistent self-hosted runner.
@@ -281,6 +307,16 @@ def _cap_problem(maximum: int) -> Callable[[object], str]:
     return check
 
 
+def _bool_problem(value: object) -> str:
+    return "" if isinstance(value, bool) else "must be true or false"
+
+
+def _approvals_problem(value: object) -> str:
+    if type(value) is not int or not 0 <= value <= MAX_REQUIRED_APPROVALS:
+        return f"must be an integer between 0 and {MAX_REQUIRED_APPROVALS}"
+    return ""
+
+
 #: field -> (OnboardSpec attribute, policy table, policy key, validator). The caps' maxima are
 #: load_policy's (`policy.py`).
 POLICY_FIELDS: dict[str, tuple[str, str, str, Callable[[object], str]]] = {
@@ -306,9 +342,29 @@ POLICY_FIELDS: dict[str, tuple[str, str, str, Callable[[object], str]]] = {
         "publisher_bot_login",
         _bot_login_field_problem,
     ),
+    "trust mode": ("trust_mode", "automation", "trust_mode", trust_mode_problem),
+    "ephemeral runners": (
+        "ephemeral_runners",
+        "automation",
+        "ephemeral_runners",
+        _bool_problem,
+    ),
+    "required approvals": (
+        "required_approvals",
+        "policy",
+        "required_approvals",
+        _approvals_problem,
+    ),
 }
-#: Policy fields a policy may omit (written before the field existed): their default.
-_POLICY_FIELD_DEFAULTS = {"python version": DEFAULT_PYTHON_VERSION, "publisher bot login": ""}
+#: Policy fields a policy may omit (written before the field existed): their default -- what
+#: that older onboard did (strict executables, no runner acknowledgement, no required approval).
+_POLICY_FIELD_DEFAULTS = {
+    "python version": DEFAULT_PYTHON_VERSION,
+    "publisher bot login": "",
+    "trust mode": STRICT,
+    "ephemeral runners": False,
+    "required approvals": 0,
+}
 _MISSING = object()
 
 
@@ -376,6 +432,15 @@ class OnboardSpec:
     publisher_bot_login: str = ""
     #: The interpreter the Claude Code hooks run (`trusted_hook_python`, Codex 4242753911).
     hook_python: str = DEFAULT_HOOK_PYTHON
+    #: `[automation] trust_mode` (`trusted_exec`): "strict" (git, gh and the hook interpreter
+    #: only root can replace) or "local" (a developer's own machine). Agent contexts -- GitHub
+    #: Actions, Claude Code cloud sessions -- are strict at run time whatever this says.
+    trust_mode: str = STRICT
+    #: `[automation] ephemeral_runners`: the owner acknowledged that self-hosted runners are
+    #: ephemeral or contained (`--ephemeral-runners`); required for any self-hosted label.
+    ephemeral_runners: bool = False
+    #: `[policy] required_approvals`: the ruleset's `required_approving_review_count`.
+    required_approvals: int = 0
 
     def __post_init__(self) -> None:
         if not _HOOK_PYTHON_PATH.fullmatch(self.hook_python):
@@ -414,6 +479,17 @@ class OnboardSpec:
         problems = [f"{f}: {p}" for f in POLICY_FIELDS if (p := policy_field_problem(f, values[f]))]
         if problems:
             raise OnboardError("; ".join(problems))
+        # Last, so every other runner rule reports first (Codex 4243193108).
+        self_hosted = [
+            ",".join(labels)
+            for labels in dict.fromkeys((tuple(self.runs_on), tuple(self.ci_labels)))
+            if not _github_hosted(set(labels))
+        ]
+        if self_hosted and not self.ephemeral_runners:
+            raise OnboardError(
+                f"self-hosted runner labels ({'; '.join(self_hosted)}) need an explicit "
+                f"acknowledgement: {SELF_HOSTED_NEEDS_ACK}"
+            )
 
     def policy_values(self) -> dict[str, object]:
         """The spec's value of every POLICY_FIELDS field (what `render_policy` writes)."""
@@ -989,9 +1065,20 @@ lease_ttl_minutes = 240
 # count (besides github-actions[bot]). Empty: none does. Set it with `sdlcctl onboard --force
 # --publisher-bot-login <app-slug>[bot]`.
 publisher_bot_login = {_toml_str(spec.publisher_bot_login)}
+# Which git, gh and hook interpreter Forge runs: "strict" (only ones root alone can replace) or
+# "local" (a developer's own machine: the first on PATH, owned by root or the user). GitHub Actions
+# and Claude Code cloud sessions are always strict. Change with `sdlcctl onboard --force
+# --trust-mode`.
+trust_mode = {_toml_str(spec.trust_mode)}
+# true: the owner acknowledged that the self-hosted runners the Forge jobs use are ephemeral or
+# contained (`--ephemeral-runners`); they run model-produced patches and pull-request code.
+ephemeral_runners = {"true" if spec.ephemeral_runners else "false"}
 {routing}
 [policy]
 human_merge_required = true
+# Approvals the "{RULESET_NAME}" ruleset requires before a merge (`--required-approvals`). 0 means
+# GitHub does not enforce the human-merge boundary: whoever can merge, merges.
+required_approvals = {spec.required_approvals}
 max_changed_files = {spec.max_changed_files}
 max_diff_lines = {spec.max_diff_lines}
 max_patch_bytes = 5000000
@@ -1033,7 +1120,8 @@ implementer may implement an explicitly approved work request only.
 0. **Claim before you code.** Every change maps to an issue. Lease it first
    (`sdlcctl claim --project {spec.project_id} --issue <N> --agent <you> --session <id>
    --branch forge/issue-<N>`);
-   if the claim is refused, another agent owns it — pick different work. Never work on an
+   if the claim fails, run `sdlcctl release` with the same `--session` (best-effort: it retracts
+   a claim marker left queued) and pick different work. Never work on an
    `in-progress` issue you do not hold. Release (or let the draft PR stand in) when done.
 1. Read the relevant code and repository instructions before proposing changes; `git fetch` first.
 2. Require complete acceptance criteria, tests, non-goals, and dependencies in the issue.
@@ -1167,7 +1255,11 @@ def render_cloud_routine_md(spec: OnboardSpec) -> str:
    reuse another run's branch. Then claim:
    `sdlcctl claim --project {spec.project_id} --issue <n> --agent cloud-routine
     --session <run id> --branch <branch>`.
-   If the claim is refused (exit 2), skip that issue and take the next one.
+   If the claim fails (ANY non-zero exit), first run {release} with this same <run id>,
+   best-effort, whatever it exits (Codex 4243193105: a claim that lost the race may have left
+   its marker queued when retracting it failed, and a queued marker becomes authoritative once
+   the holder releases; release retracts it, and is harmless for a session that never held
+   the issue), then skip that issue and take the next one.
 2. Check the request deterministically (the same validator and dependency rule as the Actions
    implement path: Codex 4241434511), with the policy as committed on the default branch
    (Codex 4241614590): `git fetch origin {branch}`, then
@@ -1191,7 +1283,9 @@ def render_cloud_routine_md(spec: OnboardSpec) -> str:
    It succeeds ONLY while this run still holds a live lease. On any non-zero exit STOP: do NOT
    push or open a PR -- another agent may own the issue now; run {release} (it refuses if
    another session holds the lease, which is fine) and end the run. It also fails once the
-   issue has been closed (Codex 4241614587): every renewal re-reads the issue's state.
+   issue has been closed (Codex 4241614587): every renewal re-reads the issue's state, and
+   once the issue has an open pull request (Codex 4243193102: one opened or linked by someone
+   else since the claim) -- that PR already represents the work.
 4. Run each, in order; all must pass:
    {spec.setup_command}
    {spec.quality_command}
@@ -1224,6 +1318,8 @@ def render_cloud_routine_md(spec: OnboardSpec) -> str:
    being implemented and a later run will start over from the new text. Exit 7: comment (once)
    that a maintainer must review it and re-apply the labels. Exit 4: a dependency was reopened.
    Exit 6: the issue is no longer open. Exit 8: the issue kept changing while it was checked.
+   Exit 9: a pull request for the issue was opened or linked meanwhile (Codex 4243193102) --
+   that PR now represents the work; do not open a second one.
 5. Push the checked commit at once -- `git push origin HEAD:refs/heads/<branch>`, never
    forced -- and
    open a DRAFT pull request titled "<issue title> (#<n>)" with a summary
@@ -1814,7 +1910,7 @@ def render_hooks(spec: OnboardSpec) -> dict[str, str]:
     # The placeholders sit in Python string literals ("PROJECT_ID"): substitute the whole
     # literal with a JSON string, which is a valid Python string literal. One pass, so a
     # project id cannot be mistaken for the branch placeholder after it is substituted.
-    literal = re.compile(r'"(PROJECT_ID|DEFAULT_BRANCH_NAME|PUBLISHER_BOT_LOGIN)"')
+    literal = re.compile(r'"(PROJECT_ID|DEFAULT_BRANCH_NAME|PUBLISHER_BOT_LOGIN|TRUST_MODE)"')
     values = {
         "PROJECT_ID": json.dumps(spec.project_id),
         "DEFAULT_BRANCH_NAME": json.dumps(spec.default_branch),
@@ -1822,6 +1918,7 @@ def render_hooks(spec: OnboardSpec) -> dict[str, str]:
     guard_values = {
         "PROJECT_ID": values["PROJECT_ID"],
         "PUBLISHER_BOT_LOGIN": json.dumps(spec.publisher_bot_login),
+        "TRUST_MODE": json.dumps(spec.trust_mode),
     }
     guard = _substitute_template(
         "hooks/forge_commit_guard.py",
@@ -1983,6 +2080,99 @@ def installed_bot_login(base: Path) -> str:
     return policy_bot_login(policy_doc)
 
 
+def _installed_policy_doc(base: Path) -> dict:
+    try:
+        doc = tomllib.loads((base / "agentic-sdlc.toml").read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def policy_trust_mode(policy_doc: object) -> str:
+    """`[automation] trust_mode` of a parsed policy: "local" only when it says exactly that;
+    anything else (absent, unreadable, invalid) is "strict"."""
+    automation = policy_doc.get("automation") if isinstance(policy_doc, dict) else None
+    value = automation.get("trust_mode") if isinstance(automation, dict) else None
+    return LOCAL if value == LOCAL else STRICT
+
+
+def installed_trust_mode(base: Path) -> str | None:
+    """The trust mode the policy installed under `base` names (None: none can be read or it
+    names none): a forced re-onboard without `--trust-mode` keeps it."""
+    automation = _installed_policy_doc(base).get("automation")
+    value = automation.get("trust_mode") if isinstance(automation, dict) else None
+    return value if value in TRUST_MODES else None
+
+
+def policy_ephemeral_runners(policy_doc: object) -> bool:
+    automation = policy_doc.get("automation") if isinstance(policy_doc, dict) else None
+    return isinstance(automation, dict) and automation.get("ephemeral_runners") is True
+
+
+def policy_required_approvals(policy_doc: object) -> int:
+    """`[policy] required_approvals` (0 when absent or not a valid count)."""
+    table = policy_doc.get("policy") if isinstance(policy_doc, dict) else None
+    value = table.get("required_approvals") if isinstance(table, dict) else None
+    return value if not _approvals_problem(value) else 0
+
+
+def installed_required_approvals(base: Path) -> int | None:
+    """The `required_approvals` of the installed policy, None when it names none."""
+    table = _installed_policy_doc(base).get("policy")
+    value = table.get("required_approvals") if isinstance(table, dict) else None
+    return value if not _approvals_problem(value) else None
+
+
+def other_writers(
+    project_id: str, gh: GhRunner, *, me: str | None = None
+) -> list[str] | Unreadable:
+    """Collaborators with write, maintain or admin access OTHER than the repository's owner and
+    the authenticated user `me` (Codex 4243193100): who could approve a pull request this
+    identity opens. `repos/{p}/collaborators?permission=push` lists users with at least write
+    access (direct, outside and organization members), every page; bots are not reviewers."""
+    rows = _paged_items(gh, f"repos/{project_id}/collaborators?permission=push&per_page=100")
+    if isinstance(rows, Unreadable):
+        return rows
+    owner = project_id.split("/")[0].casefold()
+    skip = {owner, (me or "").casefold()}
+    logins = []
+    for row in rows:
+        login = row.get("login") if isinstance(row, dict) else None
+        if not isinstance(login, str) or not login or row.get("type") == "Bot":
+            continue
+        if login.casefold() not in skip:
+            logins.append(login)
+    return sorted(set(logins), key=str.casefold)
+
+
+def authenticated_login(gh: GhRunner) -> str | None:
+    """The login `gh` is authenticated as (`GET user`), None when unreadable."""
+    answer = _safe_json(gh, ["api", "user"])
+    login = answer.get("login") if isinstance(answer, dict) else None
+    return login if isinstance(login, str) and login else None
+
+
+def default_required_approvals(project_id: str, gh: GhRunner) -> tuple[int, str]:
+    """(count, why) for `--required-approvals` left unset at `onboard --apply`: 1 when another
+    collaborator with write access can approve, else 0 (a solo owner cannot approve their own
+    pull request, so 1 would leave every PR unmergeable). Unreadable: 0, said so."""
+    found = other_writers(project_id, gh, me=authenticated_login(gh))
+    if isinstance(found, Unreadable):
+        return 0, f"the collaborators of {project_id} could not be read ({found.why})"
+    if found:
+        return 1, f"{len(found)} other collaborator(s) with write access can approve"
+    return 0, f"no collaborator of {project_id} but the owner has write access"
+
+
+HUMAN_MERGE_NOT_ENFORCED = (
+    "the ruleset requires no approving review, so GitHub does not enforce the human-merge "
+    "boundary: in cloud-routine mode the routine acts with the owner's identity and could mark "
+    "its draft ready and merge it once CI passes. Add a second collaborator with write access "
+    "(or a separate reviewer identity) and re-run `sdlcctl onboard --force --apply "
+    "--required-approvals 1`"
+)
+
+
 def _previous_guides(base: Path, spec: OnboardSpec) -> list[dict[str, str]]:
     """The guide texts the INSTALLED policy renders (what doctor's containment check compares,
     `rendered_managed_files`), under the policy's own project id and this one: the managed
@@ -2090,7 +2280,7 @@ def write_onboarding(
         raise OnboardError("destination must be an existing Git repository")
     # The hooks run this interpreter by absolute path: refuse one only root cannot replace
     # before anything is written (Codex 4242753911).
-    problem = hook_python_problem(spec.hook_python)
+    problem = hook_python_problem(spec.hook_python, spec.trust_mode)
     if problem:
         raise OnboardError(f"the hook interpreter {problem}; pass --hook-python with a trusted one")
     files = render_onboarding(spec)
@@ -2143,7 +2333,9 @@ def ruleset_payload(spec: OnboardSpec) -> dict:
             {
                 "type": "pull_request",
                 "parameters": {
-                    "required_approving_review_count": 0,
+                    # `[policy] required_approvals` (Codex 4243193100): 0 leaves the merge to
+                    # whoever can merge -- in cloud-routine mode, the agent acting as the owner.
+                    "required_approving_review_count": spec.required_approvals,
                     "dismiss_stale_reviews_on_push": True,
                     "require_code_owner_review": False,
                     "require_last_push_approval": False,
@@ -2510,9 +2702,14 @@ class Check:
     ok: bool
     detail: str = ""
     manual: bool = False  # True = only the owner can fix (secrets, app install, runner)
+    #: A passing check the owner must still read: rendered WARN, never makes doctor NOT READY.
+    warning: bool = False
 
     def as_dict(self) -> dict:
-        return {"name": self.name, "ok": self.ok, "detail": self.detail, "manual": self.manual}
+        out = {"name": self.name, "ok": self.ok, "detail": self.detail, "manual": self.manual}
+        if self.warning:
+            out["warning"] = True
+        return out
 
 
 @dataclass
@@ -2529,7 +2726,7 @@ class DoctorReport:
     def render(self) -> str:
         lines = []
         for c in self.checks:
-            mark = "PASS" if c.ok else ("TODO" if c.manual else "FAIL")
+            mark = ("WARN" if c.warning else "PASS") if c.ok else ("TODO" if c.manual else "FAIL")
             lines.append(f"[{mark}] {c.name}" + (f" — {c.detail}" if c.detail else ""))
         lines.append("READY" if self.ok else "NOT READY")
         return "\n".join(lines)
@@ -2546,6 +2743,117 @@ def _remote_file_state(gh: GhRunner, args: Sequence[str]) -> str:
     except json.JSONDecodeError:
         return "unknown"
     return "present" if isinstance(data, (dict, list)) and data else "unknown"
+
+
+TRUST_MODE_CHECK = "executable trust mode"
+RUNNER_ISOLATION_CHECK = "self-hosted runners are acknowledged ephemeral"
+APPROVALS_CHECK = "ruleset requires a human approval"
+
+
+def trust_mode_check(mode: str) -> Check:
+    """Doctor reports the policy's trust mode; local is a warning: strict is what protects agent
+    contexts (and agent contexts are strict at run time anyway)."""
+    context = agent_context()
+    if mode == LOCAL:
+        return Check(
+            TRUST_MODE_CHECK,
+            True,
+            '[automation] trust_mode = "local": git, gh and the hook interpreter may be any '
+            "the user owns (first on PATH). Strict mode -- only executables root alone can "
+            "replace -- is what protects agent contexts; GitHub Actions and Claude Code cloud "
+            "sessions use it regardless"
+            + (f" (this run is one: {context})" if context else "")
+            + ". The pinned hook interpreter must exist wherever the hooks run",
+            warning=True,
+        )
+    return Check(
+        TRUST_MODE_CHECK,
+        True,
+        '[automation] trust_mode = "strict": git, gh and the hook interpreter only root can '
+        "replace",
+    )
+
+
+def _installed_runner_labels(base: Path) -> list[tuple[str, tuple[str, ...]]]:
+    """(where, labels) for every runner the installed Forge callers target: each reusable call's
+    `with.runs_on` (JSON) and every job's `runs-on`. Unparseable values are skipped (the
+    runner checks report them)."""
+    found: list[tuple[str, tuple[str, ...]]] = []
+    for path in sorted((base / ".github/workflows").glob("*.yml")):
+        doc = _workflow_doc(path)
+        jobs = doc.get("jobs") if isinstance(doc, dict) else None
+        for name, job in (jobs or {}).items() if isinstance(jobs, dict) else ():
+            if not isinstance(job, dict):
+                continue
+            values = []
+            passed = job.get("with")
+            if isinstance(passed, dict) and isinstance(passed.get("runs_on"), str):
+                with contextlib.suppress(ValueError):
+                    values.append(json.loads(passed["runs_on"]))
+            if "runs-on" in job:
+                values.append(job["runs-on"])
+            for value in values:
+                labels = [value] if isinstance(value, str) else value
+                if isinstance(labels, list) and all(isinstance(x, str) for x in labels):
+                    if any("${{" in x for x in labels):
+                        continue
+                    found.append((f"{path.name}:{name}", tuple(labels)))
+    return found
+
+
+def runner_isolation_check(base: Path, policy_doc: object) -> Check:
+    """Codex 4243193108: a self-hosted label on a Forge job without the owner's acknowledgement
+    (`[automation] ephemeral_runners = true`) that the runners are ephemeral or contained."""
+    self_hosted = sorted(
+        {
+            f"{where} ({','.join(labels)})"
+            for where, labels in _installed_runner_labels(base)
+            if not _github_hosted(set(labels))
+        }
+    )
+    if not self_hosted:
+        return Check(RUNNER_ISOLATION_CHECK, True, "every Forge job runs on a GitHub-hosted runner")
+    if policy_ephemeral_runners(policy_doc):
+        return Check(
+            RUNNER_ISOLATION_CHECK,
+            True,
+            "self-hosted, acknowledged ephemeral/contained ([automation] ephemeral_runners = "
+            "true): " + ", ".join(self_hosted),
+        )
+    return Check(
+        RUNNER_ISOLATION_CHECK,
+        True,
+        "WARNING: persistent self-hosted runners are not acknowledged as ephemeral: "
+        + ", ".join(self_hosted)
+        + f" -- {SELF_HOSTED_NEEDS_ACK} (re-run `sdlcctl onboard --force "
+        f"{EPHEMERAL_RUNNERS_FLAG}` once they are)",
+        warning=True,
+    )
+
+
+def approvals_check(count: int, *, cloud: bool, writers: list[str] | Unreadable | None) -> Check:
+    """Codex 4243193100: the ruleset's required approvals (the policy's `required_approvals`,
+    which the ruleset check holds the ruleset to). 0 in cloud-routine mode is a loud warning: the
+    human-merge boundary is not enforced server-side. `writers`: the other collaborators with
+    write access (who could approve), when read."""
+    if count >= 1:
+        return Check(APPROVALS_CHECK, True, f"[policy] required_approvals = {count}")
+    detail = "[policy] required_approvals = 0"
+    if isinstance(writers, list) and writers:
+        detail += (
+            f"; {', '.join(writers)} could approve -- re-run `sdlcctl onboard --force --apply "
+            "--required-approvals 1`"
+        )
+    if cloud:
+        return Check(
+            APPROVALS_CHECK, True, f"WARNING: {detail}: {HUMAN_MERGE_NOT_ENFORCED}", warning=True
+        )
+    return Check(
+        APPROVALS_CHECK,
+        True,
+        detail + " (merges are gated by a human pressing merge, not by a required review)",
+        warning=bool(isinstance(writers, list) and writers),
+    )
 
 
 PLATFORM_ACCESS_CHECK = "private platform lets this repository call its workflows"
@@ -6562,13 +6870,21 @@ def _hook_python_probe_problem(path: str) -> str:
     return problem
 
 
-def hook_python_problem(path: str) -> str:
+def hook_python_problem(path: str, mode: str = STRICT) -> str:
     """Why `path` may not be the hook interpreter ('' = it may): an absolute path the handler
-    can carry as one shell word, to an executable only root can replace (`trusted_exec`), that
-    IS a CPython of at least HOOK_PYTHON_MIN_VERSION when run the way the handler runs it
-    (`_hook_python_probe_problem`, Codex 4242925452)."""
+    can carry as one shell word, to an executable only root can replace (`trusted_exec`; in
+    trust mode local: owned by root or this user, not group/other-writable), that IS a CPython of
+    at least HOOK_PYTHON_MIN_VERSION when run the way the handler runs it
+    (`_hook_python_probe_problem`, Codex 4242925452) -- in both modes."""
     if not _HOOK_PYTHON_PATH.fullmatch(path or ""):
         return f"{path!r} is not an absolute path made of [A-Za-z0-9._+/-]"
+    if mode == LOCAL:
+        from .trusted_exec import local_candidate_reason
+
+        reason = local_candidate_reason(path)
+        if reason:
+            return f"{reason} (trust mode local: owned by root or you, not group/other-writable)"
+        return _hook_python_probe_problem(path)
     from .trusted_exec import candidate_reason
 
     reason = candidate_reason(path)
@@ -6577,29 +6893,54 @@ def hook_python_problem(path: str) -> str:
     return _hook_python_probe_problem(path)
 
 
-def trusted_hook_python(explicit: str | None = None) -> str:
-    """The interpreter onboard writes into the hook handlers: `explicit` (`--hook-python`) when
-    given, else the first of HOOK_PYTHON_CANDIDATES that `hook_python_problem` accepts. Raises
-    OnboardError when there is none: onboarding never falls back to a PATH lookup."""
+def _path_pythons() -> list[str]:
+    """Absolute `python3` candidates on PATH, in PATH order (trust mode local only)."""
+    return [
+        os.path.join(entry, "python3")
+        for entry in os.environ.get("PATH", "").split(os.pathsep)
+        if entry and os.path.isabs(entry)
+    ]
+
+
+def trusted_hook_python(explicit: str | None = None, mode: str = STRICT) -> str:
+    """The interpreter onboard writes into the hook handlers (an absolute path, pinned): `explicit`
+    (`--hook-python`) when given, else the first of HOOK_PYTHON_CANDIDATES that
+    `hook_python_problem` accepts -- and in trust mode local, then the first acceptable `python3`
+    on PATH (a Homebrew CPython 3.11+, say). Raises OnboardError when there is none: in strict
+    mode onboarding never falls back to a PATH lookup."""
     if explicit:
-        problem = hook_python_problem(explicit)
+        problem = hook_python_problem(explicit, mode)
         if problem:
             raise OnboardError(f"--hook-python {problem}")
         return explicit
     rejected = []
-    for candidate in HOOK_PYTHON_CANDIDATES:
+    candidates = list(HOOK_PYTHON_CANDIDATES)
+    if mode == LOCAL:
+        candidates += _path_pythons()
+    for candidate in dict.fromkeys(candidates):
         if not os.path.lexists(candidate):
-            rejected.append(f"{candidate} does not exist")
+            if candidate in HOOK_PYTHON_CANDIDATES:
+                rejected.append(f"{candidate} does not exist")
             continue
-        problem = hook_python_problem(candidate)
+        if mode == LOCAL and not _HOOK_PYTHON_PATH.fullmatch(candidate):
+            continue
+        problem = hook_python_problem(candidate, mode)
         if not problem:
             return candidate
         rejected.append(problem)
+    if mode == LOCAL:
+        raise OnboardError(
+            "no usable interpreter for the Claude Code hooks (" + "; ".join(rejected) + "). "
+            "Trust mode local takes the system python3 or the first python3 on PATH that is a "
+            f"CPython {'.'.join(map(str, HOOK_PYTHON_MIN_VERSION))}+ owned by root or you; "
+            "install one, or pass --hook-python /absolute/path/to/python3."
+        )
     raise OnboardError(
         "no trusted interpreter for the Claude Code hooks (" + "; ".join(rejected) + "). The "
         "hooks must run a Python 3 that only root can replace -- never one found on PATH. "
         "Install the system python3, or pass --hook-python /absolute/path/to/python3 (a "
-        "root-owned file in root-owned, non-writable directories)."
+        "root-owned file in root-owned, non-writable directories). On a developer's own "
+        "machine (e.g. a Homebrew Python on macOS), `--trust-mode local` accepts one you own."
     )
 
 
@@ -6717,7 +7058,9 @@ def _matcher_covers(matcher: object, tool: str | None) -> bool:
         return False
 
 
-def _forge_entry_deviation(group: dict, entry: dict, event: str, digest: str | None) -> str:
+def _forge_entry_deviation(
+    group: dict, entry: dict, event: str, digest: str | None, mode: str = STRICT
+) -> str:
     """How a handler that runs a Forge script differs from `forge_hook_entry` ('' = it does
     not): any extra, missing or different handler field, an extra group field, a script not
     anchored at the project root, an interpreter resolved through PATH or one only root cannot
@@ -6745,7 +7088,7 @@ def _forge_entry_deviation(group: dict, entry: dict, event: str, digest: str | N
             "script's SHA-256 pinned"
         )
     else:
-        problem = hook_python_problem(parsed.python)
+        problem = hook_python_problem(parsed.python, mode)
         if problem:
             found.append(f"an untrusted interpreter ({problem})")
         if digest is None:
@@ -6768,7 +7111,7 @@ def _installed_digest(base: Path, script: str) -> str | None:
         return None
 
 
-def hook_problems(settings_path: Path) -> list[str]:
+def hook_problems(settings_path: Path, mode: str = STRICT) -> list[str]:
     """Why Claude Code would NOT run the Forge hooks from this settings file as onboard installed
     them (empty = it will): the parsed `hooks` structure must hold a SessionStart group firing on
     startup that runs the session-start script, and a PreToolUse group matching Bash that runs the
@@ -6801,7 +7144,7 @@ def hook_problems(settings_path: Path) -> list[str]:
             for entry in entries:
                 if not _hook_runs(entry, script):
                     continue
-                deviation = _forge_entry_deviation(group, entry, event, digest)
+                deviation = _forge_entry_deviation(group, entry, event, digest, mode)
                 if deviation:
                     # Wherever it sits: an `async` guard never blocks, even beside a good one.
                     problems.append(
@@ -7041,6 +7384,7 @@ def rendered_managed_files(
         default_branch=str(project.get("default_branch") or "main"),
         ready_label=_policy_ready_label(policy_doc),
         implementer="cloud-routine" if cloud else "claude",
+        trust_mode=policy_trust_mode(policy_doc),  # rendered into the guard
     )
     rendered: dict[str, str] = {}
     login = policy_bot_login(policy_doc)
@@ -7496,9 +7840,14 @@ def doctor(
         ]
     missing = [problem for r in required if (problem := _regular_file_problem(base, r))]
     settings = base / ".claude/settings.json"
+    installed_policy = _installed_policy_doc(base)
+    trust = policy_trust_mode(installed_policy)
     if settings.exists():
-        missing += hook_problems(settings)
+        missing += hook_problems(settings, trust)
     add(Check("required files present", not missing, ", ".join(missing) if missing else ""))
+    if (base / "agentic-sdlc.toml").exists():
+        add(trust_mode_check(trust))
+        add(runner_isolation_check(base, installed_policy))
     if cloud and actions_impl:
         add(
             Check(
@@ -7950,6 +8299,12 @@ def doctor(
         label_check = local_runner_label_check(local_targets, local_ci_labels)
         if label_check is not None:
             add(label_check)
+        if (base / "agentic-sdlc.toml").exists():
+            add(
+                approvals_check(
+                    policy_required_approvals(installed_policy), cloud=cloud, writers=None
+                )
+            )
         return rep
 
     # --- platform reachable at that pin, and its reusable workflows accept the generated calls
@@ -8297,6 +8652,7 @@ def doctor(
                     platform_ref="0" * 40,
                     test_command="-",
                     default_branch=branch,
+                    required_approvals=policy_required_approvals(installed_policy),
                 ),
             )
             if isinstance(detail, dict)
@@ -8309,6 +8665,13 @@ def doctor(
                 "; ".join(problems),
             )
         )
+    add(
+        approvals_check(
+            policy_required_approvals(installed_policy),
+            cloud=cloud,
+            writers=other_writers(project_id, gh, me=authenticated_login(gh)),
+        )
+    )
 
     # --- the EFFECTIVE rules of the default branch: rulesets inherited from the organization or
     # enterprise apply too, and a requirement no Forge PR can meet leaves every PR unmergeable

@@ -1,10 +1,19 @@
-"""Run trusted project verification commands without invoking a shell."""
+"""Run trusted project verification commands with the shell semantics of the generated CI.
+
+Each gate is ONE shell command line, run exactly as the generated `ci.yml` runs it: a GitHub
+Actions `run:` step with no `shell:` key on Linux is `bash -e {0}` (`sh -e {0}` when no bash is
+found), so `run-gates` runs `bash -e -c <command>` (or `sh -e -c`), in its own process, from the
+repository root. `cd sub && make test`, `VAR=x pytest` and `true && false` (which fails) mean
+here what they mean in CI (Codex 4243193109: tokenizing the line and executing the first word
+let `true && false` pass and turned `VAR=x cmd` into a missing program). What differs from CI is
+only the environment: an allowlist, never the runner's credentials or control files.
+"""
 
 from __future__ import annotations
 
 import json
 import os
-import shlex
+import shutil
 import subprocess
 import time
 import tomllib
@@ -86,6 +95,24 @@ def _environment(verification: dict[str, Any]) -> dict[str, str]:
     return {name: os.environ[name] for name in names if name in os.environ}
 
 
+#: Where the gate shell is looked up first (never a PATH search alone: a workspace-controlled
+#: PATH entry must not decide which shell interprets the gate).
+_SHELL_CANDIDATES = ("/bin/bash", "/usr/bin/bash", "/bin/sh", "/usr/bin/sh")
+
+
+def gate_shell() -> list[str]:
+    """The argv prefix the generated CI's default `run:` shell uses on Linux (`bash -e`, else
+    `sh -e`), ending in `-c`; the gate's command line follows it as ONE argument."""
+    for candidate in _SHELL_CANDIDATES:
+        if Path(candidate).is_file():
+            return [candidate, "-e", "-c"]
+    for name in ("bash", "sh"):
+        found = shutil.which(name, path="/usr/bin:/bin")
+        if found:
+            return [found, "-e", "-c"]
+    raise GateError("no POSIX shell (bash or sh) to run the verification gates with")
+
+
 def run_gates(
     config: str | Path,
     repository: str | Path,
@@ -106,9 +133,11 @@ def run_gates(
         command = commands.get(name)
         if command is None:
             raise GateError(f"verification gate has no command: {name}")
-        arguments = shlex.split(command, posix=True)
-        if not arguments:
+        if not command.strip():
             raise GateError(f"verification command is empty: {name}")
+        if "\n" in command or "\r" in command or "\0" in command:
+            raise GateError(f"verification command must be a single line: {name}")
+        arguments = [*gate_shell(), command]
         accepted = allowed_exit_codes.get(name, [0])
         if not isinstance(accepted, list) or not all(isinstance(code, int) for code in accepted):
             raise GateError(f"allowed exit codes are invalid: {name}")

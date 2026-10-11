@@ -29,6 +29,14 @@ def _system_dirs_read_only(monkeypatch, tmp_path_factory):
     monkeypatch.setattr(os, "access", access)
 
 
+@pytest.fixture(autouse=True)
+def _no_policy_trust_mode(monkeypatch):
+    """Each test starts with no policy trust mode recorded (`use_trust_mode` is process state)."""
+    from agentic_sdlc import trusted_exec
+
+    monkeypatch.setattr(trusted_exec, "_POLICY_MODE", None)
+
+
 @pytest.fixture
 def policy_file(tmp_path: Path) -> Path:
     path = tmp_path / "agentic-sdlc.toml"

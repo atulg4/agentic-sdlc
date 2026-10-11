@@ -1641,6 +1641,16 @@ def _ref_free_fanout(words: list[str]) -> bool:
 # root's). `AGENTIC_SDLC_GIT` / `AGENTIC_SDLC_GH` may name another copy, vetted the same way and
 # never honoured as root. No trusted program is a refusal (fail closed): the branch is
 # BRANCH_UNKNOWN, the lease UNAVAILABLE, and the refusal names why (`_trust_note`).
+#
+# That is the STRICT trust mode. `onboard` renders the policy's `[automation] trust_mode` into
+# TRUST_MODE below; "local" (a developer's own machine, where Homebrew's git/gh are owned by the
+# user) takes the FIRST git/gh on PATH (then the system locations) and the override even as
+# root, and requires only that the file be owned by root or this user with no group or other
+# write bit. The environment the programs run in is allowlisted in both modes. Any value but
+# "local" is strict, and an agent context -- GitHub Actions (`GITHUB_ACTIONS=true`) or a Claude
+# Code cloud session (`CLAUDE_CODE_REMOTE=true`) -- is always strict, whatever was rendered.
+TRUST_MODE = "TRUST_MODE"  # the policy's [automation] trust_mode
+AGENT_CONTEXT_MARKERS = (("GITHUB_ACTIONS", "true"), ("CLAUDE_CODE_REMOTE", "true"))
 SYSTEM_GH_PATHS = ("/usr/bin/gh", "/bin/gh", "/usr/local/bin/gh", "/opt/homebrew/bin/gh")
 TRUSTED_OVERRIDE_ENV = {"git": "AGENTIC_SDLC_GIT", "gh": "AGENTIC_SDLC_GH"}
 #: The fixed search path every program the guard runs gets: system directories only.
@@ -1698,12 +1708,70 @@ def _trust_candidate_reason(candidate: str) -> str | None:
     return None
 
 
+def _trust_mode() -> str:
+    """`local` only when rendered so AND not in an agent context; else `strict`."""
+    for variable, value in AGENT_CONTEXT_MARKERS:
+        if os.environ.get(variable, "").strip().lower() == value:
+            return "strict"
+    return "local" if TRUST_MODE == "local" else "strict"
+
+
+def _local_candidate_reason(candidate: str) -> str | None:
+    """Local mode: why the program at absolute path `candidate` may not run, or None. The
+    resolved file must be owned by root or this user, with no group or other write bit."""
+    euid = _euid()
+    if euid is None:
+        return "file ownership cannot be checked on this platform"
+    if not os.path.isabs(candidate):
+        return f"{candidate} is not an absolute path"
+    real = os.path.realpath(candidate)
+    if not (os.path.isfile(real) and os.access(real, os.X_OK)):
+        return f"{candidate} is not an executable file"
+    try:
+        info = os.stat(real)
+    except OSError as exc:
+        return f"{candidate}: {real} cannot be inspected ({exc.strerror or exc})"
+    if info.st_uid not in (0, euid):
+        return f"{candidate}: {real} is owned by neither root nor this user"
+    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return f"{candidate}: {real} is writable by its group or by others"
+    return None
+
+
+def _local_program(name: str, system: tuple[str, ...], override_env: str) -> str:
+    """Local mode: the override, else the FIRST `name` on PATH's absolute entries, then the
+    system locations; one that fails `_local_candidate_reason` is refused, never skipped."""
+    override = os.environ.get(override_env, "")
+    if override:
+        reason = _local_candidate_reason(override)
+        if reason:
+            raise UntrustedProgram(f"{override_env} names an unsafe {name}: {reason}")
+        return os.path.realpath(override)
+    candidates = [
+        os.path.join(entry, name)
+        for entry in os.environ.get("PATH", "").split(os.pathsep)
+        if entry and os.path.isabs(entry)
+    ]
+    for candidate in dict.fromkeys([*candidates, *system]):
+        real = os.path.realpath(candidate)
+        if not (os.path.isfile(real) and os.access(real, os.X_OK)):
+            continue
+        reason = _local_candidate_reason(candidate)
+        if reason:
+            raise UntrustedProgram(f"the {name} found first (trust mode local) is unsafe: {reason}")
+        return real
+    raise UntrustedProgram(f"no {name} executable was found on PATH or in {', '.join(system)}")
+
+
 def _trusted_program(name: str) -> str:
     """The resolved path of a trusted `name` ("git" or "gh"); UntrustedProgram when none."""
     if name in _TRUSTED:
         return _TRUSTED[name]
     system = SYSTEM_GIT_PATHS if name == "git" else SYSTEM_GH_PATHS
     override_env = TRUSTED_OVERRIDE_ENV[name]
+    if _trust_mode() == "local":
+        _TRUSTED[name] = _local_program(name, tuple(system), override_env)
+        return _TRUSTED[name]
     euid = _euid()
     override = os.environ.get(override_env, "")
     if override:
@@ -1743,10 +1811,16 @@ def _trust_note(name: str) -> str:
     try:
         _trusted_program(name)
     except UntrustedProgram as exc:
+        if _trust_mode() == "local":
+            return (
+                f" (The guard found no usable {name} -- {exc}. In trust mode local it runs the "
+                f"first {name} on PATH, owned by root or you and not group/other-writable.)"
+            )
         return (
             f" (The guard runs only a {name} that only root can replace and found none -- "
             f"{exc}. Install {name} root-owned in a system location, e.g. "
-            f"{(SYSTEM_GIT_PATHS if name == 'git' else SYSTEM_GH_PATHS)[0]}.)"
+            f"{(SYSTEM_GIT_PATHS if name == 'git' else SYSTEM_GH_PATHS)[0]}; on a developer's "
+            "own machine, `sdlcctl onboard --force --trust-mode local` relaxes this.)"
         )
     return ""
 

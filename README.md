@@ -83,11 +83,12 @@ sdlcctl evaluate-diff \
 
 ### Fast path: `sdlcctl onboard` (production profile)
 
-`onboard` installs the shape the real consumer repos run — self-hosted or hosted
-runners, preflight + failure-notify jobs, `claude-ready` labels, optional provider
-routing — with the platform pinned to the current `main` SHA, and (with `--apply`)
-configures the GitHub repo itself: labels, the "Protect main" ruleset (review-thread
-resolution + required `test` check) and repo variables. `doctor` then reports what
+`onboard` installs the shape the real consumer repos run — GitHub-hosted runners by
+default (self-hosted only with `--ephemeral-runners`), preflight + failure-notify jobs,
+`claude-ready` labels, optional provider routing — with the platform pinned to the current
+`main` SHA, and (with `--apply`) configures the GitHub repo itself: labels, the "Protect main"
+ruleset (review-thread resolution + required `test` check + `--required-approvals` approving
+reviews) and repo variables. `doctor` then reports what
 is still missing and which steps only the owner can do (secrets, GitHub App, runner).
 
 ```bash
@@ -100,12 +101,45 @@ sdlcctl onboard \
   --forbidden "data/**" --protected "app/server.py" \
   --apply
 
-# implementer = GitHub Actions with provider routing on self-hosted runners (MusicMaestro shape)
+# implementer = GitHub Actions with provider routing on self-hosted runners (MusicMaestro shape);
+# self-hosted labels need the owner's acknowledgement that the runners are ephemeral/contained
 sdlcctl onboard --destination ... --project-id owner/repo --test "pytest -q" \
-  --implementer route --apply --copy-vars-from atulg4/MusicMaestro
+  --implementer route --runs-on self-hosted,linux,x64 --ephemeral-runners \
+  --apply --copy-vars-from atulg4/MusicMaestro
 
 sdlcctl doctor --destination /path/to/consumer-repository   # exit 2 until READY
 ```
+
+Three owner choices are recorded in `agentic-sdlc.toml` and checked by `doctor`:
+
+- **Runners** (`--runs-on`, default `ubuntu-latest`): the reusable implement/repair jobs apply a
+  model-produced patch and run the repository's setup/quality/test commands on it, and `ci.yml`
+  runs every pull request's code. On a persistent self-hosted runner that code could persist into
+  later jobs holding model credentials and Publisher App secrets, so self-hosted labels are
+  refused unless `--ephemeral-runners` acknowledges that each runner is ephemeral (one job, then
+  discarded) or otherwise contained (`[automation] ephemeral_runners = true`); `doctor` warns
+  about a self-hosted label without it. Hosted minutes cost money and a hosted VM cannot reach a
+  private network: that trade-off is the owner's.
+- **Required approvals** (`--required-approvals N`, `[policy] required_approvals`): the "Protect
+  main" ruleset's approving-review count. Default with `--apply`: 1 when the repository has a
+  collaborator with write/maintain/admin access other than the owner and the authenticated user,
+  else 0 (GitHub never lets an author approve their own PR, so 1 would leave a solo owner unable
+  to merge anything); offline, 0. At 0 the human-merge boundary is not enforced server-side --
+  in `cloud-routine` mode the routine acts as the owner and could merge its own PR -- and both
+  `onboard` and `doctor` say so loudly.
+- **Executable trust mode** (`--trust-mode strict|local`, `[automation] trust_mode`, default
+  strict, kept on `--force`): strict runs only a git, gh and hook interpreter that root alone can
+  replace; local (a developer's own machine, e.g. Homebrew's Python 3.11+, gh and git on macOS)
+  takes the first on PATH owned by root or the user and not group/other-writable, and keeps
+  everything else (allowlisted environments, a fresh gh config, an absolute probed hook
+  interpreter). GitHub Actions (`GITHUB_ACTIONS=true`) and Claude Code cloud sessions
+  (`CLAUDE_CODE_REMOTE=true`) are strict whatever the policy says; `doctor` reports the mode.
+
+**Migrating an onboarded repository:** re-run `sdlcctl onboard --force` (with `--apply` to update
+the ruleset). A repository on self-hosted runners must add `--runs-on <labels>
+--ephemeral-runners` (or move to hosted runners), and should pass `--required-approvals 1` when a
+second reviewer exists. A policy written before these fields reads as strict, unacknowledged and
+0 approvals.
 
 `--implementer` is one of `route` (multi-provider, needs `.forge/` + DeepSeek secrets),
 `claude`, `codex`, or `cloud-routine` (no Actions implementer; see the generated
@@ -213,7 +247,8 @@ tool name, a Bash call without a string command); only a payload shown to be ano
 unread.
 
 The hooks run a Python interpreter `onboard` vetted (`/usr/bin/python3`, else `/bin/python3`, or
-`--hook-python`: a file only root can replace that, run with `-I -c`, answers as CPython 3.11 or
+`--hook-python`; in trust mode local also the first `python3` on PATH owned by you: a file only
+root can replace -- in local mode, one owned by root or you, not group/other-writable -- that, run with `-I -c`, answers as CPython 3.11 or
 newer -- a root-owned `/bin/true` would exit 0 without guarding) by absolute path, isolated (`-I`), under a fixed
 PATH -- never `python3` looked up on the session's PATH, where a planted copy could stand in for
 the guard -- and each handler pins its script's SHA-256, refusing (exit 2) to run a modified copy.
