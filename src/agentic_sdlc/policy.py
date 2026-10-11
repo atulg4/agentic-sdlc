@@ -5,6 +5,7 @@ from __future__ import annotations
 import fnmatch
 import re
 import tomllib
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,7 +13,61 @@ from .models import PolicyDecision, RiskLevel, TaskSpec
 from .spec_stage import spec_review_block
 
 _PROJECT_ID = re.compile(r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+$")
-_BRANCH = re.compile(r"^[A-Za-z0-9._/-]+$")
+#: Characters Git accepts in a branch name that a sink downstream cannot carry. The platform's
+#: reusable-implement.yml expands the default branch with `${{ ... }}` inside a double-quoted
+#: shell word (`gh pr create --base "..."`), where these are shell syntax, not text; the cloud
+#: routine prompt also quotes its git commands in backticks.
+_BRANCH_SHELL_UNSAFE = '"$`'
+
+
+def git_branch_format_problem(name: str) -> str:
+    """Why `git check-ref-format --branch NAME` would refuse `name` ('' = it would not), by git's
+    own rules, so the answer does not depend on a git binary being installed."""
+    if not name:
+        return "must not be empty"
+    if name in ("@", "HEAD"):
+        return f"must not be {name!r}"
+    if name.startswith("-"):
+        return "must not start with '-'"
+    if name.startswith("/") or name.endswith("/") or "//" in name:
+        return "must not start or end with '/' or contain '//'"
+    if ".." in name or "@{" in name:
+        return "must not contain '..' or '@{'"
+    if name.endswith("."):
+        return "must not end with '.'"
+    if any(part.startswith(".") or part.endswith(".lock") for part in name.split("/")):
+        return "must not have a path component starting with '.' or ending with '.lock'"
+    if any(ord(c) < 0x20 or c == "\x7f" or c in " ~^:?*[\\" for c in name):
+        return "must not contain spaces, control characters or any of ~^:?*[\\"
+    return ""
+
+
+def branch_name_problem(name: str) -> str:
+    """Why `name` cannot be the policy's default branch ('' = it can): any name Git accepts as a
+    branch (`git check-ref-format --branch`), except the few characters a downstream sink cannot
+    carry. Every sink Forge renders itself quotes or escapes the name: TOML and YAML strings,
+    shell words (`shlex.quote`), GitHub branch-filter globs (backslash escapes), ruleset
+    conditions (`~DEFAULT_BRANCH`, matched literally) and REST paths (percent-encoding)."""
+    if not isinstance(name, str):
+        return "must be a string"
+    if any(unicodedata.category(c) in {"Cc", "Cs", "Zl", "Zp"} for c in name):
+        # A line or paragraph separator breaks a YAML or prompt line; a lone surrogate is not
+        # encodable as UTF-8.
+        return "must not contain control characters or line separators"
+    problem = git_branch_format_problem(name)
+    if problem:
+        return f"is not a valid Git branch name: {problem}"
+    unsafe = sorted({c for c in name if c in _BRANCH_SHELL_UNSAFE})
+    if unsafe:
+        return (
+            "must not contain " + " ".join(repr(c) for c in unsafe) + ": the platform's "
+            "reusable-implement.yml passes the default branch to `gh pr create --base` inside a "
+            'double-quoted shell word, where `"`, `$` and a backtick are shell syntax (and '
+            "the cloud routine prompt quotes git commands in backticks)"
+        )
+    return ""
+
+
 _BASELINE_FORBIDDEN_PATHS = (
     ".github/**",
     ".github/workflows/**",
@@ -119,8 +174,9 @@ def load_policy_bytes(raw: bytes) -> ProjectPolicy:
         raise ValueError("project.provider must be github or gitlab")
     if not _PROJECT_ID.fullmatch(project_id):
         raise ValueError("project.id must use namespace/name format")
-    if not _BRANCH.fullmatch(default_branch):
-        raise ValueError("project.default_branch contains unsupported characters")
+    problem = branch_name_problem(default_branch)
+    if problem:
+        raise ValueError(f"project.default_branch {problem}")
 
     ready_label = _string(automation, "ready_label", "agent-ready")
     human_review_label = _string(
