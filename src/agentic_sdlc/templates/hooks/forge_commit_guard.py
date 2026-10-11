@@ -58,6 +58,13 @@ PATH/GIT_* taint), scripts it runs are read in turn up to MAX_SUBST_DEPTH, and a
 missing, not a regular file, binary, over MAX_SCRIPT_BYTES, unparseable or nested deeper is
 UNRESOLVED_REPO: refused on every branch, whatever lease the session holds.
 
+A PATH-QUALIFIED git (`/usr/bin/git`, `./git`, `~/bin/git`, `bin/git`) is not found by a PATH
+search, so the writable-PATH rule never sees it (Codex 4241050279): a command could write its own
+`git` script anywhere and run `/tmp/git status`. Such a program is trusted only when it is the
+SAME file as the git a non-writable PATH lookup finds, or a known system git
+(`SYSTEM_GIT_PATHS`), and neither the file nor any directory traversed to reach it is writable by
+this user (`_path_git_reason`); otherwise the command is UNRESOLVED_REPO, refused on every branch.
+
 A raw-text proof (`_raw_unproven`) backs the parser: the shell can ASSEMBLE a program or
 subcommand (`g$'it' com$'mit'`, `"g"it`, `\\git`, `co{m,}mit`, `$(echo git)`) the parser cannot
 see, so every program and git subcommand must be a plain literal word in the raw text
@@ -1109,7 +1116,9 @@ def _commit_targets(argv: list[str], depth: int = 0, cwd: str | None = None) -> 
             # it updates) arrive from stdin or are assembled -- no destination can be known.
             # `python -c '...git'`: every issue ref the text names is a destination.
             if program in FANOUT or program in _EVAL_LIKE:
-                fanned = _fanout_git_target(words, chdirs, env) if program in FANOUT else None
+                fanned = (
+                    _fanout_git_target(words, chdirs, env, where) if program in FANOUT else None
+                )
                 base = [fanned] if fanned is not None else unresolved
                 if not _ref_free_fanout(words):
                     return [_with_ref(unknown[0], UNKNOWN_REF), *base, *named]
@@ -1122,6 +1131,11 @@ def _commit_targets(argv: list[str], depth: int = 0, cwd: str | None = None) -> 
         ):
             return unresolved + named  # `xargs sh`, `find -exec bash -c ...`, `-exec ./x.sh`
         return []
+    if "/" in words[0]:  # Codex 4241050279: a git named by path is the file at that path
+        why = _path_git_reason(words[0], where)
+        if why:
+            _GIT_PROGRAM_NOTES[why] = None
+            return unresolved + named
     unsafe = any(
         key not in SAFE_GIT_ENV and not key.startswith("LC_") for key in keys
     )  # GIT_EXTERNAL_DIFF=..., GIT_CONFIG_*=..., PAGER=... git log
@@ -1173,19 +1187,25 @@ def _commit_targets(argv: list[str], depth: int = 0, cwd: str | None = None) -> 
 
 
 def _fanout_git_target(
-    words: list[str], chdirs: list[str], env: list[tuple[str, str]]
+    words: list[str], chdirs: list[str], env: list[tuple[str, str]], where: str
 ) -> Target | None:
     """`xargs git -C DIR log`, `find . -exec git log -- {} ;`: a fan-out running a LITERAL
     `git [global options] SUB`, whose own selectors name its repository -- the words the fan-out
     supplies land after SUB, where git reads no repository option. None (unresolved, Codex
     4240170620) when they may land anywhere else: no literal subcommand (`xargs git`, `parallel
     git ::: commit`), a placeholder or replace string before it (`xargs -I{} git -C {} commit`),
-    a per-file directory (`find -execdir`, `parallel --wd`), or a wrapper, shell or assignment
-    between the fan-out and git."""
+    a per-file directory (`find -execdir`, `parallel --wd`), a wrapper, shell or assignment
+    between the fan-out and git, or a path-qualified git that is not the system's
+    (`_path_git_reason`, Codex 4241050279)."""
     program = os.path.basename(words[0])
     index = next((i for i, w in enumerate(words) if os.path.basename(w) in GIT_PROGRAMS), None)
     if index is None:
         return None
+    if "/" in words[index]:
+        why = _path_git_reason(words[index], where)
+        if why:
+            _GIT_PROGRAM_NOTES[why] = None
+            return None
     for word in words[1:index]:
         name = os.path.basename(word)
         if _ASSIGNMENT.match(word) or name in WRAPPERS or name in SHELLS or name == "eval":
@@ -1866,6 +1886,89 @@ def _writable_path_reason(
     return None
 
 
+# ---- Path-qualified git (Codex 4241050279). `/tmp/git status` names its program by path: no
+# PATH search runs, so `_writable_path_reason` never looks at it, and a `git` script dropped
+# anywhere (`printf '...git commit...' > /tmp/git`) would run as an allowlisted read. The file a
+# path names is trusted only when it IS the git this hook would run itself -- the first `git` a
+# PATH lookup finds when no PATH entry up to it is writable or relative -- or a known system git
+# below, compared as the same file (`os.path.samefile`: same device and inode, symlinks
+# followed), AND neither that file nor any directory traversed to reach it (every prefix of the
+# path as written, resolved, and every ancestor of each) is writable by this user: a writable
+# directory on the way lets a command swap the file or the directory for its own before the
+# shell runs it. Anything else is UNRESOLVED_REPO. The cost mirrors the writable-PATH rule's:
+# where those directories ARE writable (running as root; a user-owned Homebrew prefix) a
+# path-qualified git is refused outright -- spell it `git`.
+SYSTEM_GIT_PATHS = ("/usr/bin/git", "/bin/git", "/usr/local/bin/git", "/opt/homebrew/bin/git")
+# Why a path-qualified git in the current check is not trusted, for the refusal message.
+_GIT_PROGRAM_NOTES: dict[str, None] = {}
+
+
+def _ancestors(path: str) -> list[str]:
+    """`path` and every directory above it, up to the root."""
+    out = [path]
+    while os.path.dirname(out[-1]) != out[-1]:
+        out.append(os.path.dirname(out[-1]))
+    return out
+
+
+def _reference_gits() -> list[str]:
+    """The git files a path-qualified git may be: the one a PATH lookup finds when nothing it
+    searches up to it is relative or writable, and every known system git that exists."""
+    found: list[str] = []
+    entries = os.environ.get("PATH", "").split(os.pathsep)
+    path = [("PATH entry", entry) for entry in entries]
+    if _relative_path_entry() is None and _first_writable("git", path) is None:
+        for entry in entries:
+            candidate = os.path.join(entry, "git")
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                found.append(candidate)
+                break
+    return found + [p for p in SYSTEM_GIT_PATHS if os.path.isfile(p)]
+
+
+def _path_git_reason(word: str, where: str) -> str | None:
+    """Why the path-qualified git program `word`, run from `where`, may not be the system's
+    git (see the block comment above), or None when it provably is."""
+    if _SELECTOR_EXPANSION.search(word) or _BRACE_EXPANSION.search(word) or "~" in word[1:]:
+        return f"{word} is expanded by the shell"
+    if word.startswith("~"):
+        if not word.startswith("~/"):
+            return f"{word} names another user's home"
+        word = os.path.expanduser(word)
+    elif not os.path.isabs(word) and re.search(r"[$`]", where):
+        return f"{word} is relative to a directory the shell expands"
+    path = os.path.join(where, word)
+    if not os.path.isabs(path):
+        return f"{word} could not be resolved to an absolute path"
+    real = os.path.realpath(path)
+    if not (os.path.isfile(real) and os.access(real, os.X_OK)):
+        return f"{word} is not an executable file"
+    if os.access(real, os.W_OK):
+        return f"{word} resolves to the writable file {real}"
+    traversed: list[str] = []
+    prefix = os.sep
+    for part in [p for p in path.split(os.sep) if p][:-1]:
+        prefix = os.path.join(prefix, part)
+        traversed += _ancestors(os.path.realpath(prefix))
+    traversed += _ancestors(os.path.dirname(real))
+    for directory in dict.fromkeys(traversed):
+        if os.path.isdir(directory) and os.access(directory, os.W_OK):
+            return f"{word} is reached through the writable directory {directory}"
+    for reference in _reference_gits():
+        try:
+            if os.path.samefile(real, reference):
+                return None
+        except OSError:
+            continue
+    return f"{word} is not the git on a non-writable PATH or a known system git"
+
+
+def _git_program_note() -> str:
+    if not _GIT_PROGRAM_NOTES:
+        return ""
+    return f" ({'; '.join(_GIT_PROGRAM_NOTES)}: run git by its plain name, `git`.)"
+
+
 # Reasons `_helper_reason` gave in the current check, for the refusal message.
 _HELPER_NOTES: dict[str, None] = {}
 
@@ -2402,6 +2505,8 @@ def _segment_switch(seg: list[str], depth: int, cwd: str | None = None) -> tuple
         if _mentions_git(args) and _MOVES_HEAD.search(args):
             return "unknown", None  # `python -c "...['git', 'checkout', b]..."`
         return "none", None
+    if "/" in words[0] and _path_git_reason(words[0], where):
+        return "unknown", None  # not the system git: what it does is unknown (Codex 4241050279)
     sub, args = _git_sub_args(words)
     if sub is None or sub in READ_ONLY_ANY or sub in SWITCH_FREE:
         return "none", None
@@ -2473,6 +2578,7 @@ def commit_targets(command: str, depth: int = 0, cwd: str | None = None) -> list
     one; an assembled program or subcommand is one with an unknown repository."""
     if depth == 0:
         _HELPER_NOTES.clear()
+        _GIT_PROGRAM_NOTES.clear()
         unquoted = re.sub(r"[\"'\\]", "", command)
         tainted = _mentions_git(command) and bool(
             _ENV_TAINT.search(unquoted) or _PATH_TAINT.search(unquoted)
@@ -3022,14 +3128,16 @@ def _decide_branch(payload: dict, branch: str, lease_lookup, pr_lookup) -> tuple
             "GIT_DIR=/GIT_WORK_TREE= set to an expansion, `cd $DIR`, `$(...)`, backticks, a glob "
             "or an ambiguous `~`), or runs git through a name or program the guard cannot read "
             '(`"$G"`, `$(which git)`, `${GIT:-git}`, `\\git`, a quoted `"git"`, xargs/find/eval, '
-            "a script piped to a shell, an interpreter's code that selects a repository), or "
+            "a script piped to a shell, an interpreter's code that selects a repository, a "
+            "path-qualified git that is not the system's own git -- `./git`, `/tmp/git`, "
+            "`~/bin/git` -- or one in a directory this user can write), or "
             "runs a shell script file the guard could not read and analyse (missing, not a "
             f"regular file, binary, over {MAX_SCRIPT_BYTES // 1024} KiB, unparseable, or scripts "
             f"nested more than {MAX_SUBST_DEPTH} deep), so the branch it acts on -- and the lease "
             "it needs -- cannot be checked. Spell the program as a plain `git` and the repository "
             "as a literal path (git -C /path/to/checkout commit), or cd there in a separate "
             "command first; run git inline rather than from an unreadable script."
-        )
+        ) + _git_program_note()
     if branch == BRANCH_UNKNOWN:
         return 2, (
             "Forge guard: git could not report the branch of the repository this command acts on "

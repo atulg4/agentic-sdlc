@@ -11155,3 +11155,260 @@ def test_commit_guard_configured_pager_found_after_a_writable_entry_guards(
     git("config", "core.pager", "more")  # a plain pager, but `more` resolves only past `drop`
     code, message = _guarded_decision(guard, repo, "git log")
     assert code == 2 and f"writable PATH entry {drop} precedes more" in message, message
+
+
+# ---- Codex 4241050279: a PATH-QUALIFIED git program (`/tmp/git status`, `./git`, `~/bin/git`)
+# is not found by a PATH search, so it was never vetted: a `git` script dropped anywhere ran as
+# an allowlisted read and committed on an issue branch another session leases.
+
+
+def _fake_git(directory):
+    """A `git` script that commits through the real git, whatever subcommand it is given."""
+    import shutil
+
+    directory.mkdir(parents=True, exist_ok=True)
+    fake = directory / "git"
+    fake.write_text(f"#!/bin/sh\nexec {shutil.which('git')} commit --allow-empty -qm evil\n")
+    fake.chmod(0o755)
+    return fake
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "FAKE status",
+        "FAKE log --oneline",
+        "./git status",
+        "bin/git status",
+        "./bin/../git status",
+        "~/bin/git status",
+        "env FAKE status",
+        "command FAKE diff",
+        "xargs FAKE log < args.txt",
+    ],
+)
+def test_commit_guard_refuses_a_path_qualified_git_that_is_not_the_system_git(
+    helper_repo, monkeypatch, command
+):
+    guard, repo, _ = helper_repo
+    system = _system_dir(repo.parent, monkeypatch)
+    monkeypatch.setenv("PATH", str(system))
+    fake = _fake_git(repo.parent / "tmpbin")
+    _fake_git(repo)
+    _fake_git(repo / "bin")
+    _fake_git(Path(os.environ["HOME"]) / "bin")
+    command = command.replace("FAKE", str(fake))
+    assert guard.is_git_commit(command, cwd=str(repo)), command
+    branches = guard.commit_branches(command, str(repo))
+    assert guard.UNRESOLVED_REPO in branches, (command, branches)
+    # Another session's live lease does not matter, and neither does holding the lease.
+    for lease in ({"session": "other", "agent": "a", "expires": None}, {"session": "s1"}):
+        code, message = _guarded_decision(guard, repo, command, lease)
+        assert code == 2, command
+        assert "path-qualified git that is not the system's own git" in message, message
+
+
+def _read_only_chain(monkeypatch, *paths):
+    """Make `paths` and every directory above them read-only to the suite's `os.access`."""
+    read_only = set()
+    for path in paths:
+        current = os.path.abspath(os.fspath(path))
+        while True:
+            read_only.add(current)
+            if os.path.dirname(current) == current:
+                break
+            current = os.path.dirname(current)
+    access = os.access
+
+    def fake(path, mode, *args, **kwargs):
+        if mode & os.W_OK and not isinstance(path, int) and os.fspath(path) in read_only:
+            return False
+        return access(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "access", fake)
+
+
+def test_commit_guard_path_qualified_git_must_be_the_same_unwritable_file(helper_repo, monkeypatch):
+    import shutil
+
+    guard, repo, _ = helper_repo
+    system = _system_dir(repo.parent, monkeypatch)
+    real = os.path.realpath(shutil.which("git"))
+    monkeypatch.setenv("PATH", os.path.dirname(real))
+    lease = {"session": "other", "agent": "a", "expires": None}
+    # The system git by its own path: allowed, as before -- also when only the PATH lookup (no
+    # known system location) vouches for it.
+    for known in (guard.SYSTEM_GIT_PATHS, ()):
+        monkeypatch.setattr(guard, "SYSTEM_GIT_PATHS", known)
+        for command in (f"{real} status", f"{real} log --grep commit"):
+            assert not guard.is_git_commit(command, cwd=str(repo)), command
+            assert _guarded_decision(guard, repo, command, lease) == (0, ""), command
+    # A link to it from a directory whose chain is read-only is the same file: allowed.
+    _read_only_chain(monkeypatch, system / "git")
+    assert _guarded_decision(guard, repo, f"{system}/git diff", lease) == (0, "")
+    # The same real git, linked from a directory this user can write: refused (the link or
+    # the directory can be swapped for another file before the shell runs it).
+    writable = repo.parent / "linkdir"
+    writable.mkdir()
+    (writable / "git").symlink_to(real)
+    code, message = _guarded_decision(guard, repo, f"{writable}/git status", {"session": "s1"})
+    assert code == 2 and f"writable directory {writable}" in message, message
+    # A read-only directory chain holding a DIFFERENT program named git: refused.
+    other = repo.parent / "other"
+    other.mkdir()
+    impostor = other / "git"
+    impostor.write_text("#!/bin/sh\nexit 0\n")
+    impostor.chmod(0o755)
+    _read_only_chain(monkeypatch, impostor)
+    code, message = _guarded_decision(guard, repo, f"{impostor} status", {"session": "s1"})
+    assert code == 2 and "not the git on a non-writable PATH" in message, message
+    # A fake git that would switch branches is unknown to the branch-change tracker too.
+    assert guard._changes_branch(f"{impostor} status", 0, str(repo))
+    assert not guard._changes_branch(f"{real} status", 0, str(repo))
+
+
+def test_commit_guard_path_qualified_fake_git_cannot_commit_under_another_lease(
+    helper_repo, monkeypatch
+):
+    """The reported case end to end: `/tmp/git status` whose script commits."""
+    import subprocess
+
+    guard, repo, _ = helper_repo
+    system = _system_dir(repo.parent, monkeypatch)
+    monkeypatch.setenv("PATH", str(system))
+    fake = _fake_git(repo.parent / "tmp")
+    command = f"{fake} status"
+    lease = {"session": "other", "agent": "a", "expires": None}
+    code, _ = _guarded_decision(guard, repo, command, lease)
+    assert code == 2
+    # (What the hook prevented: the script really commits.)
+    before = subprocess.run(["git", "rev-list", "--count", "--all"], cwd=repo, text=True,
+                            capture_output=True).stdout  # fmt: skip
+    subprocess.run([str(fake), "status"], cwd=repo, check=True)
+    after = subprocess.run(["git", "rev-list", "--count", "--all"], cwd=repo, text=True,
+                           capture_output=True).stdout  # fmt: skip
+    assert before != after
+
+
+# ---- Codex 4241050285: doctor checked only that forbidden_paths was a renderable list, so a
+# policy that dropped `.forge/**` and `.claude/**` was READY while evaluate_diff let patches
+# change the executor registry and the commit-guard hook.
+
+
+def test_doctor_requires_the_generated_forbidden_paths_to_stay_enforced(tmp_path):
+    from agentic_sdlc.onboard import BASE_FORBIDDEN, FORBIDDEN_BASELINE_CHECK
+    from agentic_sdlc.policy import evaluate_diff, load_policy
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(forbidden_paths=("vendor/**",)))
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    assert report.ok, report.render()
+    baseline = next(c for c in report.checks if c.name == FORBIDDEN_BASELINE_CHECK)
+    assert baseline.ok and str(len(BASE_FORBIDDEN)) in baseline.detail
+    toml = repo / "agentic-sdlc.toml"
+    toml.write_text(
+        toml.read_text().replace('  ".forge/**",\n', "").replace('  ".claude/**",\n', "")
+    )
+    policy = load_policy(toml)
+    assert ".forge/**" not in policy.forbidden_paths  # what the reviewer saw enforced
+    assert evaluate_diff((".forge/executors.json",), 1, 0, policy).allowed  # the hole
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    assert not report.ok and "NOT READY" in report.render()
+    failed = _failed(report)
+    assert set(failed) == {FORBIDDEN_BASELINE_CHECK}, report.render()
+    detail = failed[FORBIDDEN_BASELINE_CHECK].detail
+    assert ".forge/**" in detail and ".claude/**" in detail and "vendor/**" not in detail
+    # Restored by onboard: READY again. A project-specific entry may still be removed: only the
+    # generated baseline is mandatory.
+    write_onboarding(repo, spec(), force=True)
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    assert report.ok, report.render()
+
+
+# ---- Codex 4241050282: `doctor --local` returned before any runner-target validation, so a
+# caller whose `runs-on` and reusable `runs_on` name a runner GitHub does not host was READY.
+
+
+def _retarget_plan(repo, labels_json):
+    """agent-plan.yml's job runs-on AND the runs_on it hands reusable-plan.yml, rewritten."""
+    plan = repo / ".github/workflows/agent-plan.yml"
+    text = plan.read_text()
+    text = text.replace('runs-on: ["self-hosted", "linux", "x64"]', f"runs-on: {labels_json}")
+    escaped = json.dumps(json.dumps(json.loads(labels_json), separators=(",", ":")))
+    text = text.replace(
+        'runs_on: "[\\"self-hosted\\",\\"linux\\",\\"x64\\"]"', f"runs_on: {escaped}"
+    )
+    plan.write_text(text)
+
+
+def test_local_doctor_fails_a_runner_github_does_not_host(tmp_path):
+    from agentic_sdlc.onboard import LOCAL_RUNNER_CHECK
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    assert report.ok, report.render()
+    assert next(c for c in report.checks if c.name == LOCAL_RUNNER_CHECK).ok
+    _retarget_plan(repo, '"ubuntu-99.04"')  # the reported case
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    assert not report.ok and "NOT READY" in report.render()
+    failed = _failed(report)
+    assert not failed[LOCAL_RUNNER_CHECK].manual
+    assert "ubuntu-99.04" in failed[LOCAL_RUNNER_CHECK].detail
+    assert "agent-plan.yml:plan > reusable-plan.yml" in failed[LOCAL_RUNNER_CHECK].detail
+    assert "Forge workflows run on Linux runners" in failed
+
+
+@pytest.mark.parametrize(
+    ("labels", "check", "manual"),
+    [
+        ('"ubuntu-slim"', "runners allow the workflows' job timeouts", False),
+        ('"macos-latest"', "Forge workflows run on Linux runners", False),
+        ('"windows-latest"', "workflows target Unix runners", False),
+        (
+            '["gpu-box", "linux"]',
+            "runner labels are recognised (availability is checked remotely)",
+            True,
+        ),
+        ('["self-hosted", "linux", "ubuntu-99.04"]', None, None),
+        ('"ubuntu-24.04"', None, None),
+    ],
+)
+def test_local_doctor_applies_the_non_api_runner_rules(tmp_path, labels, check, manual):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    _retarget_plan(repo, labels)
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    if check is None:
+        assert report.ok, report.render()
+        return
+    failed = _failed(report)
+    assert check in failed, report.render()
+    assert failed[check].manual is manual
+
+
+def test_local_doctor_checks_ci_and_unresolvable_runner_targets(tmp_path):
+    from agentic_sdlc.onboard import LOCAL_RUNNER_CHECK
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    ci = repo / ".github/workflows/ci.yml"
+    original = ci.read_text()
+    ci.write_text(original.replace('runs-on: ["self-hosted", "linux", "x64"]', "runs-on: macos-99"))
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert "macos-99" in failed[LOCAL_RUNNER_CHECK].detail
+    ci.write_text(
+        original.replace('runs-on: ["self-hosted", "linux", "x64"]', "runs-on: ubuntu-slim")
+    )
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert "ubuntu-slim" in failed["ci.yml test job runs on an available runner"].detail
+    ci.write_text(original.replace('runs-on: ["self-hosted", "linux", "x64"]', "runs-on: macos-15"))
+    assert doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False).ok
+    ci.write_text(original)
+    _retarget_plan(repo, '"ubuntu-latest"')
+    plan = repo / ".github/workflows/agent-plan.yml"
+    plan.write_text(
+        plan.read_text().replace('runs_on: "\\"ubuntu-latest\\""', "runs_on: ${{ vars.X }}")
+    )
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert "workflow runner targets are verifiable" in failed
