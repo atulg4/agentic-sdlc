@@ -6,7 +6,9 @@ import os
 import re
 import subprocess
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+
+from .trusted_git import UntrustedGitError, trusted_git
 
 
 class GitDiffError(RuntimeError):
@@ -40,9 +42,15 @@ def _object_env() -> dict[str, str]:
 def _run(arguments: list[str], repository: Path) -> subprocess.CompletedProcess[bytes]:
     if arguments[:1] != ["git"]:
         raise GitDiffError(f"not a git command: {arguments[:1]!r}")
+    # Never a bare `git`: a PATH lookup could find one this session planted to fabricate the
+    # output a policy check reads (Codex 4241614592). No trusted git: fail closed.
+    try:
+        program = trusted_git()
+    except UntrustedGitError as exc:
+        raise GitDiffError(str(exc)) from exc
     # `--no-replace-objects` on the command line as well as in the environment: either alone
     # disables replacement; both together survive a caller that rewrites one of them.
-    arguments = ["git", "--no-replace-objects", *arguments[1:]]
+    arguments = [program, "--no-replace-objects", *arguments[1:]]
     result = subprocess.run(
         arguments,
         cwd=repository,
@@ -147,3 +155,41 @@ def collect_commit_diff(repository: str | Path, base: str, head: str = "HEAD") -
         deleted += int(match.group(2)) if match.group(2).isdigit() else 0
     patch = _run(["git", "diff", *plain, "--binary", "--full-index", *span, "--"], root).stdout
     return GitDiff(paths=paths, added_lines=added, deleted_lines=deleted, patch=patch)
+
+
+def committed_path(repository: str | Path, path: str | Path) -> str:
+    """`path` as a path inside the repository at `repository` (POSIX, relative to its top
+    level), for reading it from a commit. A relative `path` is taken relative to the top level;
+    an absolute one must lie inside it."""
+    root = Path(repository)
+    top = _run(["git", "rev-parse", "--show-toplevel"], root).stdout.decode().strip()
+    if not top:
+        raise GitDiffError(f"{repository} is not inside a git work tree")
+    candidate = Path(path)
+    if candidate.is_absolute():
+        try:
+            candidate = Path(os.path.realpath(candidate)).relative_to(os.path.realpath(top))
+        except ValueError as exc:
+            raise GitDiffError(f"{path} is not inside the repository {top}") from exc
+    relative = PurePosixPath(*candidate.parts)
+    if not relative.parts or any(part in ("", ".", "..") for part in relative.parts):
+        raise GitDiffError(f"not a path inside the repository: {str(path)!r}")
+    return str(relative)
+
+
+def read_committed_file(repository: str | Path, rev: str, path: str) -> bytes:
+    """The bytes of `path` (relative to the top level) as commit `rev` holds them -- never the
+    working tree or the index, which the agent being checked can change without committing
+    (Codex 4241614590). Replace refs and grafts are ignored as for every read here, and no
+    filter, textconv or external program runs (`cat-file blob`). A missing file is an error."""
+    if not rev or rev.startswith("-"):
+        raise GitDiffError(f"not a revision: {rev!r}")
+    root = Path(repository)
+    commit = _run(["git", "rev-parse", "--verify", f"{rev}^{{commit}}"], root).stdout.decode()
+    commit = commit.strip()
+    if not re.fullmatch(r"[0-9a-f]{40,64}", commit):
+        raise GitDiffError(f"{rev} does not name a commit")
+    try:
+        return _run(["git", "cat-file", "blob", f"{commit}:{path}"], root).stdout
+    except GitDiffError as exc:
+        raise GitDiffError(f"{path} could not be read from {rev} ({commit[:12]}): {exc}") from exc

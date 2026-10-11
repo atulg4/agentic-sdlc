@@ -312,7 +312,25 @@ through a link). `onboard --force` rewrites the policy and drops the confirmatio
   never the working tree -- and exits 0 only when it passes and is non-empty. check-diff reads
   history with replacement disabled (`--no-replace-objects`, `GIT_NO_REPLACE_OBJECTS=1`, grafts
   off): a `refs/replace/*` object or graft could otherwise make it judge a benign tree while the
-  push publishes the original commit (Codex 4241532610). Each run pushes, never forced, to its
+  push publishes the original commit (Codex 4241532610). It judges the change under the
+  policy COMMITTED on `--base` (`git cat-file blob <base>:agentic-sdlc.toml`; `--config` is
+  that file's path in the repository), never the working-tree copy, which the agent could
+  loosen without committing (Codex 4241614590); a policy missing or unparseable there exits 2,
+  and the baseline forbidden paths apply whatever it lists. Every git it runs (check-diff and
+  `inspect-diff` alike) is a trusted executable, never a bare PATH lookup (Codex 4241614592): a
+  git only root can replace -- the file and every directory on the way to it owned by root,
+  with no group/other write bit and not writable by this user -- taken from the system
+  locations (`/usr/bin/git` first) and, for a non-root user, from absolute PATH entries that
+  pass the same test; running as root only the system locations count. `AGENTIC_SDLC_GIT` may
+  name another git, vetted the same way (refused as root). No trusted git exits 2.
+  `sdlcctl renew` also re-reads the issue and fails once it is closed or unreadable (Codex
+  4241614587), so every renewal is a state check. Step 2 runs `check-request --base
+  origin/<default>` (the committed policy) and keeps the `content digest: sha256:...` it
+  prints; step 4e, the last step before the push, runs it again with `--expect-digest
+  <digest>`: exit 5 when the title or body changed since step 2 (even if a maintainer then
+  re-applied the labels, which re-authorizes: Codex 4241614582), 4 when a dependency was
+  reopened (Codex 4241614596), 6 when the issue is no longer open -- on anything but 0 the
+  routine releases its lease and stops without pushing. Each run pushes, never forced, to its
   own branch `forge/issue-<N>-<stamp>` (`<stamp>` = `date -u +%Y%m%d%H%M%S`, chosen once before
   the claim and passed to it as `--branch`), so a branch left behind by a run whose PR could not
   be opened never blocks a retry (Codex 4241532615); an abandoned one can be deleted by hand.

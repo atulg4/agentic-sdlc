@@ -1705,6 +1705,22 @@ def claim(
     return ClaimResult(True, lease, took_over_from=took_over)
 
 
+def _require_open_issue(project: str, issue: int, gh: GhRunner) -> None:
+    """Raise LeaseError unless `issue` reads as an open issue (not a pull request). Any read or
+    parse failure raises too: an unknown state is never taken for open."""
+    try:
+        target = json.loads(gh(["api", f"repos/{project}/issues/{issue}"]) or "null")
+    except Exception as exc:  # noqa: BLE001 -- any failure means the state is unknown
+        raise LeaseError(
+            f"issue #{issue}: its state could not be read ({str(exc).strip()[:200]}); not renewing"
+        ) from exc
+    if not isinstance(target, dict) or target.get("pull_request"):
+        raise LeaseError(f"#{issue} is not a readable issue of {project}; not renewing")
+    state = target.get("state")
+    if state != "open":
+        raise LeaseError(f"issue #{issue} is {state or 'in an unknown state'}; not renewing")
+
+
 def renew(
     project: str,
     issue: int,
@@ -1715,9 +1731,14 @@ def renew(
     now: datetime | None = None,
     clock: Clock | None = None,
 ) -> Lease:
+    """Extend this session's live lease. Every renewal is also a state check (Codex
+    4241614587): the cloud routine renews after implementing, after verifying and immediately
+    before pushing, and an issue closed meanwhile must stop it -- so a renewal re-reads the issue
+    and refuses unless it is an open issue; an issue that cannot be read refuses too."""
     clock = _clock(now, clock)
     now = clock()
     _check_ttl(ttl_minutes)
+    _require_open_issue(project, issue, gh)
     existing = current_lease(project, issue, gh, now)
     if existing is None or existing.session != session:
         raise LeaseError(f"issue #{issue} is not leased by session {session}")
