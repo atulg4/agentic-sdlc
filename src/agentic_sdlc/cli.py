@@ -8,6 +8,7 @@ import json
 import math
 import re
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -476,6 +477,25 @@ def _issue_snapshot(document: dict[str, Any], events: list[dict]) -> dict[str, A
     }
 
 
+def _dependency_states(project: str, dependencies: Iterable[int]) -> dict[str, dict[str, str]]:
+    """{"N": {"state", "updatedAt"}} for each dependency issue, read now. The state must be open
+    or closed (anything else is an error, never "closed"); the update time is kept so a
+    dependency reopened and closed again between two reads still reads as a change (Codex
+    4242373526)."""
+    observed: dict[str, dict[str, str]] = {}
+    for dependency in dependencies:
+        document = json.loads(run_gh(["api", f"repos/{project}/issues/{dependency}"]))
+        state = document.get("state") if isinstance(document, dict) else None
+        if state not in ("open", "closed"):
+            raise ValueError(f"dependency #{dependency}: unreadable state {state!r}")
+        updated = document.get("updated_at")
+        observed[str(dependency)] = {
+            "state": state,
+            "updatedAt": updated if isinstance(updated, str) else "",
+        }
+    return observed
+
+
 def _judge_request(
     args: argparse.Namespace,
     policy: ProjectPolicy,
@@ -527,15 +547,9 @@ def _judge_request(
         if not verdict.authorized:
             result["reasons"] = [verdict.reason]
             return LABELS_NOT_AUTHORIZED, result, f"NOT AUTHORIZED: #{args.issue}: {verdict.reason}"
-    still_open = []
-    for dependency in task.dependencies:
-        state = run_gh(
-            ["api", f"repos/{args.project}/issues/{dependency}", "--jq", ".state"]
-        ).strip()
-        if state not in ("open", "closed"):
-            raise ValueError(f"dependency #{dependency}: unreadable state {state!r}")
-        if state != "closed":
-            still_open.append(dependency)
+    observed = _dependency_states(args.project, task.dependencies)
+    result["dependencyStates"] = observed
+    still_open = [n for n in task.dependencies if observed[str(n)]["state"] != "closed"]
     if still_open:
         listed = ", ".join(f"#{n}" for n in still_open)
         result["reasons"] = [f"dependency issue(s) not closed: {listed}"]
@@ -569,8 +583,9 @@ def _check_request(args: argparse.Namespace) -> int:
     land between them and pass both). It reads the issue and its event history once, judges
     that one snapshot by every rule above AND by `authorize-labeler`'s (exit 7: a label of the
     approval set not last applied by a writer, removed, or applied before the last edit), then
-    reads the issue and its history again: the update time, state, content digest, labels and
-    events must all be unchanged, or the snapshot is stale. A changed title or body fails at
+    reads the issue, its history and every dependency again: the update time, state, content
+    digest, labels, events and each dependency's state and update time must all be unchanged, or
+    the snapshot is stale. A changed title or body fails at
     once (exit 5); any other change is judged afresh from a new snapshot, at most
     `CHECK_REQUEST_ATTEMPTS` times, then exit 8 (it would not hold still)."""
     authorizing = bool(args.authorize_labels)
@@ -596,9 +611,13 @@ def _check_request(args: argparse.Namespace) -> int:
         code, result, message = _judge_request(args, policy, document, events, approval_labels)
         if code != 0 or events is None:
             break
+        # The dependencies are part of the snapshot (Codex 4242373526): one reopened between
+        # the reads is a change like any other, judged afresh on the next attempt.
         before = _issue_snapshot(document, events)
+        before["dependencies"] = result["dependencyStates"]
         again = _read_issue(args.project, args.issue)
         after = _issue_snapshot(again, issue_events(args.project, args.issue, run_gh))
+        after["dependencies"] = _dependency_states(args.project, result["dependencies"])
         if before == after:
             result["stable"] = {"updatedAt": after["updated_at"], "attempts": attempt}
             message += f" (stable across two reads at {after['updated_at']})"
@@ -1189,7 +1208,11 @@ def _doctor(args: argparse.Namespace) -> int:
 
 def _confirm_cloud_routine(args: argparse.Namespace) -> int:
     path = confirm_cloud_routine(Path(args.destination).resolve())
-    _status(f"recorded in {path}: the cloud implementer routine is scheduled")
+    _status(
+        f"recorded in {path}: the cloud implementer routine is scheduled (its environment must "
+        "run the setup script in docs/forge/cloud-implementer.md: `sdlcctl --version` there "
+        "has to print the pinned commit)"
+    )
     return 0
 
 
@@ -1310,8 +1333,46 @@ def _claims(args: argparse.Namespace) -> int:
     return 0
 
 
+def installed_version() -> str:
+    """`sdlcctl <version> commit <sha>`: the installed distribution's version and, when pip
+    recorded one (a `git+` install, as the cloud routine's setup script does), the exact commit
+    it was installed from -- what step 0 of the routine prompt compares with its pin (Codex
+    4242373521). `commit unknown` otherwise (say, an editable checkout)."""
+    from importlib import metadata
+
+    from . import __version__
+
+    try:
+        dist = metadata.distribution("agentic-sdlc")
+    except metadata.PackageNotFoundError:
+        return f"sdlcctl {__version__} commit unknown"
+    commit = ""
+    try:
+        recorded = json.loads(dist.read_text("direct_url.json") or "{}")
+    except (OSError, ValueError):
+        recorded = {}
+    vcs = recorded.get("vcs_info") if isinstance(recorded, dict) else None
+    if isinstance(vcs, dict) and isinstance(vcs.get("commit_id"), str):
+        commit = vcs["commit_id"]
+    return f"sdlcctl {dist.version} commit {commit or 'unknown'}"
+
+
+class _VersionAction(argparse.Action):
+    def __init__(self, option_strings, dest=argparse.SUPPRESS, default=argparse.SUPPRESS, **kw):
+        super().__init__(option_strings, dest=dest, default=default, nargs=0, **kw)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        print(installed_version())
+        parser.exit()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="sdlcctl")
+    parser.add_argument(
+        "--version",
+        action=_VersionAction,
+        help="print the installed version and the commit it was installed from",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
 
     validate = commands.add_parser("validate-task")

@@ -284,7 +284,12 @@ something that runs differently.
   `true` counts; the policy must be a regular file in the repository -- a symlinked or
 non-regular `agentic-sdlc.toml` is refused, and the file is replaced atomically, never written
 through a link). `onboard --force` rewrites the policy and drops the confirmation: re-check the
-  routine against the regenerated document, then confirm again. The routine prompt runs `sdlcctl
+  routine against the regenerated document, then confirm again. The document's "Environment
+  setup script" section (`python3 -m pip install --user "agentic-sdlc @
+  git+https://github.com/<platform>@<pinned sha>"`) must be the routine environment's setup
+  script: a fresh cloud environment has no `sdlcctl`, and step 0 of the prompt stops the run
+  unless `sdlcctl --version` prints `commit <pinned sha>`. Doctor compares the document at the
+  pin the installed workflows carry. The routine prompt runs `sdlcctl
   authorize-labeler --project owner/repo --issue N --label implementation-approved --label
   <ready> --label human-review-required` before claiming, the same check the Actions path runs:
   the most recent application of EACH of those labels (from the issue's label events) must be by
@@ -413,12 +418,19 @@ through a link). `onboard --force` rewrites the policy and drops the confirmatio
   host (`ubuntu-99.04`, `macos-99`) without `self-hosted` fails; a larger hosted runner or a
   custom label set without `self-hosted` is a TODO only remote `doctor` can clear.
 - **Claude Code hooks** are read from the parsed `.claude/settings.json`: a `SessionStart` group
-  firing on startup that runs `python3 .claude/hooks/forge_session_start.py`, and a `PreToolUse`
-  group whose matcher covers `Bash` running `python3 .claude/hooks/forge_commit_guard.py`. Each
-  Forge handler must be exactly the one `onboard` writes (`{"type": "command", "command": ...}`,
-  only the command's spelling may vary: `python`, a `$CLAUDE_PROJECT_DIR` prefix); a handler
-  with any other field -- `"async": true` above all, which runs it in the background where its
-  exit 2 can no longer block the commit, or a `timeout` -- fails, wherever it sits. Unrelated
+  firing on startup that runs `python3 "${CLAUDE_PROJECT_DIR}/.claude/hooks/forge_session_start.py"`,
+  and a `PreToolUse` group whose matcher covers `Bash` running
+  `python3 "${CLAUDE_PROJECT_DIR}/.claude/hooks/forge_commit_guard.py" || exit 2` with
+  `"timeout": 300` and `"onFailure": "block"`. The script is named under the project root, so a
+  `cd` in the session cannot break the hook (a relative path fails doctor); the guard fails
+  CLOSED -- a crash, a missing interpreter or file, or a timeout blocks the Bash call
+  (`onFailure: "block"` is Claude Code's documented handler field for that, v2.1.295 or later;
+  `|| exit 2` covers older clients, and the guard bounds its own run at 240s, below the
+  timeout). Each Forge handler must be exactly the one `onboard` writes (only the command's
+  spelling may vary: `python`, `$CLAUDE_PROJECT_DIR` with or without braces); a handler with any
+  other field -- `"async": true` above all, which runs it in the background where its exit 2 can
+  no longer block the commit -- or a missing or different `timeout`/`onFailure` fails, wherever
+  it sits. Settings from an older onboard fail until `sdlcctl onboard --force` rewrites them. Unrelated
   hooks may sit beside them. The commit guard is deny-by-default for git: on an issue branch without the
   session's lease, every git invocation is blocked except literal read-only subcommands (status,
   log, diff, show, blame, grep, ls-files, ls-tree, rev-parse, describe, shortlog, `reflog show`,

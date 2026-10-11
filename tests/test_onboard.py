@@ -3174,6 +3174,7 @@ def test_hosted_labels_are_the_documented_finite_set():
 
 
 HOOK_START = ".claude/hooks/forge_session_start.py"
+HOOK_GUARD = ".claude/hooks/forge_commit_guard.py"
 
 
 def _settings(repo: Path, data) -> None:
@@ -3181,7 +3182,16 @@ def _settings(repo: Path, data) -> None:
 
 
 def _hook(script: str, command: str | None = None) -> dict:
-    return {"type": "command", "command": command or f"python3 .claude/hooks/{script}"}
+    """A handler running `script`; the Forge guard's carries the fail-closed fields onboard
+    writes (Codex 4242373515), so only what a test changes differs from the generated one."""
+    if command is None and script == "forge_commit_guard.py":
+        from agentic_sdlc.onboard import forge_hook_entry
+
+        return forge_hook_entry("PreToolUse")
+    return {
+        "type": "command",
+        "command": command or f'python3 "$CLAUDE_PROJECT_DIR/.claude/hooks/{script}"',
+    }
 
 
 @pytest.mark.parametrize(
@@ -4721,8 +4731,109 @@ def test_rendered_hooks_are_the_handlers_doctor_compares_against():
     from agentic_sdlc.onboard import HOOK_SCRIPTS, forge_hook_entry
 
     settings = json.loads(render_onboarding(spec())[".claude/settings.json"])
-    for event, script in HOOK_SCRIPTS.items():
-        assert settings["hooks"][event][0]["hooks"] == [forge_hook_entry(script)]
+    for event in HOOK_SCRIPTS:
+        assert settings["hooks"][event][0]["hooks"] == [forge_hook_entry(event)]
+
+
+def test_rendered_hooks_are_anchored_at_the_project_and_the_guard_fails_closed():
+    """Codex 4242373510: the script is named under ${CLAUDE_PROJECT_DIR}, so a `cd` in the
+    session cannot break it. Codex 4242373515: the guard blocks when it cannot run --
+    `onFailure: "block"`, an explicit timeout above its own deadline, and `|| exit 2`."""
+    settings = json.loads(render_onboarding(spec())[".claude/settings.json"])
+    start = settings["hooks"]["SessionStart"][0]["hooks"][0]
+    guard = settings["hooks"]["PreToolUse"][0]["hooks"][0]
+    assert start == {
+        "type": "command",
+        "command": 'python3 "${CLAUDE_PROJECT_DIR}/.claude/hooks/forge_session_start.py"',
+    }
+    assert guard == {
+        "type": "command",
+        "command": 'python3 "${CLAUDE_PROJECT_DIR}/.claude/hooks/forge_commit_guard.py" || exit 2',
+        "timeout": 300,
+        "onFailure": "block",
+    }
+    guard_source = render_onboarding(spec())[".claude/hooks/forge_commit_guard.py"]
+    deadline = int(re.search(r"(?m)^GUARD_DEADLINE = (\d+)$", guard_source).group(1))
+    assert deadline < guard["timeout"]
+
+
+def test_the_guard_fails_closed_on_its_own_crash_or_deadline(tmp_path, monkeypatch, capsys):
+    """Codex 4242373515: an exception escaping the guard would exit 1, a NON-blocking error in
+    Claude Code; `run` turns any failure, the deadline included, into exit 2."""
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+
+    def crash():
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(guard, "main", crash)
+    assert guard.run() == 2
+    assert "RuntimeError: boom" in capsys.readouterr().err
+
+    def stall():
+        raise guard.GuardDeadline("no verdict within 240s")
+
+    monkeypatch.setattr(guard, "main", stall)
+    assert guard.run() == 2
+    monkeypatch.setattr(guard, "main", lambda: 0)
+    assert guard.run() == 0
+
+
+@pytest.mark.parametrize(
+    "change, why",
+    [
+        ({"command": "python3 .claude/hooks/forge_commit_guard.py || exit 2"}, "relative"),
+        (
+            {"command": 'python3 "$CLAUDE_PROJECT_DIR/.claude/hooks/forge_commit_guard.py"'},
+            "exit 2",
+        ),
+        ({"onFailure": "continue"}, "onFailure"),
+        ({"onFailure": None}, "onFailure"),
+        ({"timeout": 600}, "timeout"),
+        ({"timeout": None}, "timeout"),
+    ],
+)
+def test_doctor_rejects_a_guard_hook_that_fails_open(tmp_path, change, why):
+    from agentic_sdlc.onboard import forge_hook_entry, hook_problems
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    path = repo / ".claude/settings.json"
+    entry = {**forge_hook_entry("PreToolUse"), **change}
+    entry = {k: v for k, v in entry.items() if v is not None}
+    settings = json.loads(path.read_text())
+    settings["hooks"]["PreToolUse"] = [{"matcher": "Bash", "hooks": [entry]}]
+    path.write_text(json.dumps(settings))
+    problems = hook_problems(path)
+    assert problems and why in " ".join(problems)
+
+
+def test_forced_onboard_replaces_a_relative_hook_from_an_older_onboard(tmp_path):
+    """A settings file written before Codex 4242373510 (relative paths, no fail-closed guard)
+    is flagged by doctor and fixed by `onboard --force`, leaving one copy of each hook."""
+    from agentic_sdlc.onboard import hook_problems
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    path = repo / ".claude/settings.json"
+    old = {
+        "hooks": {
+            "SessionStart": [{"hooks": [{"type": "command", "command": "python3 " + HOOK_START}]}],
+            "PreToolUse": [
+                {
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": "python3 " + HOOK_GUARD}],
+                }
+            ],
+        }
+    }
+    path.write_text(json.dumps(old))
+    problems = " ".join(hook_problems(path))
+    assert "a path relative to the working directory" in problems
+    assert "no PreToolUse (matcher Bash) hook" in problems
+    write_onboarding(repo, spec(), force=True)
+    assert hook_problems(path) == []
+    merged = json.loads(path.read_text())["hooks"]
+    assert [len(merged[e]) for e in ("SessionStart", "PreToolUse")] == [1, 1]
 
 
 def test_doctor_fails_a_cloud_routine_plan_caller_on_macos(tmp_path):
@@ -9074,7 +9185,7 @@ def test_forced_onboard_merges_claude_settings(tmp_path):
         {
             "matcher": "Bash",
             "hooks": [
-                {**forge_hook_entry(HOOK_SCRIPTS["PreToolUse"]), "async": True},
+                {**forge_hook_entry("PreToolUse"), "async": True},
                 {"type": "command", "command": "./audit.sh"},
             ],
         }
@@ -9487,6 +9598,61 @@ def test_cloud_routine_prompt_authorizes_the_labeler_before_claiming():
     assert authorize < doc.index("sdlcctl claim --project owner/comic")
     assert "--label implementation-approved" in doc
     assert "Proceed ONLY on exit 0" in doc and "do not claim" in doc
+
+
+# Codex 4242373521: a fresh cloud environment has no `sdlcctl`. The routine doc carries the
+# setup script that installs it at the workflows' pin, and step 0 refuses any other install.
+def test_cloud_routine_doc_installs_the_pinned_sdlcctl_and_checks_it_first():
+    files = render_onboarding(spec(implementer="cloud-routine", runs_on=("ubuntu-latest",)))
+    doc = files["docs/forge/cloud-implementer.md"]
+    install = (
+        "python3 -m pip install --user --disable-pip-version-check "
+        f"'agentic-sdlc @ git+https://github.com/owner/agentic-sdlc@{SHA}'"
+    )
+    assert "## Environment setup script" in doc and install in doc
+    step0 = doc.index(f"0. Run `sdlcctl --version`. It must print `commit {SHA}`")
+    assert step0 < doc.index("1. List open issues")
+    assert "STOP: claim nothing" in doc
+    assert doc.index("## Environment setup script") < doc.index("## Routine prompt")
+    # the install source is the commit every generated workflow pins
+    assert (
+        f"owner/agentic-sdlc/.github/workflows/reusable-plan.yml@{SHA}"
+        in (files[".github/workflows/agent-plan.yml"])
+    )
+
+
+def test_doctor_compares_the_routine_doc_at_the_installed_pin(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(implementer="cloud-routine", runs_on=("ubuntu-latest",)))
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    assert "managed files match the generated files" not in _failed(report)
+    routine = repo / "docs/forge/cloud-implementer.md"
+    routine.write_text(routine.read_text().replace(SHA, "1" * 40))  # a stale pin
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    drift = _failed(report)["managed files match the generated files"].detail
+    assert "cloud-implementer.md" in drift
+    assert "setup script" in _failed(report)["cloud implementer routine is scheduled"].detail
+
+
+def test_sdlcctl_version_names_the_installed_commit(monkeypatch, capsys):
+    from importlib import metadata
+
+    from agentic_sdlc import cli
+
+    class Dist:
+        version = "0.1.0"
+
+        def read_text(self, name):
+            assert name == "direct_url.json"
+            return json.dumps({"url": "https://github.com/o/p", "vcs_info": {"commit_id": SHA}})
+
+    monkeypatch.setattr(metadata, "distribution", lambda name: Dist())
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["--version"])
+    assert exit_info.value.code == 0
+    assert capsys.readouterr().out == f"sdlcctl 0.1.0 commit {SHA}\n"
+    Dist.read_text = lambda self, name: None  # an editable or sdist install records no commit
+    assert cli.installed_version() == "sdlcctl 0.1.0 commit unknown"
 
 
 # ---------------------------------------------------------------- review regressions (PR 139, 11)
