@@ -19,6 +19,8 @@ remain in MarketMaestro; reusable orchestration lives here.
 ## What exists in v0.1
 
 - A provider-neutral work-request parser.
+- A spec stage that drafts missing work-request sections for owner review
+  and holds `spec-drafted` issues out of planning and implementation until approved.
 - Deterministic task and diff policy checks.
 - Configuration-driven provider/model executor routing with recoverable
   quota, capacity, and auth fallback.

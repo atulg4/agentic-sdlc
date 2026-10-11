@@ -160,6 +160,9 @@ def scaffold_project(
             files[root / ".github/workflows/agent-auto-implement.yml"] = _render(
                 "github/agent-auto-implement.yml", platform_repository, platform_ref
             )
+            files[root / ".github/workflows/agent-auto-spec.yml"] = _render(
+                "github/agent-auto-spec.yml", platform_repository, platform_ref
+            )
     else:
         files[root / ".gitlab-ci.agentic-sdlc.yml"] = _render(
             "gitlab/include.yml", platform_repository, platform_ref

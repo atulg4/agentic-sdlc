@@ -44,6 +44,32 @@ run. Add `implementation-approved` only after accepting that plan. The pipeline
 checks that the label or manual trigger came from an actor with repository write
 authority.
 
+### Spec stage for filed issues
+
+Issues that are missing intake sections (Summary, Acceptance Criteria,
+Required Tests, Non-Goals, Dependencies) no longer sit in the backlog. Install
+`templates/github/auto-spec.yml` as `.github/workflows/agent-auto-spec.yml`.
+Replace `PLATFORM_REPOSITORY` and `PLATFORM_COMMIT_SHA` with the same pinned
+values as your other callers. Level 3 scaffolding installs this file
+automatically. The workflow needs `CLAUDE_CODE_OAUTH_TOKEN`, or pass
+`agent: codex` with `OPENAI_API_KEY`, or pass `agent: route` with an
+`executor_registry_path` to use executor routing. It requests `contents: read`,
+`issues: write` and `id-token: write`.
+
+When a maintainer opens, edits or labels an incomplete issue, Forge does four
+things:
+
+- it drafts only the missing sections;
+- it appends them under **"Drafted by Forge spec stage — owner review
+  required"** and leaves your text unchanged;
+- it adds the `spec-drafted` label;
+- it comments to say which sections it drafted; open questions sit in the drafted block.
+
+Review the draft and edit it if needed. Then remove `spec-drafted` or add
+`spec-approved`. Until you do, planning and implementation are refused even if
+`agent-ready` or `implementation-approved` is present. The spec stage never adds `agent-ready`
+or `implementation-approved`. See [Intake: spec stage](intake.md#spec-stage).
+
 The platform read token is used only to retrieve the pinned policy engine in a
 no-AI preparation job. It is not a consumer-repository write credential and is
 not passed to the AI subprocess or publisher.
