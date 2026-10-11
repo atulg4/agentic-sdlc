@@ -733,7 +733,8 @@ def open_prs_for_issue(project: str, issue: int, gh: GhRunner) -> list[dict]:
     # Codex 4240028945: `closingIssuesReferences` holds what the PR will CLOSE; a PR linked by
     # hand in the Development sidebar does not close the issue and is not in it. The issue's
     # timeline is: `connected` (minus a later `disconnected`) and same-repository open PRs that
-    # cross-reference the issue are durable work too.
+    # cross-reference the issue are durable work too, and so is an open PR of another repository
+    # that cross-references the issue AND will close it (Codex 4240306505).
     by_number = {pr.get("number"): pr for pr in prs}
     seen = {pr.get("number") for pr in hits}
     for number, row in _timeline_prs(project, issue, gh):
@@ -830,11 +831,86 @@ def _link_subjects(project: str, issue: int, ids: list[str], gh: GhRunner) -> di
     return subjects
 
 
-def _timeline_prs(project: str, issue: int, gh: GhRunner) -> list[tuple[int, dict]]:
-    """(number, row) of each OPEN pull request of `project` the issue's timeline links: one
-    connected through the Development sidebar and not disconnected since, or one that
-    cross-references the issue. A malformed event, or a link whose PR cannot be identified,
-    raises LeaseError (fail closed: it could be the work this claim would duplicate)."""
+#: An open pull request of ANOTHER repository that cross-references the issue: whether it will
+#: close it (`Fixes owner/repo#N`, which GitHub honours across repositories) is read from its own
+#: `closingIssuesReferences` (Codex 4240306505).
+_EXTERNAL_PR_QUERY = """\
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      state url title
+      closingIssuesReferences(first: 100) {
+        pageInfo { hasNextPage }
+        nodes { number repository { nameWithOwner } }
+      }
+    }
+  }
+}"""
+
+
+def _external_pr_closes(
+    project: str, issue: int, source: str, number: int, gh: GhRunner
+) -> dict | None:
+    """The open pull request `source`#`number` (another repository) as a row when it will close
+    `project` issue `issue`, else None (closed since, or it only mentions the issue). A PR that
+    cannot be read -- an inaccessible or deleted repository, an API failure, a malformed answer
+    or more linked issues than one page holds -- raises LeaseError naming it: it could be the
+    work this claim would duplicate (fail closed)."""
+    pr_name = f"{source}#{number}"
+    blocked = (
+        f"{project} issue #{issue} is cross-referenced by the open pull request {pr_name} in "
+        "another repository, which may close it, and "
+    )
+    remedy = (
+        f"; not claiming. Check {pr_name} by hand: if it closes the issue the work is taken; if "
+        "it does not (or is gone), make it readable to this `gh` login (or wait for the outage) "
+        "and retry -- `claim` has no override for an unverifiable closing pull request"
+    )
+    owner, _, name = source.partition("/")
+    args = ["api", "graphql", "-f", f"query={_EXTERNAL_PR_QUERY}"]
+    args += ["-f", f"owner={owner}", "-f", f"name={name}", "-F", f"number={number}"]
+    try:
+        answer = json.loads(gh(args) or "null")
+    except Exception as exc:  # noqa: BLE001 - any failure to read it is "unverifiable"
+        raise LeaseError(f"{blocked}it could not be read ({str(exc)[:160]}){remedy}") from exc
+    data = answer.get("data") if isinstance(answer, dict) else None
+    repo = data.get("repository") if isinstance(data, dict) else None
+    pr = repo.get("pullRequest") if isinstance(repo, dict) else None
+    if not isinstance(answer, dict) or answer.get("errors") or not isinstance(pr, dict):
+        why = answer.get("errors") if isinstance(answer, dict) else answer
+        raise LeaseError(f"{blocked}it could not be read ({str(why)[:160]}){remedy}")
+    refs = pr.get("closingIssuesReferences")
+    info = refs.get("pageInfo") if isinstance(refs, dict) else None
+    nodes = refs.get("nodes") if isinstance(refs, dict) else None
+    state = pr.get("state")
+    if not isinstance(state, str) or not isinstance(info, dict) or not isinstance(nodes, list):
+        raise LeaseError(f"{blocked}its state or closing issues could not be read{remedy}")
+    if state != "OPEN":
+        return None  # closed or merged since the timeline was read: no work in progress
+    if info.get("hasNextPage") is not False:
+        raise LeaseError(f"{blocked}its closing issues could not all be read{remedy}")
+    for node in nodes:
+        if not isinstance(node, dict):
+            raise LeaseError(f"{blocked}one of its closing issues could not be read{remedy}")
+        target = node.get("repository")
+        target_name = target.get("nameWithOwner") if isinstance(target, dict) else None
+        if _number(node.get("number")) is None or not isinstance(target_name, str):
+            raise LeaseError(f"{blocked}one of its closing issues could not be read{remedy}")
+        if node["number"] == issue and target_name.lower() == project.lower():
+            url = pr.get("url") if isinstance(pr.get("url"), str) else ""
+            title = pr.get("title") if isinstance(pr.get("title"), str) else ""
+            return {"number": number, "url": url, "title": title, "repository": source}
+    return None
+
+
+def _timeline_prs(project: str, issue: int, gh: GhRunner) -> list[tuple[int | str, dict]]:
+    """(key, row) of each OPEN pull request the issue's timeline links as work on it: a PR of
+    `project` connected through the Development sidebar and not disconnected since, or one that
+    cross-references the issue, and an open PR of ANOTHER repository that cross-references the
+    issue and will close it (Codex 4240306505). The key is the number for a PR of `project`,
+    `owner/name#N` for another repository's. A malformed event, or a link whose PR cannot be
+    identified or read, raises LeaseError (fail closed: it could be the work this claim would
+    duplicate)."""
     events = _issue_timeline(project, issue, gh)
     links = [e for e in events if e.get("event") in ("connected", "disconnected")]
     unresolved = []
@@ -864,11 +940,12 @@ def _timeline_prs(project: str, issue: int, gh: GhRunner) -> list[tuple[int, dic
             connected[number] = subject
         else:
             connected.pop(number, None)
-    found = [
+    found: list[tuple[int | str, dict]] = [
         (number, {"number": number, "url": row.get("url", ""), "title": row.get("title", "")})
         for number, row in connected.items()
         if row["state"] == "OPEN"
     ]
+    external: set[str] = set()
     for event in events:
         if event.get("event") != "cross-referenced":
             continue
@@ -883,9 +960,19 @@ def _timeline_prs(project: str, issue: int, gh: GhRunner) -> list[tuple[int, dic
             raise LeaseError(
                 f"{project} issue #{issue}: a cross-referencing pull request could not be read"
             )
-        if state == "open" and repo.lower() == project.lower():
+        if state != "open":
+            continue
+        if repo.lower() == project.lower():
             url = row.get("html_url") or ""
             found.append((number, {"number": number, "url": url, "title": row.get("title", "")}))
+            continue
+        key = f"{repo.lower()}#{number}"
+        if key in external:
+            continue  # one PR can cross-reference the issue many times; read it once
+        external.add(key)
+        closing = _external_pr_closes(project, issue, repo, number, gh)
+        if closing is not None:
+            found.append((key, closing))
     return found
 
 

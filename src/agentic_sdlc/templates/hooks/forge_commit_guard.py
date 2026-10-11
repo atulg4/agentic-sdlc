@@ -4,7 +4,9 @@
 Installed by `sdlcctl onboard`. Reads the hook payload on stdin; exit 2 blocks the tool call and
 shows the message to the agent. Only git that acts on an issue branch (`*/issue-N*`) this session
 does not lease -- the checked-out one, or one the command names as a destination -- is blocked,
-plus git whose destinations cannot be known before it runs; everything else passes.
+plus git whose destinations cannot be known before it runs; everything else passes. A payload
+that cannot be read (not JSON, truncated, not an object, no tool name, a Bash call without a
+string command) blocks too: only a payload shown to be another tool is let through unread.
 
 Posture: DENY BY DEFAULT for git. On an issue branch, EVERY git invocation needs the lease except
 a short allowlist of read-only subcommands proven by plain literal tokens (`_read_only`):
@@ -2423,12 +2425,51 @@ def _decide_branch(payload: dict, branch: str, lease_lookup, pr_lookup) -> tuple
     return 0, ""
 
 
+PAYLOAD_BLOCK = (
+    "Forge guard: the PreToolUse hook payload {why}, so whether this tool call runs a git "
+    "command on an issue branch -- and the lease it would need -- cannot be checked. Blocked "
+    "(fail closed). Retry the command; if this persists, the installed Claude Code sends a hook "
+    "payload this guard does not understand -- update Claude Code or re-run `sdlcctl onboard`."
+)
+
+
+def read_payload(text: str) -> tuple[dict | None, str]:
+    """The hook payload as (payload, "") when it is a JSON object that is either a Bash call
+    with a string `tool_input.command` (and a string `cwd`, if any) or clearly another tool;
+    otherwise (None, why). Only a payload that parses AND has that shape may be let through:
+    anything else (empty, truncated, not JSON, not an object, no tool name, a Bash call
+    without a command) blocks (Codex 4240306495)."""
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return None, "is not valid JSON (empty, truncated or corrupted)"
+    if not isinstance(payload, dict):
+        return None, "is not a JSON object"
+    tool = payload.get("tool_name")
+    if not isinstance(tool, str) or not tool:
+        return None, "names no tool (tool_name missing or not a string)"
+    if tool != "Bash":
+        return payload, ""  # clearly not the guarded tool
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict) or not isinstance(tool_input.get("command"), str):
+        return None, "is a Bash call without a string tool_input.command"
+    if payload.get("cwd") is not None and not isinstance(payload.get("cwd"), str):
+        return None, "carries a cwd that is not a string"
+    return payload, ""
+
+
 def main() -> int:
     try:
-        payload = json.loads(sys.stdin.read() or "{}")
-    except json.JSONDecodeError:
+        text = sys.stdin.read()
+    except (OSError, ValueError):  # unreadable or not text
+        text = ""
+    payload, why = read_payload(text)
+    if payload is None:
+        print(PAYLOAD_BLOCK.format(why=why), file=sys.stderr)
+        return 2
+    if payload.get("tool_name") != "Bash":
         return 0
-    command = str((payload.get("tool_input") or {}).get("command", ""))
+    command = payload["tool_input"]["command"]
     branches = (
         commit_branches(command, payload.get("cwd"))
         if is_git_commit(command, cwd=payload.get("cwd"))

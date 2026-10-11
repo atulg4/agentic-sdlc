@@ -111,7 +111,11 @@ sdlcctl doctor --destination /path/to/consumer-repository   # exit 2 until READY
 `claude`, `codex`, or `cloud-routine` (no Actions implementer; see the generated
 `docs/forge/cloud-implementer.md` for the routine prompt, which authorizes the approval labeler
 with `sdlcctl authorize-labeler` before claiming; once the routine is scheduled on claude.ai,
-record it with `sdlcctl confirm-cloud-routine` -- `doctor` stays NOT READY until then). Work requests must follow the
+record it with `sdlcctl confirm-cloud-routine` -- `doctor` stays NOT READY until then, under
+`--local` too). Planning always runs Claude Code: every generated plan caller invokes the
+platform's `reusable-plan.yml` (`anthropics/claude-code-action`), so the generated policy records
+`[agents] planner = "claude"` and `doctor` fails a planner that does not match that workflow
+(checked against the fetched `reusable-plan.yml` at the pin when online). Work requests must follow the
 generated `.github/ISSUE_TEMPLATE/agent-work-request.md`: `## Summary`, `## Acceptance
 Criteria`, `## Required Tests`, `## Non-Goals`, `## Dependencies`, the last two as lists.
 
@@ -143,12 +147,18 @@ status line (`claimed #12 …`, the `claims` table, a refusal) goes to stderr, s
 the pre-existing assignee, never one the lease owns.
 
 `claim` exits 2, changing nothing, when another live lease or an open PR for the issue exists
-(a PR that closes the issue, from any repository, or one from a same-repository branch named
-`issue-N`; a fork's identically named branch does not count), or when the issue's timeline
+(a PR of this repository that closes the issue or that comes from a same-repository branch
+named `issue-N`; a fork's identically named branch does not count), or when the issue's timeline
 links an open same-repository PR to it -- linked by hand in the Development sidebar (`connected`
-and not `disconnected` since) or cross-referencing it. Every open PR and every timeline page is
-read to the last page; a page that cannot be read, or a manual link whose PR cannot be
-identified, refuses the claim rather than reading as "no PR";
+and not `disconnected` since) or cross-referencing it -- or shows an open PR of ANOTHER
+repository cross-referencing it whose `closingIssuesReferences` name this issue (`Fixes
+owner/repo#N`; one that only mentions the issue does not block, and a Development-sidebar link
+from another repository is not counted). Every open PR and every timeline page is
+read to the last page; a page that cannot be read, a manual link whose PR cannot be
+identified, or a cross-referencing PR of another repository that cannot be read (inaccessible,
+deleted, API failure, more than 100 closing issues) refuses the claim rather than reading as
+"no PR" -- the refusal names that PR; there is no override, so check it by hand and make it
+readable to the `gh` login (or let the outage pass) before retrying;
 expired leases can be taken over (the takeover is commented). Markers count only when posted by
 a user whose repository permission (read per run from the collaborator permission API) is
 write, maintain or admin, by `github-actions[bot]`, or by the Forge Publisher App's bot (a
@@ -159,9 +169,13 @@ an outside or read-only commenter cannot forge or free a lease; the commit guard
 rule. `reusable-implement.yml` claims as the last
 step of `prepare` (with an App-minted token: issues write, pull requests read) and releases after
 the draft PR exists or on failure. `sdlcctl onboard` installs two Claude Code hooks in the consumer repo: a SessionStart
-hook that fetches origin and lists PRs and leased issues, and a PreToolUse guard that blocks
-every git command except literal read-only ones (deny by default) on `*/issue-N` branches unless
-the session holds the lease.
+hook that fetches origin and lists PRs and leased issues (every open `in-progress` issue, read
+page by page up to 5,000; an unreadable page or the cap is printed as an INCOMPLETE inventory,
+never as the whole list), and a PreToolUse guard that blocks every git command except literal
+read-only ones (deny by default) on `*/issue-N` branches unless the session holds the lease. The
+guard also blocks when its hook payload cannot be read (not JSON, truncated, not an object, no
+tool name, a Bash call without a string command); only a payload shown to be another tool passes
+unread.
 
 ### Generic profile: `sdlcctl scaffold`
 
