@@ -61,7 +61,8 @@ repository: there is no opt-in for self-hosted pull-request CI. To keep `ci.yml`
 private repository, disable forking (or fork pull-request workflows) for it first.
 
 `doctor` checks "fork pull requests cannot reach self-hosted runners". A fork-safe repository
-passes. Otherwise it fails when any `pull_request*`-triggered job (in any workflow
+passes. Otherwise it fails when any `pull_request*`- or `merge_group`-triggered job (a merge
+group's SHA contains the queued PRs' code, fork PRs included; in any workflow
 file on the default branch, enumerated through the Git Trees API -- the set GitHub runs, not this
 checkout's, which is checked in addition; the contents API stops listing a directory at 1,000
 entries without saying so, and a tree answer that is truncated, at the API's entry cap or
@@ -71,7 +72,10 @@ reusable workflow it calls (`./.github/workflows/x.yml`, with `with:` inputs sub
 to a third-party reusable workflow, a runner expression that is not a resolvable input, or a
 Forge platform reusable workflow called without an explicit `runs_on` cannot be proven hosted and
 fails. When the fork policy is merely unknown, that failure is an owner TODO (never `READY`):
-disable forking or fork pull-request workflows, or move those jobs to GitHub-hosted runners.
+disable forking or fork pull-request workflows, or move those jobs to GitHub-hosted runners. A
+private repository that disables only fork pull-request WORKFLOWS (forking still allowed) still
+merges fork PRs through its merge queue, so its `merge_group` jobs must be GitHub-hosted too;
+forking disabled outright needs nothing more.
 
 ### Runner labels
 
@@ -126,8 +130,9 @@ an issue can use the work-request template, and the template applies the plannin
 so its `preflight` job runs on `ubuntu-latest` (GitHub-hosted, NOT tunable, `permissions:
 contents: read, issues: read` -- the label events need `issues: read` in a private repository), asks
 `GET repos/{owner}/{repo}/collaborators/{login}/permission` with `GITHUB_TOKEN` whether the
-labeler (`github.event.sender`), `github.actor` AND whoever applied the ready label most recently
-(read from the issue's label events, every page) have write, maintain or admin, and the reusable
+labeler (`github.event.sender`), `github.actor` AND whoever applied each of the ready and
+human-review labels most recently (read from the issue's label events, every page) have write,
+maintain or admin, and the reusable
 `plan` call runs only `if: needs.preflight.outputs.authorized == 'true'`. An outsider's issue
 therefore never occupies a self-hosted runner; a maintainer who re-applies the ready label starts
 planning. (`agent-plan.yml` is `workflow_dispatch` only, which already requires write access.)
@@ -140,12 +145,16 @@ identical collaborator-permission check, and every job that can reach your runne
 and runs only when `needs.authorize.outputs.authorized == 'true'`. Toggling a label without write
 access therefore never schedules anything on a self-hosted runner. The approver is read from the
 label history, not taken from the event: the run can be triggered by a writer adding the last
-prerequisite label after a Triage user applied `implementation-approved`, so whoever applied
-`implementation-approved` most recently must have write, maintain or admin too -- the rule
-`sdlcctl authorize-labeler` applies for a cloud routine. That approver, not the event's sender, is
-what the reusable call receives as `trigger_actor` (the platform re-checks its permission). Label
-events that cannot be read, or that never show the label applied, fail `authorize`; a label
-removed since it was last applied is "unauthorized". (`agent-implement.yml` is
+prerequisite label after a Triage user applied `implementation-approved` (or the other way
+round), so whoever applied EACH label of the approval set -- `implementation-approved`, the ready
+label and `human-review-required` -- most recently must have write, maintain or admin too: the
+rule `sdlcctl authorize-labeler` applies for a cloud routine. A non-writer's label (for example
+the planning labels the work-request template applied for a Triage user) therefore needs a writer
+to re-apply it before implementation starts. The approver (who applied `implementation-approved`
+last), not the event's sender, is what the reusable call receives as `trigger_actor` (the
+platform re-checks its permission). Label events that cannot be read, or that never show a label
+of the set applied, fail `authorize`; a label removed since it was last applied is
+"unauthorized". (`agent-implement.yml` is
 `workflow_dispatch` only and has no `authorize` job.)
 
 A permission check that cannot get a definitive answer (rate limit, 5xx, network) after its
@@ -216,11 +225,13 @@ something that runs differently.
   confirm-cloud-routine` (sets `[automation] cloud_routine_confirmed = true`; only the boolean
   `true` counts). `onboard --force` rewrites the policy and drops the confirmation: re-check the
   routine against the regenerated document, then confirm again. The routine prompt runs `sdlcctl
-  authorize-labeler --project owner/repo --issue N` before claiming, the same check the Actions
-  path runs: the most recent application of `implementation-approved` (from the issue's label
-  events) must be by a user with write/maintain/admin -- a 200 carrying that permission; a 404 or
-  a lower role exits 3 (not authorized), and anything unreadable exits 2 (not verified); only
-  exit 0 claims.
+  authorize-labeler --project owner/repo --issue N --label implementation-approved --label
+  <ready> --label human-review-required` before claiming, the same check the Actions path runs:
+  the most recent application of EACH of those labels (from the issue's label events) must be by
+  a user with write/maintain/admin -- a 200 carrying that permission; a 404 or a lower role, or a
+  label removed since, exits 3 (not authorized), and anything unreadable exits 2 (not verified);
+  only exit 0 claims. Without `--label` it reads the three labels from `--config` (default
+  `agentic-sdlc.toml`); a policy it cannot read exits 2.
 - **Project id**: `[project].id` must equal, exactly, the `full_name` GitHub answers for `GET
   repos/{id}` -- its spelling, and after a rename or transfer (which the API follows as a
   redirect) the NEW name, since every run passes that as `$GITHUB_REPOSITORY`. A mismatch fails
@@ -280,7 +291,12 @@ something that runs differently.
   post-index-change / pre-auto-gc hook, and for `fetch`/`remote` an ssh/askpass/credential/proxy
   helper or a remote URL that needs a remote helper -- in any config scope or include, or in
   `GIT_EXTERNAL_DIFF`/`GIT_EXEC_PATH`/`GIT_PAGER`/`PAGER`/`GIT_SSH*`/`*ASKPASS`; when that
-  configuration cannot be read; and with `--ext-diff`, `--textconv` or `--filters`. Every
+  configuration cannot be read; and with `--ext-diff`, `--textconv` or `--filters`. git runs
+  the default SSH transport (`ssh`) -- and the shell runs git itself -- from PATH, so every git
+  in a command that mentions PATH anywhere (`export PATH=/tmp/bin:$PATH; git fetch origin`,
+  `read PATH`, zsh's `path=(...)`, `hash -p`) or sets an `LD_*`/`DYLD_*`/`SSH_ASKPASS*` variable
+  needs the lease, and so does every read-only subcommand while PATH holds a relative entry
+  (`.`, an empty entry). Every
   GitHub lookup is bounded at 30s and every local git call at 15s: a lookup that times out
   refuses instead of hanging the session. A branch
   change earlier in the same command re-targets the git after it: `git switch forge/issue-7 &&
@@ -351,8 +367,12 @@ something that runs differently.
   branch) need BRANCH's lease wherever they run; operands it cannot tell from option values (an
   unknown or abbreviated option, too many operands) block the command.
 - The commit guard's open-PR fallback counts only a PR whose head branch lives in this
-  repository: `gh pr list --head` matches the branch NAME, so a fork's PR from an identically
-  named branch is not this branch's claim.
+  repository: it lists `repos/{owner}/{repo}/pulls?state=open&head=OWNER:BRANCH`, every page, and
+  checks each answer's head repository, so a fork's PR from an identically named branch (however
+  many there are) is not this branch's claim and cannot hide this repository's own PR.
+- Every `gh` call `sdlcctl` makes (claim, renew, release, authorize-labeler, onboard, doctor) is
+  bounded: 60s per call, `AGENTIC_SDLC_GH_TIMEOUT` (1-3600 seconds) overrides it. A call that
+  does not answer in time fails closed (exit 2) instead of hanging the session or routine.
 - The commit guard matches a live lease to this session only by the hook payload's
   `session_id`, and only when that is a non-empty string: a payload whose id is missing, null,
   empty or not a string owns no lease, so guarded git on a leased issue branch is refused

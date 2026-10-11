@@ -61,7 +61,6 @@ from .missions import (
 )
 from .models import RiskLevel
 from .onboard import (
-    IMPLEMENTATION_LABEL,
     OnboardError,
     OnboardSpec,
     apply_repo_settings,
@@ -917,10 +916,28 @@ def _release(args: argparse.Namespace) -> int:
     return 0
 
 
+def _approval_labels(args: argparse.Namespace) -> list[str]:
+    """The labels `authorize-labeler` checks: every `--label` given (the first is the approval
+    label), else the policy's whole approval set -- implementation, ready and human-review labels
+    from `--config` (Codex 4240421144). A policy that cannot be read is an error (exit 2), never a
+    smaller set."""
+    if args.label:
+        return list(args.label)
+    try:
+        policy = load_policy(args.config)
+    except (OSError, ValueError) as exc:
+        raise LeaseError(
+            f"cannot read the approval labels from {args.config} ({exc}); pass every label of "
+            "the approval set with --label; not authorizing"
+        ) from exc
+    return [policy.implementation_label, policy.ready_label, policy.human_review_label]
+
+
 def _authorize_labeler(args: argparse.Namespace) -> int:
-    """Exit 0: the approval label was last applied by a writer. Exit 3: definitively not
-    (unauthorized labeler, or the label was removed). Exit 2 (an error): unverifiable."""
-    verdict = authorize_labeler(args.project, args.issue, args.label, run_gh)
+    """Exit 0: every label of the approval set was last applied by a writer. Exit 3:
+    definitively not (an unauthorized labeler, or a label was removed). Exit 2 (an error):
+    unverifiable."""
+    verdict = authorize_labeler(args.project, args.issue, _approval_labels(args), run_gh)
     _write(verdict.as_dict(), args.output)
     if not verdict.authorized:
         _status(f"NOT AUTHORIZED: #{args.issue}: {verdict.reason}")
@@ -1370,12 +1387,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     authorize = commands.add_parser(
         "authorize-labeler",
-        help="exit 0 only if a write/maintain/admin user applied the approval label last "
+        help="exit 0 only if a write/maintain/admin user applied each approval label last "
         "(3: not authorized, 2: could not verify)",
     )
     authorize.add_argument("--project", required=True, help="owner/name on GitHub")
     authorize.add_argument("--issue", type=int, required=True)
-    authorize.add_argument("--label", default=IMPLEMENTATION_LABEL)
+    authorize.add_argument(
+        "--label",
+        action="append",
+        help="a label of the approval set (repeat for each; the first is the approval label); "
+        "default: the implementation, ready and human-review labels of --config",
+    )
+    authorize.add_argument("--config", default="agentic-sdlc.toml")
     authorize.add_argument("--output")
     authorize.set_defaults(handler=_authorize_labeler)
 

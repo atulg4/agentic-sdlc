@@ -22,8 +22,10 @@ fast-import, filter-branch, replace, worktree, push, `git-<name>` programs, alia
 subcommands -- goes to the lease check. So does an allowlisted subcommand whose meaning git or
 the shell can change out of sight: `-c`/`--config-env`/`--exec-path=` (pager, diff and fetch
 commands are configuration), an environment assignment other than GIT_DIR/GIT_WORK_TREE/locale
-on it (or a GIT_*/PAGER/EDITOR assignment anywhere in the command), `--output`, or an argument
-holding `$`, a backtick or a brace expansion.
+on it (or a GIT_*/PAGER/EDITOR/SSH_ASKPASS*/LD_* assignment anywhere in the command, or any
+mention of PATH there: git runs `ssh` from it), `--output`, or an argument holding `$`, a
+backtick or a brace expansion. A relative PATH entry (`.`, an empty entry) guards every
+allowlisted subcommand: what it runs depends on the directory.
 
 An allowlisted subcommand is read-only only while git runs nothing configured OUTSIDE the
 command (Codex 4239667542): `diff.external`, a textconv / diff / filter driver, a non-trivial
@@ -217,8 +219,23 @@ _GIT_WORD = re.compile(r"(?<![\w.-])git(?![\w-])")
 # runs (GIT_EXTERNAL_DIFF, GIT_PAGER, GIT_CONFIG_*, GIT_SSH, PAGER, EDITOR, ...), checked
 # with quotes and backslashes removed (`export GIT_EXTERNAL"_DIFF=x"`). GIT_DIR and GIT_WORK_TREE
 # only select the repository.
+#
+# Codex 4240421142: git runs the default SSH transport, `ssh`, from PATH -- and the shell finds
+# `git` itself there -- so a command that changes PATH anywhere (`export PATH=/tmp/bin:$PATH;
+# git fetch origin`, `PATH+=...`, `read PATH`, `for PATH in ...`, `declare -n p=PATH`) can run a
+# program of its own choosing through an allowlisted git command. PATH is always exported, so ANY
+# mention of the variable taints (`_PATH_TAINT`), not only an assignment spelled `PATH=`; so do
+# the loader variables (LD_*/DYLD_*), ssh's own askpass (SSH_ASKPASS*) and `+=` appends.
 _ENV_TAINT = re.compile(
-    r"(?<![A-Za-z0-9_])(?:GIT_(?!DIR=|WORK_TREE=)[A-Z0-9_]+|PAGER|EDITOR|VISUAL|LESS[A-Z]*)="
+    r"(?<![A-Za-z0-9_])(?:GIT_(?!DIR=|WORK_TREE=)[A-Z0-9_]+|PAGER|EDITOR|VISUAL|LESS[A-Z]*"
+    r"|SSH_ASKPASS[A-Z_]*|LD_[A-Z0-9_]+|DYLD_[A-Z0-9_]+)\+?="
+)
+# zsh ties the array `path` to PATH (`path=(/tmp/bin $path)`, `path+=...`, `path[1]=...`), and
+# `hash -p FILE NAME` makes the shell run FILE for NAME (`git`) without touching PATH at all.
+_PATH_TAINT = re.compile(
+    r"(?<![A-Za-z0-9_])PATH(?![A-Za-z0-9_])"
+    r"|(?<![A-Za-z0-9_$-])path(?:\[[^\]]*\])?\+?="
+    r"|(?<![A-Za-z0-9_-])hash\s+(?:-[A-Za-z]*\s+)*-[A-Za-z]*p"
 )
 # Command-line assignments that leave a read-only git command read-only.
 SAFE_GIT_ENV = frozenset({"GIT_DIR", "GIT_WORK_TREE", "LANG", "TZ", "TERM", "NO_COLOR", "COLUMNS"})
@@ -1191,6 +1208,9 @@ def _helper_reason(sub: str, args: list[str], where: str, target: Target) -> str
         value = os.environ.get(name, "").strip()
         if value and not (name in PAGER_ENV and SAFE_PAGER.match(value)):
             return f"{name}={value} in the environment"
+    relative = _relative_path_entry()
+    if relative is not None:  # Codex 4240421142: `ssh` (and git) found relative to the cwd
+        return f"PATH entry {relative!r} is relative: what it runs depends on the directory"
     config = _read_config(where, target)
     if config is None:
         return "git configuration could not be read"
@@ -1219,6 +1239,19 @@ def _helper_reason(sub: str, args: list[str], where: str, target: Target) -> str
     code, out = _git_in(where, target, "rev-parse", "--show-toplevel")
     if code == 0 and out.strip() and os.path.lexists(os.path.join(out.strip(), ".gitmodules")):
         return "submodules (.gitmodules): git recurses into their own configuration"
+    return None
+
+
+def _relative_path_entry() -> str | None:
+    """The first PATH entry (in the hook's environment, which the command inherits) that is not
+    an absolute directory -- `.`, `bin`, or an empty entry, all resolved against the directory
+    the command runs in, which a `cd` or a file the agent wrote can make anything -- or None."""
+    path = os.environ.get("PATH")
+    if path is None:
+        return None
+    for entry in path.split(os.pathsep):
+        if not os.path.isabs(entry):
+            return entry
     return None
 
 
@@ -1821,8 +1854,9 @@ def commit_targets(command: str, depth: int = 0, cwd: str | None = None) -> list
     one; an assembled program or subcommand is one with an unknown repository."""
     if depth == 0:
         _HELPER_NOTES.clear()
+        unquoted = re.sub(r"[\"'\\]", "", command)
         tainted = _mentions_git(command) and bool(
-            _ENV_TAINT.search(re.sub(r"[\"'\\]", "", command))
+            _ENV_TAINT.search(unquoted) or _PATH_TAINT.search(unquoted)
         )
         _TAINTED[:] = [True] if tainted else []
         try:
@@ -2253,46 +2287,49 @@ def lease_for(issue: int) -> dict | None:
         return UNAVAILABLE
 
 
-def _same_repository_pr(pr: object) -> bool:
-    """True only for a PR whose head branch lives in PROJECT itself. `gh pr list --head` filters
-    by branch NAME only, so a fork's PR from an identically named branch matches too: that is
-    not this branch's claim. A missing or malformed field proves nothing and is no claim."""
-    if not isinstance(pr, dict) or pr.get("isCrossRepository") is not False:
+def _same_repository_pr(pr: object, branch: str) -> bool:
+    """True only for an open PR (REST `pulls` shape) whose head is `branch` IN PROJECT itself: a
+    fork's PR from an identically named branch is not this branch's claim. A missing or malformed
+    field proves nothing and is no claim."""
+    if not isinstance(pr, dict) or pr.get("state") != "open":
         return False
-    repo, owner = pr.get("headRepository"), pr.get("headRepositoryOwner")
-    if not isinstance(repo, dict) or not isinstance(owner, dict):
+    head = pr.get("head")
+    repo = head.get("repo") if isinstance(head, dict) else None
+    name = repo.get("full_name") if isinstance(repo, dict) else None
+    if not isinstance(name, str) or not name or head.get("ref") != branch:
         return False
-    name, login = repo.get("name"), owner.get("login")
-    if not isinstance(name, str) or not isinstance(login, str) or not name or not login:
-        return False
-    return f"{login}/{name}".lower() == PROJECT.lower()
+    return name.lower() == PROJECT.lower()
 
 
 def open_pr_for(branch: str) -> bool | None:
     """An open PR from this branch OF THIS REPOSITORY is the durable claim once the lease is
     released (a fork PR with the same head branch name is not). None when the PR list could
-    not be read."""
+    not be read.
+
+    Codex 4240421140: `gh pr list --head` fetched 30 PRs and filtered by branch NAME only, so
+    more than 30 fork PRs from an identically named branch could push the same-repository one
+    out of the answer. The REST `pulls` list takes `head=OWNER:BRANCH`, which names the head
+    repository's owner -- and so this repository's own branch -- directly; every page is read
+    (`--paginate --slurp`) and each PR is still checked to be this repository's."""
+    from urllib.parse import quote
+
+    owner = PROJECT.split("/", 1)[0]
+    head = quote(f"{owner}:{branch}", safe="")
     try:
         out = subprocess.run(
             [
                 "gh",
-                "pr",
-                "list",
-                "--repo",
-                PROJECT,
-                "--head",
-                branch,
-                "--state",
-                "open",
-                "--json",
-                "number,headRepository,headRepositoryOwner,isCrossRepository",
+                "api",
+                f"repos/{PROJECT}/pulls?state=open&head={head}&per_page=100",
+                "--paginate",
+                "--slurp",
             ],
             capture_output=True,
             text=True,
             check=True,
             timeout=GH_TIMEOUT,
         ).stdout
-        prs = json.loads(out or "[]")
+        pages = json.loads(out or "null")
     except (
         OSError,
         subprocess.CalledProcessError,
@@ -2300,9 +2337,10 @@ def open_pr_for(branch: str) -> bool | None:
         json.JSONDecodeError,
     ):
         return None
-    if not isinstance(prs, list):
+    # --slurp wraps the pages in one outer array; any other shape is unreadable, never "no PR".
+    if not isinstance(pages, list) or not all(isinstance(page, list) for page in pages):
         return None
-    return any(_same_repository_pr(pr) for pr in prs)
+    return any(_same_repository_pr(pr, branch) for page in pages for pr in page)
 
 
 def payload_session(payload: dict) -> str:
