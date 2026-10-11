@@ -207,9 +207,12 @@ reusable workflow's `release_lease_on_failure` releases a lease once `prepare` h
 work first, and a run cancelled between `claim` and the end of `prepare` keeps its lease until
 it expires. The pinned reusable workflow re-checks only `trigger_actor`'s permission, not the
 label history; a re-check of the label set inside it is left to the platform's maintainer.
-The cloud routine re-runs `sdlcctl authorize-labeler` as its LAST gate, immediately before
-pushing and after check-diff, the lease check and the final check-request (step 4e of its
-prompt, Codex 4241839918); its residual window is the seconds between that check and the push.
+The cloud routine re-authorizes the labels in its LAST gate, immediately before pushing and
+after check-diff and the lease check: step 4d of its prompt runs ONE command, `sdlcctl
+check-request --expect-digest <digest> --authorize-labels` (Codex 4241839918, 4242264478), which
+judges a single snapshot of the issue by every request and labeler rule and then re-reads the
+issue and its history and requires them unchanged; its residual window is the seconds between
+that command's second read and the push.
 
 ### Other managed files
 
@@ -338,11 +341,19 @@ through a link). `onboard --force` rewrites the policy and drops the confirmatio
   `sdlcctl renew` also re-reads the issue and fails once it is closed or unreadable (Codex
   4241614587), so every renewal is a state check. Step 2 runs `check-request --base
   origin/<default>` (the committed policy) and keeps the `content digest: sha256:...` it
-  prints; step 4d, just before the final authorization, runs it again with `--expect-digest
-  <digest>`: exit 5 when the title or body changed since step 2 (even if a maintainer then
+  prints; step 4d, the final gate run immediately before the push with nothing in between,
+  runs it again with `--expect-digest <digest> --authorize-labels` and the three approval
+  labels: ONE command that reads the issue and its event history once, judges that snapshot by
+  every rule -- exit 5 when the title or body changed since step 2 (even if a maintainer then
   re-applied the labels, which re-authorizes: Codex 4241614582), 4 when a dependency was
-  reopened (Codex 4241614596), 6 when the issue is no longer open -- on anything but 0 the
-  routine releases its lease and stops without pushing. Each run pushes, never forced, to its
+  reopened (Codex 4241614596), 6 when the issue is no longer open, 7 when an approval label was
+  not last applied by a writer after the last edit (the `authorize-labeler` rule) -- then reads
+  the issue and its history again and requires the update time, state, content digest, labels
+  and events unchanged. A changed title or body fails at once (5); any other change is judged
+  afresh from a new snapshot, at most 3 times, then exit 8. Separate digest and labeler checks
+  let an edit plus a label re-apply, or a reopened dependency, land between them and pass both
+  (Codex 4242264478). On anything but 0 the routine releases its lease and stops without
+  pushing. Each run pushes, never forced, to its
   own branch `forge/issue-<N>-<stamp>` (`<stamp>` = `date -u +%Y%m%d%H%M%S`, chosen once before
   the claim and passed to it as `--branch`), so a branch left behind by a run whose PR could not
   be opened never blocks a retry (Codex 4241532615); an abandoned one can be deleted by hand.

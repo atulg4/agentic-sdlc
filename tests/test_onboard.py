@@ -10810,17 +10810,21 @@ def test_cloud_routine_reauthorizes_right_before_publishing():
         "docs/forge/cloud-implementer.md"
     ]
     claim = doc.index("1b. Claim it")
-    # Codex 4241839918: the LAST gate, after check-diff, the lease check and check-request
-    others = [doc.index(f"4{step}. ") for step in "abcd"]
-    again = doc.index("4e. Re-authorize LAST, immediately before pushing")
+    # Codex 4241839918 / 4242264478: the LAST gate, after check-diff and the lease check, is one
+    # command that re-checks the request AND re-authorizes the labels
+    others = [doc.index(f"4{step}. ") for step in "abc"]
+    final = doc.index("4d. The final gate, LAST, immediately before pushing")
     publish = doc.index("5. Push the checked commit at once")
-    assert claim < max(others) < again < publish
-    step = _step(doc, "4e. Re-authorize LAST", "5. Push the checked commit")
-    assert "run the step 1a command again" in step
+    assert claim < max(others) < final < publish
+    assert "4e. " not in doc  # no second check after the final gate
+    step = _step(doc, "4d. The final gate", "5. Push the checked commit")
+    # ONE command decides (the other is the release on failure)
+    assert step.count("`sdlcctl check-request") == 1 and "authorize-labeler" not in step
+    assert "--authorize-labels" in step
     assert "Proceed to step 5 ONLY on exit 0" in step
     assert "do NOT push or open a PR" in step
-    assert "Run nothing between this check and the push" in step
-    assert "runs it AGAIN as the LAST gate" in " ".join(doc.split())
+    assert "run nothing between this check and the push" in step
+    assert "ONE command" in " ".join(doc.split()).split("Suggested routine prompt")[0]
 
 
 def test_authorization_failure_report_names_a_removed_label():
@@ -12202,15 +12206,13 @@ def test_cloud_routine_renews_its_lease_and_verifies_it_before_pushing():
     renew_2 = prompt.index("4a. Renew the lease again, exactly as in step 3a")
     diff = prompt.index("4b. Check the diff policy")
     renew_3 = prompt.index("4c. Verify the lease")
-    final_request = prompt.index("4d. Re-check the request")
-    authorize = prompt.index("4e. Re-authorize LAST")
+    final_gate = prompt.index("4d. The final gate")
     push = prompt.index("5. Push the checked commit")
-    assert implement < renew_1 < verify < renew_2 < diff < renew_3 < final_request
-    assert final_request < authorize < push
+    assert implement < renew_1 < verify < renew_2 < diff < renew_3 < final_gate < push
     step3a = _step(prompt, "3a. Renew the lease", "4. Run each")
     assert renew in step3a
     assert "On any non-zero exit STOP: do NOT push or open a PR" in step3a
-    step4c = _step(prompt, "4c. Verify the lease", "4d. Re-check the request")
+    step4c = _step(prompt, "4c. Verify the lease", "4d. The final gate")
     assert "run the step 3a renew command once more" in step4c
     assert "do NOT push or open a PR" in step4c
     # Codex 4241614587: a renewal is also a state check
@@ -12273,15 +12275,18 @@ def test_cloud_routine_pushes_a_run_specific_branch():
         assert re.search(r"(?:^|/)issue-(\d+)(?:$|[^0-9])", sample)
 
 
-# Codex 4241614596 / 4241614582: the request is checked again right before the final
-# authorization and the push -- dependencies still closed, issue still open, title and body the
-# ones step 2 checked (an edit followed by re-applied labels passes re-authorization, not this).
-def test_cloud_routine_rechecks_the_request_with_its_digest_right_before_pushing():
+# Codex 4241614596 / 4241614582 / 4242264478: the final gate, right before the push, is ONE
+# command: the request re-checked (dependencies still closed, issue still open, title and body
+# the ones step 2 checked) and the labels re-authorized, on one snapshot that a re-read must find
+# unchanged -- two separate commands left a gap an edit plus a label re-apply could land in.
+def test_cloud_routine_final_gate_is_one_command_right_before_pushing():
     import shlex
 
     prompt = _routine_prompt(default_branch="trunk")
-    step = _step(prompt, "4d. Re-check the request", "4e. Re-authorize LAST")
-    command = re.search(r"`(sdlcctl check-request [^`]*)`", step).group(1)
+    step = _step(prompt, "4d. The final gate", "5. Push the checked commit")
+    commands = re.findall(r"`(sdlcctl [^`]*)`", step)
+    assert len(commands) == 2 and commands[1].startswith("sdlcctl release")
+    command = commands[0]
     assert shlex.split(command) == [
         "sdlcctl",
         "check-request",
@@ -12295,28 +12300,52 @@ def test_cloud_routine_rechecks_the_request_with_its_digest_right_before_pushing
         "origin/trunk",
         "--expect-digest",
         "<digest>",
+        "--authorize-labels",
+        "--label",
+        "implementation-approved",
+        "--label",
+        "claude-ready",
+        "--label",
+        "human-review-required",
     ]
     first = re.search(r"`(sdlcctl check-request [^`]*)`", prompt).group(1)
-    assert command == first + " --expect-digest <digest>"  # the step 2 command, plus the digest
-    assert "Continue ONLY on exit 0" in step
+    assert command.startswith(first + " --expect-digest <digest> --authorize-labels")
+    # the same approval set step 1a authorizes before claiming
+    authorize = re.search(r"`(sdlcctl authorize-labeler [^`]*)`", prompt).group(1)
+    assert shlex.split(authorize)[-6:] == shlex.split(command)[-6:]
+    assert "Proceed to step 5 ONLY on exit 0" in step
+    assert "run nothing between this check and the push" in step
     assert "On any other exit do NOT push or open a PR" in step and "sdlcctl release" in step
     assert "Exit 5 means the title or body changed since step 2" in step
+    assert "Exit 7" in step and "Exit 8" in step
     order = [
         prompt.index("2. Check the request"),
         prompt.index("4b. Check the diff policy"),
         prompt.index("4c. Verify the lease"),
-        prompt.index("4d. Re-check the request"),
-        prompt.index("4e. Re-authorize LAST"),
+        prompt.index("4d. The final gate"),
         prompt.index("5. Push the checked commit"),
         prompt.index("git push origin HEAD:refs/heads/<branch>"),
     ]
     assert order == sorted(order)
-    from agentic_sdlc.cli import ISSUE_CLOSED, REQUEST_CHANGED, build_parser
+    assert "4e. " not in prompt
+    from agentic_sdlc.cli import (
+        ISSUE_CLOSED,
+        LABELS_NOT_AUTHORIZED,
+        REQUEST_CHANGED,
+        REQUEST_UNSTABLE,
+        build_parser,
+    )
 
-    assert (REQUEST_CHANGED, ISSUE_CLOSED) == (5, 6)  # the exit codes the prompt names
+    # the exit codes the prompt names
+    assert (REQUEST_CHANGED, ISSUE_CLOSED, LABELS_NOT_AUTHORIZED, REQUEST_UNSTABLE) == (5, 6, 7, 8)
     argv = ["7" if word == "<n>" else word for word in shlex.split(command)[1:]]
     args = build_parser().parse_args(argv)
     assert args.command == "check-request" and args.expect_digest == "<digest>"
+    assert args.authorize_labels and args.label == [
+        "implementation-approved",
+        "claude-ready",
+        "human-review-required",
+    ]
     assert args.base == "origin/trunk"
 
 
