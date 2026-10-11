@@ -55,6 +55,7 @@ from .infra_recovery import (
 from .knowledge import KnowledgeError, load_sources
 from .leases import (
     DEFAULT_TTL_MINUTES,
+    LEASE_BOT_LOGINS_ENV,
     ClaimResult,
     LeaseError,
     authorize_labeler,
@@ -62,9 +63,11 @@ from .leases import (
     claim_inventory,
     issue_event_keys,
     issue_events,
+    publisher_bot_login_problem,
     release,
     render_claims,
     renew,
+    use_policy_bot_logins,
 )
 from .missions import (
     MissionError,
@@ -81,12 +84,14 @@ from .onboard import (
     confirm_cloud_routine,
     copy_variables,
     doctor,
+    installed_bot_login,
     registry_model_vars,
     repository_default_branch,
     repository_fork_exposed,
     resolve_platform_ref,
     reusable_calls,
     run_gh,
+    trusted_hook_python,
     variable_name_problem,
     write_onboarding,
 )
@@ -1123,6 +1128,17 @@ def _onboard(args: argparse.Namespace) -> int:
         if problem:
             raise OnboardError(f"--var {item!r}: the variable name {problem}")
         assignments[key] = value
+    # Codex 4242753917: the Publisher App's bot, the only App bot whose lease markers count.
+    # Not given: a forced re-onboard keeps the installed policy's.
+    bot_login = args.publisher_bot_login
+    if bot_login is None:
+        bot_login = installed_bot_login(destination)
+    elif publisher_bot_login_problem(bot_login):
+        raise OnboardError(f"--publisher-bot-login {publisher_bot_login_problem(bot_login)}")
+    if bot_login and args.apply:
+        assignments.setdefault(LEASE_BOT_LOGINS_ENV, bot_login)
+    # Codex 4242753911: the hooks run an interpreter only root can replace, chosen now.
+    hook_python = trusted_hook_python(args.hook_python)
     # The policy must name the repository as GitHub spells it ($GITHUB_REPOSITORY, compared
     # exactly by prepare-request); --apply reads it anyway. Offline, doctor checks the spelling.
     project_id = canonical_project_id(args.project_id) if args.apply else args.project_id
@@ -1163,6 +1179,8 @@ def _onboard(args: argparse.Namespace) -> int:
         default_branch=default_branch,
         forbidden_paths=tuple(args.forbidden or ()),
         protected_paths=tuple(args.protected or ()),
+        publisher_bot_login=bot_login,
+        hook_python=hook_python,
     )
     written = write_onboarding(destination, spec, force=args.force)
     result: dict[str, Any] = {
@@ -1236,18 +1254,27 @@ def _explicit_lease_policy(args: argparse.Namespace) -> ProjectPolicy | None:
         raise LeaseError(f"--config {args.config} could not be read ({exc})") from exc
 
 
-def _lease_ttl(args: argparse.Namespace) -> int:
-    """`--ttl-minutes`, else the TTL of the policy `--config` names (which must be readable),
-    else -- only when `--config` was omitted -- that of ./agentic-sdlc.toml if it exists, else
-    the default."""
+def _lease_policy(args: argparse.Namespace) -> ProjectPolicy | None:
+    """The policy `--config` names (which must be readable), else -- only when `--config` was
+    omitted -- ./agentic-sdlc.toml if it exists, else None. Its `[automation]
+    publisher_bot_login` becomes the Publisher bot whose lease markers count in this process
+    (FORGE_LEASE_BOT_LOGINS still wins; with neither, no App bot does -- Codex 4242753917)."""
     policy = _explicit_lease_policy(args)
+    if policy is None and args.config is None:
+        config = Path("agentic-sdlc.toml")
+        if config.exists():
+            policy = load_policy(config)
+    use_policy_bot_logins(policy.publisher_bot_login if policy is not None else "")
+    return policy
+
+
+def _lease_ttl(args: argparse.Namespace) -> int:
+    """`--ttl-minutes`, else the TTL of the lease policy (`_lease_policy`), else the default."""
+    policy = _lease_policy(args)
     if args.ttl_minutes is not None:  # an explicit 0 must reach validation, not the default
         return args.ttl_minutes
     if policy is not None:
         return policy.lease_ttl_minutes
-    config = Path("agentic-sdlc.toml")
-    if config.exists():
-        return load_policy(config).lease_ttl_minutes
     return DEFAULT_TTL_MINUTES
 
 
@@ -1291,7 +1318,7 @@ def _renew(args: argparse.Namespace) -> int:
 
 
 def _release(args: argparse.Namespace) -> int:
-    _explicit_lease_policy(args)  # no TTL to read, but a bad explicit --config is still an error
+    _lease_policy(args)  # the Publisher bot; a bad explicit --config is still an error
     release(
         args.project,
         args.issue,
@@ -1340,6 +1367,8 @@ def _authorize_labeler(args: argparse.Namespace) -> int:
 
 
 def _claims(args: argparse.Namespace) -> int:
+    config = Path("agentic-sdlc.toml")  # its Publisher bot (Codex 4242753917), if there is one
+    use_policy_bot_logins(load_policy(config).publisher_bot_login if config.exists() else "")
     inventory = claim_inventory(args.project, run_gh)
     rows = inventory.rows
     _status(render_claims(rows))
@@ -1835,6 +1864,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     onboard.add_argument(
         "--var", action="append", help="repo variable KEY=VALUE to set (repeatable)"
+    )
+    onboard.add_argument(
+        "--publisher-bot-login",
+        help="the Publisher App's bot login, <app-slug>[bot]: the only GitHub App whose lease "
+        "markers count ([automation] publisher_bot_login; with --apply also the "
+        "FORGE_LEASE_BOT_LOGINS variable). Omitted: a forced re-onboard keeps the installed one",
+    )
+    onboard.add_argument(
+        "--hook-python",
+        help="absolute path of the Python 3 the Claude Code hooks run (default: the first of "
+        "/usr/bin/python3, /bin/python3); must be a file only root can replace",
     )
     onboard.add_argument("--output")
     onboard.set_defaults(handler=_onboard)

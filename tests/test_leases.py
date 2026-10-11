@@ -437,7 +437,13 @@ def test_markers_from_untrusted_commenters_are_ignored():
     assert claim(PROJECT, 8, agent="me", session="s2", branch="b", gh=gh, now=NOW).ok
 
 
-def test_markers_from_a_github_app_bot_are_trusted():
+def test_markers_from_the_configured_publisher_bot_are_trusted(monkeypatch):
+    """Codex 4242753917: the Publisher bot counts when named exactly -- by the policy's
+    `publisher_bot_login` (`use_policy_bot_logins`) or FORGE_LEASE_BOT_LOGINS -- and an App
+    bot whose slug merely looks like Forge's never does."""
+    from agentic_sdlc.leases import LEASE_BOT_LOGINS_ENV, use_policy_bot_logins
+
+    monkeypatch.delenv(LEASE_BOT_LOGINS_ENV, raising=False)
     bot_claim = format_claim_marker(
         Lease(7, "forge-actions", "run-1", "b", NOW + timedelta(hours=1))
     )
@@ -447,7 +453,17 @@ def test_markers_from_a_github_app_bot_are_trusted():
             60, bot_claim, "2026-09-30T01:00:00Z", "agentic-sdlc-publisher[bot]", "Bot", "NONE"
         )
     )
-    assert current_lease(PROJECT, 7, gh).session == "run-1"
+    try:
+        use_policy_bot_logins("")
+        assert current_lease(PROJECT, 7, gh, now=NOW) is None  # unset: fail closed
+        use_policy_bot_logins("agentic-sdlc-evil[bot]")
+        assert current_lease(PROJECT, 7, gh, now=NOW) is None  # a look-alike slug
+        use_policy_bot_logins("agentic-sdlc-publisher[bot]")
+        assert current_lease(PROJECT, 7, gh, now=NOW).session == "run-1"
+        monkeypatch.setenv(LEASE_BOT_LOGINS_ENV, "other[bot]")  # the variable wins
+        assert current_lease(PROJECT, 7, gh, now=NOW) is None
+    finally:
+        use_policy_bot_logins("")
 
 
 def test_accepted_expiry_is_bounded_by_the_maximum_ttl():
@@ -1080,10 +1096,12 @@ def test_an_unreadable_permission_refuses_the_lease_read():
     ("login", "kind", "configured", "trusted"),
     [
         ("github-actions[bot]", "Bot", "", True),
-        ("agentic-sdlc-publisher[bot]", "Bot", "", True),
         ("dependabot[bot]", "Bot", "", False),
         ("claude[bot]", "Bot", "", False),
         ("agentic-sdlc-publisher[bot]", "Bot", "my-forge[bot]", False),
+        # Codex 4242753917: nothing configured trusts no App bot, however Forge-like its slug
+        ("agentic-sdlc-publisher[bot]", "Bot", "", False),
+        ("agentic-sdlc[bot]", "Bot", "", False),
         ("my-forge[bot]", "Bot", "my-forge[bot]", True),
         ("github-actions[bot]", "Bot", "my-forge[bot]", True),
         ("agentic-sdlc-publisher[bot]", "User", "", False),  # not actually an App
@@ -1136,7 +1154,6 @@ def test_the_commit_guard_and_leases_make_identical_trust_and_lease_decisions(mo
     for name in (
         "WRITE_PERMISSIONS",
         "GITHUB_ACTIONS_BOT",
-        "PUBLISHER_APP_SLUG_HINT",
         "LEASE_BOT_LOGINS_ENV",
         "MAX_TTL_MINUTES",
     ):
@@ -1467,7 +1484,7 @@ def test_marker_authors_bots_and_the_permission_cache_ignore_login_case(monkeypa
     assert cache("Atulg4") == cache("atulg4") == "admin"
     for configured, login in (
         ("", "GitHub-Actions[bot]"),
-        ("", "Agentic-SDLC-Publisher[BOT]"),
+        ("agentic-sdlc-publisher[bot]", "Agentic-SDLC-Publisher[BOT]"),
         ("My-Forge[bot]", "my-forge[BOT]"),
     ):
         monkeypatch.setenv(LEASE_BOT_LOGINS_ENV, configured)
@@ -3388,3 +3405,56 @@ def test_the_lease_ttl_comes_from_the_named_config_else_the_default(tmp_path, mo
     assert cli._lease_ttl(argparse.Namespace(ttl_minutes=None, config=None)) == 240
     (tmp_path / "agentic-sdlc.toml").write_text(_POLICY.replace("30", "45"))
     assert cli._lease_ttl(argparse.Namespace(ttl_minutes=None, config=None)) == 45
+
+
+def test_the_guard_trusts_the_publisher_bot_onboard_rendered_into_it(monkeypatch, tmp_path):
+    """Codex 4242753917: the cloud session's guard reads no policy at run time; onboard renders
+    the policy's `publisher_bot_login` into it, and an unset one trusts no App bot."""
+    import importlib.util
+
+    from agentic_sdlc.leases import LEASE_BOT_LOGINS_ENV
+    from agentic_sdlc.onboard import OnboardSpec, render_hooks
+
+    monkeypatch.delenv(LEASE_BOT_LOGINS_ENV, raising=False)
+    row = _comment_row(1, "", NOW.isoformat(), "my-forge[bot]", "Bot", "NONE")
+    for login, trusted in (("my-forge[bot]", True), ("", False), ("other[bot]", False)):
+        text = render_hooks(
+            OnboardSpec(
+                project_id=PROJECT,
+                platform_repository="owner/agentic-sdlc",
+                platform_ref="e" * 40,
+                test_command="pytest",
+                publisher_bot_login=login,
+            )
+        )[".claude/hooks/forge_commit_guard.py"]
+        path = tmp_path / f"guard_{len(login)}.py"
+        path.write_text(text)
+        spec = importlib.util.spec_from_file_location(path.stem, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        assert module.trusted_marker_author(row, lambda _: None) is trusted, login
+
+
+def test_the_lease_commands_take_the_publisher_bot_from_the_policy(tmp_path, monkeypatch):
+    import argparse
+
+    from agentic_sdlc import cli, leases
+
+    policy = tmp_path / "agentic-sdlc.toml"
+    policy.write_text(
+        'version = 1\n[project]\nid = "owner/repo"\n'
+        '[automation]\npublisher_bot_login = "my-forge[bot]"\n'
+    )
+    monkeypatch.delenv(leases.LEASE_BOT_LOGINS_ENV, raising=False)
+    try:
+        cli._lease_policy(argparse.Namespace(config=str(policy)))
+        assert leases.configured_bot_logins() == "my-forge[bot]"
+        monkeypatch.chdir(tmp_path)  # omitted --config: ./agentic-sdlc.toml
+        leases.use_policy_bot_logins("")
+        cli._lease_policy(argparse.Namespace(config=None))
+        assert leases.configured_bot_logins() == "my-forge[bot]"
+        policy.write_text(policy.read_text().replace("my-forge[bot]", "agentic-sdlc"))
+        with pytest.raises(LeaseError):
+            cli._lease_policy(argparse.Namespace(config=str(policy)))
+    finally:
+        leases.use_policy_bot_logins("")

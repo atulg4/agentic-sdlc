@@ -28,6 +28,7 @@ from agentic_sdlc.onboard import (
     copy_variables,
     doctor,
     merged_ruleset,
+    render_hooks,
     render_onboarding,
     repository_default_branch,
     resolve_platform_ref,
@@ -49,6 +50,7 @@ def spec(**overrides) -> OnboardSpec:
         test_command="pytest tests -q -m 'not e2e'",
         forbidden_paths=("data/**", "*.png"),
         protected_paths=("comicmaestro/app.py",),
+        publisher_bot_login="agentic-sdlc-publisher[bot]",
     )
     base.update(overrides)
     return OnboardSpec(**base)
@@ -3181,13 +3183,22 @@ def _settings(repo: Path, data) -> None:
     (repo / ".claude/settings.json").write_text(data if isinstance(data, str) else json.dumps(data))
 
 
-def _hook(script: str, command: str | None = None) -> dict:
-    """A handler running `script`; the Forge guard's carries the fail-closed fields onboard
-    writes (Codex 4242373515), so only what a test changes differs from the generated one."""
-    if command is None and script == "forge_commit_guard.py":
-        from agentic_sdlc.onboard import forge_hook_entry
+def _forge_entry(event: str, **spec_overrides) -> dict:
+    """The handler onboard writes for `event` in a repository onboarded with `spec()`: its
+    script's SHA-256 pinned, the vetted interpreter (Codex 4242753911, 4242753904)."""
+    from agentic_sdlc.onboard import HOOK_SCRIPTS, forge_hook_entry, hook_script_digest
 
-        return forge_hook_entry("PreToolUse")
+    script = render_hooks(spec(**spec_overrides))[HOOK_SCRIPTS[event]]
+    return forge_hook_entry(event, hook_script_digest(script))
+
+
+def _hook(script: str, command: str | None = None) -> dict:
+    """A handler running `script`; a Forge script's is exactly the generated one (fail-closed
+    fields, pinned interpreter and hash), so only what a test changes differs from it."""
+    if command is None and script == "forge_commit_guard.py":
+        return _forge_entry("PreToolUse")
+    if command is None and script == "forge_session_start.py":
+        return _forge_entry("SessionStart")
     return {
         "type": "command",
         "command": command or f'python3 "$CLAUDE_PROJECT_DIR/.claude/hooks/{script}"',
@@ -3258,7 +3269,15 @@ def test_doctor_accepts_equivalent_hook_configurations(tmp_path):
                 "SessionStart": [
                     {
                         "matcher": "startup|resume",
-                        "hooks": [_hook("x", 'python3 "$CLAUDE_PROJECT_DIR"/' + HOOK_START)],
+                        "hooks": [
+                            _hook(
+                                "x",
+                                _forge_entry("SessionStart")["command"].replace(
+                                    '"${CLAUDE_PROJECT_DIR}/' + HOOK_START + '"',
+                                    '"$CLAUDE_PROJECT_DIR"/' + HOOK_START,
+                                ),
+                            )
+                        ],
                     }
                 ],
                 "PreToolUse": [
@@ -3425,11 +3444,9 @@ def test_doctor_requires_the_automatic_callers_to_trigger_on_labeled_issues(tmp_
     repo = _repo(tmp_path)
     write_onboarding(repo, spec())
     path = repo / ".github/workflows" / name
-    path.write_text(
-        path.read_text().replace(
-            "  issues:\n    types: [labeled, unlabeled, edited]\n", "  workflow_dispatch:\n"
-        )
-    )
+    text = path.read_text()
+    path.write_text(re.sub(r"  issues:\n    types: \[[^\]]*\]\n", "  workflow_dispatch:\n", text))
+    assert path.read_text() != text
     failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
     assert name in failed["automatic callers trigger on issue labels"].detail
     path.write_text(path.read_text().replace("  workflow_dispatch:\n", "  issues:\n"))
@@ -4694,7 +4711,7 @@ def test_doctor_requires_each_forge_hook_to_be_exactly_the_generated_handler(
     _settings(repo, settings)
     failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
     detail = failed["required files present"].detail
-    assert f"{event} hook running python3" in detail and next(iter(extra)) in detail
+    assert f"{event} hook running" in detail and next(iter(extra)) in detail
 
 
 def test_doctor_rejects_an_async_guard_even_beside_a_synchronous_one(tmp_path):
@@ -4728,31 +4745,38 @@ def test_doctor_allows_unrelated_hooks_with_any_fields(tmp_path):
 
 
 def test_rendered_hooks_are_the_handlers_doctor_compares_against():
-    from agentic_sdlc.onboard import HOOK_SCRIPTS, forge_hook_entry
+    from agentic_sdlc.onboard import HOOK_SCRIPTS
 
     settings = json.loads(render_onboarding(spec())[".claude/settings.json"])
     for event in HOOK_SCRIPTS:
-        assert settings["hooks"][event][0]["hooks"] == [forge_hook_entry(event)]
+        assert settings["hooks"][event][0]["hooks"] == [_forge_entry(event)]
 
 
 def test_rendered_hooks_are_anchored_at_the_project_and_the_guard_fails_closed():
     """Codex 4242373510: the script is named under ${CLAUDE_PROJECT_DIR}, so a `cd` in the
     session cannot break it. Codex 4242373515: the guard blocks when it cannot run --
     `onFailure: "block"`, an explicit timeout above its own deadline, and `|| exit 2`."""
-    settings = json.loads(render_onboarding(spec())[".claude/settings.json"])
+    from agentic_sdlc.onboard import HOOK_LOADER, hook_script_digest
+
+    files = render_onboarding(spec())
+    settings = json.loads(files[".claude/settings.json"])
     start = settings["hooks"]["SessionStart"][0]["hooks"][0]
     guard = settings["hooks"]["PreToolUse"][0]["hooks"][0]
+    run = f"FORGE_SESSION_PATH=\"$PATH\" PATH=/usr/bin:/bin /usr/bin/python3 -I -c '{HOOK_LOADER}'"
     assert start == {
         "type": "command",
-        "command": 'python3 "${CLAUDE_PROJECT_DIR}/.claude/hooks/forge_session_start.py"',
+        "command": f'{run} "${{CLAUDE_PROJECT_DIR}}/{HOOK_START}" '
+        + hook_script_digest(files[HOOK_START]),
     }
     assert guard == {
         "type": "command",
-        "command": 'python3 "${CLAUDE_PROJECT_DIR}/.claude/hooks/forge_commit_guard.py" || exit 2',
+        "command": f'{run} "${{CLAUDE_PROJECT_DIR}}/{HOOK_GUARD}" '
+        + hook_script_digest(files[HOOK_GUARD])
+        + " || exit 2",
         "timeout": 300,
         "onFailure": "block",
     }
-    guard_source = render_onboarding(spec())[".claude/hooks/forge_commit_guard.py"]
+    guard_source = files[".claude/hooks/forge_commit_guard.py"]
     deadline = int(re.search(r"(?m)^GUARD_DEADLINE = (\d+)$", guard_source).group(1))
     assert deadline < guard["timeout"]
 
@@ -4793,12 +4817,12 @@ def test_the_guard_fails_closed_on_its_own_crash_or_deadline(tmp_path, monkeypat
     ],
 )
 def test_doctor_rejects_a_guard_hook_that_fails_open(tmp_path, change, why):
-    from agentic_sdlc.onboard import forge_hook_entry, hook_problems
+    from agentic_sdlc.onboard import hook_problems
 
     repo = _repo(tmp_path)
     write_onboarding(repo, spec())
     path = repo / ".claude/settings.json"
-    entry = {**forge_hook_entry("PreToolUse"), **change}
+    entry = {**_forge_entry("PreToolUse"), **change}
     entry = {k: v for k, v in entry.items() if v is not None}
     settings = json.loads(path.read_text())
     settings["hooks"]["PreToolUse"] = [{"matcher": "Bash", "hooks": [entry]}]
@@ -9168,7 +9192,7 @@ def test_forced_onboard_refuses_an_edited_guide_rather_than_delete_notes(tmp_pat
 def test_forced_onboard_merges_claude_settings(tmp_path):
     """Codex 4239780830: permissions and unrelated hooks in `.claude/settings.json` survive a
     forced re-onboard; Forge's own handlers are written once, exactly."""
-    from agentic_sdlc.onboard import HOOK_SCRIPTS, forge_hook_entry, hook_problems
+    from agentic_sdlc.onboard import HOOK_SCRIPTS, hook_problems
 
     repo = _repo(tmp_path)
     write_onboarding(repo, spec())
@@ -9184,7 +9208,7 @@ def test_forced_onboard_merges_claude_settings(tmp_path):
         {
             "matcher": "Bash",
             "hooks": [
-                {**forge_hook_entry("PreToolUse"), "async": True},
+                {**_forge_entry("PreToolUse"), "async": True},
                 {"type": "command", "command": "./audit.sh"},
             ],
         }
@@ -10883,7 +10907,7 @@ APPROVAL_SET = [IMPLEMENTATION_LABEL, "claude-ready", "human-review-required"]
 def test_auto_implement_label_removal_cancels_the_authorized_run():
     rendered = render_onboarding(spec())[".github/workflows/agent-auto-implement.yml"]
     doc = yaml.safe_load(rendered)
-    assert doc[True]["issues"]["types"] == ["labeled", "unlabeled", "edited"]
+    assert doc[True]["issues"]["types"] == ["labeled", "unlabeled", "edited", "closed"]
     group, cancel = doc["concurrency"]["group"], doc["concurrency"]["cancel-in-progress"]
     condition = doc["jobs"]["authorize"]["if"]
     shared = "forge-auto-implement-7"
@@ -10903,6 +10927,11 @@ def test_auto_implement_label_removal_cancels_the_authorized_run():
     assert _actions_expr(group, "edited", None, APPROVAL_SET) == shared
     assert _actions_expr(cancel, "edited", None, APPROVAL_SET) is True
     assert _actions_expr(condition, "edited", None, APPROVAL_SET) is False
+    # Codex 4242753923: closing the issue cancels the implementation, and the `closed` run
+    # starts nothing even though a closed issue keeps its approval labels
+    assert _actions_expr(group, "closed", None, APPROVAL_SET) == shared
+    assert _actions_expr(cancel, "closed", None, APPROVAL_SET) is True
+    assert _actions_expr(condition, "closed", None, APPROVAL_SET) is False
     # the lease's own `in-progress` label (and any other) never cancels the work
     for action in ("labeled", "unlabeled"):
         for label in ("in-progress", "bug"):
@@ -10949,23 +10978,30 @@ def test_doctor_requires_the_label_removal_cancellation(tmp_path, name):
     write_onboarding(repo, spec())
     path = repo / ".github/workflows" / name
     text = path.read_text()
-    for weak in (
+    original = re.search(r"cancel-in-progress: .*?\}\}", text, re.DOTALL).group(0)
+    weaker = [
         "cancel-in-progress: false",
         # Codex 4241196649: an edit must cancel too
         "cancel-in-progress: ${{ github.event.action == 'unlabeled' }}",
-    ):
-        weakened = text.replace(
+    ]
+    if name == "agent-auto-implement.yml":  # Codex 4242753923: and closing the issue
+        weaker.append(
             "cancel-in-progress: "
-            "${{ github.event.action == 'unlabeled' || github.event.action == 'edited' }}",
-            weak,
+            "${{ github.event.action == 'unlabeled' || github.event.action == 'edited' }}"
         )
+    for weak in weaker:
+        weakened = text.replace(original, weak)
         assert weakened != text
         path.write_text(weakened)
         failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
         detail = failed["managed workflows match the generated templates"].detail
         assert name in detail and "concurrency" in detail
-    for types in ("types: [labeled]", "types: [labeled, unlabeled]"):
-        path.write_text(text.replace("types: [labeled, unlabeled, edited]", types))
+    types_line = re.search(r"types: \[[^\]]*\]", text).group(0)
+    weaker_types = ["types: [labeled]", "types: [labeled, unlabeled]"]
+    if name == "agent-auto-implement.yml":
+        weaker_types.append("types: [labeled, unlabeled, edited]")
+    for types in weaker_types:
+        path.write_text(text.replace(types_line, types))
         failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
         assert name in failed["managed workflows match the generated templates"].detail
 
@@ -12927,3 +12963,254 @@ def test_default_branch_rejects_only_what_the_platform_shell_sink_cannot_carry(b
     )
     with pytest.raises(ValueError, match="reusable-implement.yml"):
         load_policy(policy)
+
+
+# ---- Codex 4242753911 / 4242753904: the hooks run a vetted interpreter on pinned bytes
+
+SYSTEM_PYTHON = "/usr/bin/python3"
+needs_system_python = pytest.mark.skipif(
+    not os.path.exists(SYSTEM_PYTHON) or sys.platform == "win32",
+    reason="the hook handlers run /usr/bin/python3",
+)
+
+
+def _run_hook(repo: Path, command: str, stdin: str = "{}", path: str | None = None):
+    import subprocess
+
+    env = {
+        "CLAUDE_PROJECT_DIR": str(repo),
+        "PATH": path if path is not None else os.environ.get("PATH", ""),
+        "HOME": os.environ.get("HOME", "/"),
+    }
+    return subprocess.run(
+        ["/bin/sh", "-c", command],
+        input=stdin,
+        text=True,
+        capture_output=True,
+        env=env,
+        cwd=repo,
+        timeout=120,
+    )
+
+
+@needs_system_python
+def test_the_hook_loader_runs_the_pinned_script_isolated_with_the_session_path(tmp_path):
+    """The handler runs the vetted interpreter in isolated mode on exactly the bytes whose
+    SHA-256 it pins, as `__main__`, and hands the script the session's own PATH."""
+    from agentic_sdlc.onboard import forge_hook_entry, hook_script_digest
+
+    repo = _repo(tmp_path)
+    script = repo / HOOK_GUARD
+    script.parent.mkdir(parents=True)
+    script.write_text(
+        "import json, os, sys\n"
+        "print(json.dumps({'name': __name__, 'file': __file__, 'argv': sys.argv,\n"
+        "  'isolated': sys.flags.isolated, 'path': os.environ['PATH'],\n"
+        "  'leak': 'FORGE_SESSION_PATH' in os.environ, 'stdin': sys.stdin.read()}))\n"
+        "sys.exit(0)\n"
+    )
+    entry = forge_hook_entry("PreToolUse", hook_script_digest(script.read_bytes()))
+    done = _run_hook(repo, entry["command"], stdin="payload", path="/session/bin:/usr/bin")
+    assert done.returncode == 0, done.stderr
+    seen = json.loads(done.stdout)
+    assert seen == {
+        "name": "__main__",
+        "file": str(script),
+        "argv": [str(script)],
+        "isolated": 1,
+        "path": "/session/bin:/usr/bin",
+        "leak": False,
+        "stdin": "payload",
+    }
+
+
+@needs_system_python
+def test_a_tampered_hook_script_or_a_planted_python3_cannot_pass_the_guard(tmp_path):
+    """Codex 4242753904: a guard whose bytes are not the pinned ones is refused (exit 2, which
+    blocks) before any of it runs. Codex 4242753911: a `python3` planted in a writable PATH
+    entry is never the interpreter."""
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    command = json.loads((repo / ".claude/settings.json").read_text())["hooks"]["PreToolUse"][0][
+        "hooks"
+    ][0]["command"]
+    planted = tmp_path / "bin"
+    planted.mkdir()
+    (planted / "python3").write_text("#!/bin/sh\nexit 0\n")
+    (planted / "python3").chmod(0o755)
+    guard = repo / HOOK_GUARD
+    guard.write_text("import sys\nsys.exit(0)\n")
+    done = _run_hook(repo, command, path=f"{planted}:/usr/bin:/bin")
+    assert done.returncode == 2
+    assert "is not the copy onboard installed" in done.stderr
+    guard.unlink()
+    assert _run_hook(repo, command, path=f"{planted}:/usr/bin:/bin").returncode == 2
+
+
+@needs_system_python
+def test_the_installed_guard_runs_through_the_loader_and_allows_a_harmless_command(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    command = json.loads((repo / ".claude/settings.json").read_text())["hooks"]["PreToolUse"][0][
+        "hooks"
+    ][0]["command"]
+    payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}, "cwd": str(repo)})
+    done = _run_hook(repo, command, stdin=payload)
+    assert done.returncode == 0, done.stderr
+
+
+def test_doctor_rejects_an_unpinned_a_stale_or_an_untrusted_hook_handler(tmp_path):
+    from agentic_sdlc.onboard import forge_hook_entry, hook_problems
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    path = repo / ".claude/settings.json"
+    good = path.read_text()
+    assert hook_problems(path) == []
+    guard = _forge_entry("PreToolUse")
+    fake = tmp_path / "python3"
+    fake.write_text("#!/bin/sh\nexit 0\n")
+    fake.chmod(0o755)
+    cases = {
+        # the pre-4242753911 handler: python3 resolved through the session's PATH
+        "found on PATH": {
+            **guard,
+            "command": f'python3 "${{CLAUDE_PROJECT_DIR}}/{HOOK_GUARD}" || exit 2',
+        },
+        "pinned SHA-256": forge_hook_entry("PreToolUse", "0" * 64),
+        "untrusted interpreter": forge_hook_entry(
+            "PreToolUse", guard["command"].split()[-4], str(fake)
+        ),
+    }
+    for why, entry in cases.items():
+        settings = json.loads(good)
+        settings["hooks"]["PreToolUse"] = [{"matcher": "Bash", "hooks": [entry]}]
+        path.write_text(json.dumps(settings))
+        problems = " ".join(hook_problems(path))
+        assert why in problems, (why, problems)
+    # the script changed under an intact handler: the hash no longer matches
+    path.write_text(good)
+    (repo / HOOK_GUARD).write_text("import sys\nsys.exit(0)\n")
+    assert "pinned SHA-256" in " ".join(hook_problems(path))
+
+
+def test_onboard_refuses_an_untrusted_hook_interpreter(tmp_path, monkeypatch):
+    from agentic_sdlc import onboard as module
+
+    fake = tmp_path / "python3"
+    fake.write_text("#!/bin/sh\nexit 0\n")
+    fake.chmod(0o755)
+    with pytest.raises(OnboardError, match="--hook-python"):
+        module.trusted_hook_python(str(fake))
+    with pytest.raises(OnboardError, match="absolute path"):
+        module.trusted_hook_python("python3")
+    monkeypatch.setattr(module, "HOOK_PYTHON_CANDIDATES", (str(tmp_path / "none"), str(fake)))
+    with pytest.raises(OnboardError, match="no trusted interpreter for the Claude Code hooks"):
+        module.trusted_hook_python()
+    repo = _repo(tmp_path)
+    with pytest.raises(OnboardError, match="hook interpreter"):
+        write_onboarding(repo, spec(hook_python=str(fake)))
+    assert not (repo / ".claude").exists()  # refused before anything was written
+
+
+@needs_system_python
+def test_the_default_hook_interpreter_is_the_vetted_system_python():
+    from agentic_sdlc.onboard import hook_python_problem, trusted_hook_python
+
+    if hook_python_problem(SYSTEM_PYTHON):
+        pytest.skip(f"{SYSTEM_PYTHON} is not root-owned here")
+    assert trusted_hook_python() == SYSTEM_PYTHON
+    assert trusted_hook_python(SYSTEM_PYTHON) == SYSTEM_PYTHON
+
+
+# ---- Codex 4242753917: lease markers trust the exact Publisher bot
+
+
+def test_onboard_records_the_publisher_bot_in_the_policy_and_the_guard():
+    files = render_onboarding(spec())
+    policy = tomllib.loads(files["agentic-sdlc.toml"])
+    assert policy["automation"]["publisher_bot_login"] == "agentic-sdlc-publisher[bot]"
+    assert _policy_bot_of(files["agentic-sdlc.toml"]) == "agentic-sdlc-publisher[bot]"
+    guard = files[HOOK_GUARD]
+    assert 'PUBLISHER_BOT_LOGINS = "agentic-sdlc-publisher[bot]"' in guard
+    none = render_onboarding(spec(publisher_bot_login=""))
+    assert 'PUBLISHER_BOT_LOGINS = ""' in none[HOOK_GUARD]
+    for bad in ("agentic-sdlc", "Agentic[bot]", "x[bot] ", "a b[bot]"):
+        with pytest.raises(OnboardError, match="publisher_bot_login"):
+            spec(publisher_bot_login=bad)
+
+
+def _policy_bot_of(text: str) -> str:
+    from agentic_sdlc.policy import load_policy_bytes
+
+    return load_policy_bytes(text.encode()).publisher_bot_login
+
+
+def test_doctor_requires_the_publisher_bot_in_actions_mode_only(tmp_path):
+    from agentic_sdlc.onboard import LEASE_BOT_CHECK
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(publisher_bot_login=""))
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert "publisher_bot_login is empty" in failed[LEASE_BOT_CHECK].detail
+    write_onboarding(repo, spec(), force=True)
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    assert LEASE_BOT_CHECK not in _failed(report)
+    cloud = _repo(tmp_path / "cloud")
+    write_onboarding(
+        cloud,
+        spec(implementer="cloud-routine", runs_on=("ubuntu-latest",), publisher_bot_login=""),
+    )
+    report = doctor(cloud, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    assert LEASE_BOT_CHECK not in _failed(report)
+
+
+def test_a_forced_reonboard_keeps_the_installed_publisher_bot(tmp_path):
+    from agentic_sdlc.onboard import installed_bot_login
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    assert installed_bot_login(repo) == "agentic-sdlc-publisher[bot]"
+    assert installed_bot_login(tmp_path / "nowhere") == ""
+
+
+def test_remote_doctor_requires_the_bot_to_be_the_publisher_apps(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(publisher_bot_login="other-app[bot]"))
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh()))
+    detail = failed["lease bot login is the Publisher App's"].detail
+    assert "other-app[bot]" in detail and "agentic-sdlc-publisher[bot]" in detail
+    write_onboarding(repo, spec(), force=True)
+    gh = _healthy_gh()
+    gh.answers["api repos/owner/comic/actions/variables"] = json.dumps(
+        [
+            {
+                "total_count": 2,
+                "variables": [
+                    {"name": "PUBLISHER_APP_CLIENT_ID", "value": "publisher_app_client_id-value"},
+                    {"name": "FORGE_LEASE_BOT_LOGINS", "value": "someone-else[bot]"},
+                ],
+            }
+        ]
+    )
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))
+    assert (
+        "FORGE_LEASE_BOT_LOGINS variable" in failed["lease bot login is the Publisher App's"].detail
+    )
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh())
+    assert report.ok, report.render()
+
+
+def test_onboard_cli_validates_and_records_the_publisher_bot(tmp_path):
+    from agentic_sdlc import cli
+
+    repo = _repo(tmp_path)
+    base = ["onboard", "--destination", str(repo), "--project-id", "owner/comic"]
+    base += ["--platform-repository", "owner/agentic-sdlc", "--platform-ref", SHA]
+    base += ["--test", "pytest -q", "--visibility", "private", "--output", str(tmp_path / "o")]
+    assert cli.main([*base, "--publisher-bot-login", "agentic-sdlc"]) == 2
+    assert not (repo / "agentic-sdlc.toml").exists()
+    assert cli.main([*base, "--publisher-bot-login", "my-forge[bot]"]) == 0
+    assert load_policy(repo / "agentic-sdlc.toml").publisher_bot_login == "my-forge[bot]"
+    assert cli.main([*base, "--force"]) == 0  # kept without the flag
+    assert load_policy(repo / "agentic-sdlc.toml").publisher_bot_login == "my-forge[bot]"

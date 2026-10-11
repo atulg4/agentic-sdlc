@@ -35,8 +35,10 @@ in a marker comment (a release ``note``) has its ``<!--``/``-->`` escaped (``san
 
 Markers count only from authors who can write to the repository (``trusted_marker_author``): a
 user whose repository permission is write/maintain/admin, `github-actions[bot]`, or the Forge
-Publisher App's bot. ``author_association`` is not authority (a read-only organization member
-comments as MEMBER). The commit-guard hook mirrors the same rule.
+Publisher App's bot, named exactly (FORGE_LEASE_BOT_LOGINS or the policy's
+``[automation] publisher_bot_login``; with neither, no other App bot).
+``author_association`` is not authority (a read-only organization member comments as MEMBER).
+The commit-guard hook mirrors the same rule.
 """
 
 from __future__ import annotations
@@ -59,12 +61,15 @@ MAX_TTL_MINUTES = 7 * 24 * 60  # policy.lease_ttl_minutes maximum
 #: Repository permissions (`permission` or `role_name` of the collaborator permission API) whose
 #: holders may post lease markers.
 WRITE_PERMISSIONS = frozenset({"admin", "maintain", "write"})
-#: The only GitHub App bots whose markers count: Actions' own token, and the Forge Publisher App
-#: (its slug carries this hint, the same rule `sdlcctl doctor` identifies the App by). Name the
-#: Publisher bot exactly with FORGE_LEASE_BOT_LOGINS (comma-separated) to replace the hint rule.
+#: The only GitHub App bots whose markers count: Actions' own token, and the Forge Publisher
+#: App's bot, named EXACTLY (Codex 4242753917): FORGE_LEASE_BOT_LOGINS (comma-separated) when
+#: set, else the policy's `[automation] publisher_bot_login` (`use_policy_bot_logins`). With
+#: neither, no other App bot is trusted -- never one whose slug merely looks like Forge's.
 GITHUB_ACTIONS_BOT = "github-actions[bot]"
-PUBLISHER_APP_SLUG_HINT = "agentic-sdlc"
 LEASE_BOT_LOGINS_ENV = "FORGE_LEASE_BOT_LOGINS"
+#: A GitHub App's bot login: `<app-slug>[bot]` (App slugs are lowercase).
+PUBLISHER_BOT_LOGIN = re.compile(r"^[a-z0-9][a-z0-9-]*\[bot\]$")
+_POLICY_BOT_LOGINS: list[str] = [""]  # the policy's publisher_bot_login for this process
 _LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
 CLAIM_MARKER = "forge-claim"
 RELEASE_MARKER = "forge-release"
@@ -286,18 +291,35 @@ def same_login(a: object, b: object) -> bool:
     return login_key(a) == login_key(b)
 
 
+def publisher_bot_login_problem(value: object) -> str:
+    """Why `value` is not a Publisher App bot login (`<app-slug>[bot]`; '' = it is)."""
+    if not isinstance(value, str) or not PUBLISHER_BOT_LOGIN.fullmatch(value):
+        return f"must be the Publisher App's bot login, `<app-slug>[bot]` (got {value!r})"
+    return ""
+
+
+def use_policy_bot_logins(login: str) -> None:
+    """Record the policy's `[automation] publisher_bot_login` for this process: the Publisher
+    bot `trusted_bot` names when FORGE_LEASE_BOT_LOGINS is unset ('' = none)."""
+    _POLICY_BOT_LOGINS[0] = login or ""
+
+
+def configured_bot_logins() -> str:
+    """The exact Publisher bot logins in force: FORGE_LEASE_BOT_LOGINS, else the policy's."""
+    return os.environ.get(LEASE_BOT_LOGINS_ENV, "") or _POLICY_BOT_LOGINS[0]
+
+
 def trusted_bot(login: str, configured: str | None = None) -> bool:
-    """`github-actions[bot]`, or the Publisher App's bot: the logins in FORGE_LEASE_BOT_LOGINS
-    when set, else a `<slug>[bot]` whose slug carries PUBLISHER_APP_SLUG_HINT. No other bot."""
+    """`github-actions[bot]`, or a Publisher App bot named exactly by `configured` (default:
+    `configured_bot_logins()`). Nothing configured: no other bot (fail closed, Codex
+    4242753917) -- an App bot's markers are then ignored, never trusted on a name hint."""
     login = login_key(login)
     if login == login_key(GITHUB_ACTIONS_BOT):
         return True
     if configured is None:
-        configured = os.environ.get(LEASE_BOT_LOGINS_ENV, "")
+        configured = configured_bot_logins()
     named = {login_key(part) for part in configured.split(",") if part.strip()}
-    if named:
-        return login in named
-    return login.endswith("[bot]") and PUBLISHER_APP_SLUG_HINT in login[: -len("[bot]")]
+    return login.endswith("[bot]") and login in named
 
 
 def trusted_marker_author(

@@ -188,9 +188,13 @@ refuses all three leaves the marker live until its TTL (logged). A failed renewa
 retracted: the session held the lease before it.
 Expired leases can be taken over (the takeover is commented). Markers count only when posted by
 a user whose repository permission (read per run from the collaborator permission API) is
-write, maintain or admin, by `github-actions[bot]`, or by the Forge Publisher App's bot (a
-`<slug>[bot]` whose slug contains `agentic-sdlc`, or exactly the logins in
-`FORGE_LEASE_BOT_LOGINS`); `author_association` is not trusted (a read-only member comments as
+write, maintain or admin, by `github-actions[bot]`, or by the Forge Publisher App's bot named
+EXACTLY -- the policy's `[automation] publisher_bot_login` (`sdlcctl onboard
+--publisher-bot-login <app-slug>[bot]`, which with `--apply` also sets the
+`FORGE_LEASE_BOT_LOGINS` repository variable), or `FORGE_LEASE_BOT_LOGINS` in the environment,
+which takes precedence. With neither, no App bot's markers count (fail closed; in Actions mode
+the Publisher App's own claims are then ignored, and doctor fails until the login is set);
+`author_association` is not trusted (a read-only member comments as
 MEMBER) and an unreadable permission is untrusted. An expiry is capped at post time + 7 days, so
 an outside or read-only commenter cannot forge or free a lease; the commit guard applies the same
 rule. `reusable-implement.yml` claims as the last
@@ -203,6 +207,17 @@ read-only ones (deny by default) on `*/issue-N` branches unless the session hold
 guard also blocks when its hook payload cannot be read (not JSON, truncated, not an object, no
 tool name, a Bash call without a string command); only a payload shown to be another tool passes
 unread.
+
+The hooks run a Python interpreter `onboard` vetted (`/usr/bin/python3`, else `/bin/python3`, or
+`--hook-python`: a file only root can replace) by absolute path, isolated (`-I`), under a fixed
+PATH -- never `python3` looked up on the session's PATH, where a planted copy could stand in for
+the guard -- and each handler pins its script's SHA-256, refusing (exit 2) to run a modified copy.
+**Trust boundary:** these hooks are a guardrail against mistakes and casual misuse, not a
+sandbox. Claude Code runs them as the same user as the agent, from the agent-writable checkout:
+an agent that can write files can equally rewrite `.claude/settings.json` (handler and hash
+together) or the hook script, and no local, same-user hook can prevent that. What enforces the
+workflow is server-side: the `Protect main` ruleset, required review, and Publisher-only pushes.
+Do not treat a local hook as the control that stops a determined agent.
 
 ### Generic profile: `sdlcctl scaffold`
 
