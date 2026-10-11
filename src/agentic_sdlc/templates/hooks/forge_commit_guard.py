@@ -114,8 +114,10 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
+import tempfile
 from datetime import UTC, datetime, timedelta
 
 PROJECT = "PROJECT_ID"
@@ -1177,7 +1179,12 @@ def _commit_targets(argv: list[str], depth: int = 0, cwd: str | None = None) -> 
             if refs:
                 return target + [_with_ref(target[0], ref) for ref in refs]
         reason = _helper_reason(
-            word, rest, _where(cwd, chdirs), target[0], bare_git="/" not in words[0]
+            word,
+            rest,
+            _where(cwd, chdirs),
+            target[0],
+            bare_git="/" not in words[0],
+            program=words[0],
         )
         if reason:  # Codex 4239667542: configuration can make it run a program
             _HELPER_NOTES[reason] = None
@@ -1610,6 +1617,271 @@ def _ref_free_fanout(words: list[str]) -> bool:
     return False
 
 
+# ---- The guard's OWN programs (Codex 4242095555, 4242095556). Every git and gh this hook runs
+# for itself -- the branch probe (`current_branch`), the configuration, exec-path, hooks and ref
+# reads (`_git_in`, `_branch_exists`), and the lease, permission and open-PR reads (`_gh`) --
+# runs a VETTED ABSOLUTE program, never a PATH lookup: with a writable PATH entry ahead of the
+# system copy, an agent could drop a `git` that reports `main` for the probe (while its own
+# `git commit` delegates to /usr/bin/git) or a `gh` that fabricates a trusted-bot claim for its
+# session, and the guard would let the write through. The rule mirrors the library's
+# `trusted_exec` (this template is standalone, so it keeps its own copy): a program is trusted
+# only when only root can change what runs -- the file and every directory on the way to it (each
+# prefix of the path as written, its resolved form, and every ancestor of both) is owned by root,
+# has no group or other write bit and, for a non-root user, is not writable by this user. The
+# known system locations are tried first; PATH (absolute entries only) only for a non-root user,
+# because when this hook runs AS root ownership proves nothing (everything the agent writes is
+# root's). `AGENTIC_SDLC_GIT` / `AGENTIC_SDLC_GH` may name another copy, vetted the same way and
+# never honoured as root. No trusted program is a refusal (fail closed): the branch is
+# BRANCH_UNKNOWN, the lease UNAVAILABLE, and the refusal names why (`_trust_note`).
+SYSTEM_GH_PATHS = ("/usr/bin/gh", "/bin/gh", "/usr/local/bin/gh", "/opt/homebrew/bin/gh")
+TRUSTED_OVERRIDE_ENV = {"git": "AGENTIC_SDLC_GIT", "gh": "AGENTIC_SDLC_GH"}
+#: The fixed search path every program the guard runs gets: system directories only.
+SAFE_PATH = "/usr/bin:/bin"
+#: Resolved once per hook run, by name.
+_TRUSTED: dict[str, str] = {}
+
+
+class UntrustedProgram(OSError):
+    """No copy of git or gh could be proven to be one this session cannot have replaced. An
+    OSError, so every caller's "could not run it" path -- BRANCH_UNKNOWN, UNAVAILABLE, a guarded
+    command -- applies unchanged."""
+
+
+def _euid() -> int | None:
+    geteuid = getattr(os, "geteuid", None)
+    return geteuid() if geteuid is not None else None
+
+
+def _trust_node_reason(path: str, euid: int) -> str | None:
+    """Why `path` (a file or directory) could be changed by someone other than root."""
+    try:
+        info = os.stat(path)
+    except OSError as exc:
+        return f"{path} cannot be inspected ({exc.strerror or exc})"
+    if info.st_uid != 0:
+        return f"{path} is not owned by root"
+    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return f"{path} is writable by its group or by others"
+    if euid != 0 and os.access(path, os.W_OK):
+        return f"{path} is writable by this user"
+    return None
+
+
+def _trust_candidate_reason(candidate: str) -> str | None:
+    """Why the program at absolute path `candidate` is not trusted, or None when it is."""
+    euid = _euid()
+    if euid is None:
+        return "file ownership cannot be checked on this platform"
+    if not os.path.isabs(candidate):
+        return f"{candidate} is not an absolute path"
+    real = os.path.realpath(candidate)
+    if not (os.path.isfile(real) and os.access(real, os.X_OK)):
+        return f"{candidate} is not an executable file"
+    nodes: list[str] = [real]
+    prefix = os.sep
+    for part in [p for p in candidate.split(os.sep) if p][:-1]:
+        prefix = os.path.join(prefix, part)
+        nodes += _ancestors(prefix) + _ancestors(os.path.realpath(prefix))
+    nodes += _ancestors(os.path.dirname(real))
+    for node in dict.fromkeys(nodes):
+        reason = _trust_node_reason(node, euid)
+        if reason:
+            return f"{candidate}: {reason}"
+    return None
+
+
+def _trusted_program(name: str) -> str:
+    """The resolved path of a trusted `name` ("git" or "gh"); UntrustedProgram when none."""
+    if name in _TRUSTED:
+        return _TRUSTED[name]
+    system = SYSTEM_GIT_PATHS if name == "git" else SYSTEM_GH_PATHS
+    override_env = TRUSTED_OVERRIDE_ENV[name]
+    euid = _euid()
+    override = os.environ.get(override_env, "")
+    if override:
+        if euid == 0:
+            raise UntrustedProgram(
+                f"{override_env} is not honoured when running as root: ownership cannot tell a "
+                f"system {name} from one this session wrote; unset it"
+            )
+        reason = _trust_candidate_reason(override)
+        if reason:
+            raise UntrustedProgram(f"{override_env} names an untrusted {name}: {reason}")
+        _TRUSTED[name] = os.path.realpath(override)
+        return _TRUSTED[name]
+    candidates = list(system)
+    if euid != 0:
+        for entry in os.environ.get("PATH", "").split(os.pathsep):
+            if entry and os.path.isabs(entry):  # a relative entry depends on the cwd: never
+                candidates.append(os.path.join(entry, name))
+    rejected: list[str] = []
+    for candidate in dict.fromkeys(candidates):
+        if not os.path.lexists(candidate):
+            continue
+        reason = _trust_candidate_reason(candidate)
+        if reason is None:
+            _TRUSTED[name] = os.path.realpath(candidate)
+            return _TRUSTED[name]
+        rejected.append(reason)
+    detail = "; ".join(rejected) or f"no {name} executable was found"
+    raise UntrustedProgram(
+        f"no trusted {name} executable (one only root can replace, outside any writable PATH "
+        f"entry): {detail}"
+    )
+
+
+def _trust_note(name: str) -> str:
+    """Why the guard has no trusted `name`, for a refusal message; "" when it has one."""
+    try:
+        _trusted_program(name)
+    except UntrustedProgram as exc:
+        return (
+            f" (The guard runs only a {name} that only root can replace and found none -- "
+            f"{exc}. Install {name} root-owned in a system location, e.g. "
+            f"{(SYSTEM_GIT_PATHS if name == 'git' else SYSTEM_GH_PATHS)[0]}.)"
+        )
+    return ""
+
+
+#: The caller's variables a guard git probe keeps (Codex 4242095555). The probe must see the
+#: repository and configuration exactly as the guarded command's git will -- it runs in the same
+#: environment, so GIT_DIR / GIT_WORK_TREE / GIT_COMMON_DIR / GIT_CEILING_DIRECTORIES /
+#: GIT_CONFIG_* / GIT_EXEC_PATH (whatever re-points the repository, its configuration or git's
+#: exec path), HOME and XDG_CONFIG_HOME (the per-user configuration) are kept, together with the
+#: command's own `VAR=value` assignments of those. Stripping them would make the guard judge a
+#: different repository than the command acts on. Everything else is dropped: above all the
+#: loader's variables (`LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `DYLD_*`), which would load
+#: code of the caller's choosing into the trusted git, and the caller's PATH (the fixed
+#: SAFE_PATH: the probes are plumbing that start no helper, but none could come from a planted
+#: directory either). GIT_TRACE* is dropped (it writes files); the C locale keeps git's messages
+#: parseable. None of the probe subcommands (`rev-parse`, `symbolic-ref`, `show-ref`, `config`,
+#: `--exec-path`) runs a hook, pager, fsmonitor, external diff or network helper.
+_PROBE_ENV_KEEP = frozenset({"HOME", "XDG_CONFIG_HOME", "USER", "LOGNAME"})
+
+
+def _probe_keeps(key: str) -> bool:
+    return key in _PROBE_ENV_KEEP or (key.startswith("GIT_") and not key.startswith("GIT_TRACE"))
+
+
+def _git_probe_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """The whole environment of a guard git probe, BUILT from an allowlist (see above): the
+    kept variables of this process, then of `extra` (the command's assignments), then the fixed
+    PATH and C locale."""
+    env = {key: value for key, value in os.environ.items() if _probe_keeps(key)}
+    env.update({key: value for key, value in (extra or {}).items() if _probe_keeps(key)})
+    env.update(PATH=SAFE_PATH, LC_ALL="C", LANGUAGE="", GIT_TERMINAL_PROMPT="0")
+    return env
+
+
+def _git_probe(
+    args: list[str], cwd: str | None, extra: dict[str, str] | None = None, check: bool = False
+) -> subprocess.CompletedProcess:
+    """`git ARGS` for the guard itself: the trusted git (UntrustedProgram, an OSError, when there
+    is none), the allowlisted environment, output captured, GIT_TIMEOUT."""
+    return subprocess.run(
+        [_trusted_program("git"), *args],
+        cwd=cwd,
+        env=_git_probe_env(extra),
+        capture_output=True,
+        text=True,
+        check=check,
+        timeout=GIT_TIMEOUT,
+    )
+
+
+# ---- The guard's gh calls (Codex 4242095556), as the library's `run_gh` makes them: the
+# trusted gh, in an environment BUILT from an allowlist with a fresh private empty
+# GH_CONFIG_DIR/HOME (no alias, extension, `http_unix_socket` or stored host of the caller's
+# applies), the host pinned to github.com, the token from GH_TOKEN / GITHUB_TOKEN or else the
+# user's own `gh auth token` (a local read, through the same trusted gh), the caller's
+# SSL_CERT_FILE / SSL_CERT_DIR dropped (github.com is verified against the system store, so a
+# proxy can relay but not fabricate) and the proxy settings kept.
+GH_PINNED_HOST = "github.com"
+GH_TOKEN_ENV = ("GH_TOKEN", "GITHUB_TOKEN")
+GH_PROXY_ENV = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy")
+_GH_REDIRECT_ENV = ("GH_REPO", "GH_HOST", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
+_LOADER_ENV_PREFIXES = ("LD_", "DYLD_")
+#: The token, read once per hook run ("token" key).
+_GH_STATE: dict[str, str] = {}
+
+
+def _gh_token(program: str) -> str:
+    """The token gh authenticates with: GH_TOKEN, else GITHUB_TOKEN, else the user's stored one
+    (`gh auth token`, run by the trusted gh with the user's real configuration but no loader
+    variable, redirect or caller PATH). "" when there is none: the call then runs
+    unauthenticated and GitHub's answer decides."""
+    if "token" in _GH_STATE:
+        return _GH_STATE["token"]
+    token = ""
+    for key in GH_TOKEN_ENV:
+        if os.environ.get(key, ""):
+            token = os.environ[key]
+            break
+    else:
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in _GH_REDIRECT_ENV and not key.startswith(_LOADER_ENV_PREFIXES)
+        }
+        env["PATH"] = SAFE_PATH
+        try:
+            proc = subprocess.run(
+                [program, "auth", "token", "--hostname", GH_PINNED_HOST],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=GH_TIMEOUT,
+                env=env,
+            )
+            found = proc.stdout.strip() if proc.returncode == 0 else ""
+        except (OSError, subprocess.SubprocessError):
+            found = ""
+        token = found if found and not any(c.isspace() for c in found) else ""
+    _GH_STATE["token"] = token
+    return token
+
+
+def _gh_env(config_dir: str, token: str) -> dict[str, str]:
+    """The whole environment of a guard gh call (see above)."""
+    env = {key: os.environ[key] for key in GH_PROXY_ENV if os.environ.get(key)}
+    env.update(
+        PATH=SAFE_PATH,
+        HOME=config_dir,
+        GH_CONFIG_DIR=config_dir,
+        GH_HOST=GH_PINNED_HOST,
+        GH_PROMPT_DISABLED="1",
+        GH_NO_UPDATE_NOTIFIER="1",
+        GH_SPINNER_DISABLED="1",
+        NO_COLOR="1",
+        LC_ALL="C.UTF-8",
+    )
+    if token:
+        env["GH_TOKEN"] = token
+    return env
+
+
+def _gh(
+    args: list[str], check: bool = False, timeout: float = GH_TIMEOUT
+) -> subprocess.CompletedProcess:
+    """`gh ARGS` for the guard (and the SessionStart hook): the trusted gh (UntrustedProgram, an
+    OSError, when there is none) in `_gh_env`'s environment, run from its private config
+    directory, which is removed afterwards. `check`: a non-zero exit raises
+    CalledProcessError."""
+    program = _trusted_program("gh")
+    token = _gh_token(program)
+    with tempfile.TemporaryDirectory(prefix="forge-guard-gh-") as config_dir:
+        os.chmod(config_dir, 0o700)
+        return subprocess.run(
+            [program, *args],
+            capture_output=True,
+            text=True,
+            check=check,
+            timeout=timeout,
+            env=_gh_env(config_dir, token),
+            cwd=config_dir,
+        )
+
+
 # The guard's own git calls (`config`, `rev-parse`, `show-ref`, `symbolic-ref`, `--exec-path`)
 # are plumbing: no hook, signature program, textconv, external diff, fsmonitor, credential
 # helper or network transport runs for them, and with stdout captured no pager starts.
@@ -1630,16 +1902,8 @@ def _git_in(where: str, target: Target, *args: str) -> tuple[int, str]:
     """`git ARGS` in the repository `target` acts on: (exit code, stdout); -1 when git could
     not be run at all or did not answer within GIT_TIMEOUT (Codex 4239667544)."""
     _, opts, env = target
-    clean = {key: value for key, value in env if not key.startswith("\0")}
     try:
-        proc = subprocess.run(
-            ["git", *opts, *GIT_INTERNAL_OPTS, *args],
-            cwd=where,
-            env={**os.environ, **clean} if clean else None,
-            capture_output=True,
-            text=True,
-            timeout=GIT_TIMEOUT,
-        )
+        proc = _git_probe([*opts, *GIT_INTERNAL_OPTS, *args], where, _real_env(dict(env)))
     except (OSError, subprocess.TimeoutExpired):
         return -1, ""
     return proc.returncode, proc.stdout
@@ -1734,7 +1998,13 @@ def _read_config(where: str, target: Target) -> dict[str, list[str]] | None:
 
 
 def _helper_reason(
-    sub: str, args: list[str], where: str, target: Target, *, bare_git: bool = True
+    sub: str,
+    args: list[str],
+    where: str,
+    target: Target,
+    *,
+    bare_git: bool = True,
+    program: str | None = None,
 ) -> str | None:
     """Why the allowlisted `git SUB ARGS` may still run a program configured outside the
     command (Codex 4239667542), or None when it provably does not. Fail closed: configuration
@@ -1754,7 +2024,7 @@ def _helper_reason(
     found = _config_reason(sub, args, config)
     if found:
         return found
-    found = _writable_path_reason(sub, args, where, target, config, bare_git)
+    found = _writable_path_reason(sub, args, where, target, config, bare_git, program)
     if found:  # Codex 4240952107: a program dropped where PATH finds it first
         return found
     code, out = _git_in(where, target, "rev-parse", "--git-path", "hooks")
@@ -1872,6 +2142,36 @@ def _pager_programs(config: dict[str, list[str]]) -> list[str]:
     return names
 
 
+def _other_git_reason(word: str, where: str) -> str | None:
+    """Why the git the command runs (`word`: bare, found on PATH as the shell finds it, or a
+    path) may not be the guard's trusted git, or None when it is the same file (Codex
+    4242095555). The guard reads git's exec path -- where git looks for the helpers it runs --
+    with ITS git; another git (a second, newer copy in /usr/local/bin) searches another exec
+    path, so the check would vouch for directories that command never uses: fail closed."""
+    try:
+        trusted = _trusted_program("git")
+    except UntrustedProgram as exc:
+        return str(exc)
+    resolved = None
+    if "/" in word:
+        resolved = os.path.join(where, os.path.expanduser(word))
+    else:
+        for entry in os.environ.get("PATH", "").split(os.pathsep):
+            candidate = os.path.join(entry, word)
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                resolved = candidate
+                break
+    try:
+        if resolved is not None and os.path.samefile(resolved, trusted):
+            return None
+    except OSError:
+        pass
+    return (
+        f"the git this command runs ({resolved or word}) is not the git the guard reads with "
+        f"({trusted}): its exec path and helpers may differ"
+    )
+
+
 def _writable_path_reason(
     sub: str,
     args: list[str],
@@ -1879,12 +2179,19 @@ def _writable_path_reason(
     target: Target,
     config: dict[str, list[str]],
     bare_git: bool,
+    program: str | None = None,
 ) -> str | None:
     """Why a PATH-resolved program the allowlisted `git SUB ARGS` may launch could be one this
-    session placed (see the block comment above), or None."""
+    session placed (see the block comment above), or None. `program`: the git word the command
+    runs (`git`, `/usr/bin/git`); its exec path is only known when it IS the guard's own trusted
+    git (`_other_git_reason`). None: the caller runs the trusted git itself (SessionStart)."""
     path = [("PATH entry", entry) for entry in os.environ.get("PATH", "").split(os.pathsep)]
     if bare_git:
         found = _first_writable("git", path)
+        if found:
+            return found
+    if program is not None:
+        found = _other_git_reason(program, where)
         if found:
             return found
     code, out = _git_in(where, target, "--exec-path")
@@ -2361,21 +2668,11 @@ def _branch_exists(branch: str, where: str, target: Target) -> bool:
     """Is `branch` a local branch of the repository `target` acts on from `where`?"""
     _, opts, env = target
     try:
-        subprocess.run(
-            [
-                "git",
-                *opts,
-                *GIT_INTERNAL_OPTS,
-                "show-ref",
-                "--verify",
-                "--quiet",
-                f"refs/heads/{branch}",
-            ],
-            cwd=where,
-            env={**os.environ, **_real_env(dict(env))} if env else None,
-            capture_output=True,
+        _git_probe(
+            [*opts, *GIT_INTERNAL_OPTS, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+            where,
+            _real_env(dict(env)),
             check=True,
-            timeout=GIT_TIMEOUT,
         )
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return False  # not provably a plain switch: the command stays guarded
@@ -2843,18 +3140,12 @@ def current_branch(
     protect). Any other failure -- a directory that does not exist, git missing, an unreadable or
     untrusted repository -- is BRANCH_UNKNOWN (Codex 4239868022): a failure that read as "no
     branch" let a command into an issue checkout the probe never saw."""
-    run_env = {**os.environ, **_real_env(env or {}), "LC_ALL": "C", "LANGUAGE": ""}
 
+    # Codex 4242095555: the trusted git, never a PATH lookup a planted `git` could answer, in
+    # the allowlisted probe environment that still selects the command's repository
+    # (`_git_probe_env`). No trusted git: OSError below, BRANCH_UNKNOWN (refused).
     def probe(*args: str) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            ["git", *git_opts, *GIT_INTERNAL_OPTS, *args],
-            cwd=cwd,
-            env=run_env,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=GIT_TIMEOUT,
-        )
+        return _git_probe([*git_opts, *GIT_INTERNAL_OPTS, *args], cwd, _real_env(env or {}))
 
     try:
         proc = probe("rev-parse", "--abbrev-ref", "HEAD")
@@ -2925,13 +3216,7 @@ def repo_permission(login: str) -> str | None:
         return _PERMISSIONS[login_key(login)]
     granted: str | None = None
     try:
-        proc = subprocess.run(
-            ["gh", "api", f"repos/{PROJECT}/collaborators/{login}/permission"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=GH_TIMEOUT,
-        )
+        proc = _gh(["api", f"repos/{PROJECT}/collaborators/{login}/permission"])
     except subprocess.TimeoutExpired as exc:
         raise LeaseUnavailable(f"permission read timed out after {GH_TIMEOUT}s") from exc
     except OSError as exc:
@@ -3006,18 +3291,14 @@ def lease_for(issue: int) -> dict | None:
     """The live lease of `issue`: None when there is none, UNAVAILABLE when GitHub could not be
     read (callers must treat that as held, never as free)."""
     try:
-        out = subprocess.run(
+        out = _gh(
             [
-                "gh",
                 "api",
                 f"repos/{PROJECT}/issues/{issue}/comments?per_page=100",
                 "--paginate",
                 "--slurp",
             ],
-            capture_output=True,
-            text=True,
             check=True,
-            timeout=GH_TIMEOUT,
         ).stdout
         pages = json.loads(out or "null")
     except (
@@ -3069,18 +3350,14 @@ def open_pr_for(branch: str) -> bool | None:
     owner = PROJECT.split("/", 1)[0]
     head = quote(f"{owner}:{branch}", safe="")
     try:
-        out = subprocess.run(
+        out = _gh(
             [
-                "gh",
                 "api",
                 f"repos/{PROJECT}/pulls?state=open&head={head}&per_page=100",
                 "--paginate",
                 "--slurp",
             ],
-            capture_output=True,
-            text=True,
             check=True,
-            timeout=GH_TIMEOUT,
         ).stdout
         pages = json.loads(out or "null")
     except (
@@ -3168,7 +3445,7 @@ def _decide_branch(payload: dict, branch: str, lease_lookup, pr_lookup) -> tuple
             "(a directory that does not exist yet, an unreadable or untrusted repository, git "
             "unavailable), so the lease it needs cannot be checked. Create or enter the "
             "directory in a separate command first, then run the git command on its own."
-        )
+        ) + _trust_note("git")
     if branch == BRANCH_TIMEOUT:
         return 2, (
             f"Forge guard: git did not report the checked-out branch within {GIT_TIMEOUT}s, so "
@@ -3185,7 +3462,7 @@ def _decide_branch(payload: dict, branch: str, lease_lookup, pr_lookup) -> tuple
             f"Forge guard: the lease of issue #{issue} could not be read from GitHub "
             "(authentication, network or API failure). Lease inventory unavailable -- do not "
             "commit issue work until it can be checked; retry once `gh` works."
-        ) + _helper_note()
+        ) + _trust_note("gh") + _helper_note()
     has_pr = pr_lookup(branch) if lease is None else False
     if lease is None and has_pr:
         return 0, ""  # follow-up commits to an open PR need no lease
@@ -3195,7 +3472,7 @@ def _decide_branch(payload: dict, branch: str, lease_lookup, pr_lookup) -> tuple
             "its open PRs could not be read from GitHub (no PR could be confirmed). Claim it: "
             f"sdlcctl claim --project {PROJECT} --issue {issue} --agent claude-code "
             f"--session {session or '<session_id>'} --branch {branch}"
-        ) + _helper_note()
+        ) + _trust_note("gh") + _helper_note()
     if lease is None:
         return 2, (
             f"Forge guard: branch '{branch}' targets issue #{issue} but no live lease exists. "

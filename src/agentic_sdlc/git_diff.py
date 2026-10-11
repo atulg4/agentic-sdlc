@@ -24,6 +24,26 @@ class GitDiff:
     #: The endpoint diff's own paths, when `paths` also holds those of intermediate commits
     #: (`collect_commit_diff`); None when `paths` is the endpoint diff alone.
     net_paths: tuple[str, ...] | None = None
+    #: `collect_commit_diff` only (Codex 4242095558): the SUM over every commit in the series of
+    #: that commit's own added / deleted lines and `--binary` patch bytes. None when the diff is
+    #: the endpoint alone (`collect_git_diff`).
+    history_added_lines: int | None = None
+    history_deleted_lines: int | None = None
+    history_patch_bytes: int | None = None
+
+    @property
+    def cap_added_lines(self) -> int:
+        """The added lines the size caps are applied to: the larger of the end state's and the
+        whole history's (see `collect_commit_diff`)."""
+        return max(self.added_lines, self.history_added_lines or 0)
+
+    @property
+    def cap_deleted_lines(self) -> int:
+        return max(self.deleted_lines, self.history_deleted_lines or 0)
+
+    @property
+    def cap_patch_bytes(self) -> int:
+        return max(len(self.patch), self.history_patch_bytes or 0)
 
 
 #: A file that never exists: pointing GIT_GRAFT_FILE at it disables `.git/info/grafts`.
@@ -222,16 +242,97 @@ def collect_git_diff(repository: str | Path, base: str = "HEAD") -> GitDiff:
 _OBJECT_NAME = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
-def _paths_of_every_commit(root: _Repository, merge_base: str, tip: str) -> set[str]:
-    """Every path ANY commit in `merge_base..tip` touches (Codex 4241839922). A push publishes
-    every one of those commits, not only the endpoint tree: a forbidden or secret file added in
-    one commit and deleted in the next is absent from the endpoint diff yet published in the
-    history. Each commit is diffed against its single parent, both sides of every rename
-    (`--no-renames`: a rename is its deletion plus its addition). A merge commit in the range is
-    refused (exit 2) rather than judged: which parent its change is relative to is ambiguous,
-    and the routine never needs one -- its branch is cut from the base and committed onto."""
+@dataclass(frozen=True)
+class _History:
+    """What the commits of a series publish, commit by commit (`_every_commit`)."""
+
+    paths: set[str]
+    added_lines: int
+    deleted_lines: int
+    patch_bytes: int
+
+
+#: Options every per-commit diff here runs with: both sides of a rename as their own deletion
+#: and addition, no external diff or textconv program, every submodule change shown.
+_PLAIN_TREE_DIFF = (
+    "-r",
+    "-z",
+    "--no-commit-id",
+    "--no-renames",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--ignore-submodules=none",
+)
+
+
+def _blob_sizes(root: _Repository, rev: str) -> dict[str, int]:
+    """The size in bytes of every blob in the tree of commit `rev`, by path."""
+    listing = _run(["git", "ls-tree", "-r", "-l", "-z", "--full-tree", rev], root).stdout
+    sizes: dict[str, int] = {}
+    for entry in listing.split(b"\0"):
+        if not entry:
+            continue
+        meta, tab, name = entry.partition(b"\t")
+        fields = meta.split()
+        if not tab or len(fields) != 4:
+            raise GitDiffError("git ls-tree output is malformed")
+        if fields[1] == b"blob":
+            if not fields[3].isdigit():
+                raise GitDiffError("git ls-tree output is malformed")
+            sizes[_decode_path(name)] = int(fields[3])
+    return sizes
+
+
+def _line_counts(root: _Repository, raw: bytes, old: str, new: str) -> tuple[int, int]:
+    """(added, deleted) lines of a `--numstat -z --no-renames` listing of `old`..`new`. A binary
+    change (`-\t-`) has no line count, and counting it as zero would let any blob through the
+    line cap, so it counts FAIL-CLOSED as its size in bytes -- the new blob's as added, the old
+    one's as deleted: no text has more lines than bytes, so that is never less than the lines it
+    could hold."""
+    added = 0
+    deleted = 0
+    sizes: dict[str, dict[str, int]] = {}
+    for entry in raw.split(b"\0"):
+        if not entry:
+            continue
+        fields = entry.split(b"\t", 2)
+        if len(fields) != 3 or not fields[2]:
+            raise GitDiffError("git numstat output is malformed")
+        plus, minus, name = fields
+        if plus.isdigit() and minus.isdigit():
+            added += int(plus)
+            deleted += int(minus)
+            continue
+        if plus != b"-" or minus != b"-":
+            raise GitDiffError("git numstat output is malformed")
+        path = _decode_path(name)
+        for rev in (old, new):
+            if rev not in sizes:
+                sizes[rev] = _blob_sizes(root, rev)
+        added += sizes[new].get(path, 0)
+        deleted += sizes[old].get(path, 0)
+    return added, deleted
+
+
+def _every_commit(root: _Repository, merge_base: str, tip: str) -> _History:
+    """What ANY commit in `merge_base..tip` publishes (Codex 4241839922, 4242095558). A push
+    publishes every one of those commits, not only the endpoint tree:
+
+    - every path any commit touches: a forbidden or secret file added in one commit and deleted
+      in the next is absent from the endpoint diff yet published in the history;
+    - the SUM over the commits of each one's added and deleted lines (binary changes counted by
+      `_line_counts`) and of the bytes of its `--binary --full-index` patch against its parent:
+      10,000 lines added in one commit and shrunk to one in the next is a one-line endpoint diff,
+      while the push still publishes the 10,000-line commit and its blob. The sum, not the
+      largest single commit, because a cap split across several commits publishes all of them.
+
+    Each commit is diffed against its single parent, both sides of every rename (`--no-renames`:
+    a rename is its deletion plus its addition). A merge commit in the range is refused (exit 2)
+    rather than judged: which parent its change is relative to is ambiguous, and the routine
+    never needs one -- its branch is cut from the base and committed onto."""
     listing = _run(["git", "rev-list", "--parents", f"{merge_base}..{tip}", "--"], root)
     paths: set[str] = set()
+    added = deleted = patch_bytes = 0
     for line in listing.stdout.decode("ascii", errors="replace").splitlines():
         names = line.split(" ")
         if not all(_OBJECT_NAME.fullmatch(name) for name in names):
@@ -243,26 +344,19 @@ def _paths_of_every_commit(root: _Repository, merge_base: str, tip: str) -> set[
                 "the base only -- not concluding"
             )
         commit, parent = names
-        listed = _run(
-            [
-                "git",
-                "diff-tree",
-                "-r",
-                "-z",
-                "--no-commit-id",
-                "--name-status",
-                "--no-renames",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--ignore-submodules=none",
-                parent,
-                commit,
-                "--",
-            ],
+        span = [parent, commit, "--"]
+        listed = _run(["git", "diff-tree", *_PLAIN_TREE_DIFF, "--name-status", *span], root)
+        paths.update(_paths_from_name_status(listed.stdout))
+        stats = _run(["git", "diff-tree", *_PLAIN_TREE_DIFF, "--numstat", *span], root).stdout
+        plus, minus = _line_counts(root, stats, parent, commit)
+        added += plus
+        deleted += minus
+        patch = _run(
+            ["git", "diff-tree", *_PLAIN_TREE_DIFF, "-p", "--binary", "--full-index", *span],
             root,
         ).stdout
-        paths.update(_paths_from_name_status(listed))
-    return paths
+        patch_bytes += len(patch)
+    return _History(paths=paths, added_lines=added, deleted_lines=deleted, patch_bytes=patch_bytes)
 
 
 def collect_commit_diff(repository: str | Path, base: str, head: str = "HEAD") -> GitDiff:
@@ -270,9 +364,14 @@ def collect_commit_diff(repository: str | Path, base: str, head: str = "HEAD") -
     tree to tree -- what a pull request from `head` into `base` shows, and what a push of `head`
     publishes (Codex 4241434509). `paths` is that diff's paths PLUS every path any single commit
     of the series touches (Codex 4241839922: a push publishes the history, not only the end
-    state); the line and byte counts and the patch are the endpoint diff's. The working tree and
-    index are never read, so an uncommitted edit can neither hide a committed change nor add one
-    that is not pushed. No external diff or textconv program runs."""
+    state); `added_lines`, `deleted_lines` and `patch` are the endpoint diff's, and the
+    `history_*` fields the per-commit sums (Codex 4242095558, `_every_commit`). The size caps
+    apply to the larger of the two (`GitDiff.cap_*`): the end state alone hides a large commit
+    that a later one shrank; the history alone can, with a binary or an odd textconv-free
+    rendering, come out smaller than the net patch. Binary changes count by size in both
+    (`_line_counts`). The working tree and index are never read, so an uncommitted edit can
+    neither hide a committed change nor add one that is not pushed. No external diff or textconv
+    program runs."""
     for rev in (base, head):
         if not rev or rev.startswith("-"):
             raise GitDiffError(f"not a revision: {rev!r}")
@@ -297,16 +396,22 @@ def collect_commit_diff(repository: str | Path, base: str, head: str = "HEAD") -
         root,
     ).stdout
     net_paths = _paths_from_name_status(names)
-    paths = tuple(sorted(set(net_paths) | _paths_of_every_commit(root, *span)))
-    raw_stats = _run(["git", "diff", *plain, "--numstat", "-z", *span, "--"], root).stdout
-    added = 0
-    deleted = 0
-    for match in re.finditer(rb"(?:^|\x00)(\d+|-)\t(\d+|-)\t", raw_stats):
-        added += int(match.group(1)) if match.group(1).isdigit() else 0
-        deleted += int(match.group(2)) if match.group(2).isdigit() else 0
+    history = _every_commit(root, *span)
+    paths = tuple(sorted(set(net_paths) | history.paths))
+    raw_stats = _run(
+        ["git", "diff", *plain, "--no-renames", "--numstat", "-z", *span, "--"], root
+    ).stdout
+    added, deleted = _line_counts(root, raw_stats, *span)
     patch = _run(["git", "diff", *plain, "--binary", "--full-index", *span, "--"], root).stdout
     return GitDiff(
-        paths=paths, added_lines=added, deleted_lines=deleted, patch=patch, net_paths=net_paths
+        paths=paths,
+        added_lines=added,
+        deleted_lines=deleted,
+        patch=patch,
+        net_paths=net_paths,
+        history_added_lines=history.added_lines,
+        history_deleted_lines=history.deleted_lines,
+        history_patch_bytes=history.patch_bytes,
     )
 
 

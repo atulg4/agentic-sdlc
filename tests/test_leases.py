@@ -1124,6 +1124,8 @@ def _guard():
     spec = importlib.util.spec_from_file_location("guard_parity", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    module._TRUSTED["gh"] = "gh"  # the test's fake subprocess.run answers gh (Codex 4242095556)
+    module._GH_STATE["token"] = ""
     return module
 
 
