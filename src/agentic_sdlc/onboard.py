@@ -601,13 +601,55 @@ def _canonical_full_name(repo_info: object, project_id: str) -> str | None:
     return name
 
 
+REPO_WRITABLE_CHECK = "repository is writable (not archived or disabled)"
+
+
+def repository_writable(info: object, project_id: str) -> tuple[bool | None, str]:
+    """Whether GitHub accepts writes to the repository `GET repos/{project_id}` describes
+    (Codex 4240170627): an ARCHIVED repository's issues, pull requests, comments, branches,
+    labels and rulesets are read-only, and a DISABLED one serves nothing, so no claim, plan
+    comment, publisher push or draft PR can work there. (True, '') only when the answer says
+    `archived: false` AND `disabled: false` explicitly; (False, why) when either is true;
+    (None, why) when either is missing, not a boolean, or the answer is unreadable."""
+    if not isinstance(info, dict):
+        why = info.why if isinstance(info, Unreadable) else "not a repository object"
+        return None, f"could not read GET repos/{project_id} ({why})"
+    archived, disabled = info.get("archived"), info.get("disabled")
+    if archived is True:
+        return False, (
+            f"{project_id} is archived: GitHub makes its issues, pull requests, comments, "
+            "branches and labels read-only → unarchive it (Settings → General → Danger Zone → "
+            "Unarchive this repository)"
+        )
+    if disabled is True:
+        return False, (
+            f"{project_id} is disabled by GitHub: it accepts no writes → resolve the "
+            "suspension with GitHub (the repository's banner names the reason)"
+        )
+    if archived is False and disabled is False:
+        return True, ""
+    return None, (
+        f"GET repos/{project_id} did not report archived/disabled as booleans "
+        f"(archived={archived!r}, disabled={disabled!r}) → confirm the repository is writable"
+    )
+
+
+def require_writable_repository(info: object, project_id: str) -> None:
+    """Raise unless `info` proves the repository writable (`repository_writable`): `--apply`
+    refuses an archived, disabled or unconfirmed repository before its first mutation."""
+    writable, why = repository_writable(info, project_id)
+    if writable is not True:
+        raise OnboardError(f"{why}; nothing was changed")
+
+
 def canonical_project_id(project_id: str, gh: GhRunner = run_gh) -> str:
     """`project_id` as GitHub names it now (`full_name`): every workflow run passes the canonical
     `$GITHUB_REPOSITORY` to `prepare-request`, which compares it EXACTLY with the policy's id, so
     the policy must carry that name -- GitHub's spelling, and the new name of a renamed or
     transferred repository (the caller tells the user). Unreadable, or an answer without a
     `full_name`: raises -- `--apply` writes this id into the policy and configures the
-    repository by it, so it never proceeds on a guess."""
+    repository by it, so it never proceeds on a guess. An archived or disabled repository (or
+    one not proven writable) raises too, before `--apply` writes a file (Codex 4240170627)."""
     info = _safe_json(gh, ["api", f"repos/{project_id}"])
     if not isinstance(info, dict):
         why = info.why if isinstance(info, Unreadable) else "not a repository object"
@@ -618,6 +660,7 @@ def canonical_project_id(project_id: str, gh: GhRunner = run_gh) -> str:
             f"could not read {project_id} from GitHub (no valid full_name in the answer); "
             "nothing was changed"
         )
+    require_writable_repository(info, project_id)
     return canonical
 
 
@@ -1841,6 +1884,11 @@ def apply_repo_settings(
 ) -> list[str]:
     """Idempotently create labels, the protect-main ruleset and repo variables. Returns a log."""
     log: list[str] = []
+    # Codex 4240170627: an archived or disabled repository accepts none of the writes below (nor
+    # any Forge run's): refuse before the first one, and when writability cannot be confirmed.
+    require_writable_repository(
+        _safe_json(gh, ["api", f"repos/{spec.project_id}"]), spec.project_id
+    )
     # Read every inventory a mutation depends on BEFORE the first mutation: an unreadable
     # ruleset list is not "no `Protect main`" (creating one would duplicate it), and an
     # unreadable ruleset is not an empty one (merging into it would drop its rules).
@@ -4845,6 +4893,55 @@ def token_permission_problems(
 _WORKFLOW_FILE = re.compile(r"^[A-Za-z0-9._-]+\.ya?ml$")
 
 
+# Codex 4240170623: the contents API lists at most 1,000 entries of a directory and says nothing
+# when it stops there, so a `pull_request` workflow past that prefix went unseen. The Git Trees
+# API lists a tree in full or says `truncated: true`; one level at a time (`.github`, then
+# `workflows`) keeps each answer to that one directory.
+_REGULAR_FILE_MODES = frozenset({"100644", "100755"})
+_TREE_ENTRY_LIMIT = 100_000  # GitHub's documented cap on one tree answer: at it, fail closed
+
+
+def _tree_entries(gh: GhRunner, project_id: str, sha: str) -> tuple[list[dict] | None, str]:
+    """The entries of tree `sha`, complete -- or (None, why): unreadable, `truncated` anything
+    but an explicit false, an entry that is not an object, or as many entries as GitHub caps."""
+    answer = _safe_json(gh, ["api", f"repos/{project_id}/git/trees/{_q(sha)}"])
+    if not isinstance(answer, dict):
+        return None, f"could not read git tree {sha[:12]}"
+    entries = answer.get("tree")
+    if answer.get("truncated") is not False or not isinstance(entries, list):
+        return None, f"git tree {sha[:12]} was not listed in full (truncated or unreadable)"
+    if len(entries) >= _TREE_ENTRY_LIMIT or not all(isinstance(e, dict) for e in entries):
+        return None, f"git tree {sha[:12]} was not listed in full (at the API limit)"
+    return entries, ""
+
+
+def _workflow_tree_entries(
+    gh: GhRunner, project_id: str, ref: str
+) -> tuple[list[dict] | None, str]:
+    """Every entry of `.github/workflows` at `ref`, through the Git Trees API: `ref`'s commit,
+    its root tree, `.github`, then `workflows` -- each listed in full or (None, why)."""
+    commit = _safe_json(gh, ["api", f"repos/{project_id}/commits/{_q(ref)}"])
+    tree = commit.get("commit") if isinstance(commit, dict) else None
+    tree = tree.get("tree") if isinstance(tree, dict) else None
+    sha = tree.get("sha") if isinstance(tree, dict) else None
+    if not isinstance(sha, str) or not _SHA.fullmatch(sha):
+        return None, f"could not resolve the tree of {ref}"
+    for part in (".github", "workflows"):
+        entries, why = _tree_entries(gh, project_id, sha)
+        if entries is None:
+            return None, f"could not list .github/workflows on {ref}: {why}"
+        match = [e for e in entries if e.get("path") == part]
+        if len(match) != 1 or match[0].get("type") != "tree":
+            return None, f"could not list .github/workflows on {ref}: no {part} directory"
+        sha = match[0].get("sha")
+        if not isinstance(sha, str) or not _SHA.fullmatch(sha):
+            return None, f"could not list .github/workflows on {ref}: unreadable {part} tree"
+    entries, why = _tree_entries(gh, project_id, sha)
+    if entries is None:
+        return None, f"could not list .github/workflows on {ref}: {why}"
+    return entries, ""
+
+
 def remote_workflow_files(
     gh: GhRunner, project_id: str, ref: str | None
 ) -> tuple[dict[str, bytes] | None, str]:
@@ -4854,16 +4951,14 @@ def remote_workflow_files(
     name or content cannot be read makes the whole set unreadable: a partial set proves nothing."""
     if not ref:
         return None, "the repository's default branch is unknown"
-    listing = _safe_json(
-        gh, ["api", f"repos/{project_id}/contents/.github/workflows?ref={_q(ref)}"]
-    )
-    if not isinstance(listing, list):
-        return None, f"could not list .github/workflows on {ref}"
+    listing, why = _workflow_tree_entries(gh, project_id, ref)
+    if listing is None:
+        return None, why
     files: dict[str, bytes] = {}
     for entry in listing:
-        if not isinstance(entry, dict) or entry.get("type") != "file":
-            continue
-        name = str(entry.get("name") or "")
+        if entry.get("type") != "blob" or entry.get("mode") not in _REGULAR_FILE_MODES:
+            continue  # a directory, a submodule or a symlink: not a workflow GitHub runs
+        name = str(entry.get("path") or "")
         if not name.endswith((".yml", ".yaml")):
             continue  # GitHub runs only .yml/.yaml files
         if not _WORKFLOW_FILE.fullmatch(name):
@@ -6244,6 +6339,17 @@ def doctor(
                 else f"could not read whether GitHub Issues are enabled on {project_id} "
                 f"(GET repos/{project_id}: has_issues) → confirm they are",
                 manual=issues is not False,
+            )
+        )
+        # Codex 4240170627: an archived (or disabled) repository is read-only -- claims, plan
+        # comments, publisher pushes and draft PRs all fail -- whatever else is configured.
+        writable, why = repository_writable(repo_info, project_id)
+        add(
+            Check(
+                REPO_WRITABLE_CHECK,
+                writable is True,
+                "archived: false, disabled: false" if writable is True else why,
+                manual=writable is None,
             )
         )
 
