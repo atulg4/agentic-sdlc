@@ -45,8 +45,13 @@ Indirect execution is guarded the same way: any other program that receives `git
 (`xargs git`, `xargs -a f git`, `find -exec git`, `parallel git`, `eval git ...`,
 `python -c "...'git'..."`), `xargs`/`parallel`/`find` handing work to a shell, and a shell reading
 its program from stdin (`... | sh`, `bash <<< ...`, `bash -s`). `sh -c STRING` is parsed
-recursively, as are `$(...)`/backtick bodies; a shell running a script FILE is opaque like any
-other program and passes.
+recursively, as are `$(...)`/backtick bodies. A shell script FILE is read and parsed the same
+way (Codex 4240526381): `bash x.sh`, `sh -e x.sh`, `bash < x.sh`, `source x.sh`, `. x.sh`, and
+`./x.sh` run directly (a `.sh`/`.bash` path, or one whose `#!` line names a shell). Its git is
+guarded exactly like inline git (`-C`/`cd` selectors, named refs, the raw-text proof, the
+PATH/GIT_* taint), scripts it runs are read in turn up to MAX_SUBST_DEPTH, and a script that is
+missing, not a regular file, binary, over MAX_SCRIPT_BYTES, unparseable or nested deeper is
+UNRESOLVED_REPO: refused on every branch, whatever lease the session holds.
 
 A raw-text proof (`_raw_unproven`) backs the parser: the shell can ASSEMBLE a program or
 subcommand (`g$'it' com$'mit'`, `"g"it`, `\\git`, `co{m,}mit`, `$(echo git)`) the parser cannot
@@ -83,8 +88,12 @@ sight, so it is never mapped to the current checkout. Plain `git`, a literal pat
 (`/usr/bin/git`) and the wrappers parsed above (`env`, `command`, `exec`, `nice`, `time`,
 `sudo`, ...) keep their selectors and are checked against the repository they name.
 
-Out of scope: programs that run git without naming it on the command line (a script file, a
-Makefile target) and direct writes into `.git/`.
+SCOPE -- a guardrail, not a sandbox. The guard sees the git invocations a command line shows
+and the git inside the shell script files it runs. A PreToolUse hook cannot see what any other
+program does once it runs: a build tool or interpreter that runs git internally (`make`, `npm
+run`, `python x.py`, a compiled binary, a non-shell `#!` script) and direct writes into `.git/`
+are out of scope. The real enforcement is server side: the issue lease, branch protection and
+the review gates; this hook only stops an agent from walking past them by accident.
 """
 
 from __future__ import annotations
@@ -561,6 +570,226 @@ def _shell_reads_stdin(words: list[str]) -> bool:
     return True
 
 
+# ---- Shell script files (Codex 4240526381). `bash /tmp/do-commit.sh`, `sh -e x.sh`, `bash < x.sh`,
+# `source x.sh`, `. x.sh` and `./x.sh` (a path ending in .sh/.bash, or whose `#!` line names a
+# shell) run git the command line does not show. The script FILE is read (a regular file of at
+# most MAX_SCRIPT_BYTES, UTF-8, no NUL byte; a relative path from the directory the shell runs
+# in, and for a bare name every PATH entry too) and its text is analysed like a command string,
+# so the git inside is guarded exactly like inline git, `-C`/`cd` selectors included; a script
+# it runs is read the same way, up to MAX_SUBST_DEPTH. A script that cannot be read, is too
+# large or binary, cannot be parsed, or is nested deeper has an unresolved repository and is
+# refused on every branch. This is a bound, not a sandbox: a build tool or interpreter that runs
+# git internally (`make`, `npm run`, `python x.py`) is out of the guard's sight.
+MAX_SCRIPT_BYTES = 256 * 1024
+SCRIPT_SUFFIXES = (".sh", ".bash")
+SOURCE_BUILTINS = frozenset({"source", "."})
+
+
+def _shell_script_operand(words: list[str]) -> tuple[str, bool] | None:
+    """The script FILE a shell (without `-c`) runs, as (word, may be found on PATH): `bash x.sh`,
+    `sh -e x.sh`, `bash -o pipefail x.sh`, `bash < x.sh` (a redirection: never on PATH). None
+    when the program arrives on stdin (`bash`, `bash -s`, `... | sh`, `bash <<< ...`)."""
+    rest = list(words[1:])
+    while rest:
+        word = rest[0]
+        if word == "--":
+            rest.pop(0)
+            break
+        if word.startswith("--") and len(word) > 2:
+            rest.pop(0)
+            if word.partition("=")[0] in SHELL_LONG_VALUE_OPTS and "=" not in word and rest:
+                rest.pop(0)
+            continue
+        if word[:1] in ("-", "+") and len(word) > 1:
+            rest.pop(0)
+            letters = word[1:]
+            if word[0] == "-" and "s" in letters:
+                return None
+            for _ in range(sum(letter in SHELL_VALUE_OPTS for letter in letters)):
+                if rest:
+                    rest.pop(0)
+            continue
+        break
+    if not rest:
+        return None
+    word = rest[0]
+    if word == "<":
+        return (rest[1], False) if len(rest) > 1 else None
+    if word.startswith("<") and not word.startswith("<<"):
+        return word[1:], False
+    if word.startswith(("<", ">")):
+        return None
+    return word, True
+
+
+def _shell_shebang(path: str) -> bool:
+    """Does the regular file at `path` start with a `#!` line naming a shell (`#!/bin/sh`,
+    `#!/usr/bin/env bash`, `#!/usr/bin/env -S bash -e`)? False when it cannot be read."""
+    try:
+        if not os.path.isfile(path):
+            return False
+        with open(path, "rb") as handle:
+            head = handle.read(256)
+    except OSError:
+        return False
+    if not head.startswith(b"#!"):
+        return False
+    words = head[2:].split(b"\n", 1)[0].decode("utf-8", "replace").split()
+    if words and os.path.basename(words[0]) == "env":
+        words = [w for w in words[1:] if not w.startswith("-") and "=" not in w]
+    return bool(words) and os.path.basename(words[0]) in SHELLS
+
+
+def _script_invocation(words: list[str], where: str) -> tuple[str, bool] | None:
+    """(script word, may be found on PATH) when `words` runs a shell script FILE: a shell with a
+    script operand or `<` redirection, `source`/`.`, or a path (or `.sh`/`.bash` name) executed
+    directly that is a shell script. None for anything else (stdin shells included)."""
+    program = words[0]
+    name = os.path.basename(program)
+    if name in SHELLS:
+        return _shell_script_operand(words)
+    if name in SOURCE_BUILTINS and program == name:
+        return (words[1], True) if len(words) > 1 else None
+    if name in GIT_PROGRAMS or name in WRAPPERS:
+        return None
+    if program.endswith(SCRIPT_SUFFIXES):
+        return program, "/" not in program
+    if "/" in program and _shell_shebang(os.path.join(where, program)):
+        return program, False
+    return None
+
+
+def _script_paths(word: str, where: str, search_path: bool) -> list[str] | None:
+    """Every file the shell may run for script `word` from `where` (a bare name may come from
+    any absolute PATH entry too: all are read); None when the shell rewrites the word or the
+    directory first (an expansion, a glob, a brace or `~`)."""
+    if (
+        not word
+        or _SELECTOR_EXPANSION.search(word)
+        or _BRACE_EXPANSION.search(word)
+        or "~" in word
+        or re.search(r"[$`]", where)
+    ):
+        return None
+    local = os.path.join(where, word)
+    if "/" in word or not search_path:
+        return [local]
+    paths = [local] if os.path.lexists(local) else []
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = os.path.join(entry, word)
+        if os.path.isabs(entry) and os.path.isfile(candidate) and candidate not in paths:
+            paths.append(candidate)
+    return paths or [local]
+
+
+def _read_script(path: str) -> str | None:
+    """The text of the regular file `path`; None when it is not one, cannot be read, is larger
+    than MAX_SCRIPT_BYTES, holds a NUL byte or is not UTF-8. (Never a FIFO or device: reading
+    one could hang the hook.)"""
+    try:
+        if not os.path.isfile(path):
+            return None
+        with open(path, "rb") as handle:
+            data = handle.read(MAX_SCRIPT_BYTES + 1)
+    except OSError:
+        return None
+    if len(data) > MAX_SCRIPT_BYTES or b"\0" in data:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _script_code(text: str) -> str:
+    """A script's text as one command string: comments (a `#` opening a word, through the end
+    of its line) dropped and line continuations joined, quoting understood as `_raw_span` reads
+    it. ValueError when a quote or substitution is never closed."""
+    out: list[str] = []
+    index, in_word = 0, False
+    while index < len(text):
+        char = text[index]
+        if char in " \t\r\n;&|()":
+            out.append(char)
+            in_word = False
+            index += 1
+        elif char == "#" and not in_word:
+            newline = text.find("\n", index)
+            index = len(text) if newline == -1 else newline
+        elif text.startswith("\\\n", index):
+            index += 2  # a line continuation: the shell joins the two lines
+        else:
+            end = _raw_span(text, index)
+            out.append(text[index:end])
+            in_word = True
+            index = end
+    return "".join(out)
+
+
+def _script_texts(word: str, search_path: bool, where: str, depth: int) -> list[str] | None:
+    """The analysable text (`_script_code`) of every file script `word` may be; None when any
+    one cannot be read or parsed, or the script is nested deeper than MAX_SUBST_DEPTH."""
+    paths = _script_paths(word, where, search_path)
+    if paths is None or depth >= MAX_SUBST_DEPTH:
+        return None
+    texts: list[str] = []
+    for path in paths:
+        text = _read_script(path)
+        if text is None:
+            return None
+        try:
+            texts.append(_script_code(text))
+        except ValueError:
+            return None
+    return texts
+
+
+def _program_targets(code: str, depth: int, where: str) -> list[Target]:
+    """`commit_targets` of a script's text, with the top-level proofs a command line gets: the
+    raw-text proof (`_raw_unproven`) and the `_ENV_TAINT`/`_PATH_TAINT` rule."""
+    unquoted = re.sub(r"[\"'\\]", "", code)
+    tainted = _mentions_git(code) and bool(
+        _ENV_TAINT.search(unquoted) or _PATH_TAINT.search(unquoted)
+    )
+    if tainted:
+        _TAINTED[:] = [True]  # kept for the rest of the check: over-guarding, never under-
+    found = commit_targets(code, depth, where)
+    if _raw_unproven(code, depth):
+        found.append(_unresolved())
+        found += _mentioned_refs(((), (), ()), code)
+    if tainted:
+        cds = _cd_words(code)
+        found += [(tuple(cds[:count]), (), ()) for count in range(len(cds) + 1)]
+        found += _mentioned_refs(((), (), ()), code)
+    return found
+
+
+def _script_targets(
+    script: tuple[str, bool], depth: int, where: str, chdirs: tuple[str, ...]
+) -> list[Target]:
+    """The guarded git invocations of the shell script FILE `script` runs from `where` (see the
+    block comment above), relative to the command's own directory changes `chdirs`."""
+    texts = _script_texts(script[0], script[1], where, depth)
+    if texts is None:
+        return [_unresolved(chdirs)]
+    found: list[Target] = []
+    try:
+        for code in texts:
+            found += [
+                ((*chdirs, *dirs), opts, env)
+                for dirs, opts, env in _program_targets(code, depth + 1, where)
+            ]
+    except ValueError:
+        return [_unresolved(chdirs)]
+    return found
+
+
+def _script_changes_branch(script: tuple[str, bool], depth: int, where: str) -> bool:
+    """Could the shell script FILE `script` move HEAD (an unreadable one could)?"""
+    texts = _script_texts(script[0], script[1], where, depth)
+    return texts is None or any(_changes_branch(code, depth + 1, where) for code in texts)
+
+
 def _where(cwd: str | None, chdirs) -> str:
     """The directory `chdirs` lead to from `cwd`, in order (`cd -` is unknowable here: stay put)."""
     where = cwd or os.getcwd()
@@ -603,6 +832,13 @@ def _commit_targets(argv: list[str], depth: int = 0, cwd: str | None = None) -> 
         ]
     args = [_strip_substitutions(word) for word in words[1:]]
     named = _mentioned_refs(unknown[0], " ".join(words[1:]))
+    where = _where(cwd, chdirs)
+    script = _script_invocation(words, where)
+    if script is not None:  # Codex 4240526381: the git inside a script file is guarded too
+        found = _script_targets(script, depth, where, tuple(chdirs))
+        if any(_mentions_git(a) for a in args):
+            found += unresolved  # `bash x.sh git commit`: "$@" runs it
+        return found + named
     if program in SHELLS:  # `| sh`, `bash <<< ...`: the program arrives on stdin
         reads_stdin = _shell_reads_stdin(words)
         return unresolved + named if reads_stdin or any(_mentions_git(a) for a in args) else []
@@ -623,8 +859,10 @@ def _commit_targets(argv: list[str], depth: int = 0, cwd: str | None = None) -> 
             if program not in INERT_PROGRAMS and _REPO_SELECTOR_TEXT.search(" ".join(args)):
                 return unresolved + named  # `python -c "...['git', '-C', p, 'commit']"`
             return unknown + named
-        if program in FANOUT and any(os.path.basename(a) in SHELLS for a in args):
-            return unresolved + named  # `xargs sh`, `find -exec bash -c ...`
+        if program in FANOUT and any(
+            os.path.basename(a) in SHELLS or a.endswith(SCRIPT_SUFFIXES) for a in args
+        ):
+            return unresolved + named  # `xargs sh`, `find -exec bash -c ...`, `-exec ./x.sh`
         return []
     unsafe = any(
         key not in SAFE_GIT_ENV and not key.startswith("LC_") for key in keys
@@ -1747,7 +1985,7 @@ def _rebase_branch(args: list[str]) -> str | None:
     return positionals[limit - 1] if len(positionals) == limit else None
 
 
-def _segment_switch(seg: list[str], depth: int) -> tuple[str, str | None]:
+def _segment_switch(seg: list[str], depth: int, cwd: str | None = None) -> tuple[str, str | None]:
     """How one simple command can move HEAD (see the block comment above): ("none", None),
     ("unknown", None), or a checkout/switch/rebase/branch-rename shape for `_switch_target`'s
     kinds plus ("maybe", X) for a destination X that may or may not be taken."""
@@ -1761,24 +1999,32 @@ def _segment_switch(seg: list[str], depth: int) -> tuple[str, str | None]:
         if any(_GIT_REPO_VAR.match(w) for w in seg[1 if seg[0] in SET_BUILTINS else 0 :]):
             return "unknown", None
         return "none", None
-    words = _command_words(seg, [], [])
+    chdirs: list[str] = []
+    words = _command_words(seg, chdirs, [])
     if not words:
         return "none", None
     program = os.path.basename(words[0])
     if program in _EVAL_LIKE:
-        return "unknown", None
+        return "unknown", None  # `source x.sh` runs in THIS shell: its `cd`s and exports stay
+    where = _where(cwd, chdirs)
     inner = _shell_command_string(words)
     if inner is not None:
-        return "unknown" if depth >= MAX_SUBST_DEPTH or _changes_branch(inner, depth + 1) else (
-            "none"
-        ), None
+        return "unknown" if depth >= MAX_SUBST_DEPTH or _changes_branch(
+            inner, depth + 1, where
+        ) else ("none"), None
+    script = _script_invocation(words, where)
+    if script is not None:  # a child shell running a script file: what its git does
+        return ("unknown" if _script_changes_branch(script, depth, where) else "none"), None
     if program in SHELLS:
-        return "unknown", None  # a script file or stdin: anything
+        return "unknown", None  # stdin: anything
     if program not in GIT_PROGRAMS:
         if program.startswith("git-"):
             return "unknown", None  # `git-checkout`, `git-switch`
         args = " ".join(_strip_substitutions(w) for w in words[1:])
-        if program in FANOUT and (_mentions_git(args) or any(w in SHELLS for w in words[1:])):
+        if program in FANOUT and (
+            _mentions_git(args)
+            or any(w in SHELLS or w.endswith(SCRIPT_SUFFIXES) for w in words[1:])
+        ):
             return "unknown", None  # `xargs git` / `xargs sh`: the subcommand comes from stdin
         if _mentions_git(args) and _MOVES_HEAD.search(args):
             return "unknown", None  # `python -c "...['git', 'checkout', b]..."`
@@ -1807,7 +2053,7 @@ def _segment_switch(seg: list[str], depth: int) -> tuple[str, str | None]:
     return "unknown", None  # bisect, symbolic-ref, an alias, an unknown subcommand
 
 
-def _changes_branch(command: str, depth: int) -> bool:
+def _changes_branch(command: str, depth: int, cwd: str | None = None) -> bool:
     """Could any simple command (or substitution body) in `command` move HEAD?"""
     try:
         for seg in _segments(command):
@@ -1815,10 +2061,10 @@ def _changes_branch(command: str, depth: int) -> bool:
                 seg = seg[1:]
             if not seg:
                 continue
-            if _segment_switch(seg, depth)[0] != "none":
+            if _segment_switch(seg, depth, cwd)[0] != "none":
                 return True
             for body in _substitutions(" ".join(seg)):
-                if depth >= MAX_SUBST_DEPTH or _changes_branch(body, depth + 1):
+                if depth >= MAX_SUBST_DEPTH or _changes_branch(body, depth + 1, cwd):
                     return True
     except ValueError:
         return _mentions_git(command)
@@ -1928,10 +2174,10 @@ def _commit_targets_in(command: str, depth: int, cwd: str | None) -> list[Target
                 subst += commit_targets(body, depth + 1, where)
             except ValueError:
                 subst += [_unresolved()] if _mentions_git(body) else []
-            if _changes_branch(body, depth + 1):
+            if _changes_branch(body, depth + 1, where):
                 state = UNKNOWN_BRANCH  # it ran before this command did
         found += _retarget([((*prefix, *dirs), o, e) for dirs, o, e in subst], state)
-        kind, branch = _segment_switch(seg, depth)
+        kind, branch = _segment_switch(seg, depth, where)
         location = own[0] if own else (tuple(prefix), (), ())
         if kind in ("branch", "create", "detach") and own and branch:
             # `pure`: certainly lands on `branch` -- a creation, a detach, or a plain switch to a
@@ -2399,10 +2645,13 @@ def _decide_branch(payload: dict, branch: str, lease_lookup, pr_lookup) -> tuple
             "GIT_DIR=/GIT_WORK_TREE= set to an expansion, `cd $DIR`, `$(...)`, backticks, a glob "
             "or an ambiguous `~`), or runs git through a name or program the guard cannot read "
             '(`"$G"`, `$(which git)`, `${GIT:-git}`, `\\git`, a quoted `"git"`, xargs/find/eval, '
-            "a script piped to a shell, an interpreter's code that selects a repository), so the "
-            "branch it acts on -- and the lease it needs -- cannot be checked. Spell the program "
-            "as a plain `git` and the repository as a literal path (git -C /path/to/checkout "
-            "commit), or cd there in a separate command first."
+            "a script piped to a shell, an interpreter's code that selects a repository), or "
+            "runs a shell script file the guard could not read and analyse (missing, not a "
+            f"regular file, binary, over {MAX_SCRIPT_BYTES // 1024} KiB, unparseable, or scripts "
+            f"nested more than {MAX_SUBST_DEPTH} deep), so the branch it acts on -- and the lease "
+            "it needs -- cannot be checked. Spell the program as a plain `git` and the repository "
+            "as a literal path (git -C /path/to/checkout commit), or cd there in a separate "
+            "command first; run git inline rather than from an unreadable script."
         )
     if branch == BRANCH_UNKNOWN:
         return 2, (

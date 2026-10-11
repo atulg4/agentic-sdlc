@@ -1,27 +1,37 @@
 #!/usr/bin/env python3
 """Claude Code SessionStart hook: start every session from the real state of the repository.
 
-Installed by `sdlcctl onboard`. Fetches origin, reports how far the default branch moved, lists
-open PRs, this session's own live lease (a resume, clear or compaction after a claim) and the
-issues currently leased by other agents, and reminds the session to claim before implementing.
-Output goes into the session's context.
+Installed by `sdlcctl onboard`. Fetches origin (its remote-tracking refs only, see
+`fetch_command`), reports how far the default branch moved, lists open PRs, this session's own
+live lease (a resume, clear or compaction after a claim) and the issues currently leased by
+other agents, and reminds the session to claim before implementing. Output goes into the
+session's context.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 PROJECT = "PROJECT_ID"
 DEFAULT_BRANCH = "DEFAULT_BRANCH_NAME"
+#: the remote fetched at session start; a plain name, never a URL, path or option
+REMOTE = "origin"
+_PLAIN_REMOTE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]+)*$")
 
 
 UNAVAILABLE_WARNING = (
     "[Forge] WARNING: lease inventory unavailable -- do not start issue work until it can be "
     "checked. ({what} could not be read from GitHub: authentication, network or API failure; "
     "fix `gh` and start a new session, or run `sdlcctl claims --project {project}`.)"
+)
+FETCH_SKIPPED = (
+    "[Forge] Did not fetch {remote}: {why}. Fetching could run that program before the session "
+    "starts; fetch by hand once it is vetted."
 )
 FETCH_WARNING = (
     "[Forge] WARNING: could not fetch origin -- the remote branch state below is the last "
@@ -51,6 +61,49 @@ def run(cmd: list[str]) -> str | None:
         ).stdout.strip()
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return None
+
+
+def fetch_command(remote: str = REMOTE) -> list[str]:
+    """`git fetch` that can only write `refs/remotes/<remote>/*` (Codex 4240526383). A bare
+    `git fetch origin` follows the configured `remote.origin.fetch` refspecs, and one mapping onto
+    `refs/heads/forge/issue-7` would force-update a local issue branch before the session even
+    started. Here the refspec is explicit and `--refmap=` (empty) makes git ignore the
+    configured ones even for opportunistic updates; tags, submodules, pruning, FETCH_HEAD and
+    auto-gc are all off."""
+    return [
+        "git",
+        "fetch",
+        "--quiet",
+        "--no-tags",
+        "--no-recurse-submodules",
+        "--no-prune",
+        "--no-write-fetch-head",
+        "--no-auto-gc",
+        "--refmap=",
+        remote,
+        f"+refs/heads/*:refs/remotes/{remote}/*",
+    ]
+
+
+def fetch_blocker(remote: str = REMOTE) -> str | None:
+    """Why the session-start fetch is skipped, or None to fetch: `remote` is not a plain name,
+    or git would run a program configured outside the command (ssh/askpass/credential/proxy
+    helpers, a remote helper URL, a reference-transaction or pre-auto-gc hook, ...), judged by
+    the commit guard's own `_helper_reason`. Never raises: a session start is never blocked."""
+    if not _PLAIN_REMOTE.match(remote):
+        return f"the remote name {remote!r} is not a plain name"
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        from forge_commit_guard import _helper_reason
+    except ImportError:
+        return (
+            "the commit guard (forge_commit_guard.py) is missing, so git's configured helpers "
+            "cannot be vetted"
+        )
+    try:
+        return _helper_reason("fetch", [remote], os.getcwd(), ((), (), ()))
+    except Exception as exc:  # never block the session start
+        return f"git's configured helpers could not be vetted ({type(exc).__name__})"
 
 
 def _lease_lookup():
@@ -142,7 +195,8 @@ def main() -> int:
     # only a non-empty string identifies this session; anything else matches no lease
     session = session if isinstance(session, str) and session.strip() else ""
     # A failed fetch leaves the cached origin/<default> ref: never present it as current.
-    fetched = run(["git", "fetch", "-q", "origin"]) is not None
+    skipped = fetch_blocker()
+    fetched = skipped is None and run(fetch_command()) is not None
     behind = (
         run(["git", "rev-list", "--count", f"HEAD..origin/{DEFAULT_BRANCH}"]) if fetched else None
     )
@@ -185,6 +239,8 @@ def main() -> int:
         )
         print(recent or "  (unavailable)")
     else:
+        if skipped is not None:
+            print(FETCH_SKIPPED.format(remote=REMOTE, why=skipped))
         print(FETCH_WARNING)
         print(
             f"[Forge] {PROJECT}: how far HEAD is behind origin/{DEFAULT_BRANCH} is UNKNOWN "
