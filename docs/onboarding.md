@@ -385,6 +385,29 @@ something that runs differently.
   lease the session holds. Plain `git`, a literal path to it (`/usr/bin/git`) and the wrappers
   the guard parses (`env`, `command`, `exec`, `nice`, `time`, `timeout`, `sudo`, ...) keep their
   `-C`/`--git-dir`/`GIT_DIR` selectors and are checked against the repository they name.
+- The commit guard reads the shell script files a command runs (Codex 4240526381): `bash x.sh`,
+  `sh -e x.sh`, `bash < x.sh`, `source x.sh`, `. x.sh`, and `./x.sh` run directly (a `.sh`/`.bash`
+  path, or one whose `#!` line names a shell). The script (a regular UTF-8 file of at most
+  256 KiB, resolved from the directory the shell runs in, plus PATH for a bare name) is parsed
+  like an inline command, so `git commit` inside it on an unleased issue branch, or `git -C
+  /path/to/forge/issue-7 commit` inside it run from main, is refused just as it would be inline;
+  scripts it runs are read in turn, up to three levels. A script the guard cannot read (missing,
+  not a regular file, binary, too large, an unclosed quote, nested deeper) is refused on every
+  branch. **Scope:** the guard is a guardrail for the git invocations it can see -- inline
+  commands and shell script files -- not a sandbox. A build tool or interpreter that runs git
+  internally (`make`, `npm run`, `python x.py`, a compiled program, a non-shell `#!` script) and
+  direct writes into `.git/` are out of its sight; the issue lease, branch protection and the
+  review gates on the server are the real enforcement.
+- The SessionStart hook fetches only remote-tracking refs (Codex 4240526383): `git fetch --no-tags
+  --no-recurse-submodules --no-prune --no-write-fetch-head --no-auto-gc --refmap= origin
+  '+refs/heads/*:refs/remotes/origin/*'`. A bare `git fetch origin` follows the configured
+  `remote.origin.fetch` refspecs, and one mapped onto `refs/heads/forge/issue-7` would
+  force-update a local issue branch; the explicit refspec and the empty `--refmap=` make git
+  ignore them. When git would run a program configured outside the command for that fetch
+  (an ssh/askpass/credential/proxy helper, a remote-helper URL such as `ext::`, a
+  reference-transaction or pre-auto-gc hook -- the commit guard's own helper check), the hook
+  skips the fetch, says why and warns that the remote state shown is cached; it never blocks
+  the session.
 - **Repository writable**: `doctor` requires `GET repos/{owner}/{repo}` to answer
   `archived: false` and `disabled: false` explicitly. An archived repository's issues, pull
   requests, comments, branches and labels are read-only (a disabled one accepts nothing), so

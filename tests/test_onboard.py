@@ -1696,12 +1696,14 @@ def test_session_start_warns_when_origin_cannot_be_fetched(tmp_path, monkeypatch
         return "[]" if _is_issue_page(cmd) else ""
 
     monkeypatch.setattr(start, "run", run)
+    monkeypatch.setattr(start, "fetch_blocker", lambda: None)
     monkeypatch.setattr(start, "_lease_lookup", lambda: {}.get)
     monkeypatch.setattr(start.sys, "stdin", io.StringIO("{}"))
     out = io.StringIO()
     monkeypatch.setattr(start.sys, "stdout", out)
     assert start.main() == 0
     text = out.getvalue()
+    assert [c for c in calls if c[:2] == ["git", "fetch"]] == [start.fetch_command()]
     if fetch_ok:
         assert "HEAD is 3 commit(s) behind origin/main" in text
         assert "could not fetch origin" not in text
@@ -3294,7 +3296,15 @@ def test_commit_guard_reads_clustered_shell_c_options(tmp_path, command):
 )
 def test_commit_guard_clustered_shell_options_without_a_commit(tmp_path, command):
     guard = _guard_module(tmp_path, "forge_commit_guard")
-    assert not guard.is_git_commit(command)
+    _harmless_scripts(tmp_path)  # Codex 4240526381: a script file is read, not passed blind
+    assert not guard.is_git_commit(command, cwd=str(tmp_path))
+
+
+def _harmless_scripts(root: Path) -> None:
+    """The script files the "allowed" shell commands above run, each with no git in it."""
+    for name in ("script.sh", "run-commit.sh", "scripts/test.sh"):
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text("#!/bin/sh\n# runs the tests, doesn't commit\necho ok\n")
 
 
 @pytest.mark.parametrize("name", ["agent-auto-plan.yml", "agent-auto-implement.yml"])
@@ -4670,6 +4680,7 @@ def test_commit_guard_treats_assembled_programs_as_unproven(tmp_path, command):
 )
 def test_commit_guard_raw_proof_keeps_plain_non_commits(tmp_path, command):
     guard = _guard_module(tmp_path, "forge_commit_guard")
+    _harmless_scripts(tmp_path)
     assert not guard.is_git_commit(command, cwd=str(tmp_path))
 
 
@@ -5438,8 +5449,14 @@ def test_commit_guard_denies_git_by_default(tmp_path, command):
 )
 def test_commit_guard_allows_literal_read_only_git(tmp_path, command):
     guard = _guard_module(tmp_path, "forge_commit_guard")
+    _harmless_scripts(tmp_path)
     assert not guard.is_git_commit(command, cwd=str(tmp_path))
-    payload = {"tool_name": "Bash", "session_id": "s1", "tool_input": {"command": command}}
+    payload = {
+        "tool_name": "Bash",
+        "session_id": "s1",
+        "cwd": str(tmp_path),
+        "tool_input": {"command": command},
+    }
     assert guard.decide(payload, "forge/issue-7", lambda n: None, lambda b: False)[0] == 0
 
 
@@ -10262,3 +10279,251 @@ def test_every_subprocess_run_is_bounded():
             elif not any(k.arg == "timeout" for k in node.keywords):
                 unbounded.append(f"{where}: subprocess.run without timeout=")
     assert not unbounded, unbounded
+
+
+# ---- Codex 4240526381: git hidden in a shell script FILE is guarded like inline git.
+
+
+def _script_guard_repos(tmp_path):
+    """(guard, main checkout, issue-7 checkout, decide(command, cwd, lease) -> exit code)."""
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    main_repo, issue_repo = tmp_path / "main", tmp_path / "forge" / "issue-7"
+    for path, branch in ((main_repo, "main"), (issue_repo, "forge/issue-7")):
+        path.mkdir(parents=True)
+        _git(path, "init", "-q", "-b", branch)
+        _git(path, "commit", "-q", "--allow-empty", "-m", "init")
+    from datetime import UTC, datetime, timedelta
+
+    mine = {"agent": "claude-code", "session": "s1", "expires": datetime.now(UTC) + timedelta(1)}
+
+    def decide(command, cwd, leased=False):
+        branches = guard.commit_branches(command, str(cwd))
+        payload = {
+            "tool_name": "Bash",
+            "session_id": "s1",
+            "cwd": str(cwd),
+            "tool_input": {"command": command},
+        }
+        lease = (lambda n: mine) if leased else (lambda n: None)
+        return guard.decide(payload, branches, lease, lambda b: False)[0]
+
+    return guard, main_repo, issue_repo, decide
+
+
+def _script(path: Path, text: str, mode: int = 0o755) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    path.chmod(mode)
+    return path
+
+
+@pytest.mark.parametrize(
+    "form",
+    [
+        "bash {s}",
+        "sh {s}",
+        "zsh {s}",
+        "dash -e {s}",
+        "ksh {s}",
+        "bash -o pipefail {s}",
+        "source {s}",
+        ". {s}",
+        "{s}",
+        "bash < {s}",
+        "env FOO=1 bash {s}",
+    ],
+)
+def test_commit_guard_reads_a_script_file_that_commits_on_an_issue_branch(tmp_path, form):
+    _, _, issue_repo, decide = _script_guard_repos(tmp_path)
+    script = _script(
+        tmp_path / "bin" / "do-commit.sh",
+        "#!/bin/bash\n# don't forget the message\ngit add -A && \\\n  git commit -m x\n",
+    )
+    command = form.format(s=script)
+    assert decide(command, issue_repo) == 2, command  # no lease: refused
+    assert decide(command, issue_repo, leased=True) == 0, command  # this session's lease
+
+
+def test_commit_guard_follows_git_c_inside_a_script_run_from_main(tmp_path):
+    _, main_repo, issue_repo, decide = _script_guard_repos(tmp_path)
+    script = _script(tmp_path / "c.sh", f"echo committing\ngit -C {issue_repo} commit -m x\n")
+    _script(main_repo / "rel.sh", "git -C ../forge/issue-7 commit -m x\n")
+    for command in (f"bash {script}", f"/bin/sh {script}", "bash rel.sh", "./rel.sh"):
+        assert decide(command, main_repo) == 2, command  # issue 7's lease is needed
+        assert decide(command, main_repo, leased=True) == 0, command
+    # the same script committing in main itself needs no lease
+    local = _script(tmp_path / "m.sh", f"git -C {main_repo} commit -m x\n")
+    assert decide(f"bash {local}", issue_repo) == 0
+
+
+def test_commit_guard_passes_a_script_without_git_and_its_shebang_twin(tmp_path):
+    guard, main_repo, issue_repo, decide = _script_guard_repos(tmp_path)
+    harmless = _script(tmp_path / "echo.sh", "#!/bin/sh\necho 'hello' # it's fine\nls -la\n")
+    shebang = _script(tmp_path / "tool", "#!/usr/bin/env bash\ngit commit -m y\n")
+    other = _script(tmp_path / "py-tool", "#!/usr/bin/env python3\nprint('git commit')\n")
+    for cwd in (main_repo, issue_repo):
+        assert decide(f"bash {harmless}", cwd) == 0
+        assert decide(f"{harmless} && ls", cwd) == 0
+    assert not guard.is_git_commit(f"bash {harmless}", cwd=str(issue_repo))
+    # no .sh suffix: the `#!` line names a shell, so it is read too
+    assert decide(str(shebang), issue_repo) == 2
+    # a script that changes no branch does not make the git after it unknowable
+    assert decide(f"bash {harmless} && git commit -m x", main_repo) == 0
+    # not a shell script: out of scope (documented), like any other program
+    assert decide(str(other), issue_repo) == 0
+
+
+@pytest.mark.parametrize("kind", ["missing", "binary", "too-large", "directory", "fifo", "quote"])
+def test_commit_guard_refuses_a_script_it_cannot_read_on_any_branch(tmp_path, kind):
+    import os
+
+    guard, main_repo, issue_repo, decide = _script_guard_repos(tmp_path)
+    path = tmp_path / "s.sh"
+    if kind == "binary":
+        path.write_bytes(b"\x7fELF\x00\x00git commit")
+    elif kind == "too-large":
+        path.write_text("echo x\n" * (guard.MAX_SCRIPT_BYTES // 7 + 1))
+    elif kind == "directory":
+        path.mkdir()
+    elif kind == "fifo":
+        os.mkfifo(path)  # never opened: reading one could hang the hook
+    elif kind == "quote":
+        path.write_text("echo 'unclosed\n")
+    for command in (f"bash {path}", f"source {path}", f"{path}"):
+        if kind == "fifo" and command == str(path):
+            continue  # not a .sh/.bash path read as a script only by its `#!` line
+        for cwd in (main_repo, issue_repo):
+            assert guard.commit_branches(command, str(cwd)) == [guard.UNRESOLVED_REPO], command
+            assert decide(command, cwd, leased=True) == 2, command
+    msg = guard._decide_branch({"session_id": "s1"}, guard.UNRESOLVED_REPO, None, None)[1]
+    assert "shell script file the guard could not read" in msg
+
+
+def test_commit_guard_refuses_a_script_named_by_an_expansion(tmp_path):
+    _, main_repo, _, decide = _script_guard_repos(tmp_path)
+    _script(main_repo / "x.sh", "echo ok\n")
+    for command in ('bash "$S"', "bash ~/x.sh", "source $(mktemp)", "bash x{,}.sh"):
+        assert decide(command, main_repo, leased=True) == 2, command
+    assert decide("bash x.sh", main_repo) == 0
+
+
+def test_commit_guard_analyses_nested_scripts_up_to_the_depth_limit(tmp_path):
+    guard, main_repo, issue_repo, decide = _script_guard_repos(tmp_path)
+    inner = _script(tmp_path / "inner.sh", f"git -C {issue_repo} commit -m x\n")
+    middle = _script(tmp_path / "middle.sh", f"echo start\nsh {inner}\n")
+    outer = _script(tmp_path / "outer.sh", f"source {middle}\n")
+    assert decide(f"bash {outer}", main_repo) == 2  # found two scripts down
+    assert decide(f"bash {outer}", main_repo, leased=True) == 0
+    # a harmless chain within the limit passes; one level deeper is refused unread
+    chain = [_script(tmp_path / "d0.sh", "echo leaf\n")]
+    for level in range(1, guard.MAX_SUBST_DEPTH + 2):
+        chain.append(_script(tmp_path / f"d{level}.sh", f"bash {chain[-1]}\n"))
+    within = chain[guard.MAX_SUBST_DEPTH - 1]
+    assert decide(f"bash {within}", main_repo) == 0
+    deeper = chain[guard.MAX_SUBST_DEPTH]
+    assert guard.commit_branches(f"bash {deeper}", str(main_repo)) == [guard.UNRESOLVED_REPO]
+    assert decide(f"bash {deeper}", main_repo, leased=True) == 2
+
+
+def test_commit_guard_applies_command_line_rules_inside_a_script(tmp_path):
+    guard, main_repo, issue_repo, decide = _script_guard_repos(tmp_path)
+    cases = {
+        "assembled.sh": 'G=git\n"$G" -C /elsewhere commit -m x\n',  # raw proof: unresolved
+        "path.sh": "export PATH=/tmp/evil:$PATH\ngit fetch origin\n",  # taint: fetch guarded
+        "dollar-args.sh": 'git "$@"\n',
+    }
+    for name, text in cases.items():
+        script = _script(tmp_path / name, text)
+        assert decide(f"bash {script}", issue_repo) == 2, name
+    # a script that switches branch makes the git after it unknowable, as inline
+    _script(tmp_path / "switch.sh", "git switch forge/issue-7\n")
+    assert decide(f"bash {tmp_path / 'switch.sh'} && git commit -m x", main_repo) == 2
+    # `find -exec ./x.sh` hands work to a script per file: unresolved
+    assert guard.UNRESOLVED_REPO in guard.commit_branches(
+        "find . -name '*.py' -exec ./fmt.sh {} ;", str(main_repo)
+    )
+
+
+# ---- Codex 4240526383: the SessionStart fetch writes remote-tracking refs only.
+
+
+def test_session_start_fetch_never_updates_a_local_issue_branch(tmp_path, monkeypatch):
+    import subprocess
+
+    start = _guard_module(tmp_path, "forge_session_start")
+    _guard_module(tmp_path, "forge_commit_guard")  # the sibling whose helper check it reuses
+    upstream, local = tmp_path / "up", tmp_path / "local"
+    upstream.mkdir()
+    _git(upstream, "init", "-q", "-b", "main")
+    _git(upstream, "commit", "-q", "--allow-empty", "-m", "one")
+    _git(tmp_path, "clone", "-q", str(upstream), str(local))
+    _git(local, "branch", "forge/issue-7")
+    _git(upstream, "commit", "-q", "--allow-empty", "-m", "two")
+    # a hostile mapping: a plain `git fetch origin` would force-update the issue branch
+    _git(
+        local, "config", "--add", "remote.origin.fetch", "+refs/heads/main:refs/heads/forge/issue-7"
+    )
+
+    def rev(ref, cwd=local):
+        return subprocess.run(
+            ["git", "rev-parse", ref], cwd=cwd, capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+    before, new_main = rev("refs/heads/forge/issue-7"), rev("refs/heads/main", upstream)
+    monkeypatch.chdir(local)
+    assert start.fetch_blocker() is None
+    assert start.run(start.fetch_command()) is not None
+    assert rev("refs/heads/forge/issue-7") == before  # untouched
+    assert rev("refs/remotes/origin/main") == new_main  # the remote-tracking ref did move
+    # the control: git's own default fetch would have moved it
+    _git(local, "fetch", "-q", "origin")
+    assert rev("refs/heads/forge/issue-7") == new_main
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("core.sshCommand", "/tmp/evil-ssh"),
+        ("remote.origin.url", "ext::sh -c touch% /tmp/pwned"),
+        ("credential.helper", "!/tmp/evil-helper"),
+    ],
+)
+def test_session_start_skips_the_fetch_when_git_would_run_a_configured_program(
+    tmp_path, monkeypatch, key, value
+):
+    import io
+
+    start = _guard_module(tmp_path, "forge_session_start")
+    _guard_module(tmp_path, "forge_commit_guard")
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "remote", "add", "origin", "https://example.invalid/x.git")
+    _git(repo, "config", key, value)
+    monkeypatch.chdir(repo)
+    reason = start.fetch_blocker()
+    assert reason and key.lower().split(".")[-1] in reason.lower()
+    calls = []
+
+    def run(cmd):
+        calls.append(cmd)
+        return "[]" if _is_issue_page(cmd) else ""
+
+    monkeypatch.setattr(start, "run", run)
+    monkeypatch.setattr(start, "_lease_lookup", lambda: {}.get)
+    monkeypatch.setattr(start.sys, "stdin", io.StringIO("{}"))
+    out = io.StringIO()
+    monkeypatch.setattr(start.sys, "stdout", out)
+    assert start.main() == 0  # a session start is never blocked
+    assert not any(c[:2] == ["git", "fetch"] for c in calls)
+    text = out.getvalue()
+    assert "[Forge] Did not fetch origin:" in text and "could not fetch origin" in text
+
+
+def test_session_start_fetch_command_is_explicit_and_validates_the_remote(tmp_path):
+    start = _guard_module(tmp_path, "forge_session_start")
+    cmd = start.fetch_command()
+    assert cmd[-2:] == ["origin", "+refs/heads/*:refs/remotes/origin/*"]
+    assert "--refmap=" in cmd and "--no-tags" in cmd and "--no-recurse-submodules" in cmd
+    for bad in ("--upload-pack=x", "../up", "a b", "ext::x", "", "-o"):
+        assert "not a plain name" in start.fetch_blocker(bad), bad
