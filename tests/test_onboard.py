@@ -7824,8 +7824,9 @@ def test_token_ceiling_falls_back_to_the_repository_default_and_fails_closed():
     over, unknown = check({}, unreadable)
     assert not over and "cannot be determined" in unknown[0]
     assert isinstance(default_token_permissions({"default_workflow_permissions": "x"}), str)
+    # an invalid level is not unknown but a mismatch: GitHub rejects the workflow (4239780832)
     over, unknown = check({"permissions": {"contents": "admin"}}, "never read")
-    assert unknown
+    assert over and "invalid permission contents: 'admin'" in over[0] and not unknown
     over, unknown = token_permission_problems(
         [("caller.yml", {"permissions": "write-all"})],
         [("caller.yml:call", caller_job, "gone.yml")],
@@ -8288,3 +8289,176 @@ def test_doctor_requires_the_authorization_failure_reporter(tmp_path, name, chan
     _edit_workflow(repo, name, change)
     drift = _drift(repo)
     assert drift is not None and name in drift
+
+
+# ---------------------------------------------------------------- Codex review 5481401488
+
+
+@pytest.mark.parametrize(
+    ("permissions", "needle"),
+    [
+        ({"issuse": "none"}, "invalid permission scope 'issuse'"),
+        ({"metadata": "read"}, "invalid permission scope 'metadata'"),
+        ({"id-token": "read"}, "invalid permission id-token: 'read'"),
+        ({"models": "write"}, "invalid permission models: 'write'"),
+        ({"contents": True}, "invalid permission contents: True"),
+        ("read", "invalid permissions 'read'"),
+        (None, "invalid permissions None"),
+    ],
+)
+def test_invalid_token_permission_syntax_is_a_mismatch(permissions, needle):
+    """Codex 4239780832: GitHub's `permissions` syntax is finite. An unknown scope or a level the
+    scope does not accept makes GitHub reject the workflow: a mismatch, never READY."""
+    from agentic_sdlc.onboard import token_permission_problems, token_permissions
+
+    assert isinstance(token_permissions(permissions), str)
+    callee = {
+        "on": {"workflow_call": None},
+        "jobs": {"j": {"runs-on": "x", "permissions": permissions, "steps": []}},
+    }
+    caller_job = {"uses": f"owner/agentic-sdlc/.github/workflows/r.yml@{SHA}"}
+    calls = [("caller.yml:call", caller_job, "r.yml")]
+    graph = _permission_graph(callee)
+    over, unknown = token_permission_problems(
+        [("caller.yml", {"permissions": "write-all"})],
+        calls,
+        graph,
+        SHA,
+        "owner/agentic-sdlc",
+        lambda: "never read",
+    )
+    assert not unknown and any(needle in o for o in over), over
+    # the same entry on the caller (the ceiling) is a mismatch too
+    over, unknown = token_permission_problems(
+        [("caller.yml", {"permissions": permissions})],
+        calls,
+        _permission_graph({**callee, "jobs": {"j": {"runs-on": "x", "steps": []}}}),
+        SHA,
+        "owner/agentic-sdlc",
+        lambda: "never read",
+    )
+    assert not unknown and any(needle in o for o in over), over
+
+
+def test_valid_token_permission_syntax_reads():
+    from agentic_sdlc.onboard import TOKEN_SCOPES, token_permissions
+
+    assert token_permissions({"id-token": "write", "models": "read", "issues": "none"}) == {
+        "id-token": 2,
+        "models": 1,
+        "issues": 0,
+    }
+    assert token_permissions({"id-token": "none", "models": "none"}) == {
+        "id-token": 0,
+        "models": 0,
+    }
+    assert token_permissions({}) == {}
+    assert set(token_permissions("read-all")) == set(TOKEN_SCOPES)
+    for scope in TOKEN_SCOPES:
+        assert isinstance(token_permissions({scope: "none"}), dict), scope
+
+
+def test_forced_onboard_keeps_notes_around_the_guides(tmp_path):
+    """Codex 4239780830: doctor accepts repository notes around the generated guide text, so a
+    forced re-onboard replaces only that text and is idempotent."""
+    from agentic_sdlc.onboard import managed_file_problem, render_agents_md, render_claude_md
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    for name in ("AGENTS.md", "CLAUDE.md"):
+        guide = repo / name
+        guide.write_text(f"# Team notes for {name}\n\n" + guide.read_text() + "\nKeep me too.\n")
+    write_onboarding(repo, spec(), force=True)
+    agents = (repo / "AGENTS.md").read_text()
+    assert agents.startswith("# Team notes for AGENTS.md\n\n") and agents.endswith("Keep me too.\n")
+    first = {n: (repo / n).read_text() for n in ("AGENTS.md", "CLAUDE.md")}
+    write_onboarding(repo, spec(), force=True)
+    assert {n: (repo / n).read_text() for n in first} == first  # idempotent
+
+    # a new policy replaces the previous managed text in place, notes kept
+    newer = spec(test_command="pytest -q")
+    write_onboarding(repo, newer, force=True)
+    for name, render in (("AGENTS.md", render_agents_md), ("CLAUDE.md", render_claude_md)):
+        text = (repo / name).read_text()
+        assert text.startswith(f"# Team notes for {name}\n\n") and text.endswith("Keep me too.\n")
+        assert render(newer) in text and render(spec()) not in text
+        assert text.count(render(newer)) == 1
+        assert managed_file_problem(name, text.encode(), {name: render(newer)}) is None
+
+
+def test_forced_onboard_appends_the_guide_to_an_owners_file(tmp_path):
+    from agentic_sdlc.onboard import render_agents_md
+
+    repo = _repo(tmp_path)
+    (repo / "AGENTS.md").write_text("owner content\n")
+    write_onboarding(repo, spec(), force=True)
+    assert (repo / "AGENTS.md").read_text() == "owner content\n\n" + render_agents_md(spec())
+
+
+def test_forced_onboard_refuses_an_edited_guide_rather_than_delete_notes(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    guide = repo / "AGENTS.md"
+    edited = "my notes\n" + guide.read_text().replace("Plan before implementation.", "Plan.")
+    guide.write_text(edited)
+    workflow = repo / ".github/workflows/ci.yml"
+    workflow.write_text("stale\n")
+    with pytest.raises(OnboardError, match="AGENTS.md holds an edited Forge guide"):
+        write_onboarding(repo, spec(), force=True)
+    assert guide.read_text() == edited
+    assert workflow.read_text() == "stale\n"  # refused before anything was written
+
+
+def test_forced_onboard_merges_claude_settings(tmp_path):
+    """Codex 4239780830: permissions and unrelated hooks in `.claude/settings.json` survive a
+    forced re-onboard; Forge's own handlers are written once, exactly."""
+    from agentic_sdlc.onboard import HOOK_SCRIPTS, forge_hook_entry, hook_problems
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    path = repo / ".claude/settings.json"
+    settings = json.loads(path.read_text())
+    settings["permissions"] = {"allow": ["Bash(make test)"]}
+    settings["hooks"]["PreToolUse"].append(
+        {"matcher": "Edit", "hooks": [{"type": "command", "command": "./fmt.sh"}]}
+    )
+    settings["hooks"]["Stop"] = [{"hooks": [{"type": "command", "command": "./notify.sh"}]}]
+    # a stale async copy of the guard, beside a user hook in the same group
+    settings["hooks"]["PreToolUse"].append(
+        {
+            "matcher": "Bash",
+            "hooks": [
+                {**forge_hook_entry(HOOK_SCRIPTS["PreToolUse"]), "async": True},
+                {"type": "command", "command": "./audit.sh"},
+            ],
+        }
+    )
+    path.write_text(json.dumps(settings))
+    write_onboarding(repo, spec(), force=True)
+    merged = json.loads(path.read_text())
+    assert merged["permissions"] == {"allow": ["Bash(make test)"]}
+    assert merged["hooks"]["Stop"] == settings["hooks"]["Stop"]
+    commands = [
+        h["command"] for g in merged["hooks"]["PreToolUse"] for h in g["hooks"] if "command" in h
+    ]
+    assert "./fmt.sh" in commands and "./audit.sh" in commands
+    assert sum(HOOK_SCRIPTS["PreToolUse"] in c for c in commands) == 1
+    assert hook_problems(path) == []
+    first = path.read_text()
+    write_onboarding(repo, spec(), force=True)
+    assert path.read_text() == first  # idempotent
+
+
+@pytest.mark.parametrize("content", ["{not json", "[]", '{"hooks": []}', '{"hooks": {"Stop": 1}}'])
+def test_forced_onboard_refuses_unmergeable_settings(tmp_path, content):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    path = repo / ".claude/settings.json"
+    path.write_text(content)
+    if content == '{"hooks": {"Stop": 1}}':  # an unrelated event: kept as is
+        write_onboarding(repo, spec(), force=True)
+        assert json.loads(path.read_text())["hooks"]["Stop"] == 1
+        return
+    with pytest.raises(OnboardError, match="settings.json"):
+        write_onboarding(repo, spec(), force=True)
+    assert path.read_text() == content

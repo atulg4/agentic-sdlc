@@ -1269,7 +1269,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--forbidden", action="append", help="extra forbidden path glob (repeatable)"
     )
     onboard.add_argument("--protected", action="append", help="protected path glob (repeatable)")
-    onboard.add_argument("--force", action="store_true", help="overwrite files the profile owns")
+    onboard.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite files the profile owns (AGENTS.md, CLAUDE.md and .claude/settings.json "
+        "are merged: content added around the managed part is kept)",
+    )
     onboard.add_argument(
         "--apply", action="store_true", help="create labels, ruleset and variables via gh"
     )

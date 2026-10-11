@@ -113,6 +113,12 @@ The only tunable knobs, each validated by its own check instead:
 Everything else in those files is the template. To change it, change the policy and re-run
 `onboard --force`.
 
+`onboard --force` replaces the workflows and the other fully managed files wholesale, but merges
+the tunable ones: in `AGENTS.md` and `CLAUDE.md` only the generated guide text is replaced (notes
+around it are kept; a file with no guide gets it appended; a guide edited in place is refused
+rather than guessed at), and in `.claude/settings.json` the Forge hook handlers are written once
+beside every other key and hook (unparseable settings are refused, never overwritten).
+
 `agent-auto-plan.yml` authorizes before it schedules anything on your runners. Anyone who can open
 an issue can use the work-request template, and the template applies the planning labels itself;
 so its `preflight` job runs on `ubuntu-latest` (GitHub-hosted, NOT tunable), asks

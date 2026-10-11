@@ -1957,3 +1957,97 @@ def test_the_commit_guard_reads_a_malformed_comment_answer_as_unavailable(
 
     monkeypatch.setattr(guard.subprocess, "run", fake_run)
     assert guard.lease_unavailable(guard.lease_for(7))
+
+
+# ---------------------------------------------------------------- Codex review 5481401488
+
+
+def test_chatter_authors_permissions_are_never_read(monkeypatch):
+    """Codex 4239780833: only a comment carrying a valid lease marker needs its author's
+    permission. Ordinary discussion costs no read, and an unreadable permission of a chatter
+    cannot refuse the lease operation; a marker author's still does."""
+    gh = FakeGh().issue(7)
+    marker = format_claim_marker(Lease(7, "me", "s1", "b", NOW + timedelta(hours=1)))
+    gh.issues[7]["comments"] += [
+        _comment_row(80, "looks good to me", "2026-09-30T00:10:00Z", "chatty", "User", "NONE"),
+        _comment_row(
+            81, "see <!-- forge-claim --> above", "2026-09-30T00:11:00Z", "quoter", "User", "NONE"
+        ),
+        _comment_row(82, marker, "2026-09-30T01:00:00Z"),
+    ]
+    real = gh.__call__
+
+    def flaky(args, input=None):
+        if "/collaborators/" in args[1] and "/collaborators/atulg4/" not in args[1]:
+            raise RuntimeError("HTTP 502")
+        return real(args, input=input)
+
+    lease = current_lease(PROJECT, 7, flaky, now=NOW)
+    assert lease is not None and lease.session == "s1"
+    reads = [c for c in gh.calls if "/collaborators/" in c[1]]
+    assert reads and all("/collaborators/atulg4/" in c[1] for c in reads)
+    # the marker author's unreadable permission still refuses
+    gh.issues[7]["comments"].append(_comment_row(83, marker, "2026-09-30T01:05:00Z", "chatty"))
+    with pytest.raises(LeaseError, match="cannot read the repository permission"):
+        current_lease(PROJECT, 7, flaky, now=NOW)
+
+    # the commit guard filters the same way
+    guard = _guard()
+    asked = []
+
+    def permission(login):
+        asked.append(login)
+        if login != "atulg4":
+            raise guard.LeaseUnavailable("HTTP 502")
+        return "admin"
+
+    rows = gh.issues[7]["comments"][:-1]
+    assert guard.lease_from_comments(rows, permission, now=NOW)["session"] == "s1"
+    assert set(asked) == {"atulg4"}
+
+
+def _linked(number, owner="owner", name="repo"):
+    return {"number": number, "repository": {"name": name, "owner": {"login": owner}}}
+
+
+def test_a_pr_linked_through_the_development_sidebar_blocks_claims():
+    """Codex 4239780827: a manual Development-sidebar link shows only in
+    `closingIssuesReferences`; it marks the work like a closing keyword does."""
+    from agentic_sdlc.leases import open_prs_for_issue
+
+    gh = FakeGh().issue(7)
+    gh.prs = [
+        _fork_pr(40, head="unrelated", closingIssuesReferences=[_linked(7)]),
+        _fork_pr(41, head="x", closingIssuesReferences=[_linked(7, "OWNER", "Repo")]),
+        _fork_pr(42, head="x", closingIssuesReferences=[_linked(7, "other", "repo")]),
+        _fork_pr(43, head="x", closingIssuesReferences=[_linked(70)]),
+        _fork_pr(44, head="x", closingIssuesReferences=[_linked(True)]),
+        _fork_pr(45, head="x", closingIssuesReferences=[{"number": 7}]),
+        _fork_pr(46, head="x", closingIssuesReferences=[{"number": 7, "repository": "repo"}]),
+        _fork_pr(47, head="x", closingIssuesReferences="#7"),
+        _fork_pr(48, head="x", closingIssuesReferences=[None, "7"]),
+        _fork_pr(49, head="x", closingIssuesReferences=[_linked(7, name="")]),
+    ]
+    assert [p["number"] for p in open_prs_for_issue(PROJECT, 7, gh)] == [40, 41]
+    fields = [c for c in gh.calls if c[:2] == ("pr", "list")][-1]
+    assert "closingIssuesReferences" in fields[fields.index("--json") + 1].split(",")
+    result = claim(PROJECT, 7, agent="me", session="s1", branch="b", ttl_minutes=60, gh=gh, now=NOW)
+    assert not result.ok and "pr/40" in result.reason
+
+
+@pytest.mark.parametrize("answer", ['{"number": 1}', "[1, 2]", "not json", '[{"n": 1}, null]'])
+def test_an_unreadable_open_pr_inventory_is_never_no_pr(answer):
+    from agentic_sdlc.leases import open_prs_for_issue
+
+    gh = FakeGh().issue(7)
+    real = gh.__call__
+
+    def broken(args, input=None):
+        if tuple(args[:2]) == ("pr", "list"):
+            return answer
+        return real(args, input=input)
+
+    with pytest.raises(LeaseError, match="gh pr list"):
+        open_prs_for_issue(PROJECT, 7, broken)
+    with pytest.raises(LeaseError):
+        claim(PROJECT, 7, agent="me", session="s1", branch="b", gh=broken, now=NOW)
