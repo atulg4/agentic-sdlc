@@ -29,7 +29,7 @@ from .executors import (
     route_executor,
 )
 from .gates import GateError, run_gates, write_report
-from .git_diff import GitDiffError, collect_git_diff
+from .git_diff import GitDiffError, collect_commit_diff, collect_git_diff
 from .infra_recovery import (
     FailureClass,
     InfraRecoveryError,
@@ -284,6 +284,98 @@ def _inspect_diff(args: argparse.Namespace) -> int:
         file=sys.stderr,
     )
     return 2
+
+
+def _check_diff(args: argparse.Namespace) -> int:
+    """The diff policy (`evaluate_diff`, as `inspect-diff` applies it on the Actions path) over
+    the COMMITTED change `--head` brings onto `--base` -- what a push of `--head` publishes
+    (Codex 4241434509: the cloud routine runs it right before pushing). Exit 0 only when the
+    policy allows it and something changed; 2 otherwise, the reasons on stderr."""
+    snapshot = collect_commit_diff(args.repository, args.base, args.head)
+    decision = evaluate_diff(
+        snapshot.paths,
+        snapshot.added_lines,
+        snapshot.deleted_lines,
+        load_policy(args.config),
+        patch_bytes=len(snapshot.patch),
+    )
+    document = decision.as_dict()
+    document["diff"] = {
+        "base": args.base,
+        "head": args.head,
+        "files": len(snapshot.paths),
+        "addedLines": snapshot.added_lines,
+        "deletedLines": snapshot.deleted_lines,
+        "patchBytes": len(snapshot.patch),
+        "paths": list(snapshot.paths),
+    }
+    _write(document, args.output)
+    if decision.allowed and snapshot.paths:
+        _status(f"diff policy passed: {len(snapshot.paths)} file(s) changed")
+        return 0
+    reasons = list(decision.reasons) if not decision.allowed else []
+    if not snapshot.paths:
+        reasons.append(f"no files changed: {args.head} adds nothing to {args.base}")
+    _status("REFUSED: check-diff rejected the change: " + "; ".join(reasons))
+    return 2
+
+
+#: `check-request` exit codes beside 0 (ready) and 2 (could not be verified).
+REQUEST_INVALID = 3
+DEPENDENCY_OPEN = 4
+
+
+def _check_request(args: argparse.Namespace) -> int:
+    """Is GitHub issue `--issue` a work request the Actions implement path would run (Codex
+    4241434511)? Its body is parsed by the same validator (`parse_task`) and judged by the same
+    policy (`evaluate_task`, mode implement) as `prepare-request`, and every dependency it names
+    must be CLOSED, as the Actions "Require every dependency issue to be closed" step requires.
+    Exit 0: ready. 3: not a valid or eligible request. 4: a dependency is still open. 2 (an
+    error): anything that could not be read -- never "no dependencies"."""
+    document = json.loads(run_gh(["api", f"repos/{args.project}/issues/{args.issue}"]) or "null")
+    if not isinstance(document, dict) or "pull_request" in document:
+        raise ValueError(f"#{args.issue} is not a readable issue of {args.project}")
+    policy = load_policy(args.config)
+    if policy.provider != "github":
+        raise ValueError("policy provider is not github")
+    if policy.project_id != args.project:
+        raise ValueError("policy project ID does not match --project")
+    title, body, labels = _request_fields("github", document)
+    result: dict[str, Any] = {"issue": args.issue, "ready": False, "dependencies": []}
+    try:
+        task = parse_task(title, body, labels)
+    except TaskSpecError as exc:
+        result["reasons"] = [f"not a valid work request: {exc}"]
+        _write(result, args.output)
+        _status(f"INVALID: #{args.issue}: {exc}")
+        return REQUEST_INVALID
+    decision = evaluate_task(task, policy, "implement")
+    result["dependencies"] = list(task.dependencies)
+    if not decision.allowed:
+        result["reasons"] = list(decision.reasons)
+        _write(result, args.output)
+        _status(f"INVALID: #{args.issue}: " + "; ".join(decision.reasons))
+        return REQUEST_INVALID
+    still_open = []
+    for dependency in task.dependencies:
+        state = run_gh(
+            ["api", f"repos/{args.project}/issues/{dependency}", "--jq", ".state"]
+        ).strip()
+        if state not in ("open", "closed"):
+            raise ValueError(f"dependency #{dependency}: unreadable state {state!r}")
+        if state != "closed":
+            still_open.append(dependency)
+    if still_open:
+        listed = ", ".join(f"#{n}" for n in still_open)
+        result["reasons"] = [f"dependency issue(s) not closed: {listed}"]
+        result["openDependencies"] = still_open
+        _write(result, args.output)
+        _status(f"WAITING: #{args.issue}: dependency issue(s) not closed: {listed}")
+        return DEPENDENCY_OPEN
+    result.update(ready=True, reasons=list(decision.reasons))
+    _write(result, args.output)
+    _status(f"ready: #{args.issue} is a valid work request with every dependency closed")
+    return 0
 
 
 def _create_manifest(args: argparse.Namespace) -> int:
@@ -1051,6 +1143,31 @@ def build_parser() -> argparse.ArgumentParser:
     inspect.add_argument("--paths-output", required=True)
     inspect.add_argument("--decision-output", required=True)
     inspect.set_defaults(handler=_inspect_diff)
+
+    check_diff = commands.add_parser(
+        "check-diff",
+        help="apply the diff policy to the committed change HEAD brings onto --base; "
+        "exit 0 only if it passes (2: rejected, empty or unreadable)",
+    )
+    check_diff.add_argument("--config", default="agentic-sdlc.toml")
+    check_diff.add_argument("--repository", default=".")
+    check_diff.add_argument(
+        "--base", required=True, help="the branch the change targets, e.g. origin/main"
+    )
+    check_diff.add_argument("--head", default="HEAD", help="the commit that will be pushed")
+    check_diff.add_argument("--output")
+    check_diff.set_defaults(handler=_check_diff)
+
+    check_request = commands.add_parser(
+        "check-request",
+        help="exit 0 only if the issue is a valid work request whose dependencies are all "
+        "closed (3: invalid request, 4: a dependency is open, 2: could not verify)",
+    )
+    check_request.add_argument("--project", required=True, help="owner/name on GitHub")
+    check_request.add_argument("--issue", type=int, required=True)
+    check_request.add_argument("--config", default="agentic-sdlc.toml")
+    check_request.add_argument("--output")
+    check_request.set_defaults(handler=_check_request)
 
     manifest = commands.add_parser("create-manifest")
     manifest.add_argument("--patch", required=True)

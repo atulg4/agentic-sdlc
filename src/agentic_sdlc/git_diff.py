@@ -83,3 +83,44 @@ def collect_git_diff(repository: str | Path, base: str = "HEAD") -> GitDiff:
 
     patch = _run(["git", "diff", "--binary", "--full-index", base, "--"], root).stdout
     return GitDiff(paths=paths, added_lines=added, deleted_lines=deleted, patch=patch)
+
+
+def collect_commit_diff(repository: str | Path, base: str, head: str = "HEAD") -> GitDiff:
+    """The COMMITTED change `head` brings onto `base`: the diff from their merge base to `head`,
+    tree to tree -- what a pull request from `head` into `base` shows, and exactly what a push
+    of `head` publishes (Codex 4241434509). The working tree and index are never read, so an
+    uncommitted edit can neither hide a committed change nor add one that is not pushed. No
+    external diff or textconv program runs."""
+    for rev in (base, head):
+        if not rev or rev.startswith("-"):
+            raise GitDiffError(f"not a revision: {rev!r}")
+    root = Path(repository)
+    merge_base = _run(["git", "merge-base", base, head], root).stdout.decode().strip()
+    tip = _run(["git", "rev-parse", "--verify", f"{head}^{{commit}}"], root).stdout.decode()
+    if not merge_base or not tip.strip():
+        raise GitDiffError(f"no merge base between {base} and {head}")
+    span = [merge_base, tip.strip()]
+    plain = ["--no-ext-diff", "--no-textconv"]
+    names = _run(
+        [
+            "git",
+            "diff",
+            *plain,
+            "--name-status",
+            "-z",
+            "--find-renames",
+            "--diff-filter=ACMRD",
+            *span,
+            "--",
+        ],
+        root,
+    ).stdout
+    paths = _paths_from_name_status(names)
+    raw_stats = _run(["git", "diff", *plain, "--numstat", "-z", *span, "--"], root).stdout
+    added = 0
+    deleted = 0
+    for match in re.finditer(rb"(?:^|\x00)(\d+|-)\t(\d+|-)\t", raw_stats):
+        added += int(match.group(1)) if match.group(1).isdigit() else 0
+        deleted += int(match.group(2)) if match.group(2).isdigit() else 0
+    patch = _run(["git", "diff", *plain, "--binary", "--full-index", *span, "--"], root).stdout
+    return GitDiff(paths=paths, added_lines=added, deleted_lines=deleted, patch=patch)

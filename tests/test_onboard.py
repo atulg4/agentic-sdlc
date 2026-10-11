@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import tomllib
 from dataclasses import replace
 from pathlib import Path
@@ -1782,6 +1783,7 @@ def test_session_start_warns_when_origin_cannot_be_fetched(tmp_path, monkeypatch
 
     monkeypatch.setattr(start, "run", run)
     monkeypatch.setattr(start, "fetch_blocker", lambda: None)
+    monkeypatch.setattr(start, "log_blocker", lambda: None)
     monkeypatch.setattr(start, "_lease_lookup", lambda: {}.get)
     monkeypatch.setattr(start.sys, "stdin", io.StringIO("{}"))
     out = io.StringIO()
@@ -10793,8 +10795,8 @@ def test_cloud_routine_reauthorizes_right_before_publishing():
         "docs/forge/cloud-implementer.md"
     ]
     claim = doc.index("1b. Claim it")
-    again = doc.index("4a. Re-authorize right before publishing")
-    publish = doc.index("5. Push the branch and open a DRAFT pull request")
+    again = doc.index("4b. Re-authorize right before publishing")
+    publish = doc.index("5. Push the checked commit at once")
     assert claim < again < publish
     assert "do\n   NOT push or open a PR" in doc
     assert "runs it AGAIN right before pushing" in doc
@@ -11755,7 +11757,7 @@ def test_cloud_routine_retires_an_invalid_issue_instead_of_starving_the_queue():
         "-label:claude-blocked",
         "sort:created-asc",
     ]
-    step2 = doc[doc.index("2. Validate the issue body") : doc.index("3. On a new branch")]
+    step2 = doc[doc.index("2. Check the request") : doc.index("3. `git fetch origin")]
     assert "add label `claude-blocked`" in step2
     release = step2.index("sdlcctl release --project owner/comic --issue <n>")
     assert release > step2.index("claude-blocked") and "--session <run id>" in step2
@@ -11781,10 +11783,10 @@ def test_cloud_routine_works_through_every_listed_candidate():
     assert "never ends the run while candidates remain" in flat
     assert "Take the oldest one; if none, stop." not in flat
     # every skip in steps 1a/1b moves on to the next candidate rather than stopping
-    skips = doc[doc.index("1a. Authorize") : doc.index("2. Validate the issue body")]
+    skips = doc[doc.index("1a. Authorize") : doc.index("2. Check the request")]
     assert " ".join(skips.split()).count("take the next issue") == 2
     assert "skip that issue and take the next one" in " ".join(skips.split())
-    step2 = doc[doc.index("2. Validate the issue body") : doc.index("3. On a new branch")]
+    step2 = doc[doc.index("2. Check the request") : doc.index("3. `git fetch origin")]
     assert "next candidate of the step 1 list" in " ".join(step2.split())
 
 
@@ -11931,3 +11933,278 @@ def test_doctor_requires_rulesets_to_treat_every_cloud_branch_alike(tmp_path, in
         check = _failed(report)[CLOUD_BRANCH_RULES_CHECK]
         assert check.manual and "'org agents'" in check.detail
         assert "forge/issue-${ISSUE_NUMBER}" in check.detail
+
+
+# ---------------------------------------------------------------- review regressions (PR 139, 12)
+# Codex review 5483165195.
+
+
+def _signed_origin_repo(tmp_path):
+    """A repository whose `origin/main` is a signed commit, with `log.showSignature` on and a
+    `gpg.program` that leaves a marker file when git runs it; returns (repo, marker)."""
+    import subprocess
+
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "one")
+    tree = subprocess.run(
+        ["git", "rev-parse", "HEAD^{tree}"], cwd=repo, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    signed = (
+        f"tree {tree}\nauthor t <t@example.com> 1700000000 +0000\n"
+        "committer t <t@example.com> 1700000000 +0000\n"
+        "gpgsig -----BEGIN PGP SIGNATURE-----\n \n iQEzBAABCAAdFiEE\n -----END PGP SIGNATURE-----\n"
+        "\nsigned tip\n"
+    )
+    commit = subprocess.run(
+        ["git", "hash-object", "-t", "commit", "-w", "--stdin"],
+        cwd=repo,
+        input=signed,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    _git(repo, "update-ref", "refs/remotes/origin/main", commit)
+    marker = tmp_path / "gpg-ran"
+    program = tmp_path / "evil-gpg"
+    program.write_text(f"#!/bin/sh\ntouch {marker}\nexit 1\n")
+    program.chmod(0o755)
+    _git(repo, "config", "log.showSignature", "true")
+    _git(repo, "config", "gpg.program", str(program))
+    return repo, marker
+
+
+def _session_start_text(start, monkeypatch, repo):
+    """main() in `repo` with every git command run for real and GitHub answering nothing."""
+    import io
+
+    real = start.run
+    calls = []
+
+    def run(cmd):
+        calls.append(cmd)
+        if cmd[:1] == ["git"]:
+            return real(cmd)
+        return "[]" if _is_issue_page(cmd) or _is_comment_page(cmd) else ""
+
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(start, "run", run)
+    monkeypatch.setattr(start, "_lease_lookup", lambda: {}.get)
+    monkeypatch.setattr(start.sys, "stdin", io.StringIO("{}"))
+    out = io.StringIO()
+    monkeypatch.setattr(start.sys, "stdout", out)
+    assert start.main() == 0
+    return out.getvalue(), calls
+
+
+# Codex 4241434513: the fetch was vetted but the recent-commits `git log` ran unconditionally, so
+# `log.showSignature` made it verify the signed tip with whatever `gpg.program` names.
+def test_session_start_log_never_runs_the_signature_program(tmp_path, monkeypatch):
+    import subprocess
+
+    start = _guard_module(tmp_path, "forge_session_start")
+    _guard_module(tmp_path, "forge_commit_guard")
+    repo, marker = _signed_origin_repo(tmp_path)
+    # the control: a plain `git log` (the old command) runs the program
+    subprocess.run(["git", "log", "--oneline", "-8", "origin/main"], cwd=repo, capture_output=True)
+    assert marker.exists()
+    marker.unlink()
+    text, calls = _session_start_text(start, monkeypatch, repo)
+    assert not marker.exists()
+    assert "[Forge] Did not fetch origin: gpg." in text  # the fetch still verifies signatures
+    assert "signed tip" in text  # the listing itself ran, without verifying
+    logs = [c for c in calls if c[:2] == ["git", "log"]]
+    assert logs == [start.log_command()] and "--no-show-signature" in logs[0]
+
+
+def test_session_start_skips_the_log_when_git_would_still_run_a_program(tmp_path, monkeypatch):
+    start = _guard_module(tmp_path, "forge_session_start")
+    _guard_module(tmp_path, "forge_commit_guard")
+    repo, marker = _signed_origin_repo(tmp_path)
+    _git(repo, "config", "core.pager", str(tmp_path / "evil-pager"))
+    text, calls = _session_start_text(start, monkeypatch, repo)
+    assert not any(c[:2] == ["git", "log"] for c in calls)
+    assert "[Forge] Did not list recent commits: core.pager=" in text
+    assert not marker.exists()
+
+
+def test_session_start_log_is_skipped_without_the_commit_guard(tmp_path, monkeypatch):
+    start = _guard_module(tmp_path, "forge_session_start")  # no forge_commit_guard.py beside it
+    monkeypatch.setitem(sys.modules, "forge_commit_guard", None)  # nor one imported earlier
+    assert "commit guard" in start.log_blocker()
+
+
+def test_session_start_git_env_forces_its_overrides_after_existing_ones(tmp_path):
+    start = _guard_module(tmp_path, "forge_session_start")
+    env = start.git_env(
+        {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "a.b", "GIT_CONFIG_VALUE_0": "c"}
+    )
+    assert env["GIT_CONFIG_KEY_0"] == "a.b"  # the caller's own entry is kept
+    pairs = {
+        env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"]
+        for i in range(1, int(env["GIT_CONFIG_COUNT"]))
+    }
+    assert pairs == {"core.fsmonitor": "false", "core.hooksPath": os.devnull}
+    assert env["GIT_PAGER"] == "cat" and env["GIT_NO_LAZY_FETCH"] == "1"
+
+
+def test_session_start_runs_git_with_a_fsmonitor_hook_disabled(tmp_path, monkeypatch):
+    """A configured fsmonitor program never starts from the hook's own git (here `git status`,
+    which consults it; the hook's commands are run the same way)."""
+    start = _guard_module(tmp_path, "forge_session_start")
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    marker = tmp_path / "fsmonitor-ran"
+    program = tmp_path / "evil-fsmonitor"
+    program.write_text(f"#!/bin/sh\ntouch {marker}\n")
+    program.chmod(0o755)
+    _git(repo, "config", "core.fsmonitor", str(program))
+    monkeypatch.chdir(repo)
+    assert start.run(["git", "status", "--porcelain"]) is not None
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    ("args", "wanted"),
+    [
+        (["--no-show-signature", "--oneline"], False),
+        (["--show-signature", "--no-show-signature"], False),
+        (["--no-show-signature", "--show-signature"], True),
+        (["--no-show-signature", "--format=%G?"], True),  # a %G format always verifies
+        (["--oneline", "--", "--no-show-signature"], True),  # a path, not an option
+        (["--oneline"], True),  # log.showSignature decides
+    ],
+)
+def test_commit_guard_signature_check_honours_no_show_signature(tmp_path, args, wanted):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    config = {"log.showsignature": ["true"], "gpg.program": ["/tmp/x"]}
+    assert guard._signature_wanted(args, config) is wanted
+    reason = guard._config_reason("log", args, config)
+    assert (reason == "gpg.program=/tmp/x") is wanted
+
+
+def test_commit_guard_internal_git_never_pages(tmp_path, monkeypatch):
+    """The guard's own git calls pass `--no-pager` AFTER the vetted command's global options, so
+    `git -p ...` cannot start a pager from inside the guard."""
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    seen = []
+
+    class Done:
+        returncode = 0
+        stdout = "x\n"
+        stderr = ""
+
+    def fake(cmd, **kwargs):
+        seen.append(cmd)
+        return Done()
+
+    monkeypatch.setattr(guard.subprocess, "run", fake)
+    guard._git_in(str(tmp_path), ((), ("-p", "-C", "."), ()), "rev-parse", "--show-toplevel")
+    guard._branch_exists("b", str(tmp_path), ((), ("-p",), ()))
+    guard.current_branch(str(tmp_path), ("-p",))
+    assert seen and all(c[: c.index("--no-pager")].count("-p") == 1 for c in seen)
+    assert seen[0] == ["git", "-p", "-C", ".", "--no-pager", "rev-parse", "--show-toplevel"]
+
+
+def _routine_prompt(**overrides):
+    doc = render_onboarding(
+        spec(implementer="cloud-routine", runs_on=("ubuntu-latest",), **overrides)
+    )["docs/forge/cloud-implementer.md"]
+    return doc[doc.index("Repository: ") : doc.index("```", doc.index("Repository: "))]
+
+
+def _step(prompt, label, following):
+    return " ".join(prompt[prompt.index(label) : prompt.index(following)].split())
+
+
+# Codex 4241434509: the routine runs the deterministic diff policy on exactly what it pushes and
+# pushes nothing unless it passes.
+def test_cloud_routine_checks_the_diff_policy_right_before_pushing():
+    import shlex
+
+    prompt = _routine_prompt(default_branch="trunk")
+    step = _step(prompt, "4c. Check the diff policy", "4d. Verify the lease")
+    command = re.search(r"`(sdlcctl check-diff [^`]*)`", step).group(1)
+    assert shlex.split(command) == [
+        "sdlcctl",
+        "check-diff",
+        "--config",
+        "agentic-sdlc.toml",
+        "--base",
+        "origin/trunk",
+    ]
+    assert "`git fetch origin trunk`" in step and "Commit everything first" in step
+    assert "On any non-zero exit do NOT push or open a PR" in step
+    assert "Make no commit after this check" in step
+    order = [
+        prompt.index("4. Run each"),
+        prompt.index("4c. Check the diff policy"),
+        prompt.index("sdlcctl check-diff"),
+        prompt.index("5. Push the checked commit"),
+        prompt.index("git push origin HEAD:refs/heads/forge/issue-<n>"),
+    ]
+    assert order == sorted(order)
+    # the command the prompt names exists and gates on its exit code
+    from agentic_sdlc.cli import build_parser
+
+    args = build_parser().parse_args(shlex.split(command)[1:])
+    assert args.command == "check-diff" and args.head == "HEAD"
+
+
+# Codex 4241434506: the routine renews its lease between the long stages and verifies it holds
+# it immediately before pushing; `renew` fails unless this session holds a live lease
+# (test_leases.test_cli_renew_fails_unless_this_session_holds_a_live_lease).
+def test_cloud_routine_renews_its_lease_and_verifies_it_before_pushing():
+    prompt = _routine_prompt()
+    renew = (
+        "`sdlcctl renew --project owner/comic --issue <n> --session <run id> "
+        "--config agentic-sdlc.toml`"
+    )
+    flat = " ".join(prompt.split())
+    assert flat.count(renew) == 1  # step 3a; 4a and 4d repeat "the step 3a renew command"
+    implement = prompt.index("3. `git fetch origin main`")
+    renew_1 = prompt.index("3a. Renew the lease")
+    verify = prompt.index("4. Run each")
+    renew_2 = prompt.index("4a. Renew the lease again, exactly as in step 3a")
+    authorize = prompt.index("4b. Re-authorize right before publishing")
+    diff = prompt.index("4c. Check the diff policy")
+    renew_3 = prompt.index("4d. Verify the lease immediately before pushing")
+    push = prompt.index("5. Push the checked commit")
+    assert implement < renew_1 < verify < renew_2 < authorize < diff < renew_3 < push
+    step3a = _step(prompt, "3a. Renew the lease", "4. Run each")
+    assert renew in step3a
+    assert "On any non-zero exit STOP: do NOT push or open a PR" in step3a
+    step4d = _step(prompt, "4d. Verify the lease", "5. Push the checked commit")
+    assert "run the step 3a renew command once more" in step4d
+    assert "do NOT push or open a PR" in step4d
+
+
+# Codex 4241434511: the routine parses the request with the Actions path's validator and
+# requires every dependency closed before implementing.
+def test_cloud_routine_checks_the_request_and_its_dependencies_before_implementing():
+    import shlex
+
+    prompt = _routine_prompt()
+    step = _step(prompt, "2. Check the request", "3. `git fetch origin")
+    command = re.search(r"`(sdlcctl check-request [^`]*)`", step).group(1)
+    assert shlex.split(command) == [
+        "sdlcctl",
+        "check-request",
+        "--project",
+        "owner/comic",
+        "--issue",
+        "<n>",
+        "--config",
+        "agentic-sdlc.toml",
+    ]
+    assert "Exit 0: continue" in step
+    assert "Exit 3: not a valid work request" in step and "add label `claude-blocked`" in step
+    assert "Exit 4: a dependency issue is still open" in step and "do NOT block it" in step
+    assert "Any other exit: it could not be verified" in step
+    assert prompt.index("1b. Claim it") < prompt.index("sdlcctl check-request")
+    assert prompt.index("sdlcctl check-request") < prompt.index("3. `git fetch origin")
+    from agentic_sdlc.cli import DEPENDENCY_OPEN, REQUEST_INVALID
+
+    assert (REQUEST_INVALID, DEPENDENCY_OPEN) == (3, 4)  # the exit codes the prompt names

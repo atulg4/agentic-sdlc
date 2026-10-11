@@ -1610,6 +1610,15 @@ def _ref_free_fanout(words: list[str]) -> bool:
     return False
 
 
+# The guard's own git calls (`config`, `rev-parse`, `show-ref`, `symbolic-ref`, `--exec-path`)
+# are plumbing: no hook, signature program, textconv, external diff, fsmonitor, credential
+# helper or network transport runs for them, and with stdout captured no pager starts.
+# `--no-pager` comes AFTER the vetted command's own global options, so a `git -p ...` being
+# vetted cannot turn one on either (Codex 4241434513 audit). No `-c` override is added: `git
+# config --list` would report it as configuration.
+GIT_INTERNAL_OPTS = ("--no-pager",)
+
+
 def _git_config(where: str, target: Target, *args: str) -> tuple[int, str]:
     """`git config ARGS` in the repository `target` acts on: (exit code, stdout); -1 when git
     could not be run at all or did not answer within GIT_TIMEOUT. Exit 1 is git's "no such
@@ -1624,7 +1633,7 @@ def _git_in(where: str, target: Target, *args: str) -> tuple[int, str]:
     clean = {key: value for key, value in env if not key.startswith("\0")}
     try:
         proc = subprocess.run(
-            ["git", *opts, *args],
+            ["git", *opts, *GIT_INTERNAL_OPTS, *args],
             cwd=where,
             env={**os.environ, **clean} if clean else None,
             capture_output=True,
@@ -1648,9 +1657,16 @@ def _safe_url(url: str) -> bool:
 
 
 def _signature_wanted(args: list[str], config: dict[str, list[str]]) -> bool:
-    """Does the command verify signatures (and so run the gpg/ssh signature program)?"""
-    if any(a == "--show-signature" or "%G" in a or "%(signature" in a for a in args):
+    """Does the command verify signatures (and so run the gpg/ssh signature program)? A `%G`
+    or `%(signature` format always does; otherwise the LAST of `--show-signature` /
+    `--no-show-signature` decides, and only when neither is given does `log.showSignature`
+    (Codex 4241434513: the SessionStart log passes `--no-show-signature`)."""
+    if any("%G" in a or "%(signature" in a for a in args):
         return True
+    options = args[: args.index("--")] if "--" in args else args  # after `--`: paths
+    for arg in reversed(options):
+        if arg in ("--show-signature", "--no-show-signature"):
+            return arg == "--show-signature"
     return any(
         value.strip().lower() in ("true", "yes", "on", "1")
         for value in config.get("log.showsignature", [])
@@ -2346,7 +2362,15 @@ def _branch_exists(branch: str, where: str, target: Target) -> bool:
     _, opts, env = target
     try:
         subprocess.run(
-            ["git", *opts, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+            [
+                "git",
+                *opts,
+                *GIT_INTERNAL_OPTS,
+                "show-ref",
+                "--verify",
+                "--quiet",
+                f"refs/heads/{branch}",
+            ],
             cwd=where,
             env={**os.environ, **_real_env(dict(env))} if env else None,
             capture_output=True,
@@ -2823,7 +2847,7 @@ def current_branch(
 
     def probe(*args: str) -> subprocess.CompletedProcess:
         return subprocess.run(
-            ["git", *git_opts, *args],
+            ["git", *git_opts, *GIT_INTERNAL_OPTS, *args],
             cwd=cwd,
             env=run_env,
             capture_output=True,

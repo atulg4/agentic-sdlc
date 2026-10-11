@@ -111,7 +111,9 @@ sdlcctl doctor --destination /path/to/consumer-repository   # exit 2 until READY
 `claude`, `codex`, or `cloud-routine` (no Actions implementer; see the generated
 `docs/forge/cloud-implementer.md` for the routine prompt, which authorizes the approval labeler
 with `sdlcctl authorize-labeler` -- whoever applied each approval label last must have write
-access -- before claiming; once the routine is scheduled on claude.ai,
+access -- before claiming, gates on `sdlcctl check-request` (valid request, dependencies
+closed), renews its lease between stages and `sdlcctl check-diff` (the diff policy on the
+commit it pushes) before pushing; once the routine is scheduled on claude.ai,
 record it with `sdlcctl confirm-cloud-routine` -- `doctor` stays NOT READY until then, under
 `--local` too). Planning always runs Claude Code: every generated plan caller invokes the
 platform's `reusable-plan.yml` (`anthropics/claude-code-action`), so the generated policy records

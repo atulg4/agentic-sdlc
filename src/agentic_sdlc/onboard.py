@@ -981,6 +981,9 @@ ROUTINE_CANDIDATE_LIMIT = 1000
 
 def render_cloud_routine_md(spec: OnboardSpec) -> str:
     search = shlex.quote(_routine_search(spec))
+    lease = f"--project {spec.project_id} --issue <n> --session <run id>"
+    release = f"`sdlcctl release {lease}`"
+    renew = f"`sdlcctl renew {lease} --config agentic-sdlc.toml`"
     prompt = f"""Repository: {spec.project_id}. Every run:
 1. List open issues that carry ALL of: {_md_code(spec.ready_label)}, {_md_code(HUMAN_REVIEW_LABEL)},
    {_md_code(IMPLEMENTATION_LABEL)}
@@ -1007,24 +1010,47 @@ def render_cloud_routine_md(spec: OnboardSpec) -> str:
    `sdlcctl claim --project {spec.project_id} --issue <n> --agent cloud-routine
     --session <run id> --branch forge/issue-<n>`.
    If the claim is refused (exit 2), skip that issue and take the next one.
-2. Validate the issue body has the required sections (Summary, Acceptance Criteria, Required Tests,
-   Non-Goals, Dependencies). If not, retire it so it cannot starve the queue (Codex
-   4241196636): comment what is missing, add label {_md_code(BLOCKED_LABEL)} (step 1 skips
-   it from then on), then `sdlcctl release --project {spec.project_id} --issue <n>
-   --session <run id>`; then go back to step 1a with the next candidate of the step 1 list.
-3. On a new branch `forge/issue-<n>`, implement the smallest change that satisfies the acceptance
-   criteria, tests first. Never touch `forbidden_paths` from agentic-sdlc.toml; stay within
-   max_changed_files={spec.max_changed_files} and max_diff_lines={spec.max_diff_lines}.
+2. Check the request deterministically (the same validator and dependency rule as the Actions
+   implement path: Codex 4241434511):
+   `sdlcctl check-request --project {spec.project_id} --issue <n> --config agentic-sdlc.toml`.
+   Exit 0: continue. Exit 3: not a valid work request -- retire it so it cannot starve the
+   queue (Codex 4241196636): comment the reason it printed, add label {_md_code(BLOCKED_LABEL)}
+   (step 1 skips it from then on), then {release}; then go back to step 1a with the next
+   candidate of the step 1 list. Exit 4: a dependency issue is still open -- {release} (do
+   NOT block it: it becomes ready once its dependencies close) and go back to step 1a with the
+   next candidate. Any other exit: it could not be verified -- {release} and go back to step 1a
+   with the next candidate.
+3. `git fetch origin {spec.default_branch}` and create branch `forge/issue-<n>` from
+   `origin/{spec.default_branch}`. Implement the smallest change that satisfies the acceptance
+   criteria, tests first, and commit it. Never touch `forbidden_paths` from agentic-sdlc.toml;
+   stay within max_changed_files={spec.max_changed_files} and
+   max_diff_lines={spec.max_diff_lines}.
+3a. Renew the lease (Codex 4241434506: a lease that expires while you work can be taken over):
+   {renew}.
+   It succeeds ONLY while this run still holds a live lease. On any non-zero exit STOP: do NOT
+   push or open a PR -- another agent may own the issue now; run {release} (it refuses if
+   another session holds the lease, which is fine) and end the run.
 4. Run each, in order; all must pass:
    {spec.setup_command}
    {spec.quality_command}
    {spec.test_command}
-4a. Re-authorize right before publishing (Codex 4240628982: the labels may have been removed
+4a. Renew the lease again, exactly as in step 3a (same command; on failure stop the same way).
+4b. Re-authorize right before publishing (Codex 4240628982: the labels may have been removed
    and re-applied while you worked): run the step 1a command again. On anything but exit 0 do
-   NOT push or open a PR: `sdlcctl release` the lease, and on exit 3 comment (once) that a
+   NOT push or open a PR: {release}, and on exit 3 comment (once) that a
    maintainer must re-apply the labels; then stop.
-5. Push the branch and open a DRAFT pull request titled "<issue title> (#<n>)" with a summary
-   and test plan; link the issue. Then `sdlcctl release` the lease (the open PR now marks the
+4c. Check the diff policy on exactly what will be pushed (Codex 4241434509: the same
+   `evaluate_diff` the Actions path applies -- forbidden paths, file, line and byte caps). Commit
+   everything first; then `git fetch origin {spec.default_branch}` and
+   `sdlcctl check-diff --config agentic-sdlc.toml --base origin/{spec.default_branch}`.
+   It diffs the committed HEAD against its merge base with the default branch. On any non-zero
+   exit do NOT push or open a PR: comment the reasons it printed on the issue, {release},
+   and stop. Make no commit after this check.
+4d. Verify the lease immediately before pushing: run the step 3a renew command once more. On
+   any non-zero exit do NOT push or open a PR; stop as in step 3a.
+5. Push the checked commit at once -- `git push origin HEAD:refs/heads/forge/issue-<n>` -- and
+   open a DRAFT pull request titled "<issue title> (#<n>)" with a summary
+   and test plan; link the issue. Then {release} (the open PR now marks the
    work); on any failure, release it too so another run can retry.
    Never merge, approve, deploy, or edit workflows/policy files.
 """
@@ -1043,8 +1069,16 @@ skipped) -- and requires the issue's title and body to have been last edited BEF
 those labels was last applied, so an edit after approval is never implemented unapproved (an
 edit time that cannot be read is unverifiable). It runs it AGAIN right before pushing,
 so a label removed and re-applied, or the issue edited, while the routine worked stops the
-push. An issue whose body is not a valid work request is labelled
-{_md_code(BLOCKED_LABEL)} and its lease released; step 1 never selects a blocked issue.
+push. The Actions path's other deterministic gates are commands too, and the routine is gated
+on their exit codes: `sdlcctl check-request` parses the issue with the same work-request
+validator and policy as `prepare-request` and requires every dependency issue to be closed;
+`sdlcctl check-diff` applies the same diff policy as `inspect-diff` (forbidden paths and the
+patch caps) to exactly the commit about to be pushed; and `sdlcctl renew` -- after
+implementation, after verification and immediately before pushing -- keeps the lease alive and
+fails unless this run still holds it, so the routine never pushes over another agent's lease.
+Keep `lease_ttl_minutes` longer than the longest stage. An issue whose body is not a valid
+work request is labelled {_md_code(BLOCKED_LABEL)} and its lease released; step 1 never
+selects a blocked issue.
 Suggested routine prompt (create it with the `schedule` skill or the claude.ai routines UI):
 
 {_md_block(prompt.splitlines())}
