@@ -21,33 +21,47 @@ class GitDiff:
     added_lines: int
     deleted_lines: int
     patch: bytes
+    #: The endpoint diff's own paths, when `paths` also holds those of intermediate commits
+    #: (`collect_commit_diff`); None when `paths` is the endpoint diff alone.
+    net_paths: tuple[str, ...] | None = None
 
 
 #: A file that never exists: pointing GIT_GRAFT_FILE at it disables `.git/info/grafts`.
 _NO_GRAFTS = os.devnull + ".no-grafts"
 
 
-def _object_env() -> dict[str, str]:
-    """The environment every git run here gets. NO variable of the caller's that starts with
-    `GIT_` survives (Codex 4241745395): `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`,
-    `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
-    `GIT_NAMESPACE`, `GIT_CEILING_DIRECTORIES`, `GIT_CONFIG*`, `GIT_EXEC_PATH`, ... each re-points
-    what git reads, so a guard could inspect a benign repository while a later plain push
-    publishes the real one. The set below is the whole of git's environment:
+#: The fixed search path every trusted program runs with: system directories only, so nothing a
+#: caller put on PATH runs as a helper of the trusted git (or gh).
+SAFE_PATH = "/usr/bin:/bin"
 
+
+def _object_env() -> dict[str, str]:
+    """The environment every git run here gets: BUILT from an allowlist, never inherited
+    (Codex 4241839908). Inheriting all but `GIT_*` (Codex 4241745395) still handed git the
+    dynamic loader's variables -- `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `DYLD_*` -- which
+    load code of the caller's choosing into the trusted git, and a caller PATH for the helpers
+    git spawns. No variable of the caller's survives: `GIT_DIR`, `GIT_WORK_TREE`,
+    `GIT_COMMON_DIR`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`,
+    `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_NAMESPACE`, `GIT_CONFIG*`, `GIT_EXEC_PATH`, ... each
+    re-points what git reads, so a guard could inspect a benign repository while a later plain
+    push publishes the real one. The set below is the whole of git's environment:
+
+    - a fixed system PATH, the C locale, and no HOME (no per-user configuration or attributes);
     - history as the object store holds it: git otherwise substitutes `refs/replace/*` objects
       and grafts when it reads a commit or tree, while a push publishes the ORIGINAL objects
       (Codex 4241532610);
     - no system or global configuration: only the repository's own (and the `-c` overrides
       `_run` passes) applies;
     - never a prompt."""
-    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-    env["GIT_NO_REPLACE_OBJECTS"] = "1"
-    env["GIT_GRAFT_FILE"] = _NO_GRAFTS
-    env["GIT_CONFIG_NOSYSTEM"] = "1"
-    env["GIT_CONFIG_GLOBAL"] = os.devnull
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    return env
+    return {
+        "PATH": SAFE_PATH,
+        "LC_ALL": "C",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_GRAFT_FILE": _NO_GRAFTS,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+    }
 
 
 @dataclass(frozen=True)
@@ -204,12 +218,61 @@ def collect_git_diff(repository: str | Path, base: str = "HEAD") -> GitDiff:
     return GitDiff(paths=paths, added_lines=added, deleted_lines=deleted, patch=patch)
 
 
+#: A full object name, as `rev-list` prints it.
+_OBJECT_NAME = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
+def _paths_of_every_commit(root: _Repository, merge_base: str, tip: str) -> set[str]:
+    """Every path ANY commit in `merge_base..tip` touches (Codex 4241839922). A push publishes
+    every one of those commits, not only the endpoint tree: a forbidden or secret file added in
+    one commit and deleted in the next is absent from the endpoint diff yet published in the
+    history. Each commit is diffed against its single parent, both sides of every rename
+    (`--no-renames`: a rename is its deletion plus its addition). A merge commit in the range is
+    refused (exit 2) rather than judged: which parent its change is relative to is ambiguous,
+    and the routine never needs one -- its branch is cut from the base and committed onto."""
+    listing = _run(["git", "rev-list", "--parents", f"{merge_base}..{tip}", "--"], root)
+    paths: set[str] = set()
+    for line in listing.stdout.decode("ascii", errors="replace").splitlines():
+        names = line.split(" ")
+        if not all(_OBJECT_NAME.fullmatch(name) for name in names):
+            raise GitDiffError("git rev-list output is malformed")
+        if len(names) != 2:
+            kind = "a merge commit" if len(names) > 2 else "a commit without a parent"
+            raise GitDiffError(
+                f"{names[0][:12]} is {kind}; check-diff judges a linear series of commits on "
+                "the base only -- not concluding"
+            )
+        commit, parent = names
+        listed = _run(
+            [
+                "git",
+                "diff-tree",
+                "-r",
+                "-z",
+                "--no-commit-id",
+                "--name-status",
+                "--no-renames",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--ignore-submodules=none",
+                parent,
+                commit,
+                "--",
+            ],
+            root,
+        ).stdout
+        paths.update(_paths_from_name_status(listed))
+    return paths
+
+
 def collect_commit_diff(repository: str | Path, base: str, head: str = "HEAD") -> GitDiff:
     """The COMMITTED change `head` brings onto `base`: the diff from their merge base to `head`,
-    tree to tree -- what a pull request from `head` into `base` shows, and exactly what a push
-    of `head` publishes (Codex 4241434509). The working tree and index are never read, so an
-    uncommitted edit can neither hide a committed change nor add one that is not pushed. No
-    external diff or textconv program runs."""
+    tree to tree -- what a pull request from `head` into `base` shows, and what a push of `head`
+    publishes (Codex 4241434509). `paths` is that diff's paths PLUS every path any single commit
+    of the series touches (Codex 4241839922: a push publishes the history, not only the end
+    state); the line and byte counts and the patch are the endpoint diff's. The working tree and
+    index are never read, so an uncommitted edit can neither hide a committed change nor add one
+    that is not pushed. No external diff or textconv program runs."""
     for rev in (base, head):
         if not rev or rev.startswith("-"):
             raise GitDiffError(f"not a revision: {rev!r}")
@@ -233,7 +296,8 @@ def collect_commit_diff(repository: str | Path, base: str, head: str = "HEAD") -
         ],
         root,
     ).stdout
-    paths = _paths_from_name_status(names)
+    net_paths = _paths_from_name_status(names)
+    paths = tuple(sorted(set(net_paths) | _paths_of_every_commit(root, *span)))
     raw_stats = _run(["git", "diff", *plain, "--numstat", "-z", *span, "--"], root).stdout
     added = 0
     deleted = 0
@@ -241,7 +305,9 @@ def collect_commit_diff(repository: str | Path, base: str, head: str = "HEAD") -
         added += int(match.group(1)) if match.group(1).isdigit() else 0
         deleted += int(match.group(2)) if match.group(2).isdigit() else 0
     patch = _run(["git", "diff", *plain, "--binary", "--full-index", *span, "--"], root).stdout
-    return GitDiff(paths=paths, added_lines=added, deleted_lines=deleted, patch=patch)
+    return GitDiff(
+        paths=paths, added_lines=added, deleted_lines=deleted, patch=patch, net_paths=net_paths
+    )
 
 
 def committed_path(repository: str | Path, path: str | Path) -> str:
@@ -261,7 +327,21 @@ def committed_path(repository: str | Path, path: str | Path) -> str:
     return str(relative)
 
 
-def read_committed_file(repository: str | Path, rev: str, path: str) -> bytes:
+def resolve_commit(repository: str | Path, rev: str) -> str:
+    """The full object name of the commit `rev` names in the repository at `repository`."""
+    if not rev or rev.startswith("-"):
+        raise GitDiffError(f"not a revision: {rev!r}")
+    root = _bind(repository)
+    commit = _run(["git", "rev-parse", "--verify", f"{rev}^{{commit}}"], root).stdout.decode()
+    commit = commit.strip()
+    if not _OBJECT_NAME.fullmatch(commit):
+        raise GitDiffError(f"{rev} does not name a commit")
+    return commit
+
+
+def read_committed_file(
+    repository: str | Path, rev: str, path: str, label: str | None = None
+) -> bytes:
     """The bytes of `path` (relative to the top level) as commit `rev` holds them -- never the
     working tree or the index, which the agent being checked can change without committing
     (Codex 4241614590). Replace refs and grafts are ignored as for every read here, and no
@@ -276,4 +356,5 @@ def read_committed_file(repository: str | Path, rev: str, path: str) -> bytes:
     try:
         return _run(["git", "cat-file", "blob", f"{commit}:{path}"], root).stdout
     except GitDiffError as exc:
-        raise GitDiffError(f"{path} could not be read from {rev} ({commit[:12]}): {exc}") from exc
+        shown = label or rev
+        raise GitDiffError(f"{path} could not be read from {shown} ({commit[:12]}): {exc}") from exc

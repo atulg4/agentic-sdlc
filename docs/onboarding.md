@@ -207,8 +207,9 @@ reusable workflow's `release_lease_on_failure` releases a lease once `prepare` h
 work first, and a run cancelled between `claim` and the end of `prepare` keeps its lease until
 it expires. The pinned reusable workflow re-checks only `trigger_actor`'s permission, not the
 label history; a re-check of the label set inside it is left to the platform's maintainer.
-The cloud routine re-runs `sdlcctl authorize-labeler` right before pushing (step 4b of its
-prompt); its residual window is the seconds between that check and the push.
+The cloud routine re-runs `sdlcctl authorize-labeler` as its LAST gate, immediately before
+pushing and after check-diff, the lease check and the final check-request (step 4e of its
+prompt, Codex 4241839918); its residual window is the seconds between that check and the push.
 
 ### Other managed files
 
@@ -306,10 +307,18 @@ through a link). `onboard --force` rewrites the policy and drops the confirmatio
   lease is released and the issue stays queued; anything unreadable exits 2); `sdlcctl renew`
   runs after implementation, after verification and immediately before pushing, and fails
   unless this run still holds a live lease (it never pushes over another agent's takeover --
-  keep `lease_ttl_minutes` longer than the longest stage); and `sdlcctl check-diff --base
-  origin/<default>` applies `inspect-diff`'s diff policy (forbidden paths, file/line/byte caps)
-  to the COMMITTED change from its merge base to `HEAD` -- exactly what the push publishes,
-  never the working tree -- and exits 0 only when it passes and is non-empty. check-diff reads
+  keep `lease_ttl_minutes` longer than the longest stage); and `sdlcctl check-diff --project
+  owner/repo --base origin/<default>` applies `inspect-diff`'s diff policy (forbidden paths,
+  file/line/byte caps) to the COMMITTED change from its merge base to `HEAD` -- exactly what
+  the push publishes, never the working tree -- and exits 0 only when it passes and is
+  non-empty. The forbidden-path check covers every path ANY commit of the series touches, not
+  only the end state, since the push publishes the history (Codex 4241839922: a file added in
+  one commit and deleted in the next is still refused); a merge commit in the series exits 2;
+  the caps apply to the end-state diff. `--base` is a local ref the agent could re-point, so
+  check-diff (and `check-request --base`) first reads the default branch and its head from
+  GitHub through the trusted gh and exits 2 unless `--base` resolves to exactly that commit;
+  policy and diff are then read from that commit (Codex 4241839926), and the committed
+  policy's project must be `--project`. check-diff reads
   history with replacement disabled (`--no-replace-objects`, `GIT_NO_REPLACE_OBJECTS=1`, grafts
   off): a `refs/replace/*` object or graft could otherwise make it judge a benign tree while the
   push publishes the original commit (Codex 4241532610). It judges the change under the
@@ -322,11 +331,14 @@ through a link). `onboard --force` rewrites the policy and drops the confirmatio
   with no group/other write bit and not writable by this user -- taken from the system
   locations (`/usr/bin/git` first) and, for a non-root user, from absolute PATH entries that
   pass the same test; running as root only the system locations count. `AGENTIC_SDLC_GIT` may
-  name another git, vetted the same way (refused as root). No trusted git exits 2.
+  name another git, vetted the same way (refused as root). No trusted git exits 2. Git runs
+  with an environment built from an allowlist (fixed `PATH=/usr/bin:/bin`, `LC_ALL=C`, the
+  replacement/config switches above) -- nothing of the caller's, so `LD_PRELOAD`,
+  `LD_LIBRARY_PATH`, `LD_AUDIT` or `DYLD_*` cannot load code into it (Codex 4241839908).
   `sdlcctl renew` also re-reads the issue and fails once it is closed or unreadable (Codex
   4241614587), so every renewal is a state check. Step 2 runs `check-request --base
   origin/<default>` (the committed policy) and keeps the `content digest: sha256:...` it
-  prints; step 4e, the last step before the push, runs it again with `--expect-digest
+  prints; step 4d, just before the final authorization, runs it again with `--expect-digest
   <digest>`: exit 5 when the title or body changed since step 2 (even if a maintainer then
   re-applied the labels, which re-authorizes: Codex 4241614582), 4 when a dependency was
   reopened (Codex 4241614596), 6 when the issue is no longer open -- on anything but 0 the
@@ -503,6 +515,17 @@ through a link). `onboard --force` rewrites the policy and drops the confirmatio
 - Every `gh` call `sdlcctl` makes (claim, renew, release, authorize-labeler, onboard, doctor) is
   bounded: 60s per call, `AGENTIC_SDLC_GH_TIMEOUT` (1-3600 seconds) overrides it. A call that
   does not answer in time fails closed (exit 2) instead of hanging the session or routine.
+- Every such call runs the trusted gh in an environment built from an allowlist (Codex
+  4241839914, 4241839908): `PATH=/usr/bin:/bin`, `GH_HOST=github.com`, and `GH_CONFIG_DIR` and
+  `HOME` set to a fresh private (0700) empty directory removed afterwards, so no config of the
+  caller's (`http_unix_socket`, aliases, a stored host) applies; no `LD_*`/`DYLD_*` variable;
+  no `SSL_CERT_FILE`/`SSL_CERT_DIR`, so GitHub's certificate is verified against the system
+  trust store. The token is `GH_TOKEN`, else `GITHUB_TOKEN`, else what `gh auth login` stored
+  (`gh auth token`, a local read). The proxy variables (`HTTPS_PROXY`, `HTTP_PROXY`,
+  `NO_PROXY`, either case) are kept on purpose: a proxy can only relay TLS that the system
+  store verifies, so it cannot read or forge an answer -- but an egress proxy that intercepts
+  TLS needs its CA installed in the system store (e.g. `/usr/local/share/ca-certificates` +
+  `update-ca-certificates`), not supplied through the environment.
 - The commit guard matches a live lease to this session only by the hook payload's
   `session_id`, and only when that is a non-empty string: a payload whose id is missing, null,
   empty or not a string owns no lease, so guarded git on a leased issue branch is refused

@@ -25,6 +25,44 @@ def _git(repository: Path, *arguments: str) -> str:
     ).stdout.strip()
 
 
+#: The repository whose `main` plays GitHub's default-branch head for PROJECT (Codex
+#: 4241839926: check-diff and `check-request --base` verify the base against GitHub).
+_REMOTE: dict[str, Path | str] = {}
+
+
+def _remote_head() -> str:
+    from agentic_sdlc.git_diff import resolve_commit
+
+    if "head" in _REMOTE:  # GitHub's head pinned by the test
+        return str(_REMOTE["head"])
+    return resolve_commit(_REMOTE["repository"], "main")
+
+
+def github_answer(args):
+    """GitHub's answer to the base-verification calls, or None for any other call."""
+    if args[:2] == ["api", f"repos/{PROJECT}"]:
+        return json.dumps({"full_name": PROJECT, "default_branch": "main"})
+    if args[:2] == ["api", f"repos/{PROJECT}/git/ref/heads/main"]:
+        head = _remote_head()
+        return json.dumps({"ref": "refs/heads/main", "object": {"type": "commit", "sha": head}})
+    return None
+
+
+def _github_only(args, input=None):
+    answer = github_answer(list(args))
+    if answer is None:
+        raise OnboardError(f"unexpected gh call {list(args)}")
+    return answer
+
+
+@pytest.fixture(autouse=True)
+def _fake_github(monkeypatch):
+    """Every test here talks to a fake GitHub (`github_answer`); a test that needs more
+    replaces `cli.run_gh` with a fake that falls back to it."""
+    _REMOTE.clear()
+    monkeypatch.setattr(cli, "run_gh", _github_only)
+
+
 def _repo(tmp_path: Path, policy_file: Path) -> Path:
     """A repository whose `main` commits `policy_file` as its agentic-sdlc.toml (check-diff reads
     the policy committed on --base: Codex 4241614590), with the issue branch checked out."""
@@ -38,6 +76,7 @@ def _repo(tmp_path: Path, policy_file: Path) -> Path:
     _git(repository, "add", "--", ".")
     _git(repository, "commit", "-qm", "base")
     _git(repository, "switch", "-q", "-c", "forge/issue-7")
+    _REMOTE["repository"] = repository
     return repository
 
 
@@ -51,10 +90,14 @@ def _commit(repository: Path, files: dict[str, str], message: str = "change") ->
 
 
 def _check_diff(repository: Path, policy_file: Path, *extra: str) -> int:
-    """`policy_file` is committed on main by `_repo`; check-diff reads it from there."""
+    """`policy_file` is committed on main by `_repo`; check-diff reads it from there, after
+    verifying main against (fake) GitHub, whose head is `repository`'s main."""
+    _REMOTE["repository"] = repository
     return cli.main(
         [
             "check-diff",
+            "--project",
+            PROJECT,
             "--config",
             "agentic-sdlc.toml",
             "--repository",
@@ -121,6 +164,10 @@ def test_check_diff_judges_the_commit_not_the_working_tree(tmp_path, policy_file
     ]  # fmt: skip
     assert cli.main(inspect) == 0
     _git(repository, "commit", "-qam", "drop the workflow")
+    # the end state no longer has it, but the pushed history does (Codex 4241839922)
+    assert _check_diff(repository, policy_file) == 2
+    _git(repository, "switch", "-q", "-c", "clean", "main")
+    _commit(repository, {"module.py": "VALUE = 2\n"})
     assert _check_diff(repository, policy_file) == 0
     (repository / ".env").write_text("SECRET=1\n")  # forbidden, but never committed
     assert _check_diff(repository, policy_file) == 0
@@ -142,7 +189,7 @@ def test_check_diff_compares_with_the_merge_base(tmp_path, policy_file):
 def test_check_diff_refuses_an_unusable_base(tmp_path, policy_file, base, capsys):
     repository = _repo(tmp_path, policy_file)
     _commit(repository, {"module.py": "VALUE = 2\n"})
-    argv = ["check-diff", "--repository", str(repository)]
+    argv = ["check-diff", "--project", PROJECT, "--repository", str(repository)]
     assert cli.main([*argv, f"--base={base}"]) == 2
     assert "ERROR" in capsys.readouterr().err
 
@@ -228,6 +275,9 @@ class FakeGh:
 
     def __call__(self, args, input=None):
         args = list(args)
+        answer = github_answer(args)
+        if answer is not None:
+            return answer
         self.calls.append(args)
         number = int(args[1].rsplit("/", 1)[1])
         if number == 7:
@@ -462,7 +512,7 @@ def test_check_diff_ignores_an_uncommitted_forbidden_paths_edit(tmp_path, policy
 def test_check_diff_fails_closed_on_a_missing_or_broken_base_policy(tmp_path, policy_file, capsys):
     repository = _repo(tmp_path, policy_file)
     _commit(repository, {"module.py": "VALUE = 2\n"})
-    argv = ["check-diff", "--repository", str(repository), "--base", "main"]
+    argv = ["check-diff", "--project", PROJECT, "--repository", str(repository), "--base", "main"]
     assert cli.main([*argv, "--config", "absent.toml"]) == 2
     assert "absent.toml could not be read from main" in capsys.readouterr().err
     assert cli.main([*argv, "--config", "../outside.toml"]) == 2
@@ -481,7 +531,7 @@ def test_check_diff_fails_closed_on_a_missing_or_broken_base_policy(tmp_path, po
 def test_check_diff_accepts_the_policy_path_absolute_inside_the_repository(tmp_path, policy_file):
     repository = _repo(tmp_path, policy_file)
     _commit(repository, {"module.py": "VALUE = 2\n"})
-    argv = ["check-diff", "--repository", str(repository), "--base", "main"]
+    argv = ["check-diff", "--project", PROJECT, "--repository", str(repository), "--base", "main"]
     assert cli.main([*argv, "--config", str(repository / "agentic-sdlc.toml")]) == 0
 
 
@@ -672,22 +722,26 @@ def test_name_status_fails_closed_on_anything_else(raw):
 # ----------------------------- sdlcctl runs a trusted GitHub CLI (Codex 4241745403)
 
 
-def _plant_gh(tmp_path: Path, monkeypatch) -> Path:
-    """A fabricating `gh` at the head of PATH that would authorize anything; its marker."""
+def _plant_gh(tmp_path: Path, monkeypatch, *, alone: bool = False) -> Path:
+    """A fabricating `gh` at the head of PATH that would authorize anything; its marker. With
+    `alone`, PATH holds nothing else: as a non-root user the resolver searches PATH, and a
+    root-owned system gh further along it (`/usr/bin/gh` on a GitHub-hosted runner) is a
+    trusted one it would rightly pick instead."""
     bin_dir = tmp_path / "ghbin"
     bin_dir.mkdir()
     marker = tmp_path / "planted-gh-ran"
     fake = bin_dir / "gh"
     fake.write_text(f'#!/bin/sh\ntouch "{marker}"\necho "{{}}"\n', encoding="utf-8")
     fake.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    rest = "" if alone else f"{os.pathsep}{os.environ.get('PATH', '')}"
+    monkeypatch.setenv("PATH", f"{bin_dir}{rest}")
     return marker
 
 
 def test_run_gh_never_runs_a_gh_planted_on_path(tmp_path, monkeypatch):
     from agentic_sdlc import onboard, trusted_exec
 
-    marker = _plant_gh(tmp_path, monkeypatch)
+    marker = _plant_gh(tmp_path, monkeypatch, alone=True)
     monkeypatch.setattr(trusted_exec, "SYSTEM_GH_PATHS", ())
     with pytest.raises(OnboardError, match="no trusted gh executable"):
         onboard.run_gh(["api", f"repos/{PROJECT}/issues/7"])
@@ -697,9 +751,10 @@ def test_run_gh_never_runs_a_gh_planted_on_path(tmp_path, monkeypatch):
 def test_check_request_fails_closed_without_a_trusted_gh(
     tmp_path, policy_file, monkeypatch, capsys
 ):
-    from agentic_sdlc import trusted_exec
+    from agentic_sdlc import onboard, trusted_exec
 
-    marker = _plant_gh(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "run_gh", onboard.run_gh)  # the real one, not the fake GitHub
+    marker = _plant_gh(tmp_path, monkeypatch, alone=True)
     monkeypatch.setattr(trusted_exec, "SYSTEM_GH_PATHS", ())
     argv = ["check-request", "--project", PROJECT, "--issue", "7", "--config", str(policy_file)]
     assert cli.main(argv) == 2
@@ -749,3 +804,291 @@ def test_run_gh_pins_the_host_and_drops_repository_overrides(tmp_path, monkeypat
     env = seen["env"]
     assert env["GH_HOST"] == "github.com" and env["GH_TOKEN"] == "token"
     assert not {"GH_REPO", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"} & set(env)
+
+
+def test_a_trusted_gh_later_on_path_wins_over_a_planted_one(tmp_path, monkeypatch):
+    """As a non-root user PATH is searched; a planted gh ahead of a trusted one is skipped, not
+    run, and not a reason to fail (a GitHub-hosted runner: `runner` with a root-owned
+    /usr/bin/gh)."""
+    from agentic_sdlc import trusted_exec
+
+    planted_dir, system_dir = tmp_path / "planted", tmp_path / "system"
+    for directory in (planted_dir, system_dir):
+        directory.mkdir()
+        (directory / "gh").write_text("#!/bin/sh\n", encoding="utf-8")
+        (directory / "gh").chmod(0o755)
+    monkeypatch.setattr(trusted_exec, "_euid", lambda: 1001)
+    monkeypatch.setattr(
+        trusted_exec,
+        "candidate_reason",
+        lambda c: None if c.startswith(str(system_dir)) else f"{c} is writable by this user",
+    )
+    path = f"{planted_dir}{os.pathsep}{system_dir}"
+    assert trusted_exec.resolve_trusted("gh", (), "UNSET_OVERRIDE", {"PATH": path}) == (
+        os.path.realpath(system_dir / "gh")
+    )
+    with pytest.raises(trusted_exec.UntrustedExecutableError, match="writable by this user"):
+        trusted_exec.resolve_trusted("gh", (), "UNSET_OVERRIDE", {"PATH": str(planted_dir)})
+
+
+# ---------------- trusted programs get an allowlisted environment (Codex 4241839908, 4241839914)
+
+_LOADER = {
+    "LD_PRELOAD": "/tmp/evil.so",
+    "LD_LIBRARY_PATH": "/tmp/evil",
+    "LD_AUDIT": "/tmp/evil-audit.so",
+    "DYLD_INSERT_LIBRARIES": "/tmp/evil.dylib",
+}
+
+
+def test_every_git_run_gets_an_allowlisted_environment(tmp_path, policy_file, monkeypatch):
+    from agentic_sdlc import git_diff
+
+    repository = _repo(tmp_path, policy_file)
+    _commit(repository, {"module.py": "VALUE = 2\n"})
+    for key, value in {**_LOADER, "PATH": f"{tmp_path}:/usr/bin:/bin", "HOME": "/x"}.items():
+        monkeypatch.setenv(key, value)
+    real_run = git_diff.subprocess.run
+    seen: list[dict[str, str]] = []
+
+    def spy(*args, **kwargs):
+        seen.append(dict(kwargs["env"]))
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(git_diff.subprocess, "run", spy)
+    assert _check_diff(repository, policy_file) == 0
+    assert seen and all(env == git_diff._object_env() for env in seen)
+    assert seen[0] == {
+        "PATH": "/usr/bin:/bin",
+        "LC_ALL": "C",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_GRAFT_FILE": git_diff._NO_GRAFTS,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+
+
+def _spy_gh(monkeypatch, answers):
+    """Replace subprocess.run in onboard: record (argv, env, cwd, config-dir state) per call."""
+    import subprocess as sp
+
+    from agentic_sdlc import onboard
+
+    monkeypatch.setattr(onboard, "trusted_gh", lambda: "/trusted/gh")
+    calls = []
+
+    def fake_run(args, **kwargs):
+        env = kwargs["env"]
+        state = None
+        if "GH_CONFIG_DIR" in env:
+            where = Path(env["GH_CONFIG_DIR"])
+            state = (where.is_dir(), list(where.iterdir()), where.stat().st_mode & 0o777)
+        calls.append({"args": list(args), "env": dict(env), "cwd": kwargs.get("cwd"), "dir": state})
+        return sp.CompletedProcess(args, 0, answers.get(tuple(args[1:3]), "ok"), "")
+
+    monkeypatch.setattr(onboard.subprocess, "run", fake_run)
+    return calls
+
+
+def test_gh_runs_with_an_allowlisted_environment_and_a_fresh_config_dir(monkeypatch):
+    from agentic_sdlc import onboard
+
+    hostile = {
+        **_LOADER,
+        "GH_CONFIG_DIR": "/tmp/evil-gh",
+        "XDG_CONFIG_HOME": "/tmp/evil-xdg",
+        "HOME": "/tmp/evil-home",
+        "SSL_CERT_FILE": "/tmp/evil-ca.pem",
+        "SSL_CERT_DIR": "/tmp/evil-ca",
+        "GH_REPO": "evil/repo",
+        "PATH": "/tmp/evil-bin:/usr/bin",
+        "HTTPS_PROXY": "http://proxy.internal:3128",
+        "NO_PROXY": "localhost",
+        "GH_TOKEN": "token",
+        "GITHUB_TOKEN": "other",
+    }
+    for key in onboard.GH_PROXY_ENV:
+        monkeypatch.delenv(key, raising=False)
+    for key, value in hostile.items():
+        monkeypatch.setenv(key, value)
+    calls = _spy_gh(monkeypatch, {})
+    assert onboard.run_gh(["api", "user"]) == "ok"
+    assert len(calls) == 1  # a token in the environment: no `gh auth token`
+    (call,) = calls
+    env = call["env"]
+    config_dir = env["GH_CONFIG_DIR"]
+    assert config_dir != "/tmp/evil-gh" and env["HOME"] == config_dir == call["cwd"]
+    assert call["dir"] == (True, [], 0o700)  # existed, empty and private during the call
+    assert not Path(config_dir).exists()  # removed afterwards
+    assert env == {
+        "PATH": "/usr/bin:/bin",
+        "HOME": config_dir,
+        "GH_CONFIG_DIR": config_dir,
+        "GH_HOST": "github.com",
+        "GH_PROMPT_DISABLED": "1",
+        "GH_NO_UPDATE_NOTIFIER": "1",
+        "GH_SPINNER_DISABLED": "1",
+        "NO_COLOR": "1",
+        "LC_ALL": "C.UTF-8",
+        "GH_TOKEN": "token",
+        "HTTPS_PROXY": "http://proxy.internal:3128",
+        "NO_PROXY": "localhost",
+    }
+    assert onboard.run_gh(["api", "user"]) == "ok"
+    assert calls[1]["env"]["GH_CONFIG_DIR"] != config_dir  # fresh per call
+
+
+def test_gh_token_falls_back_to_the_users_stored_login(monkeypatch):
+    from agentic_sdlc import onboard
+
+    for key in ("GH_TOKEN", "GITHUB_TOKEN"):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in _LOADER.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("GITHUB_TOKEN", "")
+    calls = _spy_gh(monkeypatch, {("auth", "token"): "gho_stored\n"})
+    assert onboard.run_gh(["api", "user"]) == "ok"
+    lookup, call = calls
+    assert lookup["args"] == ["/trusted/gh", "auth", "token", "--hostname", "github.com"]
+    assert not any(k.startswith(("LD_", "DYLD_")) for k in lookup["env"])
+    assert call["env"]["GH_TOKEN"] == "gho_stored"
+    monkeypatch.setenv("GITHUB_TOKEN", "from-env")
+    calls.clear()
+    assert onboard.run_gh(["api", "user"]) == "ok"
+    assert len(calls) == 1 and calls[0]["env"]["GH_TOKEN"] == "from-env"
+
+
+# ---------------- check-diff judges every commit it pushes (Codex 4241839922)
+
+
+def test_check_diff_refuses_a_forbidden_file_added_then_deleted(tmp_path, policy_file, capsys):
+    repository = _repo(tmp_path, policy_file)
+    _commit(repository, {".env.production": "SECRET=1\n", "module.py": "VALUE = 2\n"})
+    (repository / ".env.production").unlink()
+    _git(repository, "commit", "-qam", "hide it again")
+    # the trap: the end state shows only module.py, yet the push publishes the secret
+    assert _git(repository, "diff", "--name-only", "main", "HEAD") == "module.py"
+    out = tmp_path / "decision.json"
+    assert _check_diff(repository, policy_file, "--output", str(out)) == 2
+    assert "forbidden paths changed: .env.production" in capsys.readouterr().err
+    assert json.loads(out.read_text())["diff"]["paths"] == [".env.production", "module.py"]
+
+
+def test_check_diff_sees_both_sides_of_a_rename_in_any_commit(tmp_path, policy_file, capsys):
+    repository = _repo(tmp_path, policy_file)
+    _commit(repository, {".github/workflows/x.yml": "on: push\n"})
+    _git(repository, "mv", ".github/workflows/x.yml", "x.yml")
+    _git(repository, "commit", "-qm", "move it out")
+    _git(repository, "rm", "-q", "x.yml")
+    _commit(repository, {"module.py": "VALUE = 2\n"})
+    assert _check_diff(repository, policy_file) == 2
+    assert "forbidden paths changed: .github/workflows/x.yml" in capsys.readouterr().err
+
+
+def test_check_diff_refuses_a_merge_commit_in_the_series(tmp_path, policy_file, capsys):
+    repository = _repo(tmp_path, policy_file)
+    _commit(repository, {"module.py": "VALUE = 2\n"})
+    _git(repository, "switch", "-q", "-c", "side", "main")
+    _commit(repository, {"other.py": "X = 1\n"})
+    _git(repository, "switch", "-q", "forge/issue-7")
+    _git(repository, "merge", "-q", "--no-ff", "--no-edit", "side")
+    assert _check_diff(repository, policy_file) == 2
+    assert "is a merge commit" in capsys.readouterr().err
+
+
+def test_check_diff_refuses_a_series_whose_net_change_is_empty(tmp_path, policy_file, capsys):
+    repository = _repo(tmp_path, policy_file)
+    _commit(repository, {"module.py": "VALUE = 2\n"})
+    _commit(repository, {"module.py": "VALUE = 1\n"})  # reverted
+    assert _check_diff(repository, policy_file) == 2
+    assert "no files changed" in capsys.readouterr().err
+
+
+# ---------------- --base must be the default branch's head on GitHub (Codex 4241839926)
+
+
+def _repointed_base(tmp_path: Path, policy_file: Path) -> Path:
+    """A repository whose local `main` was moved onto a commit that loosens the policy, with a
+    change on top that only the loosened policy allows; GitHub's head is the original main."""
+    repository = _repo(tmp_path, policy_file)
+    _REMOTE["head"] = _git(repository, "rev-parse", "main")
+    _git(repository, "switch", "-q", "-c", "loose", "main")
+    _loosen(repository / "agentic-sdlc.toml", max_changed_files="100")
+    _commit(repository, {}, "loosen")
+    _git(repository, "update-ref", "refs/heads/main", "loose")
+    _git(repository, "switch", "-q", "-c", "forge/issue-7b", "loose")
+    _commit(repository, {f"f{i}.py": "x = 1\n" for i in range(4)})  # max_changed_files = 3
+    return repository
+
+
+def test_check_diff_refuses_a_base_that_is_not_githubs_head(tmp_path, policy_file, capsys):
+    repository = _repointed_base(tmp_path, policy_file)
+    assert _check_diff(repository, policy_file) == 2
+    err = capsys.readouterr().err
+    assert "--base main is" in err and "on GitHub; fetch it again" in err
+    _REMOTE["head"] = _git(repository, "rev-parse", "main")  # had GitHub agreed: it passes
+    assert _check_diff(repository, policy_file) == 0
+
+
+def test_check_request_refuses_a_base_that_is_not_githubs_head(
+    tmp_path, policy_file, monkeypatch, capsys
+):
+    repository = _repointed_base(tmp_path, policy_file)
+    monkeypatch.setattr(cli, "run_gh", FakeGh(VALID.format(deps="None")))
+    argv = ["check-request", "--project", PROJECT, "--issue", "7", "--repository", str(repository)]
+    assert cli.main([*argv, "--config", "agentic-sdlc.toml", "--base", "main"]) == 2
+    assert "on GitHub; fetch it again" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "repo_answer, ref_answer",
+    [
+        (OnboardError("gh api failed: HTTP 502"), None),
+        ({"full_name": "someone/else", "default_branch": "main"}, None),
+        ({"full_name": PROJECT, "default_branch": ""}, None),
+        ({"full_name": PROJECT, "default_branch": "main"}, OnboardError("HTTP 404")),
+        ({"full_name": PROJECT, "default_branch": "main"}, {"object": {"type": "tag"}}),
+        ({"full_name": PROJECT, "default_branch": "main"}, "not json"),
+        ({"full_name": PROJECT, "default_branch": "dev"}, None),
+    ],
+)
+def test_check_diff_fails_closed_when_github_cannot_vouch_for_the_base(
+    tmp_path, policy_file, monkeypatch, capsys, repo_answer, ref_answer
+):
+    repository = _repo(tmp_path, policy_file)
+    _commit(repository, {"module.py": "VALUE = 2\n"})
+    head = _git(repository, "rev-parse", "main")
+
+    def gh(args, input=None):
+        answer = repo_answer if args[1] == f"repos/{PROJECT}" else ref_answer
+        if args[1].endswith("/git/ref/heads/dev"):
+            answer = {"ref": "refs/heads/dev", "object": {"type": "commit", "sha": "0" * 40}}
+        if isinstance(answer, Exception):
+            raise answer
+        if answer is None:
+            answer = {"ref": "refs/heads/main", "object": {"type": "commit", "sha": head}}
+        return answer if isinstance(answer, str) else json.dumps(answer)
+
+    monkeypatch.setattr(cli, "run_gh", gh)
+    assert _check_diff(repository, policy_file) == 2
+    assert "ERROR" in capsys.readouterr().err
+
+
+def test_check_diff_requires_the_policy_of_the_project_it_verified(
+    tmp_path, policy_file, monkeypatch, capsys
+):
+    repository = _repo(tmp_path, policy_file)
+    _commit(repository, {"module.py": "VALUE = 2\n"})
+    head = _git(repository, "rev-parse", "main")
+    other = "someone/else"
+
+    def gh(args, input=None):
+        if args[1] == f"repos/{other}":
+            return json.dumps({"full_name": other, "default_branch": "main"})
+        return json.dumps({"ref": "refs/heads/main", "object": {"type": "commit", "sha": head}})
+
+    monkeypatch.setattr(cli, "run_gh", gh)
+    argv = ["check-diff", "--project", other, "--repository", str(repository), "--base", "main"]
+    assert cli.main(argv) == 2
+    assert "is not someone/else's" in capsys.readouterr().err

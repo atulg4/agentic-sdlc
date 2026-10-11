@@ -6,9 +6,11 @@ import argparse
 import hashlib
 import json
 import math
+import re
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from .artifact import ArtifactError, create_manifest, verify_manifest, write_manifest
 from .capacity_metrics import (
@@ -35,6 +37,7 @@ from .git_diff import (
     collect_git_diff,
     committed_path,
     read_committed_file,
+    resolve_commit,
 )
 from .infra_recovery import (
     FailureClass,
@@ -308,8 +311,14 @@ def _check_diff(args: argparse.Namespace) -> int:
     the agent being checked could loosen an uncommitted copy (drop `.github/**`, raise the caps)
     and the push would publish the forbidden commit without that edit. The baseline forbidden
     paths apply whatever the base policy lists (`load_policy_bytes`)."""
-    policy = _committed_policy(args.repository, args.base, args.config)
-    snapshot = collect_commit_diff(args.repository, args.base, args.head)
+    base = _verified_base(args.repository, args.project, args.base)
+    policy = _committed_policy(args.repository, base, args.config, args.base)
+    if policy.provider != "github" or policy.project_id != args.project:
+        raise ValueError(
+            f"the policy committed on {args.base} is not {args.project}'s (provider "
+            f"{policy.provider!r}, project {policy.project_id!r}); not concluding"
+        )
+    snapshot = collect_commit_diff(args.repository, base, args.head)
     decision = evaluate_diff(
         snapshot.paths,
         snapshot.added_lines,
@@ -320,6 +329,7 @@ def _check_diff(args: argparse.Namespace) -> int:
     document = decision.as_dict()
     document["diff"] = {
         "base": args.base,
+        "baseSha": base,
         "head": args.head,
         "files": len(snapshot.paths),
         "addedLines": snapshot.added_lines,
@@ -328,25 +338,76 @@ def _check_diff(args: argparse.Namespace) -> int:
         "paths": list(snapshot.paths),
     }
     _write(document, args.output)
-    if decision.allowed and snapshot.paths:
+    changed = snapshot.paths if snapshot.net_paths is None else snapshot.net_paths
+    if decision.allowed and changed:
         _status(f"diff policy passed: {len(snapshot.paths)} file(s) changed")
         return 0
     reasons = list(decision.reasons) if not decision.allowed else []
-    if not snapshot.paths:
+    if not changed:
         reasons.append(f"no files changed: {args.head} adds nothing to {args.base}")
     _status("REFUSED: check-diff rejected the change: " + "; ".join(reasons))
     return 2
 
 
-def _committed_policy(repository: str, base: str, config: str) -> ProjectPolicy:
+_FULL_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
+def _verified_base(repository: str, project: str, base: str) -> str:
+    """The commit `base` names in `repository`, PROVEN to be the head of `project`'s default
+    branch as GitHub reports it now (Codex 4241839926). `--base origin/<default>` is a local
+    ref: the agent being checked can point it at any commit -- one whose policy it loosened,
+    or one that already holds the forbidden change -- with a single `git update-ref`, and the
+    policy and the diff would then be read from there. The default branch and its head come
+    from the trusted `gh` (`run_gh`); a commit that is not that head, or an answer that cannot
+    be read, is an error (exit 2), never a fallback to the local ref. Callers read the policy
+    and diff from the returned object name, not from `base`."""
+    local = resolve_commit(repository, base)
+    document = json.loads(run_gh(["api", f"repos/{project}"]) or "null")
+    if not isinstance(document, dict):
+        raise ValueError(f"the repository {project} could not be read from GitHub")
+    full_name = document.get("full_name")
+    branch = document.get("default_branch")
+    if not isinstance(full_name, str) or full_name.lower() != project.lower():
+        raise ValueError(f"GitHub answered for {full_name!r}, not {project}; not concluding")
+    if not isinstance(branch, str) or not branch:
+        raise ValueError(f"the default branch of {project} could not be read from GitHub")
+    ref = json.loads(
+        run_gh(["api", f"repos/{project}/git/ref/heads/{quote(branch, safe='/')}"]) or "null"
+    )
+    target = ref.get("object") if isinstance(ref, dict) else None
+    remote = target.get("sha") if isinstance(target, dict) else None
+    if (
+        not isinstance(ref, dict)
+        or ref.get("ref") != f"refs/heads/{branch}"
+        or not isinstance(target, dict)
+        or target.get("type") != "commit"
+        or not isinstance(remote, str)
+        or not _FULL_SHA.fullmatch(remote)
+    ):
+        raise ValueError(f"the head of {project}'s {branch} could not be read from GitHub")
+    if local != remote:
+        raise ValueError(
+            f"--base {base} is {local[:12]}, but the default branch {branch} of {project} is at "
+            f"{remote[:12]} on GitHub; fetch it again (`git fetch origin {branch}`) and use "
+            "that; not concluding"
+        )
+    _status(f"base verified: {base} is {project}'s {branch} head {remote[:12]} on GitHub")
+    return remote
+
+
+def _committed_policy(
+    repository: str, base: str, config: str, label: str | None = None
+) -> ProjectPolicy:
     """The policy file `config` (a path inside `repository`, relative to its top level) as the
-    commit `base` holds it. Missing or unparseable: an error (exit 2), never a looser policy."""
+    commit `base` holds it (`label` names it in messages). Missing or unparseable: an error
+    (exit 2), never a looser policy."""
+    shown = label or base
     path = committed_path(repository, config)
-    raw = read_committed_file(repository, base, path)
+    raw = read_committed_file(repository, base, path, label=shown)
     try:
         return load_policy_bytes(raw)
     except (ValueError, TypeError, UnicodeDecodeError) as exc:
-        raise ValueError(f"the policy {path} committed on {base} is not usable: {exc}") from exc
+        raise ValueError(f"the policy {path} committed on {shown} is not usable: {exc}") from exc
 
 
 #: `check-request` exit codes beside 0 (ready) and 2 (could not be verified).
@@ -382,7 +443,8 @@ def _check_request(args: argparse.Namespace) -> int:
     if not isinstance(document, dict) or "pull_request" in document:
         raise ValueError(f"#{args.issue} is not a readable issue of {args.project}")
     if args.base:
-        policy = _committed_policy(args.repository, args.base, args.config)
+        base = _verified_base(args.repository, args.project, args.base)
+        policy = _committed_policy(args.repository, base, args.config, args.base)
     else:
         policy = load_policy(args.config)
     if policy.provider != "github":
@@ -1229,9 +1291,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="the policy file's path in the repository (relative to its top level); it is read "
         "as committed on --base, never from the working tree",
     )
+    check_diff.add_argument(
+        "--project",
+        required=True,
+        help="owner/name on GitHub: --base must be the head of its default branch there",
+    )
     check_diff.add_argument("--repository", default=".")
     check_diff.add_argument(
-        "--base", required=True, help="the branch the change targets, e.g. origin/main"
+        "--base",
+        required=True,
+        help="the default branch as fetched, e.g. origin/main; it must resolve to the commit "
+        "GitHub reports as that branch's head (exit 2 otherwise)",
     )
     check_diff.add_argument("--head", default="HEAD", help="the commit that will be pushed")
     check_diff.add_argument("--output")
@@ -1251,7 +1321,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="the policy file; with --base, its path in --repository as committed there",
     )
     check_request.add_argument(
-        "--base", help="read the policy as committed on this revision, e.g. origin/main"
+        "--base",
+        help="read the policy as committed on this revision, e.g. origin/main; it must "
+        "resolve to the head of --project's default branch on GitHub (exit 2 otherwise)",
     )
     check_request.add_argument("--repository", default=".")
     check_request.add_argument(
