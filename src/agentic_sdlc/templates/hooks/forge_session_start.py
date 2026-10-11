@@ -63,11 +63,48 @@ _CLAIM_LINE = re.compile(r"^<!--\s*forge-claim\s[^>]*-->$")
 _ISSUE_URL = re.compile(r"/issues/(\d+)$")
 
 
+LOG_SKIPPED = (
+    "[Forge] Did not list recent commits: {why}. `git log` could run that program before the "
+    "session starts; look by hand once it is vetted."
+)
+
+#: Configuration forced on every git this hook runs, through GIT_CONFIG_COUNT (so the argv stays
+#: `git <subcommand> ...`): no fsmonitor hook and no hooks directory (Codex 4241434513 audit).
+#: Defence in depth -- each command is still vetted (`fetch_blocker`, `log_blocker`).
+GIT_CONFIG_OVERRIDES = (("core.fsmonitor", "false"), ("core.hooksPath", os.devnull))
+
+
+def git_env(base: dict[str, str] | None = None) -> dict[str, str]:
+    """The environment for a git this hook runs: `base` (default: this process's) with no pager
+    (`GIT_PAGER=cat`), no lazy fetch of missing objects from a promisor remote
+    (`GIT_NO_LAZY_FETCH`, which could contact the network and run its helpers), no terminal
+    prompt, and GIT_CONFIG_OVERRIDES APPENDED to any GIT_CONFIG_COUNT entries already set."""
+    env = dict(os.environ if base is None else base)
+    try:
+        count = int(env.get("GIT_CONFIG_COUNT", "0") or "0")
+    except ValueError:
+        count = 0
+    count = max(count, 0)
+    for key, value in GIT_CONFIG_OVERRIDES:
+        env[f"GIT_CONFIG_KEY_{count}"] = key
+        env[f"GIT_CONFIG_VALUE_{count}"] = value
+        count += 1
+    env["GIT_CONFIG_COUNT"] = str(count)
+    env.update(GIT_PAGER="cat", GIT_NO_LAZY_FETCH="1", GIT_TERMINAL_PROMPT="0")
+    return env
+
+
 def run(cmd: list[str]) -> str | None:
-    """The command's stdout, or None when it failed -- a failure is never an empty answer."""
+    """The command's stdout, or None when it failed -- a failure is never an empty answer. A git
+    command runs with `git_env()`."""
     try:
         return subprocess.run(
-            cmd, capture_output=True, text=True, check=True, timeout=60
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=60,
+            env=git_env() if cmd[:1] == ["git"] else None,
         ).stdout.strip()
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return None
@@ -95,13 +132,9 @@ def fetch_command(remote: str = REMOTE) -> list[str]:
     ]
 
 
-def fetch_blocker(remote: str = REMOTE) -> str | None:
-    """Why the session-start fetch is skipped, or None to fetch: `remote` is not a plain name,
-    or git would run a program configured outside the command (ssh/askpass/credential/proxy
-    helpers, a remote helper URL, a reference-transaction or pre-auto-gc hook, ...), judged by
-    the commit guard's own `_helper_reason`. Never raises: a session start is never blocked."""
-    if not _PLAIN_REMOTE.match(remote):
-        return f"the remote name {remote!r} is not a plain name"
+def _vet(sub: str, args: list[str]) -> str | None:
+    """Why `git SUB ARGS` may run a program configured outside the command, judged by the commit
+    guard's own `_helper_reason`, or None. Never raises: a session start is never blocked."""
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     try:
         from forge_commit_guard import _helper_reason
@@ -111,9 +144,43 @@ def fetch_blocker(remote: str = REMOTE) -> str | None:
             "cannot be vetted"
         )
     try:
-        return _helper_reason("fetch", [remote], os.getcwd(), ((), (), ()))
+        return _helper_reason(sub, args, os.getcwd(), ((), (), ()))
     except Exception as exc:  # never block the session start
         return f"git's configured helpers could not be vetted ({type(exc).__name__})"
+
+
+def fetch_blocker(remote: str = REMOTE) -> str | None:
+    """Why the session-start fetch is skipped, or None to fetch: `remote` is not a plain name,
+    or git would run a program configured outside the command (ssh/askpass/credential/proxy
+    helpers, a remote helper URL, a reference-transaction or pre-auto-gc hook, ...)."""
+    if not _PLAIN_REMOTE.match(remote):
+        return f"the remote name {remote!r} is not a plain name"
+    return _vet("fetch", [remote])
+
+
+def log_command(branch: str = DEFAULT_BRANCH, remote: str = REMOTE) -> list[str]:
+    """The recent-commits listing (Codex 4241434513). `log.showSignature` makes a plain `git
+    log` verify every signed commit with `gpg.program` -- any program the configuration names --
+    so signature verification is switched off explicitly; external diff and textconv drivers
+    too, though `--oneline` shows no diff (pager, fsmonitor and hooks: `git_env`)."""
+    return [
+        "git",
+        "log",
+        "--no-show-signature",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+        "--oneline",
+        "-8",
+        f"{remote}/{branch}",
+        "--",
+    ]
+
+
+def log_blocker() -> str | None:
+    """Why the recent-commits listing is skipped, or None to run it: `log_command()` vetted like
+    the fetch."""
+    return _vet("log", log_command()[2:])
 
 
 def _lease_lookup():
@@ -268,7 +335,9 @@ def main() -> int:
         run(["git", "rev-list", "--count", f"HEAD..origin/{DEFAULT_BRANCH}"]) if fetched else None
     )
     warnings: list[str] = []
-    recent = run(["git", "log", "--oneline", "-8", f"origin/{DEFAULT_BRANCH}"])
+    # rev-list above runs only after the vetted fetch (no signatures, pager, diff or hooks).
+    log_skipped = log_blocker()
+    recent = run(log_command()) if log_skipped is None else None
     prs = run(
         [
             "gh",
@@ -310,6 +379,8 @@ def main() -> int:
         print(UNAVAILABLE_WARNING.format(what=what, project=PROJECT))
     if inventory_state in ("truncated", "partial"):
         print(INCOMPLETE_WARNING.format(count=len(issues), project=PROJECT))
+    if log_skipped is not None:
+        print(LOG_SKIPPED.format(why=log_skipped))
     if fetched:
         print(
             f"[Forge] {PROJECT}: HEAD is {behind or '?'} commit(s) behind "

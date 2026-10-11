@@ -207,7 +207,7 @@ reusable workflow's `release_lease_on_failure` releases a lease once `prepare` h
 work first, and a run cancelled between `claim` and the end of `prepare` keeps its lease until
 it expires. The pinned reusable workflow re-checks only `trigger_actor`'s permission, not the
 label history; a re-check of the label set inside it is left to the platform's maintainer.
-The cloud routine re-runs `sdlcctl authorize-labeler` right before pushing (step 4a of its
+The cloud routine re-runs `sdlcctl authorize-labeler` right before pushing (step 4b of its
 prompt); its residual window is the seconds between that check and the push.
 
 ### Other managed files
@@ -299,6 +299,18 @@ through a link). `onboard --force` rewrites the policy and drops the confirmatio
   first, until it claims one: an issue skipped because it is unauthorized, unverifiable or
   leased elsewhere stays in the search, so it moves on to the next candidate instead of ending
   the run (Codex 4241327879). More than 1000 approved candidates is out of scope.
+  The Actions path's other deterministic gates run as commands in the prompt, each gating on its
+  exit code (Codex review 5483165195): `sdlcctl check-request --project owner/repo --issue N`
+  parses the issue with the same validator and policy as `prepare-request` (exit 3: invalid --
+  the issue is retired as above) and requires every dependency issue to be closed (exit 4: the
+  lease is released and the issue stays queued; anything unreadable exits 2); `sdlcctl renew`
+  runs after implementation, after verification and immediately before pushing, and fails
+  unless this run still holds a live lease (it never pushes over another agent's takeover --
+  keep `lease_ttl_minutes` longer than the longest stage); and `sdlcctl check-diff --base
+  origin/<default>` applies `inspect-diff`'s diff policy (forbidden paths, file/line/byte caps)
+  to the COMMITTED change from its merge base to `HEAD` -- exactly what the push publishes,
+  never the working tree -- and exits 0 only when it passes and is non-empty. A routine created
+  from an earlier version of the document must be re-pasted.
 - **Cloud routine branch rules** (`cloud-routine` mode, Codex 4241196640): the routine pushes
   `forge/issue-<N>` with the owner's credentials, so "effective rules on the cloud routine's
   forge/issue-<N> branches allow its push" runs the publisher's branch-domain checks against that

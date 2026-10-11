@@ -3226,3 +3226,29 @@ def test_a_renewal_whose_arbitration_read_fails_keeps_the_lease(no_retract_pause
         renew(PROJECT, 7, session="s1", ttl_minutes=60, gh=faults, now=NOW)
     assert faults.retract_attempts == 0
     assert current_lease(PROJECT, 7, gh, NOW).session == "s1"
+
+
+# Codex 4241434506: the cloud routine renews between stages and immediately before pushing, and
+# relies on `sdlcctl renew` failing unless THIS session still holds a live lease.
+@pytest.mark.parametrize("holder", ["other", "expired", "none"])
+def test_cli_renew_fails_unless_this_session_holds_a_live_lease(holder, monkeypatch, capsys):
+    from agentic_sdlc import cli
+
+    wall = datetime.now(UTC)
+    gh = FakeGh().issue(7, labels=[IN_PROGRESS_LABEL])
+    gh.posted_at = wall
+    if holder == "other":  # another session took the issue over
+        lease = Lease(7, "them", "s2", "b", wall + timedelta(hours=1))
+        gh.issues[7]["comments"].append(
+            _comment_row(1, format_claim_marker(lease), wall.isoformat())
+        )
+    elif holder == "expired":  # this session's own lease ran out: up for takeover
+        lease = Lease(7, "me", "s1", "b", wall - timedelta(minutes=1))
+        gh.issues[7]["comments"].append(
+            _comment_row(1, format_claim_marker(lease), (wall - timedelta(hours=1)).isoformat())
+        )
+    monkeypatch.setattr(cli, "run_gh", gh)
+    argv = ["renew", "--project", PROJECT, "--issue", "7", "--session", "s1"]
+    assert cli.main(argv) == 2
+    assert "ERROR" in capsys.readouterr().err
+    assert not any(c[:3] == ("api", "-X", "POST") for c in gh.calls)  # nothing posted
