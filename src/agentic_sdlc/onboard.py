@@ -440,14 +440,44 @@ class OnboardSpec:
 # ---------------------------------------------------------------- gh plumbing
 
 
+#: Codex 4240421134: every `gh` call is bounded, so a stalled network, authentication or API
+#: call fails closed (OnboardError) instead of hanging claim/renew/release/authorize-labeler/
+#: onboard/doctor forever. Seconds per call; `AGENTIC_SDLC_GH_TIMEOUT` overrides it (1-3600).
+GH_TIMEOUT_SECONDS = 60
+GH_TIMEOUT_ENV = "AGENTIC_SDLC_GH_TIMEOUT"
+
+
+def gh_timeout() -> float:
+    """The per-call `gh` timeout: GH_TIMEOUT_ENV when it is a number in 1-3600, else the
+    default (an unusable value never means "no timeout")."""
+    raw = os.environ.get(GH_TIMEOUT_ENV, "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return GH_TIMEOUT_SECONDS
+    return value if 1 <= value <= 3600 else GH_TIMEOUT_SECONDS
+
+
 def run_gh(args: Sequence[str], input: str | None = None) -> str:
-    """Run `gh` and return stdout; raises OnboardError with stderr on failure."""
+    """Run `gh` and return stdout; raises OnboardError with stderr on failure, and when the call
+    does not finish within `gh_timeout()` seconds."""
+    timeout = gh_timeout()
     try:
         proc = subprocess.run(
-            ["gh", *args], check=False, capture_output=True, text=True, input=input
+            ["gh", *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            input=input,
+            timeout=timeout,
         )
     except FileNotFoundError as exc:  # pragma: no cover - environment
         raise OnboardError("GitHub CLI `gh` is not installed") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise OnboardError(
+            f"gh {' '.join(shlex.quote(a) for a in args)} did not answer within {timeout:g}s; "
+            "not concluding"
+        ) from exc
     if proc.returncode != 0:
         raise OnboardError(
             f"gh {' '.join(shlex.quote(a) for a in args)} failed: {proc.stderr.strip()[:400]}"
@@ -907,10 +937,12 @@ def render_cloud_routine_md(spec: OnboardSpec) -> str:
 1a. Authorize the approval before claiming (labels alone are no authority: Triage users can
    apply them):
    `sdlcctl authorize-labeler --project {spec.project_id} --issue <n>
-    --label {IMPLEMENTATION_LABEL}`.
-   Proceed ONLY on exit 0 (whoever applied {_md_code(IMPLEMENTATION_LABEL)} last has
+    --label {shlex.quote(IMPLEMENTATION_LABEL)} --label {shlex.quote(spec.ready_label)}
+    --label {shlex.quote(HUMAN_REVIEW_LABEL)}`.
+   Proceed ONLY on exit 0 (whoever applied EACH of the three labels last has
    write/maintain/admin). Exit 3: not authorized -- do not claim; unless you already commented
-   so on this issue, comment that a maintainer must re-apply the label, then take the next issue.
+   so on this issue, comment that a maintainer must re-apply the labels, then take the next
+   issue.
    Any other exit: authorization could not be verified -- do not claim, take the next issue.
 1b. Claim it before touching code:
    `sdlcctl claim --project {spec.project_id} --issue <n> --agent cloud-routine
@@ -937,9 +969,11 @@ agent on claude.ai), not by a GitHub Actions job, so no self-hosted runner is re
 The routine must obey `AGENTS.md`, `CLAUDE.md` and `agentic-sdlc.toml` exactly as an Actions
 implementer would -- including the labeler check the Actions path runs: before claiming an
 issue it runs `sdlcctl authorize-labeler`, which reads the issue's label events and requires a
-definitive write/maintain/admin permission for whoever applied
-{_md_code(IMPLEMENTATION_LABEL)} most recently (a 404 is unauthorized; any other failure is
-unverifiable and the issue is skipped). Suggested routine prompt (create it with the
+definitive write/maintain/admin permission for whoever applied EACH label of the approval set
+({_md_code(IMPLEMENTATION_LABEL)}, {_md_code(spec.ready_label)},
+{_md_code(HUMAN_REVIEW_LABEL)}) most recently -- so a Triage user cannot complete the set after
+a writer approved (a 404 is unauthorized; any other failure is unverifiable and the issue is
+skipped). Suggested routine prompt (create it with the
 `schedule` skill or the claude.ai routines UI):
 
 {_md_block(prompt.splitlines())}
@@ -1263,6 +1297,7 @@ WORKFLOW_PLACEHOLDERS = (
     "AUTO_PLAN_IF",
     "AUTO_IMPLEMENT_IF",
     "APPROVAL_LABEL_VALUE",
+    "REQUIRED_LABELS_VALUE",
 )
 
 
@@ -1353,6 +1388,17 @@ def _render_workflow(name: str, spec: OnboardSpec, issue_expr: str | None = None
         # label for planning (its trigger), implementation approval for implementing.
         "APPROVAL_LABEL_VALUE": _yaml_str(
             spec.ready_label if name == "agent-auto-plan.yml" else IMPLEMENTATION_LABEL
+        ),
+        # Codex 4240421144: every label the run's condition requires present, the approval label
+        # first; whoever applied EACH most recently must hold write authority (`sdlcctl
+        # authorize-labeler` applies the same rule for a cloud routine).
+        "REQUIRED_LABELS_VALUE": _yaml_str(
+            json.dumps(
+                [spec.ready_label, HUMAN_REVIEW_LABEL]
+                if name == "agent-auto-plan.yml"
+                else [IMPLEMENTATION_LABEL, spec.ready_label, HUMAN_REVIEW_LABEL],
+                separators=(",", ":"),
+            )
         ),
     }
     if set(replacements) != set(WORKFLOW_PLACEHOLDERS):
@@ -4623,19 +4669,33 @@ def _job_runner_targets(
     return targets
 
 
+def _fork_code_trigger(trigger: str, merge_group_only: bool = False) -> bool:
+    """Does a workflow triggered by `trigger` run code a fork pull request supplied? Every
+    `pull_request*` event, and `merge_group` (Codex 4240421149): a merge group's SHA contains the
+    queued pull requests' changes, fork ones included. `merge_group_only` counts only the latter:
+    the fork-PR workflow policy gates `pull_request*` runs, never a merge queue's."""
+    if trigger == "merge_group":
+        return True
+    return not merge_group_only and trigger.startswith("pull_request")
+
+
 def _pull_request_off_hosted(
-    base: Path, platform_repository: str, load_callee: CalleeLoader | None = None
+    base: Path,
+    platform_repository: str,
+    load_callee: CalleeLoader | None = None,
+    merge_group_only: bool = False,
 ) -> list[str]:
-    """Every job a pull_request-triggered workflow (any `pull_request*` event) runs that is not
-    PROVEN to run on a single GitHub-hosted label -- including the jobs of the reusable workflows
-    it calls (`_job_runner_targets`). On a fork-exposed repository those jobs run fork code, so an
+    """Every job a workflow that runs fork pull-request code (`_fork_code_trigger`: any
+    `pull_request*` event, or `merge_group`) runs that is not PROVEN to run on a single
+    GitHub-hosted label -- including the jobs of the reusable workflows it calls
+    (`_job_runner_targets`). On a fork-exposed repository those jobs run fork code, so an
     unresolvable target fails closed."""
     found = []
     workflows = base / ".github/workflows"
     paths = sorted([*workflows.glob("*.yml"), *workflows.glob("*.yaml")])
     for path in paths:
         doc = _workflow_doc(path)
-        if doc is None or not any(t.startswith("pull_request") for t in _triggers(doc)):
+        if doc is None or not any(_fork_code_trigger(t, merge_group_only) for t in _triggers(doc)):
             continue
         targets = _job_runner_targets(base, path, platform_repository, load_callee=load_callee)
         for where, target in targets.items():
@@ -5083,11 +5143,14 @@ def _materialized_workflows(files: dict[str, bytes]) -> Iterator[Path]:
 
 
 def _remote_pull_request_off_hosted(
-    files: dict[str, bytes], platform_repository: str, load_callee: CalleeLoader | None = None
+    files: dict[str, bytes],
+    platform_repository: str,
+    load_callee: CalleeLoader | None = None,
+    merge_group_only: bool = False,
 ) -> list[str]:
     """`_pull_request_off_hosted` over a workflow set read from GitHub (`remote_workflow_files`)."""
     with _materialized_workflows(files) as root:
-        return _pull_request_off_hosted(root, platform_repository, load_callee)
+        return _pull_request_off_hosted(root, platform_repository, load_callee, merge_group_only)
 
 
 def remote_check_contexts(
@@ -5113,19 +5176,25 @@ def fork_runner_exposure(
     ref: str | None,
     load_callee: CalleeLoader | None = None,
     remote: tuple[dict[str, bytes] | None, str] | None = None,
+    merge_group_only: bool = False,
 ) -> list[str]:
-    """Every pull_request-triggered job of a fork-exposed repository not proven GitHub-hosted. The
-    authority is the default branch's workflow set as GitHub serves it (a stale or partial
-    checkout must not hide a workflow that is live there; `remote` is that set when the caller
-    already read it); the local checkout's workflows are checked IN ADDITION, never instead. An
-    unreadable remote set fails closed."""
+    """Every job of a fork-exposed repository that runs fork pull-request code (`pull_request*`
+    and `merge_group` workflows; only `merge_group` ones when `merge_group_only`) not proven
+    GitHub-hosted. The authority is the default branch's workflow set as GitHub serves it (a
+    stale or partial checkout must not hide a workflow that is live there; `remote` is that set
+    when the caller already read it); the local checkout's workflows are checked IN ADDITION,
+    never instead. An unreadable remote set fails closed."""
     files, why = remote if remote is not None else remote_workflow_files(gh, project_id, ref)
     if files is None:
         return [f"default-branch workflows unverifiable ({why}); doctor fails closed"]
-    exposed = _remote_pull_request_off_hosted(files, platform_repository, load_callee)
+    exposed = _remote_pull_request_off_hosted(
+        files, platform_repository, load_callee, merge_group_only
+    )
     exposed += [
         f"local checkout: {item}"
-        for item in _pull_request_off_hosted(base, platform_repository, load_callee)
+        for item in _pull_request_off_hosted(
+            base, platform_repository, load_callee, merge_group_only
+        )
         if item not in exposed
     ]
     return exposed
@@ -7644,7 +7713,35 @@ def doctor(
     # and private/internal ones unless forking or fork-PR workflows are PROVEN off; an unread
     # policy fails closed as an owner TODO.
     fork_state, fork_why = fork_pull_request_exposure(repo_info, gh, project_id)
-    if fork_state == "safe":
+    forking_off = isinstance(repo_info, dict) and repo_info.get("allow_forking") is False
+    if fork_state == "safe" and not forking_off:
+        # Codex 4240421149: disabling fork pull-request WORKFLOWS stops `pull_request*` runs only;
+        # a fork PR merged through the merge queue still runs in every `merge_group` workflow.
+        queued = fork_runner_exposure(
+            base,
+            gh,
+            project_id,
+            platform_repository,
+            actual_branch,
+            load_callee,
+            remote=remote_set(actual_branch),
+            merge_group_only=True,
+        )
+        add(
+            Check(
+                FORK_RUNNER_CHECK,
+                not queued,
+                f"{fork_why}, but fork pull requests merged through the merge queue would "
+                "execute on runners not proven GitHub-hosted: "
+                + "; ".join(queued)
+                + f" → set runs-on to a GitHub-hosted label (e.g. {PUBLIC_CI_RUNS_ON[0]}), or "
+                "disable forking for this repository"
+                if queued
+                else f"{fork_why}: fork pull requests run no workflows "
+                "(and no merge_group job runs off GitHub-hosted runners)",
+            )
+        )
+    elif fork_state == "safe":
         add(Check(FORK_RUNNER_CHECK, True, f"{fork_why}: fork pull requests run no workflows"))
     else:
         exposed = fork_runner_exposure(
@@ -7671,7 +7768,8 @@ def doctor(
                     else ""
                 )
                 if exposed
-                else f"{fork_why}; every pull_request-triggered job is GitHub-hosted",
+                else f"{fork_why}; every pull_request- and merge_group-triggered job is "
+                "GitHub-hosted",
                 manual=bool(exposed) and fork_state == "unknown",
             )
         )

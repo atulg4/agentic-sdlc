@@ -6141,7 +6141,18 @@ def test_auto_implement_authorizes_the_labeler_on_a_hosted_runner_first(implemen
     # (but the label whose latest applier it authorizes: Codex 4239965189)
     assert step["env"]["APPROVAL_LABEL"] == "implementation-approved"
     assert plan_step["env"]["APPROVAL_LABEL"] == "claude-ready"
-    assert {**step["env"], "APPROVAL_LABEL": "x"} == {**plan_step["env"], "APPROVAL_LABEL": "x"}
+    # ... and the label set whose latest appliers it authorizes (Codex 4240421144)
+    assert json.loads(step["env"]["REQUIRED_LABELS"]) == [
+        "implementation-approved",
+        "claude-ready",
+        "human-review-required",
+    ]
+    assert json.loads(plan_step["env"]["REQUIRED_LABELS"]) == [
+        "claude-ready",
+        "human-review-required",
+    ]
+    masked = {"APPROVAL_LABEL": "x", "REQUIRED_LABELS": "x"}
+    assert {**step["env"], **masked} == {**plan_step["env"], **masked}
     assert step["run"].replace("Implementation", "Planning") == plan_step["run"]
     assert "admin|write) ;;" in step["run"]
     gate = "needs.authorize.outputs.authorized == 'true'"
@@ -7265,8 +7276,12 @@ def _run_authorize(tmp_path: Path, script: str, workflow: str = "agent-auto-plan
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     label = step["env"]["APPROVAL_LABEL"]
+    required = step["env"]["REQUIRED_LABELS"]
     applied = json.dumps(
-        [{"event": "labeled", "label": {"name": label}, "actor": {"login": "alice"}}]
+        [
+            {"event": "labeled", "label": {"name": name}, "actor": {"login": "alice"}}
+            for name in json.loads(required)
+        ]
     )
     prelude = _gh_events_prelude(f"printf '%s' '{applied}'")
     (bin_dir / "gh").write_text("#!/usr/bin/env bash\n" + prelude + script)
@@ -7281,6 +7296,7 @@ def _run_authorize(tmp_path: Path, script: str, workflow: str = "agent-auto-plan
         "ACTOR": "alice",
         "ISSUE_NUMBER": "7",
         "APPROVAL_LABEL": label,
+        "REQUIRED_LABELS": required,
         "GITHUB_REPOSITORY": "owner/comic",
         "GITHUB_OUTPUT": str(output),
         "GH_COUNT": str(tmp_path / "count"),
@@ -7880,59 +7896,88 @@ def test_a_classic_allowlist_must_admit_the_actor_that_actually_pushes(tmp_path)
 
 
 def test_commit_guard_pr_fallback_accepts_only_a_same_repository_head(tmp_path, monkeypatch):
-    """`gh pr list --head` filters by branch NAME: a fork PR from an identically named branch
-    is not this branch's claim, and a PR whose head repository cannot be read is not one
-    either."""
+    """A fork PR from an identically named branch is not this branch's claim, and a PR whose head
+    repository cannot be read is not one either."""
     guard = _guard_module(tmp_path, "forge_commit_guard")
     seen: list[list[str]] = []
     answer: dict[str, object] = {}
 
     def fake_run(args, **kwargs):
         seen.append(list(args))
+        assert kwargs.get("timeout")
 
         class Done:
-            stdout = json.dumps(answer["prs"])
+            stdout = json.dumps(answer["pages"])
 
         return Done()
 
     monkeypatch.setattr(guard.subprocess, "run", fake_run)
     own = {
         "number": 3,
-        "isCrossRepository": False,
-        "headRepository": {"id": "R1", "name": "comic"},
-        "headRepositoryOwner": {"id": "U1", "login": "Owner"},
+        "state": "open",
+        "head": {"ref": "forge/issue-7", "repo": {"full_name": "Owner/Comic"}},
     }
-    fork = {
-        **own,
-        "isCrossRepository": True,
-        "headRepositoryOwner": {"id": "U2", "login": "mallory"},
-    }
-    answer["prs"] = [fork]
-    assert guard.open_pr_for("forge/issue-7") is False
-    fields = seen[-1][seen[-1].index("--json") + 1].split(",")
-    assert {"headRepository", "headRepositoryOwner", "isCrossRepository"} <= set(fields)
-    # A fork that claims to be same-repository but names another owner is still not the claim.
-    answer["prs"] = [{**fork, "isCrossRepository": False}]
+    fork = {**own, "head": {"ref": "forge/issue-7", "repo": {"full_name": "mallory/comic"}}}
+    answer["pages"] = [[fork]]
     assert guard.open_pr_for("forge/issue-7") is False
     for broken in (
-        {k: v for k, v in own.items() if k != "isCrossRepository"},
-        {k: v for k, v in own.items() if k != "headRepository"},
-        {**own, "headRepositoryOwner": None},
-        {**own, "isCrossRepository": "false"},
-        {**own, "headRepository": {"name": ""}},
+        {k: v for k, v in own.items() if k != "head"},
+        {**own, "state": "closed"},
+        {**own, "head": {"ref": "forge/issue-7", "repo": None}},  # deleted head repository
+        {**own, "head": {"ref": "forge/issue-8", "repo": {"full_name": "owner/comic"}}},
+        {**own, "head": {"ref": "forge/issue-7", "repo": {"full_name": ""}}},
+        {**own, "head": "owner:forge/issue-7"},
     ):
-        answer["prs"] = [broken]
+        answer["pages"] = [[broken]]
         assert guard.open_pr_for("forge/issue-7") is False, broken
-    answer["prs"] = {"number": 3}
-    assert guard.open_pr_for("forge/issue-7") is None
-    answer["prs"] = [fork, own]
+    for unreadable in ({"number": 3}, [{"number": 3}], None):
+        answer["pages"] = unreadable
+        assert guard.open_pr_for("forge/issue-7") is None, unreadable
+    answer["pages"] = [[fork], [own]]
     assert guard.open_pr_for("forge/issue-7") is True
     commit = {"tool_name": "Bash", "session_id": "s1", "tool_input": {"command": "git commit"}}
-    answer["prs"] = [fork]
+    answer["pages"] = [[fork]]
     code, message = guard.decide(commit, "forge/issue-7", lambda n: None, guard.open_pr_for)
     assert code == 2 and "no live lease exists" in message
-    answer["prs"] = [own]
+    answer["pages"] = [[own]]
     assert guard.decide(commit, "forge/issue-7", lambda n: None, guard.open_pr_for) == (0, "")
+
+
+# Codex 4240421140: `gh pr list --head` fetched only 30 PRs and filtered by branch NAME, so more
+# than 30 fork PRs from an identically named branch hid the same-repository one. The lookup is the
+# REST list filtered to `OWNER:BRANCH`, every page read.
+def test_commit_guard_pr_lookup_is_exhaustive_and_owner_qualified(tmp_path, monkeypatch):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    seen: list[list[str]] = []
+    forks = [
+        {
+            "number": n,
+            "state": "open",
+            "head": {"ref": "forge/issue-7", "repo": {"full_name": f"fork{n}/comic"}},
+        }
+        for n in range(40)
+    ]
+    own = {
+        "number": 99,
+        "state": "open",
+        "head": {"ref": "forge/issue-7", "repo": {"full_name": "owner/comic"}},
+    }
+
+    def fake_run(args, **kwargs):
+        seen.append(list(args))
+        assert 0 < kwargs["timeout"] <= guard.GH_TIMEOUT
+
+        class Done:
+            stdout = json.dumps([forks[:30], [*forks[30:], own]])
+
+        return Done()
+
+    monkeypatch.setattr(guard.subprocess, "run", fake_run)
+    assert guard.open_pr_for("forge/issue-7") is True
+    args = seen[-1]
+    assert args[:2] == ["gh", "api"] and "--paginate" in args and "--slurp" in args
+    assert "pr" not in args and "--limit" not in args
+    assert args[2] == "repos/owner/comic/pulls?state=open&head=owner%3Aforge%2Fissue-7&per_page=100"
 
 
 @pytest.mark.parametrize(
@@ -8656,7 +8701,9 @@ def test_commit_guard_local_git_timeouts_refuse(tmp_path, monkeypatch):
 
 
 def test_guard_and_leases_agree_on_same_repository_prs(tmp_path, monkeypatch):
-    """Codex 4239667540: `claim()` and the commit guard apply ONE same-repository rule."""
+    """Codex 4239667540: `claim()` and the commit guard apply ONE same-repository rule -- the
+    guard over the REST `pulls` shape (Codex 4240421140), `claim()` over GraphQL rows: the same
+    pull request reads the same way in both."""
     from agentic_sdlc import leases
 
     guard = _guard_module(tmp_path, "forge_commit_guard")
@@ -8666,19 +8713,26 @@ def test_guard_and_leases_agree_on_same_repository_prs(tmp_path, monkeypatch):
         "headRepository": {"name": "comic"},
         "headRepositoryOwner": {"login": "owner"},
     }
-    rows = [
-        own,
-        {**own, "isCrossRepository": True},
-        {**own, "isCrossRepository": None},
-        {**own, "headRepositoryOwner": {"login": "mallory"}},
-        {**own, "headRepository": {"name": "other"}},
-        {**own, "headRepository": None},
-        {**own, "headRepositoryOwner": {"login": ""}},
-        {k: v for k, v in own.items() if k != "isCrossRepository"},
-        "not a dict",
+
+    def rest(full_name):
+        repo = {"full_name": full_name} if full_name is not None else None
+        return {"state": "open", "head": {"ref": "forge/issue-7", "repo": repo}}
+
+    pairs = [
+        (own, rest("owner/comic")),
+        (
+            {**own, "isCrossRepository": True, "headRepositoryOwner": {"login": "mallory"}},
+            rest("mallory/comic"),
+        ),
+        ({**own, "headRepository": {"name": "other"}}, rest("owner/other")),
+        ({**own, "headRepository": None}, rest(None)),  # the head repository was deleted
+        ({**own, "headRepositoryOwner": {"login": ""}}, rest("")),
+        ("not a dict", "not a dict"),
     ]
-    for row in rows:
-        assert guard._same_repository_pr(row) == leases._same_repository_pr(row, "Owner/Comic")
+    for row, rest_row in pairs:
+        assert guard._same_repository_pr(rest_row, "forge/issue-7") == leases._same_repository_pr(
+            row, "Owner/Comic"
+        ), row
 
 
 def test_auto_workflows_report_a_failed_authorization_from_a_hosted_runner():
@@ -9408,6 +9462,7 @@ def _run_approval(tmp_path, workflow, events_script, permissions, sender="writer
         "ACTOR": sender,
         "ISSUE_NUMBER": "7",
         "APPROVAL_LABEL": step["env"]["APPROVAL_LABEL"],
+        "REQUIRED_LABELS": step["env"]["REQUIRED_LABELS"],
         "GITHUB_REPOSITORY": "owner/comic",
         "GITHUB_OUTPUT": str(output),
     }
@@ -9464,6 +9519,11 @@ def test_auto_implement_authorizes_the_approval_labeler_not_the_last_labeler(tmp
     ],
 )
 def test_auto_implement_passes_the_verified_approver(tmp_path, events, approver):
+    events = [
+        ("labeled", "claude-ready", "writer"),
+        ("labeled", "human-review-required", "writer"),
+        *events,
+    ]
     pages = " ".join(f"'{_events_page(e)}'" for e in events)  # one event per page
     done, out = _run_approval(
         tmp_path,
@@ -9511,7 +9571,9 @@ def test_a_removed_approval_label_is_unauthorized(tmp_path):
 
 
 def test_auto_plan_authorizes_the_ready_labeler(tmp_path):
-    events = _events_page(("labeled", "claude-ready", "outsider"))
+    events = _events_page(
+        ("labeled", "human-review-required", "writer"), ("labeled", "claude-ready", "outsider")
+    )
     done, out = _run_approval(
         tmp_path,
         "agent-auto-plan.yml",
@@ -9902,3 +9964,301 @@ def test_caller_pin_skips_non_mapping_jobs():
     assert _caller_pin(doc, "owner/agentic-sdlc") == SHA
     assert _caller_pin({"jobs": {"a": "x"}}, "owner/agentic-sdlc") is None
     assert _caller_pin({"jobs": "x"}, "owner/agentic-sdlc") is None
+
+
+# ---------------------------------------------------------------- review regressions (PR 139, 13)
+# Codex review 5482060549.
+
+
+# Codex 4240421142: git runs the default SSH transport (`ssh`) -- and the shell runs git itself --
+# from PATH, so a command that changes PATH anywhere can run a program of its own choosing through
+# an allowlisted git command. On an unleased issue branch it needs the lease.
+@pytest.mark.parametrize(
+    "command",
+    [
+        "export PATH=/tmp/bin:$PATH; git fetch origin",
+        "export PATH=/tmp/bin:$PATH && git remote show origin",
+        "PATH=/tmp/bin:$PATH; git fetch origin",
+        "PATH+=:/tmp/bin; git fetch origin",
+        'export "PATH=/tmp/bin:$PATH"; git fetch origin',
+        "declare -x PATH=/tmp/bin; git fetch origin",
+        "read -r PATH <<< /tmp/bin; git fetch origin",
+        "for PATH in /tmp/bin; do git fetch origin; done",
+        "declare -n p=PATH; p=/tmp/bin; git fetch origin",
+        "path=(/tmp/bin $path); git fetch origin",
+        "path+=(/tmp/bin); git fetch origin",
+        "hash -p /tmp/bin/git git; git status",
+        "export PATH=/tmp/bin:$PATH; git status",
+        "bash -c 'export PATH=/tmp/bin:$PATH; git fetch origin'",
+        "export SSH_ASKPASS=/tmp/x SSH_ASKPASS_REQUIRE=force; git fetch origin",
+        "export LD_PRELOAD=/tmp/x.so; git status",
+        "export GIT_SSH_COMMAND+=/tmp/x; git fetch origin",
+        "env PATH=/tmp/bin git fetch origin",
+        "PATH=/tmp/bin git fetch origin",
+    ],
+)
+def test_commit_guard_path_changes_guard_allowlisted_git(helper_repo, command):
+    guard, repo, _ = helper_repo
+    assert guard.is_git_commit(command, cwd=str(repo)), command
+    code, message = _guarded_decision(guard, repo, command)
+    assert code == 2, message  # some forms are refused outright (an unknown ref or repository)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "export PATH=/tmp/bin:$PATH; git fetch origin",
+        "export PATH=/tmp/bin:$PATH; git status",
+        "declare -x PATH=/tmp/bin; git remote show origin",
+    ],
+)
+def test_commit_guard_path_changes_need_the_lease_only(helper_repo, command):
+    guard, repo, git = helper_repo
+    code, message = _guarded_decision(guard, repo, command)
+    assert code == 2 and "no live lease exists" in message, message
+    lease = {"session": "s1", "agent": "a", "expires": None}
+    assert _guarded_decision(guard, repo, command, lease) == (0, "")
+    git("switch", "-q", "-c", "main")
+    assert _guarded_decision(guard, repo, command) == (0, "")
+
+
+def test_commit_guard_unchanged_path_keeps_fetch_allowed(helper_repo):
+    guard, repo, _ = helper_repo
+    for command in ("git fetch origin", "git remote show origin", "git log --oneline -- paths"):
+        assert not guard.is_git_commit(command, cwd=str(repo)), command
+        assert _guarded_decision(guard, repo, command) == (0, "")
+
+
+@pytest.mark.parametrize("entry", [".", "", "bin", "./tools"])
+def test_commit_guard_relative_path_entries_guard_allowlisted_git(helper_repo, monkeypatch, entry):
+    """A relative PATH entry resolves against the directory the command runs in (a `cd`, or a
+    file the agent wrote there, picks the `ssh` git runs): every allowlisted command is guarded."""
+    guard, repo, _ = helper_repo
+    (repo / "sub").mkdir()
+    monkeypatch.setenv("PATH", f"{entry}{os.pathsep}{os.environ['PATH']}")
+    for command in ("git fetch origin", "cd sub && git fetch origin", "git status"):
+        assert guard.is_git_commit(command, cwd=str(repo)), (entry, command)
+        code, message = _guarded_decision(guard, repo, command)
+        assert code == 2 and "is relative" in message, message
+
+
+# Codex 4240421149: a merge group's SHA contains the queued PRs' code, fork PRs included, so a
+# `merge_group` workflow is fork-exposed exactly like a `pull_request*` one.
+SELF_HOSTED_MERGE_GROUP = (
+    "on: merge_group\njobs:\n  queue-check:\n    runs-on: [self-hosted]\n"
+    "    steps:\n      - run: make check\n"
+)
+
+
+def test_public_runner_safety_covers_merge_group_workflows(tmp_path):
+    from agentic_sdlc.onboard import _pull_request_off_hosted, fork_runner_exposure
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(fork_exposed=True))
+    _wf(repo, "queue.yml", SELF_HOSTED_MERGE_GROUP)
+    found = _pull_request_off_hosted(repo, "owner/agentic-sdlc", _platform_loader())
+    assert any(f.startswith("queue.yml:queue-check") for f in found), found
+    gh = _public_gh()
+    exposed = fork_runner_exposure(
+        repo, gh, "owner/comic", "owner/agentic-sdlc", "main", _platform_loader()
+    )
+    assert any("queue.yml:queue-check" in item for item in exposed), exposed
+    check = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))[PUBLIC_CHECK]
+    assert "queue.yml:queue-check" in check.detail
+    # a hosted merge-group job is fine
+    _wf(repo, "queue.yml", SELF_HOSTED_MERGE_GROUP.replace("[self-hosted]", "ubuntu-latest"))
+    assert not _pull_request_off_hosted(repo, "owner/agentic-sdlc", _platform_loader())
+
+
+def test_merge_group_runs_fork_code_even_with_fork_pr_workflows_disabled(tmp_path):
+    """A private repository that only disables fork pull-request WORKFLOWS still merges fork PRs
+    through its merge queue: its `merge_group` jobs must be GitHub-hosted too. Forking disabled
+    outright leaves no fork code to run."""
+    from agentic_sdlc.onboard import FORK_PR_WORKFLOWS_PRIVATE
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    _wf(repo, "queue.yml", SELF_HOSTED_MERGE_GROUP)
+    gh = _healthy_gh()
+    info = json.loads(gh.answers["api repos/owner/comic"])
+    info.update({"visibility": "private", "allow_forking": True})
+    gh.answers["api repos/owner/comic"] = json.dumps(info)
+    gh.answers[f"api repos/owner/comic/{FORK_PR_WORKFLOWS_PRIVATE}"] = json.dumps(
+        {"run_workflows_from_fork_pull_requests": False}
+    )
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    check = next(c for c in report.checks if c.name == PUBLIC_CHECK)
+    assert not check.ok and "queue.yml:queue-check" in check.detail, check.detail
+    info["allow_forking"] = False
+    gh.answers["api repos/owner/comic"] = json.dumps(info)
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    assert next(c for c in report.checks if c.name == PUBLIC_CHECK).ok
+
+
+# Codex 4240421144: whoever applied EACH label of the approval set most recently must hold write
+# authority -- on the Actions path exactly as for `sdlcctl authorize-labeler` -- so a Triage user
+# can neither approve nor complete the set, in either order.
+@pytest.mark.parametrize(
+    ("events", "authorized"),
+    [
+        # a writer approved FIRST, a Triage user completed the set later
+        (
+            [
+                ("labeled", "implementation-approved", "writer"),
+                ("labeled", "claude-ready", "writer"),
+                ("labeled", "human-review-required", "triager"),
+            ],
+            "false",
+        ),
+        # a Triage user's prerequisite, then a writer's approval (the event's sender)
+        (
+            [
+                ("labeled", "claude-ready", "triager"),
+                ("labeled", "human-review-required", "writer"),
+                ("labeled", "implementation-approved", "writer"),
+            ],
+            "false",
+        ),
+        # a writer re-applied the Triage user's label: its LATEST applier is the writer
+        (
+            [
+                ("labeled", "claude-ready", "triager"),
+                ("unlabeled", "claude-ready", "writer"),
+                ("labeled", "Claude-Ready", "writer"),
+                ("labeled", "human-review-required", "writer"),
+                ("labeled", "implementation-approved", "writer"),
+            ],
+            "true",
+        ),
+        # a prerequisite removed since it was last applied
+        (
+            [
+                ("labeled", "claude-ready", "writer"),
+                ("labeled", "human-review-required", "writer"),
+                ("labeled", "implementation-approved", "writer"),
+                ("unlabeled", "human-review-required", "writer"),
+            ],
+            "false",
+        ),
+    ],
+)
+def test_auto_implement_authorizes_every_label_of_the_set(tmp_path, events, authorized):
+    done, out = _run_approval(
+        tmp_path,
+        "agent-auto-implement.yml",
+        f"printf '%s' '{_events_page(*events)}'; exit 0",
+        {"writer": WRITE, "triager": TRIAGE},
+    )
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    assert out["authorized"] == authorized, (done.stdout, out)
+    if authorized == "true":
+        assert out["approver"] == "writer"
+
+
+@pytest.mark.parametrize(
+    "events",
+    [
+        # a prerequisite with no labeled event at all: unverifiable, the job fails
+        [("labeled", "implementation-approved", "writer"), ("labeled", "claude-ready", "writer")],
+        # a prerequisite's latest event names no valid actor
+        [
+            ("labeled", "implementation-approved", "writer"),
+            ("labeled", "claude-ready", "writer"),
+            ("labeled", "human-review-required", "a b"),
+        ],
+    ],
+)
+def test_auto_implement_fails_when_a_prerequisite_labeler_cannot_be_verified(tmp_path, events):
+    done, out = _run_approval(
+        tmp_path,
+        "agent-auto-implement.yml",
+        f"printf '%s' '{_events_page(*events)}'; exit 0",
+        {"writer": WRITE},
+    )
+    assert done.returncode == 1, (done.stdout, done.stderr)
+    assert "authorized" not in out and "::error::" in done.stdout
+
+
+# Codex 4240421134: every `gh` call claim/renew/release/authorize-labeler/onboard/doctor make is
+# bounded; a stalled `gh` fails closed (OnboardError -> exit 2) instead of hanging the session.
+def test_run_gh_times_out_and_fails_closed(tmp_path, monkeypatch):
+    import time
+
+    from agentic_sdlc import onboard
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "gh").write_text("#!/bin/sh\nexec sleep 30\n")
+    (bin_dir / "gh").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv(onboard.GH_TIMEOUT_ENV, "1")
+    started = time.monotonic()
+    with pytest.raises(OnboardError, match="did not answer within 1s"):
+        onboard.run_gh(["api", "repos/owner/comic"])
+    assert time.monotonic() - started < 15
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("", 60), ("5", 5), ("0", 60), ("-1", 60), ("nope", 60), ("99999", 60), ("inf", 60)],
+)
+def test_gh_timeout_is_always_finite(monkeypatch, value, expected):
+    from agentic_sdlc import onboard
+
+    monkeypatch.setenv(onboard.GH_TIMEOUT_ENV, value)
+    assert onboard.gh_timeout() == expected
+    seen = {}
+
+    def fake_run(args, **kwargs):
+        seen.update(kwargs)
+        raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+
+    import subprocess
+
+    monkeypatch.setattr(onboard.subprocess, "run", fake_run)
+    with pytest.raises(OnboardError, match="did not answer"):
+        onboard.run_gh(["api", "x"])
+    assert seen["timeout"] == expected
+
+
+def test_lease_commands_exit_2_when_gh_stalls(monkeypatch):
+    import subprocess
+
+    from agentic_sdlc import cli, onboard
+
+    def stalled(args, **kwargs):
+        assert kwargs.get("timeout")
+        raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+
+    monkeypatch.setattr(onboard.subprocess, "run", stalled)
+    base = ["--project", "owner/comic", "--issue", "7"]
+    session = ["--session", "s1"]
+    for argv in (
+        ["claim", *base, *session, "--agent", "a", "--branch", "forge/issue-7"],
+        ["renew", *base, *session],
+        ["release", *base, *session],
+        ["authorize-labeler", *base, "--label", "implementation-approved"],
+    ):
+        assert cli.main(argv) == 2, argv
+
+
+def test_every_subprocess_run_is_bounded():
+    """No subprocess call in the package (hook templates included) may wait forever."""
+    import ast
+
+    root = Path(__file__).resolve().parents[1] / "src" / "agentic_sdlc"
+    unbounded: list[str] = []
+    for path in sorted(root.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            owner = node.func.value
+            if not (isinstance(owner, ast.Name) and owner.id == "subprocess"):
+                continue
+            where = f"{path.relative_to(root)}:{node.lineno}"
+            if node.func.attr != "run":
+                unbounded.append(f"{where}: subprocess.{node.func.attr} (use subprocess.run)")
+            elif not any(k.arg == "timeout" for k in node.keywords):
+                unbounded.append(f"{where}: subprocess.run without timeout=")
+    assert not unbounded, unbounded

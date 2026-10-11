@@ -1005,7 +1005,8 @@ def _links_issue(pr: dict, project: str, issue: int) -> bool:
 
 def _same_repository_pr(pr: object, project: str) -> bool:
     """True only for a PR whose head branch lives in `project` itself (the commit guard's
-    `_same_repository_pr`): `isCrossRepository` exactly false and the head repository's
+    `_same_repository_pr` applies the same rule to the REST shape): `isCrossRepository` exactly
+    false and the head repository's
     owner/name equal to `project`, case-insensitively. Missing or malformed fields prove nothing."""
     if not isinstance(pr, dict) or pr.get("isCrossRepository") is not False:
         return False
@@ -1679,12 +1680,14 @@ def render_claims(rows: Sequence[ClaimRow]) -> str:
 # ---- Approval labeler authorization (Codex 4239868029). A user with Triage permission can apply
 # labels without repository write authority, so the labels alone never authorize work: the
 # Actions path runs `_authorize-labeler.yml` before implementing (the same history rule, in shell:
-# Codex 4239965189), and a cloud routine runs
-# `sdlcctl authorize-labeler` before claiming. Both require a DEFINITIVE write/maintain/admin
-# answer for whoever applied the approval label most recently: a 200 carrying the permission, or
-# a 404 (no access: unauthorized). Anything else -- the events or the permission unreadable, no
-# `labeled` event, an event without an actor -- is unverifiable and refuses (LeaseError), never
-# reads as authorized.
+# Codex 4239965189), and a cloud routine runs `sdlcctl authorize-labeler` before claiming. Both
+# require a DEFINITIVE write/maintain/admin answer for whoever applied EACH label of the approval
+# set most recently (Codex 4240421144: checking the approval label alone let a Triage user
+# COMPLETE the set by adding a prerequisite after a writer approved): a 200 carrying the
+# permission, or a 404 (no access: unauthorized). Anything else -- the events or a permission
+# unreadable, a label with no `labeled` event, an event without an actor -- is unverifiable and
+# refuses (LeaseError), never reads as authorized. A label of the set removed since it was last
+# applied is unauthorized.
 
 
 @dataclass(frozen=True)
@@ -1695,6 +1698,8 @@ class LabelerAuthorization:
     permission: str | None
     authorized: bool
     reason: str
+    #: (label, who applied it most recently) for every label of the set, once all were read
+    labelers: tuple[tuple[str, str], ...] = ()
 
     def as_dict(self) -> dict:
         return {
@@ -1704,6 +1709,7 @@ class LabelerAuthorization:
             "permission": self.permission,
             "authorized": self.authorized,
             "reason": self.reason,
+            "labelers": dict(self.labelers),
         }
 
 
@@ -1735,9 +1741,19 @@ def labeler_permission(project: str, login: str, gh: GhRunner) -> str | None:
     return str(data.get("permission") or "") or None
 
 
-def authorize_labeler(project: str, issue: int, label: str, gh: GhRunner) -> LabelerAuthorization:
-    """Did someone with write/maintain/admin apply `label` to `issue` most recently (see above)?
-    Returns the verdict; raises LeaseError when it cannot be verified."""
+def authorize_labeler(
+    project: str, issue: int, labels: str | Sequence[str], gh: GhRunner
+) -> LabelerAuthorization:
+    """Did someone with write/maintain/admin apply EACH of `labels` (the approval set; a single
+    label is a set of one) to `issue` most recently (see above)? The verdict's `label`/`labeler`
+    are the FIRST label's (the approval label) and its latest applier. Returns the verdict;
+    raises LeaseError when it cannot be verified."""
+    wanted = [labels] if isinstance(labels, str) else list(labels)
+    if not wanted or not all(isinstance(name, str) and name.strip() for name in wanted):
+        raise LeaseError("authorize-labeler needs at least one label name; not authorizing")
+    keys = list(dict.fromkeys(name.casefold() for name in wanted))  # case-insensitive on GitHub
+    spelled = {name.casefold(): name for name in reversed(wanted)}
+    approval = wanted[0]
     try:
         events = _issue_events(project, issue, gh)
     except LeaseError:
@@ -1746,8 +1762,7 @@ def authorize_labeler(project: str, issue: int, label: str, gh: GhRunner) -> Lab
         raise LeaseError(
             f"cannot read the events of issue #{issue} ({str(exc).strip()[:200]}); not authorizing"
         ) from exc
-    wanted = label.casefold()  # label names are case-insensitive on GitHub
-    latest: dict | None = None
+    latest: dict[str, dict] = {}
     for event in events:
         if event.get("event") not in ("labeled", "unlabeled"):
             continue
@@ -1757,29 +1772,59 @@ def authorize_labeler(project: str, issue: int, label: str, gh: GhRunner) -> Lab
             raise LeaseError(
                 f"issue #{issue}: a label event carries no label name; not authorizing"
             )
-        if name.casefold() == wanted:
-            latest = event
-    if latest is None:
-        raise LeaseError(f"issue #{issue}: no `labeled` event for {label!r}; not authorizing")
-    if latest.get("event") != "labeled":
-        return LabelerAuthorization(
-            issue, label, "", None, False, f"{label!r} was removed after it was last applied"
+        if name.casefold() in keys:
+            latest[name.casefold()] = event
+    missing = [spelled[key] for key in keys if key not in latest]
+    if missing:
+        raise LeaseError(
+            f"issue #{issue}: no `labeled` event for {', '.join(map(repr, missing))}; "
+            "not authorizing"
         )
-    actor = latest.get("actor")
-    login = actor.get("login") if isinstance(actor, dict) else None
-    if not isinstance(login, str) or not login.strip():
-        raise LeaseError(f"issue #{issue}: the {label!r} event names no actor; not authorizing")
-    permission = labeler_permission(project, login, gh)
-    if permission is not None and login_key(permission) in WRITE_PERMISSIONS:
+    removed = [spelled[key] for key in keys if latest[key].get("event") != "labeled"]
+    if removed:
         return LabelerAuthorization(
-            issue, label, login, permission, True, f"{login} has {permission} permission"
+            issue,
+            approval,
+            "",
+            None,
+            False,
+            f"{', '.join(map(repr, removed))} was removed after it was last applied",
         )
+    appliers: dict[str, str] = {}
+    for key in keys:
+        actor = latest[key].get("actor")
+        login = actor.get("login") if isinstance(actor, dict) else None
+        if not isinstance(login, str) or not login.strip():
+            raise LeaseError(
+                f"issue #{issue}: the {spelled[key]!r} event names no actor; not authorizing"
+            )
+        appliers[key] = login
+    labelers = tuple((spelled[key], appliers[key]) for key in keys)
+    permissions = {
+        login: labeler_permission(project, login, gh) for login in dict.fromkeys(appliers.values())
+    }
+    approver = appliers[keys[0]]
+    for key in keys:
+        login = appliers[key]
+        permission = permissions[login]
+        if permission is None or login_key(permission) not in WRITE_PERMISSIONS:
+            return LabelerAuthorization(
+                issue,
+                approval,
+                approver,
+                permissions[approver],
+                False,
+                f"{login} applied {spelled[key]!r} without repository write authority "
+                f"(permission: {permission or 'none'})",
+                labelers,
+            )
+    who = ", ".join(f"{login} has {permissions[login]}" for login in permissions)
     return LabelerAuthorization(
         issue,
-        label,
-        login,
-        permission,
-        False,
-        f"{login} applied {label!r} without repository write authority "
-        f"(permission: {permission or 'none'})",
+        approval,
+        approver,
+        permissions[approver],
+        True,
+        f"{who} permission (latest applier of each approval label)",
+        labelers,
     )

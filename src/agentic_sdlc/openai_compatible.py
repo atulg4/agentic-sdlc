@@ -13,6 +13,9 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+#: Every local git call is bounded (Codex 4240421134): a stalled git fails the run, never hangs it.
+GIT_TIMEOUT_SECONDS = 300
+
 
 class AdapterError(RuntimeError):
     """Raised when a provider cannot produce an applicable patch."""
@@ -146,6 +149,7 @@ def _tracked_files() -> list[str]:
         check=True,
         capture_output=True,
         text=True,
+        timeout=GIT_TIMEOUT_SECONDS,
     )
     return [line for line in result.stdout.splitlines() if _safe_text_path(line)]
 
@@ -496,6 +500,7 @@ def generate_and_apply_patch(
             ["git", "apply", "--check", str(output_patch)],
             capture_output=True,
             text=True,
+            timeout=GIT_TIMEOUT_SECONDS,
         )
         if result.returncode != 0:
             raise AdapterError(
@@ -522,7 +527,7 @@ def generate_and_apply_patch(
             print(f"Routing fallback: {label} {error.status}", file=sys.stderr)
             continue
         output_patch.write_text(patch, encoding="utf-8")
-        subprocess.run(["git", "apply", str(output_patch)], check=True)
+        subprocess.run(["git", "apply", str(output_patch)], check=True, timeout=GIT_TIMEOUT_SECONDS)
         message = f"Generated patch with routed OpenAI-compatible provider {attempt.provider}.\n"
         if fallbacks:
             message += "Routing fallback: " + "; ".join(fallbacks) + "\n"
@@ -552,7 +557,12 @@ def main(argv: list[str] | None = None) -> int:
             output_message=Path(message_output),
             candidates=candidates,
         )
-    except (AdapterError, OSError, subprocess.CalledProcessError) as error:
+    except (
+        AdapterError,
+        OSError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 2
     return 0

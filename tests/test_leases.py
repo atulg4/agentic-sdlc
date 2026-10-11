@@ -2524,7 +2524,7 @@ def test_cli_authorize_labeler_exit_codes(tmp_path, monkeypatch):
         "triager": json.dumps({"permission": "read", "role_name": "triage"}),
         "bot%5Bbot%5D": json.dumps({"permission": "read"}),
     }
-    base = ["authorize-labeler", "--project", PROJECT, "--issue", "7"]
+    base = ["authorize-labeler", "--project", PROJECT, "--issue", "7", "--label", APPROVAL]
     for login, code in (("writer", 0), ("triager", 3), ("bot[bot]", 3)):
         pages = [[_label_event("labeled", APPROVAL, login, 1)]]
         monkeypatch.setattr(cli, "run_gh", _labeler_gh(pages, perms, calls))
@@ -2534,6 +2534,122 @@ def test_cli_authorize_labeler_exit_codes(tmp_path, monkeypatch):
     assert ["api", f"repos/{PROJECT}/collaborators/bot%5Bbot%5D/permission"] in calls
     monkeypatch.setattr(cli, "run_gh", _labeler_gh(OSError("down"), perms))
     assert cli.main(base) == 2  # unverifiable: an error, never "authorized"
+
+
+# Codex 4240421144: the cloud routine authorized only the latest applier of the approval label, so
+# a Triage user could COMPLETE the set by adding a prerequisite after a writer approved. Whoever
+# applied EACH label of the set most recently must hold write authority.
+APPROVAL_SET = [APPROVAL, "agent-ready", "human-review-required"]
+WRITE_PERMS = {
+    "writer": json.dumps({"permission": "write"}),
+    "keeper": json.dumps({"permission": "write", "role_name": "maintain"}),
+    "triager": json.dumps({"permission": "read", "role_name": "triage"}),
+}
+
+
+@pytest.mark.parametrize(
+    ("events", "authorized"),
+    [
+        # the reported ordering: a writer approved first, a Triage user completed the set
+        (
+            [
+                ("labeled", "agent-ready", "writer"),
+                ("labeled", APPROVAL, "writer"),
+                ("labeled", "human-review-required", "triager"),
+            ],
+            False,
+        ),
+        # a Triage user's prerequisite before a writer's approval
+        (
+            [
+                ("labeled", "agent-ready", "triager"),
+                ("labeled", "human-review-required", "writer"),
+                ("labeled", APPROVAL, "writer"),
+            ],
+            False,
+        ),
+        # re-applied by a writer: the LATEST application of each label counts (any case)
+        (
+            [
+                ("labeled", "agent-ready", "triager"),
+                ("unlabeled", "agent-ready", "keeper"),
+                ("labeled", "Agent-Ready", "keeper"),
+                ("labeled", "human-review-required", "writer"),
+                ("labeled", APPROVAL, "writer"),
+            ],
+            True,
+        ),
+        # a prerequisite removed since it was last applied
+        (
+            [
+                ("labeled", "agent-ready", "writer"),
+                ("labeled", "human-review-required", "writer"),
+                ("labeled", APPROVAL, "writer"),
+                ("unlabeled", "agent-ready", "writer"),
+            ],
+            False,
+        ),
+    ],
+)
+def test_authorize_labeler_requires_write_authority_for_every_label_of_the_set(events, authorized):
+    from agentic_sdlc.leases import authorize_labeler
+
+    pages = [[_label_event(kind, name, login, n) for n, (kind, name, login) in enumerate(events)]]
+    verdict = authorize_labeler(PROJECT, 7, APPROVAL_SET, _labeler_gh(pages, WRITE_PERMS))
+    assert verdict.authorized is authorized, verdict.reason
+    if authorized:
+        assert verdict.labeler == "writer" and verdict.label == APPROVAL
+        assert dict(verdict.labelers)["agent-ready"] == "keeper"
+
+
+@pytest.mark.parametrize(
+    "events",
+    [
+        [("labeled", APPROVAL, "writer"), ("labeled", "agent-ready", "writer")],  # one never
+        [  # a prerequisite's latest event names no actor
+            ("labeled", APPROVAL, "writer"),
+            ("labeled", "agent-ready", "writer"),
+            ("labeled", "human-review-required", ""),
+        ],
+    ],
+)
+def test_authorize_labeler_fails_closed_on_an_unverifiable_prerequisite(events):
+    from agentic_sdlc.leases import authorize_labeler
+
+    pages = [[_label_event(kind, name, login, n) for n, (kind, name, login) in enumerate(events)]]
+    with pytest.raises(LeaseError, match="not authorizing"):
+        authorize_labeler(PROJECT, 7, APPROVAL_SET, _labeler_gh(pages, WRITE_PERMS))
+    with pytest.raises(LeaseError, match="not authorizing"):
+        authorize_labeler(PROJECT, 7, [], _labeler_gh(pages, WRITE_PERMS))
+
+
+def test_cli_authorize_labeler_checks_the_whole_approval_set(tmp_path, monkeypatch):
+    from agentic_sdlc import cli
+
+    pages = [
+        [
+            _label_event("labeled", "agent-ready", "writer", 1),
+            _label_event("labeled", APPROVAL, "writer", 2),
+            _label_event("labeled", "human-review-required", "triager", 3),
+        ]
+    ]
+    monkeypatch.setattr(cli, "run_gh", _labeler_gh(pages, WRITE_PERMS))
+    base = ["authorize-labeler", "--project", PROJECT, "--issue", "7"]
+    labels = [arg for name in APPROVAL_SET for arg in ("--label", name)]
+    assert cli.main([*base, *labels]) == 3  # the Triage user completed the set
+    assert cli.main([*base, "--label", APPROVAL]) == 0  # (the approval label alone: a writer)
+    # the default: the policy's whole approval set
+    policy = tmp_path / "agentic-sdlc.toml"
+    policy.write_text(
+        'version = 1\n[project]\nid = "owner/repo"\n[automation]\nready_label = "agent-ready"\n'
+    )
+    out = tmp_path / "verdict.json"
+    assert cli.main([*base, "--config", str(policy), "--output", str(out)]) == 3
+    assert set(json.loads(out.read_text())["labelers"]) == set(APPROVAL_SET)
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(base) == 3  # agentic-sdlc.toml in the working directory
+    # no readable policy and no --label: an error, never a smaller set
+    assert cli.main([*base, "--config", str(tmp_path / "missing.toml")]) == 2
 
 
 # ---------------------------------------------------------------- Codex 4240306505
