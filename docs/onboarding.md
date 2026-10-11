@@ -351,6 +351,10 @@ something that runs differently.
 - The commit guard's open-PR fallback counts only a PR whose head branch lives in this
   repository: `gh pr list --head` matches the branch NAME, so a fork's PR from an identically
   named branch is not this branch's claim.
+- The commit guard matches a live lease to this session only by the hook payload's
+  `session_id`, and only when that is a non-empty string: a payload whose id is missing, null,
+  empty or not a string owns no lease, so guarded git on a leased issue branch is refused
+  (fail closed) and the SessionStart hook reports no lease as this session's.
 
 ## Required repository state
 

@@ -2173,6 +2173,16 @@ def open_pr_for(branch: str) -> bool | None:
     return any(_same_repository_pr(pr) for pr in prs)
 
 
+def payload_session(payload: dict) -> str:
+    """The hook payload's session id, or "" when it is missing, null, empty, blank or not a
+    string. Never stringified: a non-string id (a number, a list, ...) is no identity at all and
+    must not be able to equal a lease's session text (Codex 4240101138)."""
+    session = payload.get("session_id") if isinstance(payload, dict) else None
+    if not isinstance(session, str) or not session.strip():
+        return ""
+    return session
+
+
 def decide(
     payload: dict, branch: str | list[str], lease_lookup=lease_for, pr_lookup=open_pr_for
 ) -> tuple[int, str]:
@@ -2237,7 +2247,7 @@ def _decide_branch(payload: dict, branch: str, lease_lookup, pr_lookup) -> tuple
     if not m:
         return 0, ""
     issue = int(m.group(1))
-    session = str(payload.get("session_id") or "")
+    session = payload_session(payload)
     lease = lease_lookup(issue)
     if lease_unavailable(lease):
         return 2, (
@@ -2261,7 +2271,17 @@ def _decide_branch(payload: dict, branch: str, lease_lookup, pr_lookup) -> tuple
             f"Claim it first: sdlcctl claim --project {PROJECT} --issue {issue} "
             f"--agent claude-code --session {session or '<session_id>'} --branch {branch}"
         ) + _helper_note()
-    if session and lease.get("session") != session:
+    if not session:
+        # Codex 4240101138: without a usable session id no lease can be shown to be this
+        # session's, so a live lease is never taken as ours (fail closed).
+        return 2, (
+            f"Forge guard: issue #{issue} is leased by agent={lease.get('agent')} "
+            f"session={lease.get('session')} until {lease['expires'].isoformat()}, and this "
+            "hook payload carries no usable session_id (missing, null, empty or not a string), "
+            "so the lease cannot be confirmed as this session's. Do not commit to it; restart "
+            "the session so Claude Code supplies its session id, then retry."
+        ) + _helper_note()
+    if lease.get("session") != session:
         return 2, (
             f"Forge guard: issue #{issue} is leased by agent={lease.get('agent')} "
             f"session={lease.get('session')} until {lease['expires'].isoformat()}. "

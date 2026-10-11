@@ -65,7 +65,12 @@ def classify_leased(
             live.append(f"{line} -- lease unreadable, treat as held")
         elif lease is None:
             stale.append(line)
-        elif session and isinstance(lease, dict) and str(lease.get("session") or "") == session:
+        elif (
+            isinstance(session, str)
+            and session.strip()
+            and isinstance(lease, dict)
+            and lease.get("session") == session
+        ):
             mine.append(line)
         else:
             live.append(line)
@@ -77,7 +82,9 @@ def main() -> int:
         payload = json.loads(sys.stdin.read() or "{}")
     except json.JSONDecodeError:
         payload = {}
-    session = str(payload.get("session_id") or "")
+    session = payload.get("session_id") if isinstance(payload, dict) else None
+    # only a non-empty string identifies this session; anything else matches no lease
+    session = session if isinstance(session, str) and session.strip() else ""
     # A failed fetch leaves the cached origin/<default> ref: never present it as current.
     fetched = run(["git", "fetch", "-q", "origin"]) is not None
     behind = (
