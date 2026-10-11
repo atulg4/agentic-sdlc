@@ -57,6 +57,15 @@ def _open_prs_page(prs, args, size=100):
     return {"data": {"repository": {"pullRequests": {"pageInfo": info, "nodes": nodes}}}}
 
 
+def _timeline_page(timelines: dict, path: str, size: int = 100) -> list:
+    """One page (`?per_page=&page=`) of an issue timeline from {issue: [events]}."""
+    n = int(path.split("/")[4])
+    query = dict(kv.split("=", 1) for kv in path.split("?", 1)[1].split("&"))
+    assert int(query["per_page"]) == size
+    start = (int(query["page"]) - 1) * size
+    return timelines.get(n, [])[start : start + size]
+
+
 class FakeGh:
     """Minimal GitHub: issues with labels/assignees/comments, open PRs."""
 
@@ -71,6 +80,8 @@ class FakeGh:
         # repository permission per login (the collaborator permission API); others: 404
         self.permissions: dict[str, str] = {"atulg4": "admin"}
         self.events: dict[int, list[dict]] = {}  # issue events (assigned, ...)
+        self.timeline: dict[int, list[dict]] = {}  # issue timeline (connected, cross-referenced)
+        self.link_subjects: dict[str, dict | None] = {}  # connected/disconnected node -> subject
 
     def issue(self, number, labels=(), assignees=(), comments=()):
         self.issues[number] = {
@@ -112,6 +123,8 @@ class FakeGh:
         if args[0] == "api" and args[1].split("?")[0].endswith("/events"):
             n = int(args[1].split("/")[4])
             return self._pages(self.events.get(n, []), args)
+        if args[0] == "api" and args[1].split("?")[0].endswith("/timeline"):
+            return json.dumps(_timeline_page(self.timeline, args[1]))
         if args[0] == "api" and args[1].split("?")[0].endswith("/comments") and "-X" not in args:
             n = int(args[1].split("/")[4])
             return self._pages(self.issues[n]["comments"], args)
@@ -171,6 +184,10 @@ class FakeGh:
                     **issue.get("extra", {}),
                 }
             )
+        if args[:2] == ("api", "graphql") and "nodes(ids:" in args[3]:
+            ids = [a.split("=", 1)[1] for a in args if a.startswith("ids[]=")]
+            nodes = [{"subject": self.link_subjects.get(i)} for i in ids]
+            return json.dumps({"data": {"nodes": nodes}})
         if args[:2] == ("api", "graphql"):
             return json.dumps(_open_prs_page(self.prs, args))
         if args[:2] == ("label", "create"):
@@ -2142,6 +2159,236 @@ def test_a_cursor_that_never_advances_refuses():
 
     with pytest.raises(LeaseError, match="next one starts"):
         open_prs_for_issue(PROJECT, 7, stuck)
+
+
+# Codex 4240028945: a PR linked by hand in the Development sidebar does not close the issue, so
+# it is not in `closingIssuesReferences`; the issue timeline's `connected`/`cross-referenced`
+# events are read too.
+def _link_event(kind, node_id):
+    return {"event": kind, "node_id": node_id, "id": hash(node_id) & 0xFFFF}
+
+
+def _pr_subject(number, state="OPEN", repo="owner/repo"):
+    return {
+        "__typename": "PullRequest",
+        "number": number,
+        "url": f"https://x/pr/{number}",
+        "title": "t",
+        "state": state,
+        "repository": {"nameWithOwner": repo},
+    }
+
+
+def _xref(number, state="open", repo="owner/repo", pull=True):
+    row = {
+        "number": number,
+        "state": state,
+        "title": "t",
+        "html_url": f"https://x/pr/{number}",
+        "repository": {"full_name": repo},
+    }
+    if pull:
+        row["pull_request"] = {"url": f"https://api/pulls/{number}"}
+    return {"event": "cross-referenced", "source": {"type": "issue", "issue": row}}
+
+
+def _claim(gh):
+    return claim(PROJECT, 7, agent="me", session="s1", branch="b", ttl_minutes=60, gh=gh, now=NOW)
+
+
+def test_a_manually_linked_pr_blocks_claims():
+    gh = FakeGh().issue(7)
+    gh.prs = [
+        {"number": 50, "url": "https://x/pr/50", "title": "t", "body": "", "headRefName": "x"}
+    ]
+    gh.timeline[7] = [_link_event("connected", "CE_1")]
+    gh.link_subjects["CE_1"] = _pr_subject(50)
+    result = _claim(gh)
+    assert not result.ok and "pr/50" in result.reason
+    assert not any(c[:3] == ("api", "-X", "POST") for c in gh.calls)
+
+
+def test_a_manual_link_to_an_open_pr_outside_the_inventory_still_blocks():
+    gh = FakeGh().issue(7)
+    gh.timeline[7] = [_link_event("connected", "CE_1")]
+    gh.link_subjects["CE_1"] = _pr_subject(51)
+    result = _claim(gh)
+    assert not result.ok and "pr/51" in result.reason
+
+
+@pytest.mark.parametrize(
+    ("events", "subjects"),
+    [
+        (  # linked, then unlinked
+            [_link_event("connected", "CE_1"), _link_event("disconnected", "DE_1")],
+            {"CE_1": _pr_subject(52), "DE_1": _pr_subject(52)},
+        ),
+        ([_link_event("connected", "CE_1")], {"CE_1": _pr_subject(52, state="CLOSED")}),
+        ([_link_event("connected", "CE_1")], {"CE_1": _pr_subject(52, state="MERGED")}),
+        ([_link_event("connected", "CE_1")], {"CE_1": _pr_subject(52, repo="other/repo")}),
+        ([_link_event("connected", "CE_1")], {"CE_1": {"__typename": "Issue", "number": 9}}),
+    ],
+)
+def test_a_link_that_is_gone_closed_or_elsewhere_does_not_block(events, subjects):
+    gh = FakeGh().issue(7)
+    gh.timeline[7] = events
+    gh.link_subjects.update(subjects)
+    result = _claim(gh)
+    assert result.ok, result.reason
+
+
+def test_a_relinked_pr_blocks_again():
+    gh = FakeGh().issue(7)
+    gh.timeline[7] = [
+        _link_event("connected", "CE_1"),
+        _link_event("disconnected", "DE_1"),
+        _link_event("connected", "CE_2"),
+    ]
+    gh.link_subjects.update(
+        {"CE_1": _pr_subject(53), "DE_1": _pr_subject(53), "CE_2": _pr_subject(53)}
+    )
+    assert not _claim(gh).ok
+
+
+def test_the_link_owner_repository_compares_case_insensitively():
+    gh = FakeGh().issue(7)
+    gh.timeline[7] = [_link_event("connected", "CE_1")]
+    gh.link_subjects["CE_1"] = _pr_subject(54, repo="Owner/REPO")
+    assert not _claim(gh).ok
+
+
+@pytest.mark.parametrize(
+    ("event", "subject"),
+    [
+        ({"event": "connected"}, None),  # no node id
+        ({"event": "connected", "node_id": ""}, None),
+        (_link_event("connected", "CE_1"), None),  # the subject could not be read
+        (_link_event("connected", "CE_1"), {"number": 55}),  # no type
+        (_link_event("connected", "CE_1"), {**_pr_subject(55), "number": None}),
+        (_link_event("connected", "CE_1"), {**_pr_subject(55), "repository": None}),
+        (_link_event("connected", "CE_1"), {**_pr_subject(55), "state": None}),
+        (_link_event("disconnected", "DE_1"), None),
+    ],
+)
+def test_an_unidentified_manual_link_fails_closed(event, subject):
+    gh = FakeGh().issue(7)
+    gh.timeline[7] = [event]
+    if subject is not None:
+        gh.link_subjects[event["node_id"]] = subject
+    with pytest.raises(LeaseError):
+        _claim(gh)
+    assert not any(c[:3] == ("api", "-X", "POST") for c in gh.calls)
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"errors": [{"message": "x"}]},
+        {"data": None},
+        {"data": {"nodes": []}},  # fewer nodes than ids
+        "not json",
+    ],
+)
+def test_an_unreadable_link_lookup_fails_closed(answer):
+    fake = FakeGh().issue(7)
+    fake.timeline[7] = [_link_event("connected", "CE_1")]
+
+    def gh(args, input=None):
+        args = tuple(args)
+        if args[:2] == ("api", "graphql") and "nodes(ids:" in args[3]:
+            return answer if isinstance(answer, str) else json.dumps(answer)
+        return fake(args, input)
+
+    with pytest.raises(LeaseError):
+        _claim(gh)
+
+
+def test_an_open_same_repository_pr_cross_referencing_the_issue_blocks():
+    gh = FakeGh().issue(7)
+    gh.timeline[7] = [_xref(60)]
+    result = _claim(gh)
+    assert not result.ok and "pr/60" in result.reason
+
+
+def test_a_cross_reference_falls_back_to_the_repository_url():
+    gh = FakeGh().issue(7)
+    event = _xref(61)
+    del event["source"]["issue"]["repository"]
+    event["source"]["issue"]["repository_url"] = "https://api.github.com/repos/OWNER/repo"
+    gh.timeline[7] = [event]
+    assert not _claim(gh).ok
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        _xref(62, state="closed"),
+        _xref(62, repo="other/repo"),
+        _xref(62, pull=False),  # mentioned from an issue
+        {"event": "commented", "body": "see #7"},
+    ],
+)
+def test_a_cross_reference_that_is_not_open_same_repository_work_does_not_block(event):
+    gh = FakeGh().issue(7)
+    gh.timeline[7] = [event]
+    result = _claim(gh)
+    assert result.ok, result.reason
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"event": "cross-referenced"},
+        {"event": "cross-referenced", "source": {"issue": None}},
+        {"event": "cross-referenced", "source": {"issue": {"pull_request": {}, "state": "open"}}},
+        {
+            "event": "cross-referenced",
+            "source": {"issue": {"pull_request": {}, "number": 1, "repository": {}}},
+        },
+    ],
+)
+def test_a_malformed_cross_reference_fails_closed(event):
+    gh = FakeGh().issue(7)
+    gh.timeline[7] = [event]
+    with pytest.raises(LeaseError):
+        _claim(gh)
+
+
+@pytest.mark.parametrize(
+    "page",
+    ["not json", json.dumps({"message": "x"}), json.dumps([None]), json.dumps(["s"]), "null"],
+)
+def test_an_unreadable_timeline_fails_closed(page):
+    fake = FakeGh().issue(7)
+
+    def gh(args, input=None):
+        args = tuple(args)
+        if args[0] == "api" and args[1].split("?")[0].endswith("/timeline"):
+            return page
+        return fake(args, input)
+
+    with pytest.raises(LeaseError):
+        _claim(gh)
+    assert not any(c[:3] == ("api", "-X", "POST") for c in fake.calls)
+
+
+def test_the_timeline_is_read_to_its_last_page():
+    gh = FakeGh().issue(7)
+    filler = [{"event": "commented", "id": i} for i in range(100)]
+    gh.timeline[7] = filler + [_xref(63)]
+    result = _claim(gh)
+    assert not result.ok and "pr/63" in result.reason
+    pages = [c[1] for c in gh.calls if c[0] == "api" and "/timeline" in c[1]]
+    assert [p.rsplit("page=", 1)[1] for p in pages] == ["1", "2"]
+
+
+def test_the_existing_signals_still_decide_without_timeline_links():
+    from agentic_sdlc.leases import open_prs_for_issue
+
+    gh = FakeGh().issue(7)
+    gh.prs = [_fork_pr(64, head="patch-1", body="Closes #7")]
+    gh.timeline[7] = [_xref(64)]  # the same PR found twice is listed once
+    assert [p["number"] for p in open_prs_for_issue(PROJECT, 7, gh)] == [64]
 
 
 # Codex 4239868029: a cloud routine claims only work whose approval label a writer applied.

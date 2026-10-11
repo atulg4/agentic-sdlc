@@ -5855,6 +5855,68 @@ def test_doctor_requires_the_auto_implement_authorization(tmp_path, change):
     assert drift is not None and "agent-auto-implement.yml" in drift
 
 
+# Codex 4240028941: naming any job permission sets the others to none, and the authorization
+# step lists the issue's label events, which needs `issues: read` in a private repository.
+@pytest.mark.parametrize(
+    ("name", "job"),
+    [("agent-auto-implement.yml", "authorize"), ("agent-auto-plan.yml", "preflight")],
+)
+def test_labeler_authorization_job_can_read_the_issue_events(name, job):
+    for implementer in ("route", "claude", "codex"):
+        doc = yaml.safe_load(
+            render_onboarding(spec(implementer=implementer))[f".github/workflows/{name}"]
+        )
+        authorize = doc["jobs"][job]
+        assert "/issues/${ISSUE_NUMBER}/events" in authorize["steps"][0]["run"]
+        # least privilege: exactly the scopes the step's API calls need
+        assert authorize["permissions"] == {"contents": "read", "issues": "read"}
+
+
+@pytest.mark.parametrize(
+    ("name", "job"),
+    [("agent-auto-implement.yml", "authorize"), ("agent-auto-plan.yml", "preflight")],
+)
+def test_doctor_requires_issue_read_on_the_authorization_job(tmp_path, name, job):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    assert _drift(repo) is None
+    _edit_workflow(repo, name, lambda d: d["jobs"][job]["permissions"].pop("issues"))
+    drift = _drift(repo)
+    assert drift is not None and name in drift and "permissions" in drift
+
+
+_ISSUE_READ_CALLS = ("/issues/${ISSUE_NUMBER}/events",)
+_ISSUE_WRITE_CALLS = ("issues.createComment", "issues.addLabels", "issues.removeLabel")
+_LEVELS = {"none": 0, "read": 1, "write": 2}
+
+
+def test_every_rendered_forge_job_has_the_permissions_its_api_calls_need():
+    """Audit: a job that names `permissions` has no scope it does not name, so every REST call
+    a step makes with the job token must be covered by what the job grants."""
+    for implementer in ("route", "claude", "codex", "cloud-routine"):
+        files = render_onboarding(spec(implementer=implementer))
+        for path, text in files.items():
+            if not path.startswith(".github/workflows/"):
+                continue
+            doc = yaml.safe_load(text)
+            for job_name, job in (doc.get("jobs") or {}).items():
+                steps = job.get("steps") or []
+                body = "\n".join(
+                    str(step.get("run", "")) + str((step.get("with") or {}).get("script", ""))
+                    for step in steps
+                )
+                granted = job.get("permissions", doc.get("permissions"))
+                granted = granted if isinstance(granted, dict) else {}
+                issues = _LEVELS[granted.get("issues", "none")]
+                where = f"{path}:{job_name}"
+                if any(call in body for call in _ISSUE_READ_CALLS):
+                    assert issues >= _LEVELS["read"], where
+                if any(call in body for call in _ISSUE_WRITE_CALLS):
+                    assert issues >= _LEVELS["write"], where
+                if "actions/checkout@" in str(steps):
+                    assert _LEVELS[granted.get("contents", "none")] >= 1, where
+
+
 # Codex 4238935465: GitHub retired the macOS 13 images on 2025-12-04; their labels never start.
 @pytest.mark.parametrize("label", ["macos-13", "macos-13-large", "macos-13-xlarge"])
 def test_retired_macos_13_labels_are_not_github_hosted(tmp_path, label):

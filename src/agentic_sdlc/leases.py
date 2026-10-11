@@ -623,7 +623,8 @@ def _reassigned_in(events: list[dict], login: str, claimed_at: datetime) -> bool
 #: `gh pr list --limit N` TRUNCATES, so an issue's PR beyond the first N went unseen and a claim
 #: started duplicate work). The fields are those `gh pr list --json` returned -- GitHub's GraphQL
 #: names -- so every signal below reads them unchanged; `closingIssuesReferences` carries the
-#: Development-sidebar links (Codex 4239780827), which no REST pulls endpoint exposes.
+#: issues each PR will close (Codex 4239780827). A manual Development-sidebar link that does not
+#: close the issue is read from the issue's timeline instead (`_timeline_prs`, Codex 4240028945).
 _OPEN_PRS_QUERY = """\
 query($owner: String!, $name: String!, $after: String) {
   repository(owner: $owner, name: $name) {
@@ -729,12 +730,168 @@ def open_prs_for_issue(project: str, issue: int, gh: GhRunner) -> list[dict]:
         )
         if issue in refs or by_branch or _links_issue(pr, project, issue):
             hits.append(pr)
+    # Codex 4240028945: `closingIssuesReferences` holds what the PR will CLOSE; a PR linked by
+    # hand in the Development sidebar does not close the issue and is not in it. The issue's
+    # timeline is: `connected` (minus a later `disconnected`) and same-repository open PRs that
+    # cross-reference the issue are durable work too.
+    by_number = {pr.get("number"): pr for pr in prs}
+    seen = {pr.get("number") for pr in hits}
+    for number, row in _timeline_prs(project, issue, gh):
+        if number in seen:
+            continue
+        seen.add(number)
+        hits.append(by_number.get(number) or row)
     return hits
 
 
+#: Pages of an issue timeline read before refusing (a runaway answer is never "no PR").
+_MAX_TIMELINE_PAGES = 1000
+_TIMELINE_PAGE = 100
+
+#: The PR a `connected`/`disconnected` timeline event links, by the event's global node id:
+#: the REST timeline names no PR for these events, so they are resolved through GraphQL.
+_LINK_EVENTS_QUERY = """\
+query($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    __typename
+    ... on ConnectedEvent { subject { ...linked } }
+    ... on DisconnectedEvent { subject { ...linked } }
+  }
+}
+fragment linked on ReferencedSubject {
+  __typename
+  ... on PullRequest { number url title state repository { nameWithOwner } }
+  ... on Issue { number }
+}"""
+
+
+def _issue_timeline(project: str, issue: int, gh: GhRunner) -> list[dict]:
+    """Every event of the issue's timeline, page by page until a short page. Anything but a
+    list of objects raises LeaseError: an unreadable timeline is never "no linked PR"."""
+    events: list[dict] = []
+    for page in range(1, _MAX_TIMELINE_PAGES + 1):
+        path = f"repos/{project}/issues/{issue}/timeline?per_page={_TIMELINE_PAGE}&page={page}"
+        try:
+            items = json.loads(gh(["api", path]) or "null")
+        except ValueError as exc:
+            raise LeaseError(f"unreadable answer from {path}: not JSON") from exc
+        if not isinstance(items, list):
+            raise LeaseError(f"unreadable answer from {path}: not a list of events")
+        if not all(isinstance(item, dict) for item in items):
+            raise LeaseError(f"unreadable answer from {path}: an event is not an object")
+        events.extend(items)
+        if len(items) < _TIMELINE_PAGE:
+            return events
+    raise LeaseError(f"the timeline of {project} issue #{issue} did not end; not concluding")
+
+
+def _repo_of(issue_row: dict) -> str | None:
+    """`owner/name` of a timeline `source.issue`: its `repository.full_name`, else the API URL."""
+    repo = issue_row.get("repository")
+    if isinstance(repo, dict) and isinstance(repo.get("full_name"), str):
+        return repo["full_name"]
+    url = issue_row.get("repository_url")
+    if isinstance(url, str):
+        found = re.search(r"/repos/([^/]+/[^/]+)$", url)
+        if found:
+            return found.group(1)
+    return None
+
+
+def _number(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _link_subjects(project: str, issue: int, ids: list[str], gh: GhRunner) -> dict[str, dict]:
+    """The `subject` of each connected/disconnected event (by node id). Any id whose subject
+    cannot be read raises LeaseError: an unidentified manual link could be this issue's PR."""
+    what = f"{project} issue #{issue}: a Development-sidebar link could not be identified"
+    subjects: dict[str, dict] = {}
+    for start in range(0, len(ids), 100):
+        chunk = ids[start : start + 100]
+        args = ["api", "graphql", "-f", f"query={_LINK_EVENTS_QUERY}"]
+        for node_id in chunk:
+            args += ["-f", f"ids[]={node_id}"]
+        try:
+            answer = json.loads(gh(args) or "null")
+        except ValueError as exc:
+            raise LeaseError(f"{what}: not JSON") from exc
+        if not isinstance(answer, dict) or answer.get("errors"):
+            raise LeaseError(f"{what}: {str(answer)[:200]}")
+        data = answer.get("data")
+        nodes = data.get("nodes") if isinstance(data, dict) else None
+        if not isinstance(nodes, list) or len(nodes) != len(chunk):
+            raise LeaseError(f"{what}: no answer for every link event")
+        for node_id, node in zip(chunk, nodes, strict=True):
+            subject = node.get("subject") if isinstance(node, dict) else None
+            if not isinstance(subject, dict) or not isinstance(subject.get("__typename"), str):
+                raise LeaseError(f"{what}: event {node_id} names no subject")
+            subjects[node_id] = subject
+    return subjects
+
+
+def _timeline_prs(project: str, issue: int, gh: GhRunner) -> list[tuple[int, dict]]:
+    """(number, row) of each OPEN pull request of `project` the issue's timeline links: one
+    connected through the Development sidebar and not disconnected since, or one that
+    cross-references the issue. A malformed event, or a link whose PR cannot be identified,
+    raises LeaseError (fail closed: it could be the work this claim would duplicate)."""
+    events = _issue_timeline(project, issue, gh)
+    links = [e for e in events if e.get("event") in ("connected", "disconnected")]
+    unresolved = []
+    for event in links:
+        if not isinstance(event.get("node_id"), str) or not event["node_id"]:
+            raise LeaseError(
+                f"{project} issue #{issue}: a {event.get('event')} event has no id; "
+                "not concluding that no linked PR covers the issue"
+            )
+        unresolved.append(event["node_id"])
+    subjects = _link_subjects(project, issue, unresolved, gh) if unresolved else {}
+    connected: dict[int, dict] = {}
+    for event in links:
+        subject = subjects[event["node_id"]]
+        if subject["__typename"] != "PullRequest":
+            continue  # an issue-to-issue link is not work in progress
+        number = _number(subject.get("number"))
+        repo = subject.get("repository")
+        name = repo.get("nameWithOwner") if isinstance(repo, dict) else None
+        if number is None or not isinstance(name, str) or not isinstance(subject.get("state"), str):
+            raise LeaseError(
+                f"{project} issue #{issue}: a linked pull request could not be identified"
+            )
+        if name.lower() != project.lower():
+            continue
+        if event["event"] == "connected":
+            connected[number] = subject
+        else:
+            connected.pop(number, None)
+    found = [
+        (number, {"number": number, "url": row.get("url", ""), "title": row.get("title", "")})
+        for number, row in connected.items()
+        if row["state"] == "OPEN"
+    ]
+    for event in events:
+        if event.get("event") != "cross-referenced":
+            continue
+        source = event.get("source")
+        row = source.get("issue") if isinstance(source, dict) else None
+        if not isinstance(row, dict):
+            raise LeaseError(f"{project} issue #{issue}: a cross-reference names no source")
+        if "pull_request" not in row:
+            continue  # referenced from an issue, not a pull request
+        number, repo, state = _number(row.get("number")), _repo_of(row), row.get("state")
+        if number is None or repo is None or not isinstance(state, str):
+            raise LeaseError(
+                f"{project} issue #{issue}: a cross-referencing pull request could not be read"
+            )
+        if state == "open" and repo.lower() == project.lower():
+            url = row.get("html_url") or ""
+            found.append((number, {"number": number, "url": url, "title": row.get("title", "")}))
+    return found
+
+
 def _links_issue(pr: dict, project: str, issue: int) -> bool:
-    """Does the PR's `closingIssuesReferences` -- which carries the issues linked through the
-    Development sidebar as well as closing keywords (Codex 4239780827) -- name issue `issue` of
+    """Does the PR's `closingIssuesReferences` -- the issues it will close, by keyword or by a
+    closing link (Codex 4239780827); manual links come from the timeline -- name issue `issue` of
     `project` itself? Owner/name compare case-insensitively; a malformed field or entry proves
     nothing (the textual and branch signals still decide)."""
     refs = pr.get("closingIssuesReferences")
