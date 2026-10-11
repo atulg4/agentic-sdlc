@@ -277,12 +277,15 @@ MAX_TTL_MINUTES = 7 * 24 * 60  # leases.MAX_TTL_MINUTES
 # Who may post lease markers -- the SAME rule as leases.trusted_marker_author (a test holds the
 # two to identical decisions): a user with write/maintain/admin on the repository, read from the
 # collaborator permission API (author_association is no authority: a read-only member is MEMBER),
-# `github-actions[bot]`, or the Forge Publisher App's bot. A 404 = no access (untrusted); any
-# other unreadable permission refuses the lease read (LeaseUnavailable), never drops the marker.
+# `github-actions[bot]`, or the Forge Publisher App's bot named EXACTLY (Codex 4242753917):
+# FORGE_LEASE_BOT_LOGINS when set, else the policy's `[automation] publisher_bot_login`, which
+# onboard renders into PUBLISHER_BOT_LOGINS below. Neither: no other App bot is trusted. A 404 =
+# no access (untrusted); any other unreadable permission refuses the lease read
+# (LeaseUnavailable), never drops the marker.
 WRITE_PERMISSIONS = frozenset({"admin", "maintain", "write"})  # leases.WRITE_PERMISSIONS
 GITHUB_ACTIONS_BOT = "github-actions[bot]"  # leases.GITHUB_ACTIONS_BOT
-PUBLISHER_APP_SLUG_HINT = "agentic-sdlc"  # leases.PUBLISHER_APP_SLUG_HINT
 LEASE_BOT_LOGINS_ENV = "FORGE_LEASE_BOT_LOGINS"  # leases.LEASE_BOT_LOGINS_ENV
+PUBLISHER_BOT_LOGINS = "PUBLISHER_BOT_LOGIN"  # the policy's [automation] publisher_bot_login
 _LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
 
 
@@ -3183,17 +3186,16 @@ def login_key(login: object) -> str:
 
 
 def trusted_bot(login: str, configured: str | None = None) -> bool:
-    """`github-actions[bot]`, or the Publisher App's bot: the logins in FORGE_LEASE_BOT_LOGINS
-    when set, else a `<slug>[bot]` whose slug carries PUBLISHER_APP_SLUG_HINT. No other bot."""
+    """`github-actions[bot]`, or a Publisher App bot named exactly by `configured` (default:
+    FORGE_LEASE_BOT_LOGINS, else PUBLISHER_BOT_LOGINS). Nothing configured: no other bot
+    (leases.trusted_bot)."""
     login = login_key(login)
     if login == login_key(GITHUB_ACTIONS_BOT):
         return True
     if configured is None:
-        configured = os.environ.get(LEASE_BOT_LOGINS_ENV, "")
+        configured = os.environ.get(LEASE_BOT_LOGINS_ENV, "") or PUBLISHER_BOT_LOGINS
     named = {login_key(part) for part in configured.split(",") if part.strip()}
-    if named:
-        return login in named
-    return login.endswith("[bot]") and PUBLISHER_APP_SLUG_HINT in login[: -len("[bot]")]
+    return login.endswith("[bot]") and login in named
 
 
 def trusted_marker_author(comment: dict, permission, configured: str | None = None) -> bool:

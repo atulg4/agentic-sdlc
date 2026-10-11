@@ -61,9 +61,14 @@ token never pushes. The AI and verification jobs (`generate_patch`, `verify`,
 
 The lease markers count only because the App's bot is a trusted marker author:
 `sdlcctl` and the commit-guard hook accept markers from the Publisher App bot
-(a `<slug>[bot]` login whose slug contains `agentic-sdlc`, or exactly the
-logins in `FORGE_LEASE_BOT_LOGINS`) and `github-actions[bot]`, besides users
-with write access. Suspending or uninstalling the App therefore also stops the
+named EXACTLY -- `[automation] publisher_bot_login` in the policy (set with
+`sdlcctl onboard --force --publisher-bot-login <app-slug>[bot]`; `--apply`
+also sets the `FORGE_LEASE_BOT_LOGINS` repository variable; the commit guard
+carries it as rendered at onboard time), or `FORGE_LEASE_BOT_LOGINS` in the
+environment, which wins -- and `github-actions[bot]`, besides users with write
+access. No App bot is trusted on its slug alone: with no login configured,
+the Publisher App's own claims are ignored and every Actions implementation is
+refused at its claim (doctor reports it). Suspending or uninstalling the App therefore also stops the
 Actions path from claiming issues.
 
 GitHub limits workflow chaining for events created with `GITHUB_TOKEN`. The

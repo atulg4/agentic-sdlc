@@ -115,6 +115,13 @@ class ProjectPolicy:
     low_risk_paths: tuple[str, ...]
     forbidden_task_patterns: tuple[str, ...]
     lease_ttl_minutes: int = 240
+    #: `[automation] publisher_bot_login`: the Publisher App's bot (`<app-slug>[bot]`), the only
+    #: App bot besides github-actions[bot] whose lease markers count; '' = none.
+    publisher_bot_login: str = ""
+
+
+#: A GitHub App bot login (leases.PUBLISHER_BOT_LOGIN; policy cannot import leases).
+_BOT_LOGIN = re.compile(r"^[a-z0-9][a-z0-9-]*\[bot\]$")
 
 
 def _table(document: dict[str, object], name: str) -> dict[str, object]:
@@ -194,6 +201,11 @@ def load_policy_bytes(raw: bytes) -> ProjectPolicy:
     )
     if len({ready_label, human_review_label, implementation_label}) != 3:
         raise ValueError("automation approval labels must be distinct")
+    publisher_bot_login = automation.get("publisher_bot_login", "")
+    if not isinstance(publisher_bot_login, str) or (
+        publisher_bot_login and not _BOT_LOGIN.fullmatch(publisher_bot_login)
+    ):
+        raise ValueError("automation.publisher_bot_login must be empty or `<app-slug>[bot]`")
 
     human_merge_required = policy.get("human_merge_required", True)
     if type(human_merge_required) is not bool:
@@ -224,6 +236,7 @@ def load_policy_bytes(raw: bytes) -> ProjectPolicy:
         low_risk_paths=_patterns(policy, "low_risk_paths", ("docs/**", "**/*.md")),
         forbidden_task_patterns=forbidden_task_patterns,
         lease_ttl_minutes=_integer(automation, "lease_ttl_minutes", 240, maximum=7 * 24 * 60),
+        publisher_bot_login=publisher_bot_login,
     )
 
 

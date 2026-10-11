@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import hashlib
 import importlib.resources
 import json
 import math
@@ -37,7 +38,7 @@ from .executors import (
     request_from_mission,
     route_executor,
 )
-from .leases import IN_PROGRESS_LABEL, PUBLISHER_APP_SLUG_HINT
+from .leases import IN_PROGRESS_LABEL, LEASE_BOT_LOGINS_ENV, publisher_bot_login_problem
 from .missions import MissionError, load_registry
 from .openai_compatible import PROVIDERS as OPENAI_COMPATIBLE_PROVIDERS
 from .openai_compatible import ROUTED_MIN_CONTEXT_WINDOW
@@ -62,6 +63,13 @@ PUBLIC_CI_RUNS_ON = ("ubuntu-latest",)
 DEFAULT_QUALITY = "python -m ruff check --select E9,F63,F7,F82 ."
 #: The interpreter ci.yml's pinned actions/setup-python installs (`[ci] python_version`).
 DEFAULT_PYTHON_VERSION = "3.12"
+#: How `doctor` recognises a Publisher App installation when no bot login is configured yet
+#: (diagnosis only: lease markers are trusted from the EXACT configured login, never this).
+PUBLISHER_APP_SLUG_HINT = "agentic-sdlc"
+#: Where `onboard` looks for the hook interpreter, in preference order (`--hook-python` names
+#: another, vetted the same way). Never a PATH search.
+HOOK_PYTHON_CANDIDATES = ("/usr/bin/python3", "/bin/python3")
+DEFAULT_HOOK_PYTHON = HOOK_PYTHON_CANDIDATES[0]
 _PYTHON_VERSION = re.compile(r"^\d+\.\d+(?:\.\d+)?$")
 #: The policy's gate commands, in the order ci.yml runs them.
 GATE_COMMANDS = ("setup", "quality", "test")
@@ -218,6 +226,13 @@ def _branch_problem(value: object) -> str:
     return ""
 
 
+def _bot_login_field_problem(value: object) -> str:
+    """'' (none configured: no App bot's lease markers are trusted) or `<app-slug>[bot]`."""
+    if value == "":
+        return ""
+    return publisher_bot_login_problem(value)
+
+
 def _ready_label_problem(value: object) -> str:
     problem = _str_problem(value)
     if problem:
@@ -285,9 +300,15 @@ POLICY_FIELDS: dict[str, tuple[str, str, str, Callable[[object], str]]] = {
         _cap_problem(10_000),
     ),
     "max diff lines": ("max_diff_lines", "policy", "max_diff_lines", _cap_problem(10_000_000)),
+    "publisher bot login": (
+        "publisher_bot_login",
+        "automation",
+        "publisher_bot_login",
+        _bot_login_field_problem,
+    ),
 }
 #: Policy fields a policy may omit (written before the field existed): their default.
-_POLICY_FIELD_DEFAULTS = {"python version": DEFAULT_PYTHON_VERSION}
+_POLICY_FIELD_DEFAULTS = {"python version": DEFAULT_PYTHON_VERSION, "publisher bot login": ""}
 _MISSING = object()
 
 
@@ -350,8 +371,17 @@ class OnboardSpec:
     max_changed_files: int = 20
     max_diff_lines: int = 2500
     python_version: str = DEFAULT_PYTHON_VERSION
+    #: The Publisher App's bot login (`<app-slug>[bot]`), the only App bot whose lease markers
+    #: count besides `github-actions[bot]` (Codex 4242753917); '' = none.
+    publisher_bot_login: str = ""
+    #: The interpreter the Claude Code hooks run (`trusted_hook_python`, Codex 4242753911).
+    hook_python: str = DEFAULT_HOOK_PYTHON
 
     def __post_init__(self) -> None:
+        if not _HOOK_PYTHON_PATH.fullmatch(self.hook_python):
+            raise OnboardError(
+                f"hook interpreter must be an absolute path, got {self.hook_python!r}"
+            )
         if not _PROJECT.fullmatch(self.platform_repository):
             raise OnboardError("project identifiers must use owner/name format")
         if not _SHA.fullmatch(self.platform_ref):
@@ -889,15 +919,19 @@ def auto_concurrency_group(kind: str, triggers: Sequence[str], required: Sequenc
     share one group per issue, so removing an approval label or editing the issue cancels a run
     that is queued or running (`cancel-in-progress` is true for `unlabeled` and `edited` runs
     only, `AUTO_CANCEL_IN_PROGRESS`); every other label event -- the lease's own `in-progress`
-    label included -- gets a group of its own and cancels nothing."""
+    label included -- gets a group of its own and cancels nothing. For implementation a `closed`
+    event joins the issue's group too (Codex 4242753923): closing the issue cancels a queued or
+    running implementation, and the `closed` run itself starts nothing (`authorize` runs only
+    on `labeled`)."""
 
     def named(labels: Sequence[str]) -> str:
         return " || ".join(f"github.event.label.name == {_expr_str(label)}" for label in labels)
 
+    closed = " ||\ngithub.event.action == 'closed'" if kind == "implement" else ""
     return (
         f"${{{{ ((github.event.action == 'labeled' && ({named(triggers)})) ||\n"
         f"(github.event.action == 'unlabeled' && ({named(required)})) ||\n"
-        "github.event.action == 'edited') &&\n"
+        f"github.event.action == 'edited'{closed}) &&\n"
         f"format('forge-auto-{kind}-{{0}}', github.event.issue.number) ||\n"
         f"format('forge-auto-{kind}-{{0}}-run-{{1}}',\n"
         "github.event.issue.number, github.run_id) }}"
@@ -951,6 +985,10 @@ ready_label = {_toml_str(spec.ready_label)}
 human_review_label = {_toml_str(HUMAN_REVIEW_LABEL)}
 implementation_label = {_toml_str(IMPLEMENTATION_LABEL)}
 lease_ttl_minutes = 240
+# The Publisher App's bot login, `<app-slug>[bot]`: the only GitHub App whose lease markers
+# count (besides github-actions[bot]). Empty: none does. Set it with `sdlcctl onboard --force
+# --publisher-bot-login <app-slug>[bot]`.
+publisher_bot_login = {_toml_str(spec.publisher_bot_login)}
 {routing}
 [policy]
 human_merge_required = true
@@ -1773,26 +1811,24 @@ def render_work_request(spec: OnboardSpec) -> str:
 
 def render_hooks(spec: OnboardSpec) -> dict[str, str]:
     """Claude Code hooks: fetch-and-report at session start; block commits without a lease."""
-    settings = {
-        "hooks": {
-            "SessionStart": [{"hooks": [forge_hook_entry("SessionStart")]}],
-            "PreToolUse": [{"matcher": "Bash", "hooks": [forge_hook_entry("PreToolUse")]}],
-        }
-    }
     # The placeholders sit in Python string literals ("PROJECT_ID"): substitute the whole
     # literal with a JSON string, which is a valid Python string literal. One pass, so a
     # project id cannot be mistaken for the branch placeholder after it is substituted.
-    literal = re.compile(r'"(PROJECT_ID|DEFAULT_BRANCH_NAME)"')
+    literal = re.compile(r'"(PROJECT_ID|DEFAULT_BRANCH_NAME|PUBLISHER_BOT_LOGIN)"')
     values = {
         "PROJECT_ID": json.dumps(spec.project_id),
         "DEFAULT_BRANCH_NAME": json.dumps(spec.default_branch),
     }
+    guard_values = {
+        "PROJECT_ID": values["PROJECT_ID"],
+        "PUBLISHER_BOT_LOGIN": json.dumps(spec.publisher_bot_login),
+    }
     guard = _substitute_template(
         "hooks/forge_commit_guard.py",
         _resource("hooks/forge_commit_guard.py"),
-        {"PROJECT_ID": values["PROJECT_ID"]},
+        guard_values,
         literal,
-        required=("PROJECT_ID",),
+        required=tuple(guard_values),
     )
     start = _substitute_template(
         "hooks/forge_session_start.py",
@@ -1801,6 +1837,29 @@ def render_hooks(spec: OnboardSpec) -> dict[str, str]:
         literal,
         required=tuple(values),
     )
+    # Each handler pins its script's SHA-256 and runs the vetted interpreter (Codex 4242753911,
+    # 4242753904; see `forge_hook_entry`).
+    settings = {
+        "hooks": {
+            "SessionStart": [
+                {
+                    "hooks": [
+                        forge_hook_entry(
+                            "SessionStart", hook_script_digest(start), spec.hook_python
+                        )
+                    ]
+                }
+            ],
+            "PreToolUse": [
+                {
+                    "matcher": "Bash",
+                    "hooks": [
+                        forge_hook_entry("PreToolUse", hook_script_digest(guard), spec.hook_python)
+                    ],
+                }
+            ],
+        }
+    }
     return {
         ".claude/settings.json": json.dumps(settings, indent=2) + "\n",
         ".claude/hooks/forge_commit_guard.py": guard,
@@ -1904,6 +1963,24 @@ def _replace_file(path: Path, content: str) -> None:
 
 
 SETTINGS_FILE = ".claude/settings.json"
+
+
+def policy_bot_login(policy_doc: object) -> str:
+    """The policy's `[automation] publisher_bot_login` ('' when absent or not a string)."""
+    doc = policy_doc if isinstance(policy_doc, dict) else {}
+    automation = doc.get("automation")
+    value = automation.get("publisher_bot_login") if isinstance(automation, dict) else None
+    return value if isinstance(value, str) else ""
+
+
+def installed_bot_login(base: Path) -> str:
+    """The `publisher_bot_login` of the policy installed under `base` ('' when none can be
+    read): a forced re-onboard without `--publisher-bot-login` keeps it."""
+    try:
+        policy_doc = tomllib.loads((base / "agentic-sdlc.toml").read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return ""
+    return policy_bot_login(policy_doc)
 
 
 def _previous_guides(base: Path, spec: OnboardSpec) -> list[dict[str, str]]:
@@ -2011,6 +2088,11 @@ def write_onboarding(
     base = Path(root).resolve()
     if not base.is_dir() or not (base / ".git").exists():
         raise OnboardError("destination must be an existing Git repository")
+    # The hooks run this interpreter by absolute path: refuse one only root cannot replace
+    # before anything is written (Codex 4242753911).
+    problem = hook_python_problem(spec.hook_python)
+    if problem:
+        raise OnboardError(f"the hook interpreter {problem}; pass --hook-python with a trusted one")
     files = render_onboarding(spec)
     owned = [rel for rel in MODE_OWNED_FILES if rel not in files] if force else []
     states = {rel: _managed_path_state(base, rel) for rel in (*files, *owned)}
@@ -6360,7 +6442,9 @@ HOOK_SCRIPTS = {
     "SessionStart": ".claude/hooks/forge_session_start.py",
     "PreToolUse": ".claude/hooks/forge_commit_guard.py",
 }
-_HOOK_INTERPRETERS = {"python3", "python"}
+#: Interpreter names an OLD (pre-Codex 4242753911) handler ran its script with. Recognised only
+#: so a forced re-onboard replaces such a handler; doctor rejects every one of them.
+_LEGACY_HOOK_INTERPRETERS = {"python3", "python"}
 #: How a Forge handler may name its script's directory. Only the project-anchored forms count
 #: for `doctor` (Codex 4242373510: a bare relative path is resolved against whatever directory
 #: the session's shell is in, so a `cd` broke every Bash call); "" is still RECOGNISED, so a
@@ -6372,15 +6456,98 @@ HOOK_PROJECT_DIR = "${CLAUDE_PROJECT_DIR}"
 #: The commit guard's handler `timeout`, in seconds. The guard bounds its own run below it
 #: (`GUARD_DEADLINE` in forge_commit_guard.py), and with `onFailure: "block"` a timeout blocks.
 GUARD_HOOK_TIMEOUT = 300
-#: What follows the guard's script in its command: any failure to run it -- no python3, a
-#: missing file, a crash past its own handler -- becomes exit 2, which blocks on every Claude
-#: Code version, including those that predate `onFailure`.
+#: What follows the guard's command: any failure to run it -- no interpreter, a missing file, a
+#: crash past its own handler -- becomes exit 2, which blocks on every Claude Code version,
+#: including those that predate `onFailure`.
 _GUARD_FAIL_CLOSED = ("||", "exit", "2")
 
+# ---- the hook interpreter (Codex 4242753911) and the script pin (Codex 4242753904)
+#
+# A handler that says `python3` is a PATH lookup in the session's environment, and the cloud
+# setup puts the user-writable `~/.local/bin` on that PATH: an agent could drop a `python3` there
+# that exits 0 and the guard would never run. So the handler names an ABSOLUTE interpreter that
+# `onboard` vetted (only root can replace it or any directory above it, `trusted_exec`), starts
+# it under a fixed PATH and in isolated mode (`-I`: no PYTHON* variables, no user site, no
+# script directory on sys.path), and runs a fixed inline loader instead of the script itself.
+# The loader reads the script ONCE, refuses (exit 2) unless its SHA-256 is the one onboard
+# recorded in the handler, and executes exactly those bytes as `__main__`. The session's own
+# PATH is handed through as data (`FORGE_SESSION_PATH`) and restored for the script: the guard
+# models what a Bash command's bare program names resolve to from it.
+#
+# This is a guardrail, not a sandbox: an agent that can write the checkout can also rewrite
+# .claude/settings.json (handler and hash together) or the hook's environment. The enforcement
+# is server-side (the ruleset, Publisher-only pushes, required review); see docs/onboarding.md.
 
-def forge_hook_entry(event: str) -> dict[str, object]:
+#: The PATH the hook interpreter starts under.
+HOOK_SAFE_PATH = "/usr/bin:/bin"
+#: Carries the session's PATH past the fixed one; the loader restores it for the script.
+HOOK_SESSION_PATH_ENV = "FORGE_SESSION_PATH"
+_HOOK_PREFIX = (f'{HOOK_SESSION_PATH_ENV}="$PATH"', f"PATH={HOOK_SAFE_PATH}")
+#: An interpreter path the handler can carry unquoted (it is a shell word).
+_HOOK_PYTHON_PATH = re.compile(r"^/[A-Za-z0-9._+/-]+$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+#: The inline loader (one line, no single quote: it is single-quoted in the handler).
+HOOK_LOADER = (
+    'import hashlib,os,sys,types;p,h=sys.argv[1:3];b=open(p,"rb").read();'
+    "d=hashlib.sha256(b).hexdigest();"
+    'd==h or (sys.stderr.write("Forge hook: "+p+" is not the copy onboard installed (sha256 "'
+    '+d+"); blocking. Restore it or re-run sdlcctl onboard --force.\\n"),sys.exit(2));'
+    f'os.environ["PATH"]=os.environ.pop("{HOOK_SESSION_PATH_ENV}","");'
+    'sys.argv=[p];m=types.ModuleType("__main__");m.__file__=p;sys.modules["__main__"]=m;'
+    'exec(compile(b,p,"exec"),m.__dict__)'
+)
+
+
+def hook_python_problem(path: str) -> str:
+    """Why `path` may not be the hook interpreter ('' = it may): an absolute path the handler
+    can carry as one shell word, to an executable only root can replace (`trusted_exec`)."""
+    if not _HOOK_PYTHON_PATH.fullmatch(path or ""):
+        return f"{path!r} is not an absolute path made of [A-Za-z0-9._+/-]"
+    from .trusted_exec import candidate_reason
+
+    reason = candidate_reason(path)
+    return f"{reason} (it must be a file only root can replace)" if reason else ""
+
+
+def trusted_hook_python(explicit: str | None = None) -> str:
+    """The interpreter onboard writes into the hook handlers: `explicit` (`--hook-python`) when
+    given, else the first of HOOK_PYTHON_CANDIDATES that `hook_python_problem` accepts. Raises
+    OnboardError when there is none: onboarding never falls back to a PATH lookup."""
+    if explicit:
+        problem = hook_python_problem(explicit)
+        if problem:
+            raise OnboardError(f"--hook-python {problem}")
+        return explicit
+    rejected = []
+    for candidate in HOOK_PYTHON_CANDIDATES:
+        if not os.path.lexists(candidate):
+            rejected.append(f"{candidate} does not exist")
+            continue
+        problem = hook_python_problem(candidate)
+        if not problem:
+            return candidate
+        rejected.append(problem)
+    raise OnboardError(
+        "no trusted interpreter for the Claude Code hooks (" + "; ".join(rejected) + "). The "
+        "hooks must run a Python 3 that only root can replace -- never one found on PATH. "
+        "Install the system python3, or pass --hook-python /absolute/path/to/python3 (a "
+        "root-owned file in root-owned, non-writable directories)."
+    )
+
+
+def hook_script_digest(content: str | bytes) -> str:
+    """The SHA-256 the handler pins its script to (of the bytes onboard writes)."""
+    data = content.encode("utf-8") if isinstance(content, str) else content
+    return hashlib.sha256(data).hexdigest()
+
+
+def forge_hook_entry(
+    event: str, digest: str, python: str = DEFAULT_HOOK_PYTHON
+) -> dict[str, object]:
     """THE hook handler `onboard` writes for the Forge script of `event` (`HOOK_SCRIPTS`), and
-    the only shape `doctor` accepts for one. The script is named under the project root
+    the only shape `doctor` accepts for one: `python` (vetted, absolute) under a fixed PATH in
+    isolated mode runs HOOK_LOADER, which executes the script only if its SHA-256 is `digest`
+    (Codex 4242753911, 4242753904). The script is named under the project root
     (`HOOK_PROJECT_DIR`), never relative to the session's working directory (Codex 4242373510).
     The commit guard fails CLOSED (Codex 4242373515): `onFailure: "block"` (Claude Code's
     documented handler field: a command that cannot start, an exit other than 0 or 2, a timeout
@@ -6389,8 +6556,22 @@ def forge_hook_entry(event: str) -> dict[str, object]:
     Any other handler field changes how it runs -- `async` runs it in the background, where it
     can no longer block (or report) anything; `once` stops it after one run -- so a Forge
     handler that carries one is not the hook onboard installed."""
+    if not _SHA256.fullmatch(digest):
+        raise OnboardError(f"hook script digest must be a SHA-256 hex string, got {digest!r}")
+    if not _HOOK_PYTHON_PATH.fullmatch(python):
+        raise OnboardError(f"hook interpreter must be an absolute path, got {python!r}")
     script = HOOK_SCRIPTS[event]
-    command = f'python3 "{HOOK_PROJECT_DIR}/{script}"'
+    command = " ".join(
+        (
+            *_HOOK_PREFIX,
+            python,
+            "-I",
+            "-c",
+            shlex.quote(HOOK_LOADER),
+            f'"{HOOK_PROJECT_DIR}/{script}"',
+            digest,
+        )
+    )
     if event != "PreToolUse":
         return {"type": "command", "command": command}
     return {
@@ -6406,28 +6587,51 @@ def forge_hook_entry(event: str) -> dict[str, object]:
 _FORGE_HOOK_GROUP_KEYS = frozenset({"matcher", "hooks"})
 
 
-def _hook_argv(entry: object, script: str) -> list[str] | None:
-    """The argv of a hook handler that runs `python3 <script>` (optionally under
-    $CLAUDE_PROJECT_DIR, optionally followed by `|| exit 2`), else None."""
+@dataclass(frozen=True)
+class _HookCommand:
+    """A parsed handler command that runs a Forge script: `pinned` when it is the
+    onboard-written form (vetting interpreter `python`, script hash `digest`), else an old
+    `python3 <script>` handler. `relative`: the script is not anchored at the project root.
+    `tail`: what follows the script (and digest)."""
+
+    pinned: bool
+    python: str
+    digest: str
+    relative: bool
+    tail: tuple[str, ...]
+
+
+def _hook_command(entry: object, script: str) -> _HookCommand | None:
+    """The parsed command of a hook handler that runs `script` -- in the pinned form or as an
+    old `python3 <script>` handler (optionally under $CLAUDE_PROJECT_DIR, optionally followed
+    by `|| exit 2`) -- else None."""
     if not isinstance(entry, dict) or entry.get("type") != "command":
         return None
     try:
         argv = shlex.split(str(entry.get("command", "")))
     except ValueError:
         return None
+    paths = {prefix + script for prefix in _HOOK_DIR_PREFIXES}
+    tails = {(), _GUARD_FAIL_CLOSED}
+    if len(argv) >= 2 and argv[0] in _LEGACY_HOOK_INTERPRETERS and argv[1] in paths:
+        if tuple(argv[2:]) in tails:
+            return _HookCommand(False, argv[0], "", argv[1] == script, tuple(argv[2:]))
+        return None
+    prefix = (f"{HOOK_SESSION_PATH_ENV}=$PATH", f"PATH={HOOK_SAFE_PATH}")
     if (
-        len(argv) >= 2
-        and argv[0] in _HOOK_INTERPRETERS
-        and argv[1] in {prefix + script for prefix in _HOOK_DIR_PREFIXES}
-        and tuple(argv[2:]) in {(), _GUARD_FAIL_CLOSED}
+        len(argv) >= 8
+        and tuple(argv[:2]) == prefix
+        and argv[3:6] == ["-I", "-c", HOOK_LOADER]
+        and argv[6] in paths
+        and tuple(argv[8:]) in tails
     ):
-        return argv
+        return _HookCommand(True, argv[2], argv[7], argv[6] == script, tuple(argv[8:]))
     return None
 
 
 def _hook_runs(entry: object, script: str) -> bool:
-    """A hook handler that runs `python3 <script>` in any spelling `_hook_argv` recognises."""
-    return _hook_argv(entry, script) is not None
+    """A hook handler that runs `script` in any spelling `_hook_command` recognises."""
+    return _hook_command(entry, script) is not None
 
 
 def _matcher_covers(matcher: object, tool: str | None) -> bool:
@@ -6445,13 +6649,17 @@ def _matcher_covers(matcher: object, tool: str | None) -> bool:
         return False
 
 
-def _forge_entry_deviation(group: dict, entry: dict, event: str) -> str:
+def _forge_entry_deviation(group: dict, entry: dict, event: str, digest: str | None) -> str:
     """How a handler that runs a Forge script differs from `forge_hook_entry` ('' = it does
     not): any extra, missing or different handler field, an extra group field, a script not
-    anchored at the project root, or (the guard) no `|| exit 2`. Only the command's spelling
-    may vary (`python`, `$CLAUDE_PROJECT_DIR` with or without braces or quotes)."""
-    want = forge_hook_entry(event)
+    anchored at the project root, an interpreter resolved through PATH or one only root cannot
+    replace, a script hash other than the installed script's (`digest`; None: the script cannot
+    be read), or (the guard) no `|| exit 2`. Only the command's spelling may vary
+    (`$CLAUDE_PROJECT_DIR` with or without braces or quotes, the vetted interpreter's path)."""
     script = HOOK_SCRIPTS[event]
+    parsed = _hook_command(entry, script)
+    assert parsed is not None
+    want = forge_hook_entry(event, "0" * 64)
     found = []
     for key in sorted(set(entry) | set(want)):
         if key in ("type", "command"):
@@ -6461,12 +6669,35 @@ def _forge_entry_deviation(group: dict, entry: dict, event: str) -> str:
         elif entry.get(key) != want[key]:
             found.append(f"{key} not {json.dumps(want[key])}")
     found += sorted(f"group {k}" for k in set(group) - _FORGE_HOOK_GROUP_KEYS)
-    argv = _hook_argv(entry, script) or []
-    if argv[1:2] == [script]:
+    if parsed.relative:
         found.append(f"a path relative to the working directory (not {HOOK_PROJECT_DIR})")
-    if tuple(argv[2:]) != tuple(shlex.split(str(want["command"]))[2:]):
+    if not parsed.pinned:
+        found.append(
+            f"`{parsed.python}` found on PATH instead of a vetted absolute interpreter with the "
+            "script's SHA-256 pinned"
+        )
+    else:
+        problem = hook_python_problem(parsed.python)
+        if problem:
+            found.append(f"an untrusted interpreter ({problem})")
+        if digest is None:
+            found.append(f"{script} cannot be read to check its pinned SHA-256")
+        elif parsed.digest != digest:
+            found.append(f"a pinned SHA-256 that is not {script}'s")
+    if parsed.tail != (_GUARD_FAIL_CLOSED if event == "PreToolUse" else ()):
         found.append("`|| exit 2`" if event == "PreToolUse" else "trailing words")
     return ", ".join(found)
+
+
+def _installed_digest(base: Path, script: str) -> str | None:
+    """The SHA-256 of the installed `script` (a regular file under `base`), else None."""
+    path = base / script
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        return hook_script_digest(path.read_bytes())
+    except OSError:
+        return None
 
 
 def hook_problems(settings_path: Path) -> list[str]:
@@ -6474,8 +6705,11 @@ def hook_problems(settings_path: Path) -> list[str]:
     them (empty = it will): the parsed `hooks` structure must hold a SessionStart group firing on
     startup that runs the session-start script, and a PreToolUse group matching Bash that runs the
     commit guard, each handler exactly `forge_hook_entry` -- synchronous, so the guard's exit 2
-    blocks the commit. A mention anywhere else in the file -- a string, a disabled or malformed
-    entry -- is no hook. Unrelated hooks (other scripts, other events) may sit beside them."""
+    blocks the commit; a vetted absolute interpreter; and the SHA-256 of the script installed
+    beside it (which doctor separately requires to be the rendered template, so the recorded
+    hash IS the shipped template's). A mention anywhere else in the file -- a string, a disabled
+    or malformed entry -- is no hook. Unrelated hooks (other scripts, other events) may sit
+    beside them."""
     try:
         settings = json.loads(settings_path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
@@ -6484,6 +6718,7 @@ def hook_problems(settings_path: Path) -> list[str]:
         return [".claude/settings.json is not a JSON object"]
     if settings.get("disableAllHooks") is True:
         return [".claude/settings.json sets disableAllHooks"]
+    base = settings_path.parent.parent
     hooks = settings.get("hooks")
     hooks = hooks if isinstance(hooks, dict) else {}
     problems = []
@@ -6491,17 +6726,18 @@ def hook_problems(settings_path: Path) -> list[str]:
         tool = "Bash" if event == "PreToolUse" else None
         groups = hooks.get(event)
         groups = [g for g in groups if isinstance(g, dict)] if isinstance(groups, list) else []
+        digest = _installed_digest(base, script)
         found = False
         for group in groups:
             entries = group.get("hooks") if isinstance(group.get("hooks"), list) else []
             for entry in entries:
                 if not _hook_runs(entry, script):
                     continue
-                deviation = _forge_entry_deviation(group, entry, event)
+                deviation = _forge_entry_deviation(group, entry, event, digest)
                 if deviation:
                     # Wherever it sits: an `async` guard never blocks, even beside a good one.
                     problems.append(
-                        f".claude/settings.json {event} hook running python3 {script} has "
+                        f".claude/settings.json {event} hook running {script} has "
                         f"what onboard does not write ({deviation}); it must be exactly the "
                         "generated handler (an `async` hook cannot block; re-run `sdlcctl "
                         "onboard --force`)"
@@ -6511,7 +6747,7 @@ def hook_problems(settings_path: Path) -> list[str]:
                     found = True
         if not found:
             where = f"{event} (matcher Bash)" if tool else event
-            problems.append(f".claude/settings.json has no {where} hook running python3 {script}")
+            problems.append(f".claude/settings.json has no {where} hook running {script}")
     return problems
 
 
@@ -6739,6 +6975,9 @@ def rendered_managed_files(
         implementer="cloud-routine" if cloud else "claude",
     )
     rendered: dict[str, str] = {}
+    login = policy_bot_login(policy_doc)
+    if login and not _bot_login_field_problem(login):
+        fields["publisher_bot_login"] = login  # rendered into the guard (Codex 4242753917)
     problems: list[str] = []
     try:
         # The hooks and the issue template depend on the project, branch and label only.
@@ -7103,6 +7342,41 @@ def local_runner_label_check(
     )
 
 
+LEASE_BOT_CHECK = "lease markers trust the exact Publisher bot"
+
+
+def lease_bot_check(login: str, *, cloud: bool) -> Check:
+    """Codex 4242753917: lease markers from an App bot count only when the bot is named exactly
+    (`[automation] publisher_bot_login`, FORGE_LEASE_BOT_LOGINS). In Actions mode the Publisher
+    App posts the claims, so with none named its own claims are ignored and every
+    implementation run is refused at the claim."""
+    fix = (
+        "re-run `sdlcctl onboard --force --publisher-bot-login <app-slug>[bot]` with the "
+        "Publisher App's slug (with --apply it also sets the "
+        f"{LEASE_BOT_LOGINS_ENV} repository variable)"
+    )
+    problem = _bot_login_field_problem(login)
+    if problem:
+        return Check(LEASE_BOT_CHECK, False, f"[automation] publisher_bot_login {problem} → {fix}")
+    if login:
+        return Check(LEASE_BOT_CHECK, True, f"{login} (and github-actions[bot])")
+    if cloud:
+        return Check(
+            LEASE_BOT_CHECK,
+            True,
+            "no App bot is trusted (the cloud routine claims as the owner; "
+            "[automation] publisher_bot_login is empty)",
+        )
+    return Check(
+        LEASE_BOT_CHECK,
+        False,
+        "TODO: [automation] publisher_bot_login is empty, so no App bot's lease markers count "
+        "and the Publisher App's own claims are ignored (every Actions implementation is "
+        f"refused at its claim) → {fix}",
+        manual=True,
+    )
+
+
 def doctor(
     root: str | Path,
     project_id: str,
@@ -7339,6 +7613,8 @@ def doctor(
                 else ", ".join(policy_field_location(f) for f in POLICY_FIELDS),
             )
         )
+    if toml_path.exists():
+        add(lease_bot_check(policy_bot_login(policy_doc), cloud=cloud))
     # Route mode is what the installed callers/policy ask for, not whether the registry exists;
     # an agent doctor cannot read may be `route`, so it is checked as one (fails closed).
     routed = (
@@ -8571,7 +8847,14 @@ def doctor(
             )
         )
         return rep
-    apps = [i for i in installs if PUBLISHER_APP_SLUG_HINT in str(i.get("app_slug", "")).lower()]
+    bot_login = policy_bot_login(policy_doc)
+    pinned_slug = bot_login[: -len("[bot]")] if bot_login.endswith("[bot]") else ""
+    apps = [
+        i
+        for i in installs
+        if PUBLISHER_APP_SLUG_HINT in str(i.get("app_slug", "")).lower()
+        or (pinned_slug and str(i.get("app_slug", "")).lower() == pinned_slug)
+    ]
     # create-github-app-token pairs PUBLISHER_APP_CLIENT_ID with the private key: only the App
     # that client ID belongs to counts, not any similarly named installation.
     client_id = variable_values.get("PUBLISHER_APP_CLIENT_ID", "").strip()
@@ -8586,6 +8869,31 @@ def doctor(
         and str(meta[str(a["app_slug"])].get("client_id") or "") == client_id
         and client_id
     ]
+    # Codex 4242753917: the bot whose lease markers count must BE the App the client ID names,
+    # and a FORGE_LEASE_BOT_LOGINS variable, when set, must name the same bot.
+    if apps and bot_login:
+        bots = sorted({f"{str(a['app_slug']).lower()}[bot]" for a in apps})
+        variable = variable_values.get(LEASE_BOT_LOGINS_ENV, "").strip()
+        wrong = []
+        if bot_login.casefold() not in bots:
+            wrong.append(
+                f"[automation] publisher_bot_login is {bot_login}, but the Publisher App "
+                f"(PUBLISHER_APP_CLIENT_ID) posts as {', '.join(bots)}"
+            )
+        if variable and {v.strip().casefold() for v in variable.split(",") if v.strip()} != {
+            bot_login.casefold()
+        }:
+            wrong.append(f"the {LEASE_BOT_LOGINS_ENV} variable is {variable!r}, not {bot_login}")
+        add(
+            Check(
+                "lease bot login is the Publisher App's",
+                not wrong,
+                "; ".join(wrong) + " → re-run `sdlcctl onboard --force --apply "
+                "--publisher-bot-login <app-slug>[bot]`"
+                if wrong
+                else bot_login,
+            )
+        )
     if named and not apps:
         add(
             Check(

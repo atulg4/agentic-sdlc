@@ -191,10 +191,16 @@ unverified labeler must never reach.
 
 Authorization is read when a run starts, so REMOVING an approval label stops a run that is
 already queued or running (Codex 4240628982): both automatic callers trigger on `issues:
-[labeled, unlabeled, edited]`, and the workflow-level `concurrency` puts every `labeled` event of
-a triggering label, every `unlabeled` event of a required label and every `edited` event in one
-group per issue (`forge-auto-implement-<n>` / `forge-auto-plan-<n>`), with `cancel-in-progress`
-true only for the `unlabeled` and `edited` runs. A Triage user who removes a writer's label and re-applies it while the
+[labeled, unlabeled, edited]` (the implementation caller on `closed` too), and the
+workflow-level `concurrency` puts every `labeled` event of a triggering label, every `unlabeled`
+event of a required label and every `edited` event in one group per issue
+(`forge-auto-implement-<n>` / `forge-auto-plan-<n>`), with `cancel-in-progress` true only for the
+`unlabeled` and `edited` runs. Closing the issue cancels a queued or running implementation the
+same way (Codex 4242753923): the `closed` run joins the issue's group with `cancel-in-progress`
+and starts nothing itself (`authorize` requires `labeled`, although a closed issue keeps its
+labels). The reusable workflow does not yet re-read the issue state just before publishing, so
+a close that lands after the patch is generated but before the cancel takes effect can still
+publish a draft PR. A Triage user who removes a writer's label and re-applies it while the
 authorized run waits for a runner therefore cancels that run; the `unlabeled` run itself starts
 nothing (every label condition requires `github.event.action == 'labeled'`), and the re-applied
 label starts a run that re-authorizes from the label history -- and finds the Triage user.
@@ -418,19 +424,41 @@ through a link). `onboard --force` rewrites the policy and drops the confirmatio
   host (`ubuntu-99.04`, `macos-99`) without `self-hosted` fails; a larger hosted runner or a
   custom label set without `self-hosted` is a TODO only remote `doctor` can clear.
 - **Claude Code hooks** are read from the parsed `.claude/settings.json`: a `SessionStart` group
-  firing on startup that runs `python3 "${CLAUDE_PROJECT_DIR}/.claude/hooks/forge_session_start.py"`,
-  and a `PreToolUse` group whose matcher covers `Bash` running
-  `python3 "${CLAUDE_PROJECT_DIR}/.claude/hooks/forge_commit_guard.py" || exit 2` with
-  `"timeout": 300` and `"onFailure": "block"`. The script is named under the project root, so a
+  firing on startup that runs the session-start script, and a `PreToolUse` group whose matcher
+  covers `Bash` running the commit guard followed by `|| exit 2`, with `"timeout": 300` and
+  `"onFailure": "block"`. Each handler is
+  `FORGE_SESSION_PATH="$PATH" PATH=/usr/bin:/bin <python> -I -c '<loader>'
+  "${CLAUDE_PROJECT_DIR}/.claude/hooks/<script>.py" <sha256>` (Codex 4242753911, 4242753904):
+  `<python>` is an absolute interpreter `onboard` vetted -- `/usr/bin/python3`, else
+  `/bin/python3`, or `--hook-python PATH` -- that only root can replace (the file and every
+  directory above it root-owned and not group/other-writable); onboarding FAILS when there is
+  none, and doctor fails a handler whose interpreter is not trusted on the machine it runs on,
+  or one that runs a bare `python3` (a PATH lookup: the cloud setup puts the user-writable
+  `~/.local/bin` on PATH, where a planted `python3` could exit 0 instead of guarding). `-I`
+  ignores `PYTHON*` variables and the user site. The fixed inline loader reads the script once,
+  refuses (exit 2, which blocks) unless its SHA-256 is the one recorded in the handler, restores
+  the session's PATH (the guard models what a command's bare program names resolve to from it)
+  and runs exactly those bytes as `__main__`. Doctor requires the recorded hash to be the
+  installed script's, and the installed script to be the rendered template (byte for byte), so
+  the hash in the handler is the shipped template's. On a machine without a root-owned Python
+  (macOS with only a Homebrew python: `/opt/homebrew` and `/usr/local` are user/admin-writable)
+  onboarding refuses; there `/usr/bin/python3` (Apple's, root-owned) is the one to use. The
+  script is named under the project root, so a
   `cd` in the session cannot break the hook (a relative path fails doctor); the guard fails
   CLOSED -- a crash, a missing interpreter or file, or a timeout blocks the Bash call
   (`onFailure: "block"` is Claude Code's documented handler field for that, v2.1.295 or later;
   `|| exit 2` covers older clients, and the guard bounds its own run at 240s, below the
   timeout). Each Forge handler must be exactly the one `onboard` writes (only the command's
-  spelling may vary: `python`, `$CLAUDE_PROJECT_DIR` with or without braces); a handler with any
+  spelling may vary: the vetted interpreter's path, `$CLAUDE_PROJECT_DIR` with or without
+  braces); a handler with any
   other field -- `"async": true` above all, which runs it in the background where its exit 2 can
   no longer block the commit -- or a missing or different `timeout`/`onFailure` fails, wherever
-  it sits. Settings from an older onboard fail until `sdlcctl onboard --force` rewrites them. Unrelated
+  it sits. Settings from an older onboard fail until `sdlcctl onboard --force` rewrites them.
+  **Trust boundary:** the hooks are a guardrail against mistakes and casual misuse. They run as
+  the agent's own user from the agent-writable checkout, so an agent with write access can edit
+  `.claude/settings.json` (handler and hash together) as easily as the script; no local,
+  same-user hook can be tamper-proof. Enforcement is server-side -- the `Protect main` ruleset,
+  required review and Publisher-only pushes. Unrelated
   hooks may sit beside them. The commit guard is deny-by-default for git: on an issue branch without the
   session's lease, every git invocation is blocked except literal read-only subcommands (status,
   log, diff, show, blame, grep, ls-files, ls-tree, rev-parse, describe, shortlog, `reflog show`,
