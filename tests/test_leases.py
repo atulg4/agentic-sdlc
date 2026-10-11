@@ -20,6 +20,7 @@ from agentic_sdlc.leases import (
     release,
     renew,
 )
+from agentic_sdlc.onboard import GhCommandError, OnboardError
 
 NOW = datetime(2026, 9, 30, 12, 0, tzinfo=UTC)
 PROJECT = "owner/repo"
@@ -127,8 +128,8 @@ class FakeGh:
             assert args[1] == f"repos/{PROJECT}/contents/agentic-sdlc.toml?ref=main"
             if isinstance(self.committed_policy, Exception):
                 raise self.committed_policy
-            if self.committed_policy is None:
-                raise RuntimeError("gh: Not Found (HTTP 404)")
+            if self.committed_policy is None:  # what run_gh raises for GitHub's 404 answer
+                raise GhCommandError("gh: Not Found (HTTP 404)", http_status=404)
             content = base64.b64encode(self.committed_policy.encode()).decode()
             return json.dumps({"type": "file", "encoding": "base64", "content": content})
         if args[0] == "api" and args[1].startswith(f"repos/{PROJECT}/collaborators/"):
@@ -3841,3 +3842,99 @@ def test_renew_refuses_when_the_open_pr_inventory_cannot_be_read():
     with pytest.raises(LeaseError, match="open pull requests could not be read"):
         renew(PROJECT, 7, session="s1", ttl_minutes=60, gh=faulty, now=NOW)
     assert not any(c[:3] == ("api", "-X", "POST") for c in gh.calls)
+
+
+# ---------------------------------------------------------------- Codex 4243386515
+# "No committed policy" is GitHub's 404 ANSWER, never a "404" in the message: a repository or
+# default branch literally named `404` echoes it in every request path, so a 403, 5xx or timeout
+# there must still fail closed.
+
+
+@pytest.mark.parametrize(
+    ("stderr", "stdout", "expected"),
+    [
+        ("gh: Not Found (HTTP 404)", '{"message":"Not Found","status":"404"}', 404),
+        ("gh: Not Found (HTTP 404)\n", "", 404),
+        ("gh: Forbidden (HTTP 403)", '{"message":"Forbidden","status":"403"}', 403),
+        ("gh: Server Error (HTTP 502)", "", 502),
+        # the body's own status disagrees: not a clean answer
+        ("gh: Not Found (HTTP 404)", '{"message":"x","status":"500"}', None),
+        # a 404 that is only in the message, not the trailing status
+        ("gh: repos/o/404 (HTTP 404) proxy said no", "", None),
+        ("error connecting to api.github.com (repos/o/404)", "", None),
+        ("", "", None),
+        ("gh: Bad (HTTP 404)\ngh: Server Error (HTTP 500)", "", 500),
+    ],
+)
+def test_gh_error_http_status_reads_only_the_response_status(stderr, stdout, expected):
+    from agentic_sdlc.onboard import gh_error_http_status
+
+    assert gh_error_http_status(stderr, stdout) == expected
+
+
+def test_run_gh_carries_the_response_status(tmp_path, monkeypatch):
+    from agentic_sdlc import onboard
+
+    gh = tmp_path / "gh"
+    gh.write_text(
+        "#!/bin/sh\n"
+        'printf \'%s\' \'{"message":"Not Found","status":"404"}\'\n'
+        "echo 'gh: Not Found (HTTP 404)' >&2\nexit 1\n"
+    )
+    gh.chmod(0o755)
+    monkeypatch.setattr(onboard, "trusted_gh", lambda: str(gh))
+    monkeypatch.setenv("GH_TOKEN", "t")
+    with pytest.raises(GhCommandError) as caught:
+        onboard.run_gh(["api", "repos/o/404/contents/agentic-sdlc.toml?ref=404"])
+    assert caught.value.http_status == 404 and onboard.gh_http_status(caught.value) == 404
+    gh.write_text("#!/bin/sh\necho 'gh: Forbidden (HTTP 403)' >&2\nexit 1\n")
+    with pytest.raises(GhCommandError) as caught:
+        onboard.run_gh(["api", "repos/o/404/contents/agentic-sdlc.toml?ref=404"])
+    assert caught.value.http_status == 403
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        GhCommandError(
+            "gh api repos/o/404/contents/agentic-sdlc.toml?ref=404 failed: "
+            "gh: Forbidden (HTTP 403)",
+            http_status=403,
+        ),
+        GhCommandError(
+            "gh api repos/o/404/contents/agentic-sdlc.toml?ref=404 failed: "
+            "gh: Server Error (HTTP 502)",
+            http_status=502,
+        ),
+        GhCommandError(
+            "gh api repos/o/404/contents/agentic-sdlc.toml?ref=404 failed: Not Found 404",
+            http_status=None,
+        ),
+        # run_gh's timeout: the path carries "404" twice, the answer never came
+        OnboardError(
+            "gh api repos/o/404/contents/agentic-sdlc.toml?ref=404 did not answer within 60s; "
+            "not concluding"
+        ),
+        RuntimeError("gh: Not Found (HTTP 404)"),  # not run_gh's error: no parsed status
+    ],
+)
+def test_committed_policy_fails_closed_unless_github_answered_404(failure, monkeypatch):
+    from agentic_sdlc import cli
+
+    def fake(args, input=None):
+        if args == ["api", "repos/o/404"]:
+            return json.dumps({"full_name": "o/404", "default_branch": "404"})
+        assert args == ["api", "repos/o/404/contents/agentic-sdlc.toml?ref=404"]
+        raise failure
+
+    monkeypatch.setattr(cli, "run_gh", fake)
+    with pytest.raises(LeaseError, match="cannot read the committed policy"):
+        cli._committed_lease_policy("o/404")
+
+    def absent(args, input=None):
+        if args == ["api", "repos/o/404"]:
+            return json.dumps({"full_name": "o/404", "default_branch": "404"})
+        raise GhCommandError("gh: Not Found (HTTP 404)", http_status=404)
+
+    monkeypatch.setattr(cli, "run_gh", absent)
+    assert cli._committed_lease_policy("o/404") is None

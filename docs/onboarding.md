@@ -28,13 +28,18 @@ automates.
   ephemeral" as WARN for any self-hosted label without it.
 - `--required-approvals N` (0-10, `[policy] required_approvals`) is the ruleset's
   `required_approving_review_count` (Codex 4243193100), and `doctor` holds the ruleset to at least
-  that. Unset with `--apply`, it is 1 when `GET repos/{repo}/collaborators?permission=push` (every
-  page; bots, the owner and the authenticated user excluded) finds another writer, else 0 -- an
-  author can never approve their own PR, so 1 for a solo owner would block every merge; offline,
-  or when the collaborators cannot be read, 0. At 0, `onboard` prints a WARNING and `doctor`
-  shows "ruleset requires a human approval" as WARN -- loudly in `cloud-routine` mode, where the
-  routine acts with the owner's identity, so the server-side human-merge boundary is not
-  enforced.
+  that. Unset, it depends on who authors the pull requests (Codex 4243386518). In the Actions
+  modes (`route`, `claude`, `codex`) the Publisher App opens them, so the owner is not the author
+  and can approve: the default is 1, with or without `--apply`. In `cloud-routine` mode the
+  routine opens them as the owner: with `--apply` it is 1 when
+  `GET repos/{repo}/collaborators?permission=push` (every page; bots, the owner and the
+  authenticated user excluded) finds another writer, else 0 -- an author can never approve their
+  own PR, so 1 for a solo owner would block every merge; offline, or when the collaborators
+  cannot be read, 0. At 0, `onboard` prints a WARNING and `doctor` shows "ruleset requires a
+  human approval" as WARN -- loudly in `cloud-routine` mode, where the routine acts with the
+  owner's identity, so the server-side human-merge boundary is not enforced; in the Actions modes
+  with the `--required-approvals 1` fix, since the owner can review the App's PR. The ruleset
+  has no bypass, so at 1 a pull request the owner opens by hand needs another reviewer too.
 - `--trust-mode strict|local` (`[automation] trust_mode`, default strict; `--force` keeps the
   installed policy's) decides which git, gh and hook interpreter Forge will run. Strict: only
   files root alone can replace (the file and every directory above it), no PATH search as root,
@@ -52,7 +57,8 @@ automates.
 
 **Migration:** re-run `sdlcctl onboard --force` (plus `--apply` for the ruleset). Repositories on
 self-hosted runners add `--runs-on <labels> --ephemeral-runners` or move to hosted runners; pass
-`--required-approvals 1` once a second reviewer exists. A policy written before these fields
+`--required-approvals 1` (Actions modes: now the default) once a reviewer other than the PR's
+author exists. A policy written before these fields
 reads as `trust_mode = "strict"`, `ephemeral_runners = false`, `required_approvals = 0`.
 
 ### Credentials `doctor` requires
@@ -62,6 +68,10 @@ Secrets are set with `gh secret set NAME --repo owner/repo`; variables with
 `--copy-vars-from owner/onboarded-repo`). `doctor` derives the list from the installed workflows
 and the routed registry, and `tests/test_onboard.py` checks that every name it can demand appears
 here.
+In an organization-owned repository the organization's secrets and variables shared with it
+count too (`repos/{repo}/actions/organization-secrets` / `organization-variables`; a repository
+variable wins over an organization one of the same name). When those inherited inventories cannot
+be read, a name missing at repository scope is a WARN to confirm, not a failure.
 
 | `--implementer` | Secrets | Variables |
 |---|---|---|

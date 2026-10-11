@@ -406,18 +406,38 @@ def test_other_writers_reads_every_page_and_skips_the_owner_me_and_bots():
     ],
 )
 def test_the_default_required_approvals_follows_the_collaborators(pages, fail, count):
-    found, why = default_required_approvals("owner/comic", _collaborators_gh(pages, fail=fail))
+    found, why = default_required_approvals(
+        "owner/comic", _collaborators_gh(pages, fail=fail), cloud=True
+    )
     assert found == count
     assert ("could not be read" in why) is fail
+
+
+# Codex 4243386518: in the Actions modes the Publisher App authors the PR, so the owner can
+# approve it: the default is 1 whoever the collaborators are, and nothing is read for it.
+@pytest.mark.parametrize(
+    ("pages", "fail"),
+    [([[{"login": "owner", "type": "User"}]], False), ([], True), ([], False)],
+)
+def test_actions_modes_default_to_one_approval(pages, fail):
+    gh = _collaborators_gh(pages, fail=fail)
+    found, why = default_required_approvals("owner/comic", gh, cloud=False)
+    assert found == 1 and "Publisher App" in why
+    assert gh.calls == []
 
 
 def test_doctor_warns_loudly_when_no_approval_is_required_in_cloud_routine_mode():
     loud = approvals_check(0, cloud=True, writers=None)
     assert loud.ok and loud.warning and loud.name == APPROVALS_CHECK
     assert "human-merge boundary" in loud.detail and "not enforce" in loud.detail
-    hinted = approvals_check(0, cloud=False, writers=["alice"])
+    hinted = approvals_check(0, cloud=True, writers=["alice"])
     assert hinted.warning and "alice could approve" in hinted.detail
-    assert not approvals_check(0, cloud=False, writers=[]).warning
+    # Actions modes: the owner can approve the App-authored PR, so 0 always warns with the fix
+    solo = approvals_check(0, cloud=False, writers=[])
+    assert (
+        solo.warning and "Publisher App" in solo.detail and "--required-approvals 1" in solo.detail
+    )
+    assert approvals_check(0, cloud=False, writers=None).warning
     enforced = approvals_check(1, cloud=True, writers=None)
     assert enforced.ok and not enforced.warning
 
@@ -443,6 +463,23 @@ def test_cli_onboard_offline_uses_zero_and_warns(tmp_path, capsys):
     )
     with pytest.raises(SystemExit):  # argparse: 0-10 only
         cli.main([*base, "--force", "--required-approvals", "11"])
+
+
+@pytest.mark.parametrize("implementer", ["route", "claude", "codex"])
+def test_cli_onboard_actions_modes_default_to_one_approval(tmp_path, capsys, implementer):
+    from agentic_sdlc import cli
+
+    repo = tmp_path / "consumer"
+    (repo / ".git").mkdir(parents=True)
+    base = ["onboard", "--destination", str(repo), "--project-id", "owner/comic"]
+    base += ["--platform-repository", "owner/agentic-sdlc", "--platform-ref", SHA]
+    base += ["--test", "pytest -q", "--visibility", "private", "--implementer", implementer]
+    assert cli.main(base) == 0
+    err = capsys.readouterr().err
+    assert "--required-approvals 1" in err and "Publisher App" in err and "WARNING" not in err
+    assert (
+        tomllib.loads((repo / "agentic-sdlc.toml").read_text())["policy"]["required_approvals"] == 1
+    )
 
 
 def test_doctor_local_reports_the_three_choices(tmp_path, no_agent_context):

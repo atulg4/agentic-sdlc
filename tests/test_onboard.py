@@ -13327,3 +13327,84 @@ def test_cloud_routine_stops_when_a_pr_appears_after_the_claim():
     assert "once the issue has an open pull request" in step3a
     step4d = doc[doc.index("4d. The final gate") : doc.index("5. Push the checked commit")]
     assert "Exit 9: a pull request for the issue was opened or linked meanwhile" in step4d
+
+
+# ---------------------------------------------------------------- Codex 4243386524
+# An organization repository's workflows also see the organization secrets and variables shared
+# with it: doctor unions the inherited inventories in, and one it cannot read leaves what is
+# missing at repository scope unverifiable (a warning), never "missing".
+ORG_SECRETS = "api repos/owner/comic/actions/organization-secrets"
+ORG_VARIABLES = "api repos/owner/comic/actions/organization-variables"
+
+
+def _org_gh(owner_type: str = "Organization", **first) -> FakeGh:
+    gh = _healthy_gh()
+    repo = json.loads(gh.answers["api repos/owner/comic"])
+    gh.answers["api repos/owner/comic"] = json.dumps(
+        {**repo, "owner": {"login": "owner", "type": owner_type}}
+    )
+    # FakeGh answers by prefix in order: the inherited endpoints before `api repos/owner/comic`
+    gh.answers = {**first, **gh.answers}
+    gh.answers["api repos/owner/comic/actions/secrets"] = _secret_pages(
+        "DEEPSEEK_API_KEY", "ZAI_API_KEY", "KIMI_API_KEY"
+    )
+    gh.answers["api repos/owner/comic/actions/variables"] = _var_pages(
+        "DEEPSEEK_MODEL_FLASH", "DEEPSEEK_MODEL_PRO", "ZAI_MODEL_GLM", "KIMI_MODEL_K3"
+    )
+    return gh
+
+
+def test_doctor_counts_inherited_organization_secrets_and_variables(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _org_gh(
+        **{
+            ORG_SECRETS: _secret_pages("PUBLISHER_APP_PRIVATE_KEY", "CLAUDE_CODE_OAUTH_TOKEN"),
+            ORG_VARIABLES: _var_pages("PUBLISHER_APP_CLIENT_ID"),
+        }
+    )
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    assert report.ok, report.render()
+    by_name = {c.name: c for c in report.checks}
+    assert not by_name["repo secrets set (by name)"].warning
+    assert not by_name["repo variables set (non-empty)"].warning
+    called = {" ".join(c[:2]) for c, _ in gh.calls}
+    assert ORG_SECRETS in called and ORG_VARIABLES in called
+
+
+def test_doctor_still_fails_a_secret_set_nowhere_in_an_organization(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _org_gh(
+        **{
+            ORG_SECRETS: _secret_pages("CLAUDE_CODE_OAUTH_TOKEN"),
+            ORG_VARIABLES: _var_pages("PUBLISHER_APP_CLIENT_ID"),
+        }
+    )
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))
+    assert "PUBLISHER_APP_PRIVATE_KEY" in failed["repo secrets set (by name)"].detail
+
+
+def test_doctor_warns_when_the_inherited_inventory_is_unreadable(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    denied = OnboardError("gh: Resource not accessible by integration (HTTP 403)")
+    gh = _org_gh(**{ORG_SECRETS: denied, ORG_VARIABLES: denied})
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    by_name = {c.name: c for c in report.checks}
+    for name, missing in (
+        ("repo secrets set (by name)", "PUBLISHER_APP_PRIVATE_KEY"),
+        ("repo variables set (non-empty)", "PUBLISHER_APP_CLIENT_ID"),
+    ):
+        check = by_name[name]
+        assert check.ok and check.warning, check
+        assert missing in check.detail and "could not be read" in check.detail
+
+
+def test_doctor_reads_no_organization_inventory_for_a_user_repository(tmp_path):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _org_gh(owner_type="User")
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))
+    assert "PUBLISHER_APP_PRIVATE_KEY" in failed["repo secrets set (by name)"].detail
+    assert not any("organization-" in c[1] for c, _ in gh.calls if len(c) > 1)
