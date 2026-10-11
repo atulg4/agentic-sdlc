@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,11 @@ from .capacity_metrics import (
     ObservationWindow,
     build_capacity_report,
     load_capacity_inputs,
+)
+from .control_center import (
+    ControlCenterError,
+    build_control_center_snapshot,
+    read_control_center_inputs,
 )
 from .dashboard_efficiency import build_infrastructure_blocker_panel
 from .event_ledger import EventLedger, LedgerError, LifecycleStage, load_lifecycle_event
@@ -30,6 +36,13 @@ from .executors import (
 )
 from .gates import GateError, run_gates, write_report
 from .git_diff import GitDiffError, collect_git_diff
+from .github_backlog import (
+    backlog_document_from_issues,
+    incident_document,
+    incidents_from_change_requests,
+    incidents_from_issues,
+    parent_links,
+)
 from .infra_recovery import (
     FailureClass,
     InfraRecoveryError,
@@ -507,6 +520,94 @@ def _project_state(args: argparse.Namespace) -> int:
     return 0
 
 
+def _control_center(args: argparse.Namespace) -> int:
+    registry, backlog, incidents = read_control_center_inputs(
+        registry_path=args.registry,
+        backlog_path=args.backlog,
+        incidents_path=args.incidents,
+    )
+    projections: tuple[Any, ...] = ()
+    sources: list[str] = []
+    if args.registry:
+        sources.append(f"registry:{args.registry}")
+    if args.ledger:
+        ledger = EventLedger.from_dict(
+            json.loads(Path(args.ledger).read_text(encoding="utf-8")), registry=registry
+        )
+        projections = ledger.projections()
+        sources.append(f"ledger:{args.ledger}")
+    if args.backlog:
+        sources.append(f"backlog:{args.backlog}")
+    if args.incidents:
+        sources.append(f"incidents:{args.incidents}")
+    generated_at = args.generated_at or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    snapshot = build_control_center_snapshot(
+        generated_at=generated_at,
+        registry=registry,
+        projections=projections,
+        backlog=backlog,
+        incidents=incidents,
+        sources=sources,
+        project_ids=tuple(args.project_id) or None,
+    )
+    _write(snapshot.as_document(), args.output)
+    return 0
+
+
+def _json_file(path: str) -> Any:
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _failing_checks(values: list[str]) -> dict[int, str]:
+    """Parse ``--failing NUMBER=check`` pairs the caller read from its CI API."""
+    failing: dict[int, str] = {}
+    for entry in values:
+        number, _, name = entry.partition("=")
+        if not number.strip().isdigit() or not name.strip():
+            raise ControlCenterError(f"--failing expects NUMBER=check-name, got: {entry}")
+        failing[int(number)] = name.strip()
+    return failing
+
+
+def _github_backlog(args: argparse.Namespace) -> int:
+    issues = _json_file(args.issues)
+    if not isinstance(issues, list):
+        raise ControlCenterError("--issues must hold a JSON array of issue payloads")
+    links = parent_links(*(_json_file(path) for path in args.sub_issues))
+    backlog = backlog_document_from_issues(
+        issues,
+        project_id=args.project_id,
+        repository=args.repository,
+        parents=links,
+    )
+    observed_at = args.observed_at or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    groups = [
+        incidents_from_issues(
+            issues,
+            project_id=args.project_id,
+            repository=args.repository,
+            observed_at=observed_at,
+        )
+    ]
+    if args.pulls:
+        pulls = _json_file(args.pulls)
+        if not isinstance(pulls, list):
+            raise ControlCenterError("--pulls must hold a JSON array of change requests")
+        groups.append(
+            incidents_from_change_requests(
+                pulls,
+                project_id=args.project_id,
+                repository=args.repository,
+                observed_at=observed_at,
+                failing=_failing_checks(args.failing),
+            )
+        )
+    _write(backlog, args.backlog_output)
+    if args.incidents_output:
+        _write(incident_document(*groups), args.incidents_output)
+    return 0
+
+
 def _read_usage_ledger(path: str, registry_path: str | None, *, create: bool) -> UsageLedger:
     registry = read_optional_project_registry(registry_path)
     ledger_path = Path(path)
@@ -917,6 +1018,28 @@ def build_parser() -> argparse.ArgumentParser:
     project_state.add_argument("--output")
     project_state.set_defaults(handler=_project_state)
 
+    control_center = commands.add_parser("control-center")
+    control_center.add_argument("--registry")
+    control_center.add_argument("--ledger")
+    control_center.add_argument("--backlog")
+    control_center.add_argument("--incidents")
+    control_center.add_argument("--project-id", action="append", default=[])
+    control_center.add_argument("--generated-at")
+    control_center.add_argument("--output")
+    control_center.set_defaults(handler=_control_center)
+
+    github_backlog = commands.add_parser("github-backlog")
+    github_backlog.add_argument("--issues", required=True)
+    github_backlog.add_argument("--project-id", required=True)
+    github_backlog.add_argument("--repository", required=True)
+    github_backlog.add_argument("--sub-issues", action="append", default=[])
+    github_backlog.add_argument("--pulls")
+    github_backlog.add_argument("--failing", action="append", default=[])
+    github_backlog.add_argument("--observed-at")
+    github_backlog.add_argument("--incidents-output")
+    github_backlog.add_argument("--backlog-output")
+    github_backlog.set_defaults(handler=_github_backlog)
+
     record_usage = commands.add_parser("record-usage")
     record_usage.add_argument("--ledger", required=True)
     record_usage.add_argument("--record", required=True)
@@ -1036,6 +1159,7 @@ def main(argv: list[str] | None = None) -> int:
         TaskSpecError,
         ArtifactError,
         CapacityError,
+        ControlCenterError,
         EventError,
         ExecutorError,
         GateError,

@@ -1,0 +1,964 @@
+<title>Forge Control Center</title>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #f6f7f9;
+    --panel: #ffffff;
+    --panel-2: #f0f2f5;
+    --ink: #11161d;
+    --ink-2: #4b5563;
+    --ink-3: #6b7280;
+    --line: #dfe3e8;
+    --accent: #1f5fd0;
+    --accent-ink: #ffffff;
+    --ok: #15803d;
+    --ok-bg: #e7f6ec;
+    --warn: #a35a00;
+    --warn-bg: #fdf1dc;
+    --bad: #b3261e;
+    --bad-bg: #fdeceb;
+    --mute-bg: #eceff3;
+    --radius: 12px;
+    --radius-sm: 8px;
+    --gut: 16px;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg: #0d1117;
+      --panel: #161b22;
+      --panel-2: #1c2230;
+      --ink: #e8edf4;
+      --ink-2: #aab4c0;
+      --ink-3: #8b949e;
+      --line: #2b323c;
+      --accent: #58a0ff;
+      --accent-ink: #0d1117;
+      --ok: #6ee7a0;
+      --ok-bg: #11291c;
+      --warn: #f0b858;
+      --warn-bg: #2d2211;
+      --bad: #ff8d85;
+      --bad-bg: #2d1514;
+      --mute-bg: #222935;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel-2: #1c2230;
+    --ink: #e8edf4;
+    --ink-2: #aab4c0;
+    --ink-3: #8b949e;
+    --line: #2b323c;
+    --accent: #58a0ff;
+    --accent-ink: #0d1117;
+    --ok: #6ee7a0;
+    --ok-bg: #11291c;
+    --warn: #f0b858;
+    --warn-bg: #2d2211;
+    --bad: #ff8d85;
+    --bad-bg: #2d1514;
+    --mute-bg: #222935;
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 15px/1.5 var(--sans);
+    overflow-x: hidden;
+  }
+  a { color: var(--accent); }
+  button { font: inherit; }
+
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 var(--gut) 64px; }
+
+  header.top {
+    position: sticky; top: 0; z-index: 10;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--line);
+  }
+  .top-inner {
+    max-width: 1120px; margin: 0 auto; padding: 12px var(--gut);
+    display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+  }
+  .brand { font-weight: 650; letter-spacing: -0.01em; margin-right: auto; }
+  .brand small { display: block; font-weight: 400; color: var(--ink-3); font-size: 12px; }
+
+  .btn {
+    border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+    padding: 7px 12px; border-radius: var(--radius-sm); cursor: pointer;
+    display: inline-flex; align-items: center; gap: 6px;
+  }
+  .btn:hover { border-color: var(--accent); }
+  .btn.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+  .btn.sm { padding: 4px 9px; font-size: 13px; }
+  .btn[disabled] { opacity: .5; cursor: not-allowed; }
+
+  .tabs { display: flex; gap: 4px; overflow-x: auto; padding: 10px 0 2px; }
+  .tab {
+    border: 0; background: transparent; color: var(--ink-2); cursor: pointer;
+    padding: 7px 12px; border-radius: 999px; white-space: nowrap;
+  }
+  .tab[aria-selected="true"] { background: var(--panel); color: var(--ink); box-shadow: inset 0 0 0 1px var(--line); }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 14px; margin: 12px 0;
+  }
+  .card h2, .card h3 { margin: 0 0 8px; font-size: 15px; letter-spacing: -0.01em; }
+  .card h2 { font-size: 17px; }
+  .muted { color: var(--ink-3); }
+  .small { font-size: 13px; }
+  .tiny { font-size: 12px; }
+  .mono { font-family: var(--mono); font-size: 12.5px; }
+
+  .grid { display: grid; gap: 12px; grid-template-columns: 1fr; }
+  @media (min-width: 760px) { .grid.two { grid-template-columns: 1fr 1fr; } }
+
+  .chip {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 2px 8px; border-radius: 999px; font-size: 12px;
+    background: var(--mute-bg); color: var(--ink-2); white-space: nowrap;
+  }
+  .chip.ok { background: var(--ok-bg); color: var(--ok); }
+  .chip.warn { background: var(--warn-bg); color: var(--warn); }
+  .chip.bad { background: var(--bad-bg); color: var(--bad); }
+  .chip.line { background: transparent; box-shadow: inset 0 0 0 1px var(--line); }
+
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; flex: none; }
+
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .between { display: flex; gap: 10px; align-items: baseline; justify-content: space-between; }
+
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(92px, 1fr)); gap: 8px; }
+  .stat { background: var(--panel-2); border-radius: var(--radius-sm); padding: 9px 10px; }
+  .stat b { display: block; font-size: 20px; line-height: 1.1; letter-spacing: -0.02em; }
+  .stat span { font-size: 11.5px; color: var(--ink-3); }
+
+  .proj {
+    display: block; width: 100%; text-align: left; cursor: pointer;
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 14px; color: inherit;
+  }
+  .proj:hover { border-color: var(--accent); }
+
+  .unit { border-top: 1px solid var(--line); padding: 10px 0; }
+  .unit:first-of-type { border-top: 0; }
+
+  .tree { list-style: none; margin: 0; padding: 0; }
+  .tree ul { list-style: none; margin: 0; padding-left: 14px; border-left: 1px dashed var(--line); }
+  .node { padding: 6px 0; }
+  .node-head { display: flex; gap: 8px; align-items: flex-start; }
+  .twist {
+    border: 0; background: transparent; color: var(--ink-3); cursor: pointer;
+    padding: 0 2px; width: 18px; flex: none; font-family: var(--mono);
+  }
+  .node-title { flex: 1; min-width: 0; }
+  .node-title a { text-decoration: none; }
+  .node-title a:hover { text-decoration: underline; }
+
+  .inc { border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 11px; margin: 9px 0; }
+  .inc.blocker { border-left: 3px solid var(--bad); }
+  .inc.degraded { border-left: 3px solid var(--warn); }
+  .inc.advisory { border-left: 3px solid var(--line); }
+  .rem { background: var(--panel-2); border-radius: var(--radius-sm); padding: 9px; margin-top: 8px; }
+
+  pre.cmd {
+    margin: 6px 0 0; padding: 8px 9px; background: var(--panel-2);
+    border-radius: 6px; overflow-x: auto; font-family: var(--mono); font-size: 12.5px;
+  }
+
+  label.field { display: block; margin: 9px 0; }
+  label.field span { display: block; font-size: 12.5px; color: var(--ink-2); margin-bottom: 4px; }
+  input[type="text"], textarea, select {
+    width: 100%; padding: 8px 10px; border-radius: var(--radius-sm);
+    border: 1px solid var(--line); background: var(--bg); color: var(--ink); font: inherit;
+  }
+  textarea { min-height: 120px; font-family: var(--mono); font-size: 12.5px; resize: vertical; }
+
+  .banner {
+    border-radius: var(--radius-sm); padding: 10px 12px; margin: 10px 0;
+    background: var(--warn-bg); color: var(--warn); font-size: 13.5px;
+  }
+  .banner.bad { background: var(--bad-bg); color: var(--bad); }
+  .banner.ok { background: var(--ok-bg); color: var(--ok); }
+
+  .skeleton { color: var(--ink-3); padding: 28px 0; text-align: center; }
+  .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+</style>
+
+<header class="top">
+  <div class="top-inner">
+    <div class="brand">Forge Control Center
+      <small id="subtitle">loading…</small>
+    </div>
+    <button class="btn sm" id="theme-btn" type="button">Theme</button>
+    <button class="btn sm" id="refresh-btn" type="button">Snapshot</button>
+  </div>
+</header>
+
+<main class="wrap">
+  <div class="tabs" id="tabs" role="tablist"></div>
+  <div id="view"><div class="skeleton">Connecting to the Control Center store…</div></div>
+</main>
+
+<script type="module">
+  const SCHEMA = 1;
+  const HEALTH = {
+    blocked:      { cls: "bad",  text: "blocked" },
+    "needs-attention": { cls: "warn", text: "needs attention" },
+    degraded:     { cls: "warn", text: "degraded" },
+    running:      { cls: "ok",   text: "running" },
+    idle:         { cls: "line", text: "idle" },
+    "no-data":    { cls: "line", text: "no data" },
+    unregistered: { cls: "warn", text: "unregistered" },
+  };
+  const SEVERITY = { blocker: "bad", degraded: "warn", advisory: "line" };
+  const AUTHORITY = {
+    operator: "an operator runs this",
+    agent: "an agent may take this on",
+    "human-only": "only a person may do this",
+  };
+  const KIND_ICON = { epic: "◆", story: "▸", task: "·" };
+
+  const state = {
+    db: null, user: null, sample: null, viewer: null, canWrite: null,
+    snapshot: null, snapshotMeta: null, notes: new Map(), drafts: [],
+    tab: "portfolio", project: null, open: new Set(), connecting: true, error: "",
+  };
+
+  /* ---------- tiny DOM helper: text is always set as text ---------- */
+  function el(tag, props, ...kids) {
+    const node = document.createElement(tag);
+    for (const [key, value] of Object.entries(props || {})) {
+      if (value === null || value === undefined || value === false) continue;
+      if (key === "text") node.textContent = String(value);
+      else if (key === "class") node.className = value;
+      else if (key === "on") for (const [ev, fn] of Object.entries(value)) node.addEventListener(ev, fn);
+      else node.setAttribute(key, value === true ? "" : String(value));
+    }
+    for (const kid of kids.flat()) {
+      if (kid === null || kid === undefined || kid === false) continue;
+      node.append(typeof kid === "string" || typeof kid === "number" ? String(kid) : kid);
+    }
+    return node;
+  }
+  const txt = (value, fallback = "—") => (value === null || value === undefined || value === "" ? fallback : String(value));
+
+  function chip(text, cls) { return el("span", { class: "chip " + (cls || ""), text }); }
+
+  function copyButton(value, label = "Copy") {
+    return el("button", {
+      class: "btn sm", type: "button", on: {
+        click: async (event) => {
+          const button = event.currentTarget;
+          try {
+            await navigator.clipboard.writeText(value);
+            button.textContent = "Copied";
+          } catch { button.textContent = "Copy failed"; }
+          setTimeout(() => { button.textContent = label; }, 1600);
+        },
+      },
+    }, label);
+  }
+
+  /* ---------- theme ---------- */
+  const themeKey = "forge-cc-theme";
+  function applyTheme(value) {
+    if (value) document.documentElement.setAttribute("data-theme", value);
+    else document.documentElement.removeAttribute("data-theme");
+  }
+  try { const saved = localStorage.getItem(themeKey); if (saved) applyTheme(saved); } catch {}
+  document.getElementById("theme-btn").addEventListener("click", () => {
+    const now = document.documentElement.getAttribute("data-theme");
+    const next = now === "dark" ? "light" : "dark";
+    applyTheme(next);
+    try { localStorage.setItem(themeKey, next); } catch {}
+  });
+
+  /* ---------- store ---------- */
+  const docId = (value) => String(value).replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 120) || "item";
+
+  function tryUse(name) {
+    try {
+      const pending = window.claude?.use?.(name);
+      return pending && typeof pending.then === "function" ? pending.catch(() => null) : Promise.resolve(null);
+    } catch { return Promise.resolve(null); }
+  }
+
+  async function connect() {
+    const [db, user, sample] = await Promise.all(["db", "user", "sample"].map(tryUse));
+    state.db = db || null;
+    state.user = user || null;
+    state.sample = sample || null;
+    state.connecting = false;
+    if (state.user) {
+      try { state.viewer = await state.user.me(); } catch { state.viewer = null; }
+      try { state.canWrite = state.user.can("data.write"); } catch { state.canWrite = null; }
+    }
+    if (!state.db) { render(); return; }
+    try {
+      const snap = await state.db.doc("snapshots/current").get();
+      if (snap?.exists) {
+        const body = snap.data() || {};
+        adoptSnapshot(body.document, body.loadedAt, body.loadedBy);
+      }
+    } catch (error) { state.error = describe(error); }
+    subscribe("notes", (docs) => {
+      state.notes = new Map();
+      for (const entry of docs) if (entry?.incidentId) state.notes.set(entry.incidentId, entry);
+    });
+    subscribe("projectDrafts", (docs) => { state.drafts = docs; });
+    render();
+  }
+
+  function subscribe(collection, adopt) {
+    try {
+      state.db.collection(collection).onSnapshot(
+        (snapshot) => {
+          adopt(snapshot.docs.map((entry) => entry.data()).filter(Boolean));
+          render();
+        },
+        () => { /* a dropped subscription leaves the last view in place */ },
+      );
+    } catch { /* this view keeps an empty set */ }
+  }
+
+  function describe(error) {
+    if (!error) return "unknown error";
+    if (typeof error === "string") return error;
+    return error.message || error.code || "unknown error";
+  }
+
+  function adoptSnapshot(document_, loadedAt, loadedBy) {
+    const problem = validateSnapshot(document_);
+    if (problem) { state.error = problem; return problem; }
+    state.snapshot = document_;
+    state.snapshotMeta = { loadedAt: loadedAt || "", loadedBy: loadedBy || "" };
+    state.error = "";
+    if (!state.project && document_.projects?.length) state.project = document_.projects[0].projectId;
+    return "";
+  }
+
+  function validateSnapshot(value) {
+    if (!value || typeof value !== "object") return "That is not a snapshot document.";
+    if (value.schemaVersion !== SCHEMA) return `Unsupported snapshot schemaVersion: ${value.schemaVersion}. This page renders version ${SCHEMA}.`;
+    if (!Array.isArray(value.projects)) return "The snapshot has no projects array.";
+    for (const project of value.projects) {
+      if (!project || typeof project.projectId !== "string" || !project.projectId) return "Every project needs a projectId.";
+    }
+    return "";
+  }
+
+  /* ---------- render ---------- */
+  const viewNode = document.getElementById("view");
+  const tabsNode = document.getElementById("tabs");
+
+  function render() {
+    renderSubtitle();
+    if (state.connecting) return;
+    renderTabs();
+    viewNode.replaceChildren();
+    if (state.error) viewNode.append(el("div", { class: "banner bad", text: state.error }));
+    if (!state.db && !state.snapshot) viewNode.append(offlineNotice());
+    if (state.tab === "portfolio") viewNode.append(...portfolioView());
+    else if (state.tab === "project") viewNode.append(...projectView());
+    else if (state.tab === "blockers") viewNode.append(...blockersView());
+    else if (state.tab === "add") viewNode.append(...addProjectView());
+    else if (state.tab === "snapshot") viewNode.append(...snapshotView());
+  }
+
+  function renderSubtitle() {
+    const node = document.getElementById("subtitle");
+    if (state.connecting) { node.textContent = "connecting…"; return; }
+    if (!state.snapshot) { node.textContent = state.db ? "no snapshot loaded" : "read-only, no store"; return; }
+    const totals = state.snapshot.totals || {};
+    const parts = [
+      `${totals.projects ?? 0} project${totals.projects === 1 ? "" : "s"}`,
+      `${totals.blockers ?? 0} blocker${totals.blockers === 1 ? "" : "s"}`,
+      `as of ${txt(state.snapshot.generatedAt, "unknown")}`,
+    ];
+    node.textContent = parts.join(" · ");
+  }
+
+  function renderTabs() {
+    const tabs = [
+      ["portfolio", "Portfolio"],
+      ["project", "Project"],
+      ["blockers", "Blockers"],
+      ["add", "Add project"],
+      ["snapshot", "Snapshot"],
+    ];
+    tabsNode.replaceChildren(...tabs.map(([id, label]) => el("button", {
+      class: "tab", type: "button", role: "tab", "aria-selected": state.tab === id ? "true" : "false",
+      on: { click: () => { state.tab = id; render(); window.scrollTo({ top: 0 }); } },
+    }, label)));
+  }
+
+  function offlineNotice() {
+    return el("div", { class: "card" },
+      el("h2", { text: "No shared store in this view" }),
+      el("p", { class: "small muted", text: "This view cannot reach the Control Center store, so nothing is saved and no snapshot was loaded. You can still paste a snapshot under Snapshot to read it here for this session." }),
+    );
+  }
+
+  function projects() { return state.snapshot?.projects || []; }
+  function currentProject() {
+    const list = projects();
+    return list.find((item) => item.projectId === state.project) || list[0] || null;
+  }
+
+  /* ---------- portfolio ---------- */
+  function portfolioView() {
+    const nodes = [];
+    const totals = state.snapshot?.totals;
+    if (totals) {
+      nodes.push(el("div", { class: "card" },
+        el("div", { class: "stats" },
+          stat(totals.projects, "projects"),
+          stat(totals.active, "running now"),
+          stat(totals.attention, "waiting on a person"),
+          stat(totals.blockers, "blockers"),
+          stat(totals.backlogItems, "backlog items"),
+          stat(totals.workUnits, "work units"),
+        ),
+      ));
+    }
+    if (!projects().length) {
+      nodes.push(el("div", { class: "card" },
+        el("h2", { text: "Nothing to show yet" }),
+        el("p", { class: "small muted", text: "Load a snapshot built by `sdlcctl control-center` under the Snapshot tab, then every managed project appears here." }),
+      ));
+      return nodes;
+    }
+    nodes.push(el("div", { class: "grid two" }, projects().map(projectCard)));
+    for (const warning of state.snapshot.warnings || []) {
+      nodes.push(el("div", { class: "banner", text: warning }));
+    }
+    return nodes;
+  }
+
+  function stat(value, label) {
+    return el("div", { class: "stat" }, el("b", { text: value ?? 0 }), el("span", { text: label }));
+  }
+
+  function projectCard(project) {
+    const health = HEALTH[project.health] || HEALTH["no-data"];
+    const counts = project.counts || {};
+    const running = (project.active || [])[0];
+    return el("button", {
+      class: "proj", type: "button",
+      on: { click: () => { state.project = project.projectId; state.tab = "project"; render(); window.scrollTo({ top: 0 }); } },
+    },
+      el("div", { class: "between" },
+        el("div", null,
+          el("div", { style: "font-weight:620", text: txt(project.displayName, project.projectId) }),
+          el("div", { class: "tiny muted", text: (project.repositories || []).join(" · ") || project.projectId }),
+        ),
+        el("span", { class: "chip " + health.cls }, el("i", { class: "dot" }), health.text),
+      ),
+      el("div", { class: "row", style: "margin-top:10px" },
+        chip(`${counts.backlogItems ?? 0} backlog`, "line"),
+        counts.active ? chip(`${counts.active} running`, "ok") : null,
+        counts.attention ? chip(`${counts.attention} waiting`, "warn") : null,
+        counts.blockers ? chip(`${counts.blockers} blocker${counts.blockers === 1 ? "" : "s"}`, "bad") : null,
+        !project.registered ? chip("not in registry", "warn") : null,
+      ),
+      running ? el("div", { class: "tiny muted", style: "margin-top:9px" },
+        `now: ${txt(running.activity, running.state)}`) : null,
+    );
+  }
+
+  /* ---------- project detail ---------- */
+  function projectView() {
+    const project = currentProject();
+    if (!project) return portfolioView();
+    const nodes = [];
+    nodes.push(el("div", { class: "card" },
+      el("div", { class: "between" },
+        el("div", null,
+          el("h2", { text: txt(project.displayName, project.projectId) }),
+          el("div", { class: "tiny muted", text: `${project.projectId}${project.group ? " · " + project.group : ""}` }),
+        ),
+        projects().length > 1 ? el("select", {
+          "aria-label": "Choose a project",
+          style: "max-width:190px",
+          on: { change: (event) => { state.project = event.currentTarget.value; render(); } },
+        }, projects().map((item) => el("option", { value: item.projectId, selected: item.projectId === project.projectId }, txt(item.displayName, item.projectId)))) : null,
+      ),
+      el("div", { class: "row", style: "margin:10px 0" },
+        el("span", { class: "chip " + (HEALTH[project.health] || HEALTH["no-data"]).cls }, el("i", { class: "dot" }), (HEALTH[project.health] || HEALTH["no-data"]).text),
+        (project.repositories || []).map((repo) => chip(repo, "line")),
+        (project.environments || []).map((env) => chip(env, "line")),
+      ),
+      el("div", { class: "stats" },
+        stat(project.counts?.backlogItems, "backlog items"),
+        stat(project.counts?.active, "running now"),
+        stat(project.counts?.attention, "waiting on a person"),
+        stat(project.counts?.blockers, "blockers"),
+      ),
+      (project.capabilities || []).length ? el("div", { class: "tiny muted", style: "margin-top:10px", text: "capabilities: " + project.capabilities.join(", ") }) : null,
+    ));
+
+    nodes.push(nowRunningCard(project));
+    nodes.push(attentionCard(project));
+    nodes.push(backlogCard(project));
+    if ((project.incidents || []).length) {
+      nodes.push(el("div", { class: "card" },
+        el("div", { class: "between" },
+          el("h3", { text: `Problems in this project (${project.incidents.length})` }),
+          el("button", { class: "btn sm", type: "button", on: { click: () => { state.tab = "blockers"; render(); } } }, "Work the list"),
+        ),
+        el("div", { class: "small muted", text: "Highest severity first. Each one carries the remediation Forge declares for its kind." }),
+        project.incidents.slice().sort(bySeverity).slice(0, 4).map((incident) => incidentCard(incident, project)),
+      ));
+    }
+    for (const warning of project.warnings || []) nodes.push(el("div", { class: "banner", text: warning }));
+    return nodes;
+  }
+
+  function nowRunningCard(project) {
+    const active = project.active || [];
+    return el("div", { class: "card" },
+      el("h3", { text: `Running now (${active.length})` }),
+      active.length ? active.map((unit) => unitRow(unit)) :
+        el("p", { class: "small muted", text: "No work unit is in flight. Either nothing is dispatched, or the lifecycle ledger has no events for this project yet." }),
+    );
+  }
+
+  function attentionCard(project) {
+    const items = project.attention || [];
+    if (!items.length) return el("div", { class: "card" },
+      el("h3", { text: "Waiting on a person" }),
+      el("p", { class: "small muted", text: "Nothing is parked at a human gate." }));
+    return el("div", { class: "card" },
+      el("h3", { text: `Waiting on a person (${items.length})` }),
+      items.map((unit) => unitRow(unit)),
+    );
+  }
+
+  function unitRow(unit) {
+    const cls = unit.needsAttention ? "warn" : "ok";
+    return el("div", { class: "unit" },
+      el("div", { class: "row" },
+        el("span", { class: "chip " + cls, text: txt(unit.state) }),
+        el("span", { class: "mono", text: txt(unit.workUnitId) }),
+        unit.awaitsHuman ? chip("human gate", "warn") : null,
+        unit.repairCycles ? chip(`${unit.repairCycles} repair cycle${unit.repairCycles === 1 ? "" : "s"}`, "line") : null,
+      ),
+      el("div", { class: "small", style: "margin-top:5px", text: txt(unit.activity, "no activity recorded") }),
+      el("div", { class: "tiny muted", style: "margin-top:4px", text: [
+        unit.stage && `stage ${unit.stage}`,
+        unit.actor && `by ${unit.actor}`,
+        unit.model && `model ${unit.model}`,
+        unit.worker && `worker ${unit.worker}`,
+        unit.lastEventAt && `last event ${unit.lastEventAt}`,
+      ].filter(Boolean).join(" · ") || "no actor recorded" }),
+      unit.blockedReason ? el("div", { class: "small", style: "margin-top:4px", text: "blocked: " + unit.blockedReason }) : null,
+      (unit.issueRef || unit.changeRequestRef || unit.runRef) ? el("div", { class: "row tiny muted", style: "margin-top:5px" },
+        unit.issueRef ? chip(unit.issueRef, "line") : null,
+        unit.changeRequestRef ? chip(unit.changeRequestRef, "line") : null,
+        unit.runRef ? chip("run " + unit.runRef, "line") : null,
+      ) : null,
+    );
+  }
+
+  /* ---------- backlog tree ---------- */
+  function backlogCard(project) {
+    const roots = project.backlog || [];
+    const card = el("div", { class: "card" },
+      el("div", { class: "between" },
+        el("h3", { text: `Epics, stories and tasks (${project.counts?.backlogItems ?? 0})` }),
+        roots.length ? el("div", { class: "row" },
+          el("button", { class: "btn sm", type: "button", on: { click: () => { expandAll(roots, true); render(); } } }, "Expand all"),
+          el("button", { class: "btn sm", type: "button", on: { click: () => { expandAll(roots, false); render(); } } }, "Collapse"),
+        ) : null,
+      ),
+    );
+    if (!roots.length) {
+      card.append(el("p", { class: "small muted", text: "No backlog has been exported for this project yet." }));
+      return card;
+    }
+    card.append(el("ul", { class: "tree" }, roots.map((node) => treeNode(node))));
+    return card;
+  }
+
+  function expandAll(nodes, open) {
+    for (const node of nodes) {
+      if (open) state.open.add(node.itemId); else state.open.delete(node.itemId);
+      expandAll(node.children || [], open);
+    }
+  }
+
+  function treeNode(node) {
+    const kids = node.children || [];
+    const isOpen = state.open.has(node.itemId);
+    const unknown = node.stateBasis && node.stateBasis.startsWith("state unknown");
+    const head = el("div", { class: "node-head" },
+      kids.length ? el("button", {
+        class: "twist", type: "button", "aria-expanded": isOpen ? "true" : "false",
+        "aria-label": isOpen ? "Collapse" : "Expand",
+        on: { click: () => { if (isOpen) state.open.delete(node.itemId); else state.open.add(node.itemId); render(); } },
+      }, isOpen ? "▾" : "▸") : el("span", { class: "twist muted", text: KIND_ICON[node.kind] || "·" }),
+      el("div", { class: "node-title" },
+        node.url
+          ? el("a", { href: node.url, target: "_blank", rel: "noreferrer noopener", text: node.title })
+          : el("span", { text: node.title }),
+        el("div", { class: "row tiny", style: "margin-top:4px" },
+          chip(node.kind, "line"),
+          chip(unknown ? "state unknown" : txt(node.state), unknown ? "warn" : stateClass(node.state)),
+          node.issueRef ? el("span", { class: "mono muted", text: node.issueRef }) : null,
+          kids.length ? chip(`${kids.length} child${kids.length === 1 ? "" : "ren"}`, "line") : null,
+          node.parentMissing ? chip("parent outside snapshot", "warn") : null,
+        ),
+        el("div", { class: "tiny muted", style: "margin-top:3px", text: txt(node.stateBasis, "") }),
+      ),
+    );
+    const item = el("li", { class: "node" }, head);
+    if (kids.length && isOpen) item.append(el("ul", null, kids.map((kid) => treeNode(kid))));
+    return item;
+  }
+
+  function stateClass(value) {
+    if (!value) return "line";
+    if (["merged", "live", "approved"].includes(value)) return "ok";
+    if (["blocked", "failed", "rolled-back", "cancelled"].includes(value)) return "bad";
+    if (["approval-pending", "ready-for-human-merge", "repair-needed"].includes(value)) return "warn";
+    return "line";
+  }
+
+  /* ---------- blockers ---------- */
+  function bySeverity(left, right) {
+    const order = { blocker: 0, degraded: 1, advisory: 2 };
+    return (order[left.severity] ?? 3) - (order[right.severity] ?? 3);
+  }
+
+  function blockersView() {
+    const nodes = [];
+    const all = [];
+    for (const project of projects()) {
+      for (const incident of project.incidents || []) all.push({ incident, project });
+    }
+    if (!all.length) {
+      nodes.push(el("div", { class: "card" },
+        el("h2", { text: "Nothing is failing" }),
+        el("p", { class: "small muted", text: "No snapshot incident is open. Load a fresher snapshot to confirm." }),
+      ));
+      return nodes;
+    }
+    all.sort((left, right) => bySeverity(left.incident, right.incident));
+    const groups = new Map();
+    for (const row of all) {
+      const key = row.incident.kind || "unclassified";
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(row);
+    }
+    nodes.push(el("div", { class: "card" },
+      el("h2", { text: `${all.length} open problem${all.length === 1 ? "" : "s"}` }),
+      el("div", { class: "row", style: "margin-top:8px" },
+        [...groups.entries()].map(([kind, rows]) => chip(`${kind} · ${rows.length}`, SEVERITY[rows[0].incident.severity] || "line")),
+      ),
+      el("p", { class: "tiny muted", style: "margin:10px 0 0", text: "Every remediation below is one Forge declares for that kind of problem, with the authority allowed to carry it out. This page takes none of them for you: it has no repository credential, by design." }),
+    ));
+    for (const [kind, rows] of groups) {
+      nodes.push(el("div", { class: "card" },
+        el("h3", { text: `${kind} (${rows.length})` }),
+        rows.map((row) => incidentCard(row.incident, row.project)),
+      ));
+    }
+    return nodes;
+  }
+
+  function incidentCard(incident, project) {
+    const note = state.notes.get(incident.incidentId);
+    const card = el("div", { class: "inc " + (incident.severity || "advisory") },
+      el("div", { class: "row" },
+        chip(txt(incident.severity), SEVERITY[incident.severity] || "line"),
+        chip(txt(project.displayName, project.projectId), "line"),
+        note?.status ? chip(note.status, note.status === "resolved" ? "ok" : "warn") : null,
+      ),
+      el("div", { style: "margin-top:7px; font-weight:560", text: txt(incident.summary) }),
+      incident.detail ? el("div", { class: "small muted", style: "margin-top:3px", text: incident.detail }) : null,
+      el("div", { class: "row tiny muted", style: "margin-top:6px" },
+        incident.backlogItemId ? el("span", { class: "mono", text: incident.backlogItemId }) : null,
+        incident.workUnitId ? el("span", { class: "mono", text: incident.workUnitId }) : null,
+        incident.observedAt ? el("span", { text: "observed " + incident.observedAt }) : null,
+      ),
+    );
+    for (const action of incident.remediations || []) card.append(remediationNode(action));
+    card.append(noteNode(incident, note));
+    return card;
+  }
+
+  function remediationNode(action) {
+    const cls = action.authority === "human-only" ? "warn" : action.authority === "agent" ? "line" : "ok";
+    return el("div", { class: "rem" },
+      el("div", { class: "row" },
+        chip(action.authority, cls),
+        el("b", { class: "small", text: txt(action.title) }),
+      ),
+      el("div", { class: "small", style: "margin-top:4px", text: txt(action.description) }),
+      action.handoff ? el("div", { class: "small", style: "margin-top:4px", text: "Handoff: " + action.handoff }) : null,
+      action.command ? el("div", null,
+        el("pre", { class: "cmd", text: action.command }),
+        el("div", { class: "row", style: "margin-top:6px" }, copyButton(action.command, "Copy command")),
+      ) : null,
+      el("div", { class: "tiny muted", style: "margin-top:5px", text: AUTHORITY[action.authority] || "" }),
+    );
+  }
+
+  function noteNode(incident, note) {
+    const wrap = el("div", { style: "margin-top:9px" });
+    if (note?.text) {
+      wrap.append(el("div", { class: "small", text: note.text }));
+      wrap.append(el("div", { class: "tiny muted", style: "margin-top:3px", text: `noted ${txt(note.at, "")}` }));
+    }
+    if (!state.db) {
+      wrap.append(el("div", { class: "tiny muted", text: "This view cannot record a remediation note." }));
+      return wrap;
+    }
+    const input = el("input", { type: "text", placeholder: "What you did, or what you are waiting on" });
+    const row = el("div", { class: "row", style: "margin-top:7px" },
+      el("select", { "aria-label": "Status" },
+        ["acknowledged", "in-progress", "resolved"].map((value) => el("option", { value, selected: note?.status === value }, value)),
+      ),
+      el("button", { class: "btn sm primary", type: "button", on: { click: async (event) => {
+        const button = event.currentTarget;
+        const status = row.querySelector("select").value;
+        button.disabled = true;
+        const saved = await saveNote(incident, status, input.value.trim());
+        button.disabled = false;
+        if (saved) { button.textContent = saved; setTimeout(render, 1200); }
+      } } }, "Record"),
+    );
+    wrap.append(el("label", { class: "field" }, el("span", { text: "Remediation note" }), input), row);
+    if (state.sample) {
+      wrap.append(el("div", { class: "row", style: "margin-top:7px" },
+        el("button", { class: "btn sm", type: "button", on: { click: (event) => draftPlan(event.currentTarget, incident) } }, "Draft a plan with Claude"),
+      ));
+    }
+    return wrap;
+  }
+
+  async function saveNote(incident, status, text) {
+    try {
+      await state.db.doc("notes/" + docId(incident.incidentId)).set({
+        incidentId: incident.incidentId,
+        projectId: incident.projectId || "",
+        kind: incident.kind || "",
+        status,
+        text,
+        byId: state.viewer?.id || "",
+        at: new Date().toISOString(),
+      });
+      return "Recorded";
+    } catch (error) {
+      const code = error?.code || "";
+      if (code === "not_granted" || code === "permission_denied") return "Not allowed";
+      return "Failed";
+    }
+  }
+
+  async function draftPlan(button, incident) {
+    const target = button.parentElement;
+    button.disabled = true;
+    const out = el("div", { class: "small", style: "margin-top:7px; white-space:pre-wrap", text: "Thinking…" });
+    target.after(out);
+    const declared = (incident.remediations || []).map((action) => `- ${action.title} (${action.authority}): ${action.description}${action.command ? " | command: " + action.command : ""}`).join("\n");
+    const prompt = [
+      "You are helping an operator clear one problem in an AI software factory.",
+      "Write at most six short numbered steps. Use only the declared remediations below;",
+      "if they are not enough, say what evidence is missing instead of inventing a step.",
+      "Never propose that an agent merge code or change deployment capacity: those are human-only.",
+      "",
+      `Problem kind: ${incident.kind}`,
+      `Severity: ${incident.severity}`,
+      `Summary: ${incident.summary}`,
+      incident.detail ? `Detail: ${incident.detail}` : "",
+      "",
+      "Declared remediations:",
+      declared || "- none declared",
+    ].filter(Boolean).join("\n");
+    try {
+      const answer = await state.sample(prompt, { modelTier: "quick", onText: ({ text }) => { out.textContent = text; } });
+      out.textContent = answer.text;
+    } catch (error) {
+      out.textContent = "Could not draft a plan: " + describe(error);
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  /* ---------- add a project ---------- */
+  function addProjectView() {
+    const nodes = [];
+    const fields = {};
+    const form = el("div", { class: "card" },
+      el("h2", { text: "Add a project" }),
+      el("p", { class: "small muted", text: "This writes a registry entry draft to the Control Center store and shows you the exact JSON to commit. It does not change any repository: the project registry is reviewed and merged like any other change." }),
+      field(fields, "projectId", "Project ID", "lowercase, digits, dot, dash or underscore"),
+      field(fields, "displayName", "Display name", "MarketMaestro"),
+      field(fields, "repository", "Primary repository", "owner/name"),
+      el("label", { class: "field" }, el("span", { text: "SCM provider" }),
+        fields.provider = el("select", null, el("option", { value: "github" }, "github"), el("option", { value: "gitlab" }, "gitlab"))),
+      field(fields, "defaultBranch", "Default branch", "main"),
+      field(fields, "group", "Group (optional)", "maestro"),
+    );
+    const output = el("div");
+    form.append(el("div", { class: "row", style: "margin-top:10px" },
+      el("button", { class: "btn primary", type: "button", on: { click: async (event) => {
+        const entry = buildEntry(fields);
+        output.replaceChildren();
+        if (typeof entry === "string") { output.append(el("div", { class: "banner bad", text: entry })); return; }
+        const json = JSON.stringify(entry, null, 2);
+        output.append(el("pre", { class: "cmd", text: json }), el("div", { class: "row", style: "margin-top:8px" }, copyButton(json, "Copy registry entry")));
+        if (state.db) {
+          const button = event.currentTarget;
+          button.disabled = true;
+          try {
+            await state.db.doc("projectDrafts/" + docId(entry.projectId)).set({
+              projectId: entry.projectId, entry, byId: state.viewer?.id || "", at: new Date().toISOString(),
+            });
+            output.append(el("div", { class: "banner ok", text: "Saved as a draft in the Control Center store. Commit the JSON above to the project registry to make it real." }));
+          } catch (error) {
+            output.append(el("div", { class: "banner bad", text: "Could not save the draft: " + describe(error) }));
+          } finally { button.disabled = false; }
+        }
+      } } }, "Build the registry entry"),
+    ), output);
+    nodes.push(form);
+
+    if (state.drafts.length) {
+      nodes.push(el("div", { class: "card" },
+        el("h3", { text: `Drafts waiting to be committed (${state.drafts.length})` }),
+        state.drafts.map((draft) => el("div", { class: "unit" },
+          el("div", { class: "row" },
+            el("b", { class: "small", text: txt(draft.entry?.displayName, draft.projectId) }),
+            chip(txt(draft.projectId), "line"),
+            draft.at ? el("span", { class: "tiny muted", text: draft.at }) : null,
+          ),
+          el("pre", { class: "cmd", text: JSON.stringify(draft.entry, null, 2) }),
+          el("div", { class: "row", style: "margin-top:7px" },
+            copyButton(JSON.stringify(draft.entry, null, 2), "Copy"),
+            state.db ? el("button", { class: "btn sm", type: "button", on: { click: async (event) => {
+              event.currentTarget.disabled = true;
+              try { await state.db.doc("projectDrafts/" + docId(draft.projectId)).delete(); } catch { event.currentTarget.textContent = "Failed"; }
+            } } }, "Discard") : null,
+          ),
+        )),
+      ));
+    }
+    return nodes;
+  }
+
+  function field(store, key, label, placeholder) {
+    store[key] = el("input", { type: "text", placeholder: placeholder || "" });
+    return el("label", { class: "field" }, el("span", { text: label }), store[key]);
+  }
+
+  function buildEntry(fields) {
+    const projectId = fields.projectId.value.trim();
+    const displayName = fields.displayName.value.trim();
+    const repository = fields.repository.value.trim();
+    if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(projectId)) return "A project ID must start with a letter or digit and hold only lowercase letters, digits, dot, dash or underscore.";
+    if (!displayName) return "A display name is required.";
+    if (!/^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)+$/.test(repository)) return "A repository looks like owner/name.";
+    const entry = {
+      projectId,
+      displayName,
+      defaultBranch: fields.defaultBranch.value.trim() || "main",
+      repositories: [{ provider: fields.provider.value, identifier: repository, role: "primary" }],
+      capabilities: ["planning", "implementation", "independent-review", "protected-merge"],
+    };
+    const group = fields.group.value.trim();
+    if (group) entry.group = group;
+    return entry;
+  }
+
+  /* ---------- snapshot ---------- */
+  function snapshotView() {
+    const nodes = [];
+    nodes.push(el("div", { class: "card" },
+      el("h2", { text: "Where this page's data comes from" }),
+      el("p", { class: "small", text: "This console renders one read-only snapshot document. It holds no GitHub, GitLab or model credential, and it never calls a provider API. Rebuild the snapshot with the Forge CLI and paste it below." }),
+      el("pre", { class: "cmd", text: SNAPSHOT_RECIPE }),
+      el("div", { class: "row", style: "margin-top:8px" }, copyButton(SNAPSHOT_RECIPE, "Copy the commands")),
+    ));
+    const area = el("textarea", { placeholder: "Paste the JSON that `sdlcctl control-center` printed" });
+    const result = el("div");
+    nodes.push(el("div", { class: "card" },
+      el("h3", { text: "Load a snapshot" }),
+      el("label", { class: "field" }, el("span", { text: "Snapshot JSON" }), area),
+      el("div", { class: "row" },
+        el("button", { class: "btn primary", type: "button", on: { click: async (event) => {
+          result.replaceChildren();
+          let parsed;
+          try { parsed = JSON.parse(area.value); }
+          catch (error) { result.append(el("div", { class: "banner bad", text: "That is not valid JSON: " + describe(error) })); return; }
+          const problem = validateSnapshot(parsed);
+          if (problem) { result.append(el("div", { class: "banner bad", text: problem })); return; }
+          const bytes = JSON.stringify(parsed).length;
+          if (bytes > 240000) {
+            result.append(el("div", { class: "banner bad", text: `That snapshot is ${Math.round(bytes / 1024)} KiB; the store holds 256 KiB per document. Narrow it with --project-id and load one project at a time.` }));
+            return;
+          }
+          const button = event.currentTarget;
+          button.disabled = true;
+          const at = new Date().toISOString();
+          if (state.db) {
+            try {
+              await state.db.doc("snapshots/current").set({ document: parsed, loadedAt: at, loadedBy: state.viewer?.id || "" });
+            } catch (error) {
+              result.append(el("div", { class: "banner bad", text: "Loaded here, but could not save it for everyone: " + describe(error) }));
+            }
+          }
+          adoptSnapshot(parsed, at, state.viewer?.id || "");
+          button.disabled = false;
+          state.tab = "portfolio";
+          render();
+        } } }, "Load it"),
+        state.snapshot ? copyButton(JSON.stringify(state.snapshot, null, 2), "Copy the current snapshot") : null,
+      ),
+      result,
+    ));
+    if (state.snapshot) {
+      nodes.push(el("div", { class: "card" },
+        el("h3", { text: "The snapshot in view" }),
+        el("div", { class: "row" },
+          chip("generated " + txt(state.snapshot.generatedAt), "line"),
+          state.snapshot.snapshotSha256 ? chip("sha256 " + state.snapshot.snapshotSha256.slice(0, 12), "line") : null,
+          state.snapshotMeta?.loadedAt ? chip("loaded " + state.snapshotMeta.loadedAt, "line") : null,
+        ),
+        (state.snapshot.sources || []).length ? el("div", { class: "small muted", style: "margin-top:8px", text: "sources: " + state.snapshot.sources.join(", ") }) : null,
+      ));
+    }
+    nodes.push(el("div", { class: "card" },
+      el("h3", { text: "What this page will not do" }),
+      el("p", { class: "small muted", text: "It will not merge a change request, scale a runner pool, apply a label, or write to any repository. Those remain with the authority that owns them, and the snapshot names that authority on every remediation. Recording a note or a project draft here changes only this console's own store." }),
+    ));
+    return nodes;
+  }
+
+  const SNAPSHOT_RECIPE = [
+    "gh api 'repos/OWNER/REPO/issues?state=all&per_page=100' > issues.json",
+    "gh api 'repos/OWNER/REPO/pulls?state=open' > pulls.json",
+    "",
+    "sdlcctl github-backlog --issues issues.json --pulls pulls.json \\",
+    "  --project-id PROJECT --repository OWNER/REPO \\",
+    "  --backlog-output backlog.json --incidents-output incidents.json",
+    "",
+    "sdlcctl control-center --registry project-registry.json \\",
+    "  --backlog backlog.json --incidents incidents.json --output snapshot.json",
+  ].join("\n");
+
+  render();
+  connect();
+</script>
