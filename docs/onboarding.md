@@ -123,7 +123,8 @@ beside every other key and hook (unparseable settings are refused, never overwri
 an issue can use the work-request template, and the template applies the planning labels itself;
 so its `preflight` job runs on `ubuntu-latest` (GitHub-hosted, NOT tunable), asks
 `GET repos/{owner}/{repo}/collaborators/{login}/permission` with `GITHUB_TOKEN` whether the
-labeler (`github.event.sender`) and `github.actor` have write, maintain or admin, and the reusable
+labeler (`github.event.sender`), `github.actor` AND whoever applied the ready label most recently
+(read from the issue's label events, every page) have write, maintain or admin, and the reusable
 `plan` call runs only `if: needs.preflight.outputs.authorized == 'true'`. An outsider's issue
 therefore never occupies a self-hosted runner; a maintainer who re-applies the ready label starts
 planning. (`agent-plan.yml` is `workflow_dispatch` only, which already requires write access.)
@@ -134,7 +135,14 @@ first job, `authorize` (`ubuntu-latest`, carrying the label condition, NOT tunab
 identical collaborator-permission check, and every job that can reach your runners --
 `preflight`, the reusable `implement` call and `notify_failure` -- lists `authorize` in `needs`
 and runs only when `needs.authorize.outputs.authorized == 'true'`. Toggling a label without write
-access therefore never schedules anything on a self-hosted runner. (`agent-implement.yml` is
+access therefore never schedules anything on a self-hosted runner. The approver is read from the
+label history, not taken from the event: the run can be triggered by a writer adding the last
+prerequisite label after a Triage user applied `implementation-approved`, so whoever applied
+`implementation-approved` most recently must have write, maintain or admin too -- the rule
+`sdlcctl authorize-labeler` applies for a cloud routine. That approver, not the event's sender, is
+what the reusable call receives as `trigger_actor` (the platform re-checks its permission). Label
+events that cannot be read, or that never show the label applied, fail `authorize`; a label
+removed since it was last applied is "unauthorized". (`agent-implement.yml` is
 `workflow_dispatch` only and has no `authorize` job.)
 
 A permission check that cannot get a definitive answer (rate limit, 5xx, network) after its
@@ -335,6 +343,10 @@ something that runs differently.
   default from `GET repos/{owner}/{repo}/actions/permissions/workflow`) is the ceiling for every
   job of the callee and everything it calls in turn; a callee job asking for more fails the
   contract check, and a ceiling doctor cannot determine is a manual TODO.
+- The commit guard checks a rebase's branch operand like any other named destination: `git
+  rebase UPSTREAM BRANCH` and `git rebase [--onto X] --root BRANCH` (whose only operand is the
+  branch) need BRANCH's lease wherever they run; operands it cannot tell from option values (an
+  unknown or abbreviated option, too many operands) block the command.
 - The commit guard's open-PR fallback counts only a PR whose head branch lives in this
   repository: `gh pr list --head` matches the branch NAME, so a fork's PR from an identically
   named branch is not this branch's claim.

@@ -619,33 +619,96 @@ def _reassigned_in(events: list[dict], login: str, claimed_at: datetime) -> bool
     return False
 
 
-def open_prs_for_issue(project: str, issue: int, gh: GhRunner) -> list[dict]:
-    raw = (
-        gh(
-            [
-                "pr",
-                "list",
-                "--repo",
-                project,
-                "--state",
-                "open",
-                "--limit",
-                "1000",
-                "--json",
-                "number,url,body,title,headRefName,"
-                "headRepository,headRepositoryOwner,isCrossRepository,"
-                "closingIssuesReferences",
-            ]
-        )
-        or "[]"
-    )
+#: Every open pull request of the repository, one cursor page at a time (Codex 4239965191:
+#: `gh pr list --limit N` TRUNCATES, so an issue's PR beyond the first N went unseen and a claim
+#: started duplicate work). The fields are those `gh pr list --json` returned -- GitHub's GraphQL
+#: names -- so every signal below reads them unchanged; `closingIssuesReferences` carries the
+#: Development-sidebar links (Codex 4239780827), which no REST pulls endpoint exposes.
+_OPEN_PRS_QUERY = """\
+query($owner: String!, $name: String!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(states: OPEN, first: 100, after: $after) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number url title body headRefName isCrossRepository
+        headRepository { name }
+        headRepositoryOwner { login }
+        closingIssuesReferences(first: 100) {
+          pageInfo { hasNextPage }
+          nodes { number repository { name owner { login } } }
+        }
+      }
+    }
+  }
+}"""
+#: A runaway cursor (an answer that never ends) stops here and refuses, never "no PR".
+_MAX_PR_PAGES = 1000
+
+
+def _open_pr_page(project: str, after: str | None, gh: GhRunner) -> tuple[list, str | None]:
+    """One page of open PRs and the cursor of the next (None: this was the last). Anything but
+    a well-formed page raises LeaseError: an unreadable inventory is never "no open PR"."""
+    owner, _, name = project.partition("/")
+    args = ["api", "graphql", "-f", f"query={_OPEN_PRS_QUERY}"]
+    args += ["-f", f"owner={owner}", "-f", f"name={name}"]
+    if after is not None:
+        args += ["-f", f"after={after}"]
+    what = "unreadable answer listing the open pull requests"
     try:
-        prs = json.loads(raw)
+        answer = json.loads(gh(args) or "null")
     except ValueError as exc:
-        raise LeaseError("unreadable answer from gh pr list: not JSON") from exc
-    # An unreadable inventory is never "no open PR": that would let a claim start duplicate work.
-    if not isinstance(prs, list) or not all(isinstance(pr, dict) for pr in prs):
-        raise LeaseError("unreadable answer from gh pr list: not a list of pull requests")
+        raise LeaseError(f"{what}: not JSON") from exc
+    if not isinstance(answer, dict) or answer.get("errors"):
+        raise LeaseError(
+            f"{what}: {str(answer.get('errors') if isinstance(answer, dict) else answer)[:200]}"
+        )
+    data = answer.get("data")
+    repo = data.get("repository") if isinstance(data, dict) else None
+    prs = repo.get("pullRequests") if isinstance(repo, dict) else None
+    info = prs.get("pageInfo") if isinstance(prs, dict) else None
+    nodes = prs.get("nodes") if isinstance(prs, dict) else None
+    if not isinstance(info, dict) or not isinstance(nodes, list):
+        raise LeaseError(f"{what}: no page of pull requests in it")
+    if not all(isinstance(pr, dict) for pr in nodes):
+        raise LeaseError(f"{what}: not a list of pull requests")
+    more = info.get("hasNextPage")
+    if more is False:
+        return nodes, None
+    cursor = info.get("endCursor")
+    if more is not True or not isinstance(cursor, str) or not cursor or cursor == after:
+        raise LeaseError(f"{what}: the page does not say where the next one starts")
+    return nodes, cursor
+
+
+def _flatten_links(pr: dict, project: str) -> dict:
+    """`pr` with `closingIssuesReferences` as the plain list `_links_issue` reads. A PR with
+    more linked issues than one page holds raises: the unread ones could be this issue."""
+    refs = pr.get("closingIssuesReferences")
+    if isinstance(refs, dict):
+        info = refs.get("pageInfo")
+        if not isinstance(info, dict) or info.get("hasNextPage") is not False:
+            raise LeaseError(
+                f"{project} pull request #{pr.get('number')}: its linked issues could not all "
+                "be read; not concluding that no open PR covers the issue"
+            )
+        pr = {**pr, "closingIssuesReferences": refs.get("nodes")}
+    return pr
+
+
+def open_pull_requests(project: str, gh: GhRunner) -> list[dict]:
+    """EVERY open pull request of `project` (cursor-paginated to the end; see above)."""
+    prs: list[dict] = []
+    after: str | None = None
+    for _ in range(_MAX_PR_PAGES):
+        nodes, after = _open_pr_page(project, after, gh)
+        prs.extend(_flatten_links(pr, project) for pr in nodes)
+        if after is None:
+            return prs
+    raise LeaseError(f"listing the open pull requests of {project} did not end; not concluding")
+
+
+def open_prs_for_issue(project: str, issue: int, gh: GhRunner) -> list[dict]:
+    prs = open_pull_requests(project, gh)
     hits = []
     for pr in prs:
         text = f"{pr.get('title', '')}\n{pr.get('body', '')}"
@@ -1371,7 +1434,8 @@ def render_claims(rows: Sequence[ClaimRow]) -> str:
 
 # ---- Approval labeler authorization (Codex 4239868029). A user with Triage permission can apply
 # labels without repository write authority, so the labels alone never authorize work: the
-# Actions path runs `_authorize-labeler.yml` before implementing, and a cloud routine runs
+# Actions path runs `_authorize-labeler.yml` before implementing (the same history rule, in shell:
+# Codex 4239965189), and a cloud routine runs
 # `sdlcctl authorize-labeler` before claiming. Both require a DEFINITIVE write/maintain/admin
 # answer for whoever applied the approval label most recently: a 200 carrying the permission, or
 # a 404 (no access: unauthorized). Anything else -- the events or the permission unreadable, no

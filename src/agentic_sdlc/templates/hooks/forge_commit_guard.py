@@ -869,8 +869,35 @@ SWITCH_FREE = frozenset(
 QUIET_OPTS = frozenset({"-q", "--quiet"})
 CHECKOUT_CREATE_OPTS = frozenset({"-b", "-B", "--orphan"})
 SWITCH_CREATE_OPTS = frozenset({"-c", "-C", "--create", "--force-create", "--orphan"})
-REBASE_VALUE_OPTS = frozenset({"--onto", "-s", "--strategy", "-X", "--strategy-option", "-x"})
-REBASE_VALUE_OPTS |= {"--exec", "-S", "--gpg-sign"}
+# `git rebase` options (Codex 4239965192): which ones take a value -- attached (`--onto=X`,
+# `-sours`) or as the next word -- and which take none. `-S`/`--gpg-sign` and `-r`/
+# `--rebase-merges` take an OPTIONAL value, attached only: `-S main forge/issue-7` is two
+# operands. Anything else -- an abbreviated `--ont`, an option this list does not know -- makes
+# the operands unknowable and the command is blocked (`_rebase_branch` returns UNKNOWN_REF).
+REBASE_LONG_VALUE = frozenset(
+    {"--onto", "--strategy", "--strategy-option", "--exec", "--whitespace", "--empty", "--trailer"}
+)
+REBASE_LONG_OPTIONAL = frozenset({"--gpg-sign", "--rebase-merges"})
+REBASE_LONG_FLAGS = frozenset(
+    {
+        "--interactive", "--keep-base", "--root", "--fork-point", "--no-fork-point",
+        "--autosquash", "--no-autosquash", "--autostash", "--no-autostash", "--quiet",
+        "--verbose", "--stat", "--no-stat", "--verify", "--no-verify", "--signoff",
+        "--committer-date-is-author-date", "--reset-author-date", "--ignore-date",
+        "--ignore-whitespace", "--force-rebase", "--no-ff", "--merge", "--apply",
+        "--keep-empty", "--no-keep-empty", "--reapply-cherry-picks",
+        "--no-reapply-cherry-picks", "--allow-empty-message", "--rerere-autoupdate",
+        "--no-rerere-autoupdate", "--no-rebase-merges", "--no-gpg-sign", "--update-refs",
+        "--no-update-refs", "--reschedule-failed-exec", "--no-reschedule-failed-exec",
+    }
+)  # fmt: skip
+# The action forms (`git rebase --continue`) take no operand at all.
+REBASE_ACTIONS = frozenset(
+    {"--continue", "--skip", "--abort", "--quit", "--edit-todo", "--show-current-patch"}
+)
+REBASE_SHORT_FLAGS = frozenset("iqvnfmk")
+REBASE_SHORT_OPTIONAL = frozenset("rS")
+REBASE_SHORT_VALUE = frozenset("sXxC")
 # A program that mentions git AND one of these words may move HEAD through it.
 _MOVES_HEAD = re.compile(
     r"(?<![\w-])(?:checkout|switch|rebase|bisect|symbolic-ref|branch)(?![\w-])"
@@ -1414,9 +1441,15 @@ def _rebase_refs(args: list[str], where: str, target: Target, unsafe: bool) -> l
     for arg in args:
         if arg.startswith(("--exec", "--update-refs")) or "x" in _short_cluster(arg):
             return [UNKNOWN_REF]
+    # The branch operand is a destination like any named ref (`git rebase --onto X --root
+    # forge/issue-7` from main rewrites issue 7's branch); unknowable operands block.
+    branch = _rebase_branch(args)
+    if branch == UNKNOWN_REF:
+        return [UNKNOWN_REF]
+    named = [_branch_name(branch)] if branch else []
     if "--no-update-refs" in args:
-        return []
-    return _rebase_update_refs(where, target, unsafe)
+        return named
+    return named + [r for r in _rebase_update_refs(where, target, unsafe) if r not in named]
 
 
 def _rebase_update_refs(where: str, target: Target, unsafe: bool) -> list[str]:
@@ -1534,17 +1567,64 @@ def _dynamic_ref(arg: str) -> bool:
     )
 
 
-def _rebase_branch(args: list[str]) -> str | None:
-    """The branch `git rebase [opts] UPSTREAM BRANCH` checks out first (None without one)."""
-    rest, positionals = list(args), []
+def _rebase_operands(args: list[str]) -> tuple[bool, bool, list[str]] | None:
+    """(--root given, an action form, the positional operands) of `git rebase ARGS`, or None
+    when they cannot be told apart from option values (see REBASE_LONG_VALUE)."""
+    rest, positionals, root, action = list(args), [], False, False
     while rest:
         arg = rest.pop(0)
-        if arg in REBASE_VALUE_OPTS:
-            if rest:
-                rest.pop(0)
-        elif not arg.startswith("-"):
+        if arg == "--":
+            positionals += rest
+            break
+        if arg.startswith("--"):
+            option, eq, _ = arg.partition("=")
+            if option in REBASE_LONG_VALUE:
+                if not eq:
+                    if not rest:
+                        return None
+                    rest.pop(0)
+            elif option in REBASE_LONG_OPTIONAL:
+                pass  # its value is attached or absent
+            elif option in REBASE_LONG_FLAGS and not eq:
+                root = root or option == "--root"
+            elif option in REBASE_ACTIONS and not eq:
+                action = True
+            else:
+                return None
+        elif arg.startswith("-") and len(arg) > 1:
+            letters = arg[1:]
+            for index, letter in enumerate(letters):
+                if letter in REBASE_SHORT_FLAGS:
+                    continue
+                if letter in REBASE_SHORT_OPTIONAL:
+                    break  # the rest of the cluster is its value
+                if letter in REBASE_SHORT_VALUE:
+                    if index == len(letters) - 1:
+                        if not rest:
+                            return None
+                        rest.pop(0)
+                    break
+                return None
+        else:
             positionals.append(arg)
-    return positionals[1] if len(positionals) > 1 else None
+    return root, action, positionals
+
+
+def _rebase_branch(args: list[str]) -> str | None:
+    """The branch `git rebase` checks out and rewrites when it names one, None when it names
+    none (it rebases the current branch), UNKNOWN_REF when that cannot be known. The forms
+    (Codex 4239965192): `[UPSTREAM [BRANCH]]` -- with or without `--onto X`, `--keep-base`,
+    `--fork-point`, `-i` -- and `--root [BRANCH]`, whose ONLY operand is the branch."""
+    parsed = _rebase_operands(args)
+    if parsed is None:
+        return UNKNOWN_REF
+    root, action, positionals = parsed
+    if action:
+        return UNKNOWN_REF if positionals else None
+    limit = 1 if root else 2
+    if len(positionals) > limit:
+        return UNKNOWN_REF  # git refuses too many operands; never guess which one is the branch
+    return positionals[limit - 1] if len(positionals) == limit else None
 
 
 def _segment_switch(seg: list[str], depth: int) -> tuple[str, str | None]:
@@ -1594,6 +1674,8 @@ def _segment_switch(seg: list[str], depth: int) -> tuple[str, str | None]:
         if any(_EXPANSION.search(a) for a in args):
             return "unknown", None
         branch = _rebase_branch(args)
+        if branch == UNKNOWN_REF:
+            return "unknown", None
         return ("maybe", branch) if branch else ("none", None)
     if sub == "branch":
         if not any(a in ("-m", "-M", "--move") for a in args):
