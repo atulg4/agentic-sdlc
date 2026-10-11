@@ -22,7 +22,7 @@ import subprocess
 import tempfile
 import tomllib
 import unicodedata
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import quote
@@ -41,7 +41,7 @@ from .leases import IN_PROGRESS_LABEL, PUBLISHER_APP_SLUG_HINT
 from .missions import MissionError, load_registry
 from .openai_compatible import PROVIDERS as OPENAI_COMPATIBLE_PROVIDERS
 from .openai_compatible import ROUTED_MIN_CONTEXT_WINDOW
-from .policy import load_policy
+from .policy import branch_name_problem, load_policy
 from .trusted_exec import UntrustedExecutableError, trusted_gh
 
 GhRunner = Callable[..., str]  # (args: Sequence[str], input: str | None = None) -> stdout
@@ -185,26 +185,6 @@ def _project_id_problem(value: object) -> str:
     )
 
 
-def _ref_format_problem(name: str) -> str:
-    """Why `git check-ref-format --branch NAME` would refuse `name` ('' = it would not), by git's
-    own rules, so the answer does not depend on a git binary being installed."""
-    if name in ("@", "HEAD"):
-        return f"must not be {name!r}"
-    if name.startswith("-"):
-        return "must not start with '-'"
-    if name.startswith("/") or name.endswith("/") or "//" in name:
-        return "must not start or end with '/' or contain '//'"
-    if ".." in name or "@{" in name:
-        return "must not contain '..' or '@{'"
-    if name.endswith("."):
-        return "must not end with '.'"
-    if any(part.startswith(".") or part.endswith(".lock") for part in name.split("/")):
-        return "must not have a path component starting with '.' or ending with '.lock'"
-    if any(ord(c) < 0x20 or c == "\x7f" or c in " ~^:?*[\\" for c in name):
-        return "must not contain spaces, control characters or any of ~^:?*[\\"
-    return ""
-
-
 def _git_rejects_branch(name: str) -> bool:
     """Does the installed git refuse `name` as a branch name? False when git cannot be run (the
     rules above are then the whole check)."""
@@ -222,18 +202,17 @@ def _git_rejects_branch(name: str) -> bool:
 
 
 def _branch_problem(value: object) -> str:
-    """A branch name: renderable, a valid Git branch name by `git check-ref-format --branch`'s
-    rules (and by the installed git, when there is one: both must accept it), and within the
-    character set every generated workflow can carry unquoted."""
+    """A branch name: renderable and a valid Git branch name by `git check-ref-format --branch`'s
+    rules (and by the installed git, when there is one: both must accept it), minus only the
+    characters a downstream sink cannot carry (`policy.branch_name_problem`, which the policy
+    loader applies too). Codex 4242545214: `release+next`, `feature@two` are valid."""
     problem = _str_problem(value)
     if problem:
         return problem
     name = str(value)
-    if not re.fullmatch(r"[A-Za-z0-9._/-]+", name):
-        return "contains unsupported characters"
-    problem = _ref_format_problem(name)
+    problem = branch_name_problem(name)
     if problem:
-        return f"is not a valid Git branch name: {problem}"
+        return problem
     if _git_rejects_branch(name):
         return "is not a valid Git branch name (git check-ref-format --branch refuses it)"
     return ""
@@ -826,6 +805,14 @@ def _yaml_str(value: object) -> str:
     return json.dumps(str(value), ensure_ascii=False)
 
 
+def _branch_filter_literal(branch: str) -> str:
+    """`branch` as a GitHub workflow branch-filter pattern matching exactly that one branch:
+    every filter-special character (`*?+[]\\!`) backslash-escaped (the filter pattern cheat
+    sheet's escape). Git refuses `*?[\\` in branch names; `release+next` needs `\\+`, or the
+    filter would read `+` as "one or more `e`" and never match the branch itself."""
+    return "".join("\\" + c if c in _GLOB_SPECIAL else c for c in branch)
+
+
 def _yaml_labels(labels: Sequence[str]) -> str:
     """A YAML flow sequence of quoted strings (runner labels stay labels, never true/null/123)."""
     return "[" + ", ".join(_yaml_str(label) for label in labels) + "]"
@@ -1089,7 +1076,9 @@ def render_cloud_routine_md(spec: OnboardSpec) -> str:
     lease = f"--project {spec.project_id} --issue <n> --session <run id>"
     release = f"`sdlcctl release {lease}`"
     renew = f"`sdlcctl renew {lease} --config agentic-sdlc.toml`"
-    base = f"origin/{spec.default_branch}"
+    # Shell words (Codex 4242545214): a Git-valid branch name can hold `&`, `;`, `(`, `'` ...
+    branch = shlex.quote(spec.default_branch)
+    base = shlex.quote(f"origin/{spec.default_branch}")
     check_request = (
         f"sdlcctl check-request --project {spec.project_id} --issue <n> "
         f"--config agentic-sdlc.toml --base {base}"
@@ -1139,7 +1128,7 @@ def render_cloud_routine_md(spec: OnboardSpec) -> str:
    If the claim is refused (exit 2), skip that issue and take the next one.
 2. Check the request deterministically (the same validator and dependency rule as the Actions
    implement path: Codex 4241434511), with the policy as committed on the default branch
-   (Codex 4241614590): `git fetch origin {spec.default_branch}`, then
+   (Codex 4241614590): `git fetch origin {branch}`, then
    `{check_request}`.
    It prints `content digest: sha256:...`; keep that value as <digest> -- it names the request
    exactly as checked here, and step 4d refuses to publish if the title or body changes after
@@ -1150,8 +1139,8 @@ def render_cloud_routine_md(spec: OnboardSpec) -> str:
    still open -- {release} (do NOT block it: it becomes ready once its dependencies close)
    and go back to step 1a with the next candidate. Any other exit: it could not be verified
    -- {release} and go back to step 1a with the next candidate.
-3. `git fetch origin {spec.default_branch}` and create branch <branch> from
-   `origin/{spec.default_branch}`. Implement the smallest change that satisfies the acceptance
+3. `git fetch origin {branch}` and create branch <branch> from
+   `{base}`. Implement the smallest change that satisfies the acceptance
    criteria, tests first, and commit it. Never touch `forbidden_paths` from agentic-sdlc.toml;
    stay within max_changed_files={spec.max_changed_files} and
    max_diff_lines={spec.max_diff_lines}.
@@ -1168,7 +1157,7 @@ def render_cloud_routine_md(spec: OnboardSpec) -> str:
 4a. Renew the lease again, exactly as in step 3a (same command; on failure stop the same way).
 4b. Check the diff policy on exactly what will be pushed (Codex 4241434509: the same
    `evaluate_diff` the Actions path applies -- forbidden paths, file, line and byte caps). Commit
-   everything first; then `git fetch origin {spec.default_branch}` and
+   everything first; then `git fetch origin {branch}` and
    `{check_diff}`.
    It diffs the committed HEAD against its merge base with the default branch -- every commit
    of the series, not only the end state (Codex 4241839922) -- under the policy committed on
@@ -1674,7 +1663,8 @@ def _render_workflow(name: str, spec: OnboardSpec, issue_expr: str | None = None
         "AGENT": _yaml_str(spec.implementer),
         "EXECUTOR_REGISTRY_PATH": _yaml_str(".forge/executors.json" if spec.routed else ""),
         "ROUTING_POLICY_PATH": _yaml_str(".forge/routing-policy.json" if spec.routed else ""),
-        "DEFAULT_BRANCH": _yaml_str(spec.default_branch),
+        # A GitHub branch FILTER, not a name: `+`, `!`, `]` would be glob syntax there.
+        "DEFAULT_BRANCH": _yaml_str(_branch_filter_literal(spec.default_branch)),
         "SETUP_COMMAND": _yaml_run(spec.setup_command),
         "QUALITY_COMMAND": _yaml_run(spec.quality_command),
         "TEST_COMMAND": _yaml_run(spec.test_command),
@@ -2299,6 +2289,11 @@ def apply_repo_settings(
 ) -> list[str]:
     """Idempotently create labels, the protect-main ruleset and repo variables. Returns a log."""
     log: list[str] = []
+    # Codex 4242545209: a name GitHub refuses would fail at `gh variable set`, AFTER the labels
+    # and ruleset below were already changed. Refuse it before the first remote call.
+    problem = variable_names_problem(variables or {})
+    if problem:
+        raise OnboardError(f"{problem}; nothing was changed")
     # Codex 4240170627: an archived or disabled repository accepts none of the writes below (nor
     # any Forge run's): refuse before the first one, and when writability cannot be confirmed.
     require_writable_repository(
@@ -2369,6 +2364,30 @@ def apply_repo_settings(
         gh(["variable", "set", key, "--repo", spec.project_id, "--body", value])
         log.append(f"variable {key}")
     return log
+
+
+_VARIABLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def variable_name_problem(name: str) -> str:
+    """Why GitHub would refuse `name` as an Actions variable name ('' = it would not): only
+    alphanumerics and `_`, not starting with a digit, and no `GITHUB_` prefix (any case)."""
+    if not name:
+        return "must not be empty"
+    if not _VARIABLE_NAME.fullmatch(name):
+        return "may contain only letters, digits and '_', and must not start with a digit"
+    if name.upper().startswith("GITHUB_"):
+        return "must not start with 'GITHUB_' (reserved by GitHub)"
+    return ""
+
+
+def variable_names_problem(names: Iterable[str]) -> str:
+    """The first invalid Actions variable name in `names`, as an error message ('' = none)."""
+    for name in names:
+        problem = variable_name_problem(name)
+        if problem:
+            return f"repo variable name {name!r} {problem}"
+    return ""
 
 
 def registry_model_vars(registry: dict) -> list[str]:
@@ -3964,13 +3983,16 @@ def _ref_pattern_scope_case(
     low = (lambda x: x.lower()) if fold else (lambda x: x)
     if pattern == "~ALL":
         return True
-    if pattern == "~DEFAULT_BRANCH":
-        pattern = "refs/heads/" + default_branch  # git ref names hold no glob characters
+    # `~DEFAULT_BRANCH` names the branch itself, never a glob: a Git-valid name may hold `{`,
+    # `}`, `!` (Codex 4242545214), which fnmatch would read as syntax. Match it literally.
+    literal = pattern == "~DEFAULT_BRANCH"
+    if literal:
+        pattern = "refs/heads/" + default_branch
     pattern = low(pattern)
     ref = PublisherValue(tuple(low(lit) for lit in ref.literals), ref.variables)
     if not pattern.startswith("refs/"):
         return None  # GitHub may read it relative to refs/heads/: do not guess
-    readings = _ref_glob_regexes(pattern)
+    readings = [re.escape(pattern)] if literal else _ref_glob_regexes(pattern)
     if ref.constant:
         if readings is None:
             return None

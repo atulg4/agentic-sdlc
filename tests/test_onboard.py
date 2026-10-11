@@ -12741,3 +12741,147 @@ def test_session_start_runs_only_trusted_programs(tmp_path, monkeypatch):
     if os.geteuid() == 0 or guard._trust_note("gh"):
         assert start.run(["gh", "api", "repos/x/y/issues"]) is None
     assert not marker.exists()
+
+
+# Codex 4242545209: every --var name is validated before any file is written or anything
+# remote is read or changed; `gh variable set ''` used to fail only after labels and rulesets.
+
+
+@pytest.mark.parametrize(
+    "item",
+    ["=value", "1ABC=x", "A-B=x", "A B=x", "GITHUB_TOKEN=x", "github_sha=x", "Ä=x"],
+)
+def test_cli_onboard_rejects_an_invalid_var_name_before_anything(item, tmp_path, monkeypatch):
+    from agentic_sdlc import cli
+
+    for name in (
+        "apply_repo_settings",
+        "canonical_project_id",
+        "resolve_platform_ref",
+        "repository_default_branch",
+        "repository_fork_exposed",
+        "write_onboarding",
+    ):
+        monkeypatch.setattr(cli, name, lambda *a, _n=name, **k: pytest.fail(f"{_n} called"))
+    repo = _repo(tmp_path)
+    with pytest.raises(OnboardError, match="variable name") as caught:
+        cli._onboard(
+            cli.build_parser().parse_args(
+                [
+                    "onboard",
+                    "--visibility",
+                    "auto",
+                    "--destination",
+                    str(repo),
+                    "--project-id",
+                    "owner/comic",
+                    "--platform-repository",
+                    "owner/agentic-sdlc",
+                    "--platform-ref",
+                    "main",
+                    "--test",
+                    "pytest -q",
+                    "--apply",
+                    "--var",
+                    "GOOD_NAME=1",
+                    "--var",
+                    item,
+                ]
+            )
+        )
+    assert repr(item) in str(caught.value)
+    assert not (repo / "agentic-sdlc.toml").exists()
+
+
+@pytest.mark.parametrize("name", ["A", "_x", "model_1", "DEEPSEEK_MODEL_PRO", "GITHUBX"])
+def test_variable_name_problem_accepts_github_variable_names(name):
+    from agentic_sdlc.onboard import variable_name_problem
+
+    assert variable_name_problem(name) == ""
+
+
+@pytest.mark.parametrize("name", ["", "1A", "A-B", "A.B", "GITHUB_X", "Github_x"])
+def test_variable_name_problem_rejects_what_github_refuses(name):
+    from agentic_sdlc.onboard import variable_name_problem
+
+    assert variable_name_problem(name)
+
+
+def test_apply_repo_settings_refuses_a_bad_variable_name_before_any_gh_call():
+    from agentic_sdlc.onboard import apply_repo_settings
+
+    gh = FakeGh()
+    with pytest.raises(OnboardError, match="nothing was changed"):
+        apply_repo_settings(spec(), gh, variables={"OK": "1", "": "x"})
+    assert gh.calls == []
+
+
+# Codex 4242545214: any name `git check-ref-format --branch` accepts is a valid default branch,
+# except the characters the platform's double-quoted shell sink cannot carry; every sink Forge
+# renders itself quotes or escapes it.
+
+GIT_VALID_BRANCHES = ["release+next", "feature@two", "a{b}!c", "x&y;(z)", "it's"]
+
+
+@pytest.mark.parametrize("branch", GIT_VALID_BRANCHES)
+def test_git_valid_default_branches_round_trip_through_onboarding(branch, tmp_path):
+    import shlex
+    import subprocess
+
+    from agentic_sdlc import onboard
+    from agentic_sdlc.policy import load_policy
+
+    git = subprocess.run(["git", "check-ref-format", "--branch", branch], capture_output=True)
+    assert git.returncode == 0, branch
+    assert onboard.policy_field_problem("default branch", branch) == ""
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(default_branch=branch))
+    assert load_policy(repo / "agentic-sdlc.toml").default_branch == branch
+    # ci.yml: the push filter is a glob that matches exactly this branch
+    ci = yaml.safe_load((repo / ".github/workflows/ci.yml").read_text())
+    (pattern,) = ci[True]["push"]["branches"]
+    assert onboard._branch_glob_matches(pattern, branch) is True
+    assert onboard._branch_glob_matches(pattern, branch + "x") is False
+    if "+" in branch:
+        assert onboard._branch_glob_matches(pattern, branch.replace("+", "")) is False
+    # the session-start hook carries it as a Python string literal
+    hook = (repo / ".claude/hooks/forge_session_start.py").read_text()
+    assert f"DEFAULT_BRANCH = {json.dumps(branch)}" in hook
+    # the ruleset's ~DEFAULT_BRANCH is that one branch, matched literally (never a glob)
+    agent = onboard.PublisherValue(
+        ("refs/heads/forge/issue-", "-", ""), ("ISSUE_NUMBER", "RUN_STAMP")
+    )
+    assert onboard._ref_pattern_scope("~DEFAULT_BRANCH", agent, branch) is False
+    itself = onboard.PublisherValue(("refs/heads/" + branch,), ())
+    assert onboard._ref_pattern_scope("~DEFAULT_BRANCH", itself, branch) is True
+    # the cloud routine prompt passes it as one shell word
+    prompt = _routine_prompt(default_branch=branch)
+    fetch = re.search(r"`(git fetch origin [^`]*)`", prompt).group(1)
+    assert shlex.split(fetch) == ["git", "fetch", "origin", branch]
+    check = re.search(r"`(sdlcctl check-diff [^`]*)`", prompt).group(1)
+    assert shlex.split(check)[-2:] == ["--base", f"origin/{branch}"]
+    # doctor, offline, finds nothing about it that it would not find for `main`
+    plain = _repo(tmp_path / "plain")
+    write_onboarding(plain, spec())
+
+    def failures(path):
+        report = doctor(path, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+        return {c.name for c in report.checks if not c.ok}
+
+    assert failures(repo) == failures(plain)
+
+
+@pytest.mark.parametrize("branch", ['a"b', "a$b", "a${{x}}", "a`b"])
+def test_default_branch_rejects_only_what_the_platform_shell_sink_cannot_carry(branch, tmp_path):
+    from agentic_sdlc import onboard
+    from agentic_sdlc.policy import load_policy
+
+    assert "reusable-implement.yml" in onboard.policy_field_problem("default branch", branch)
+    with pytest.raises(OnboardError):
+        spec(default_branch=branch)
+    policy = tmp_path / "agentic-sdlc.toml"
+    policy.write_text(
+        f'version = 1\n[project]\nid = "owner/comic"\ndefault_branch = {json.dumps(branch)}\n'
+    )
+    with pytest.raises(ValueError, match="reusable-implement.yml"):
+        load_policy(policy)

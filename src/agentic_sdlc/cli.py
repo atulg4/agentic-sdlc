@@ -86,6 +86,7 @@ from .onboard import (
     resolve_platform_ref,
     reusable_calls,
     run_gh,
+    variable_name_problem,
     write_onboarding,
 )
 from .orchestration import OrchestrationError, Orchestrator
@@ -1110,6 +1111,17 @@ def _scaffold(args: argparse.Namespace) -> int:
 
 def _onboard(args: argparse.Namespace) -> int:
     destination = Path(args.destination).resolve()
+    # Validate CLI input before any file is written or anything remote is read or changed
+    # (Codex 4242545209: `--var '=value'` used to get as far as `gh variable set ''`).
+    assignments: dict[str, str] = {}
+    for item in args.var or ():
+        key, sep, value = item.partition("=")
+        if not sep:
+            raise OnboardError(f"--var expects KEY=VALUE, got {item!r}")
+        problem = variable_name_problem(key)
+        if problem:
+            raise OnboardError(f"--var {item!r}: the variable name {problem}")
+        assignments[key] = value
     # The policy must name the repository as GitHub spells it ($GITHUB_REPOSITORY, compared
     # exactly by prepare-request); --apply reads it anyway. Offline, doctor checks the spelling.
     project_id = canonical_project_id(args.project_id) if args.apply else args.project_id
@@ -1151,12 +1163,6 @@ def _onboard(args: argparse.Namespace) -> int:
         forbidden_paths=tuple(args.forbidden or ()),
         protected_paths=tuple(args.protected or ()),
     )
-    assignments: dict[str, str] = {}
-    for item in args.var or ():  # validate CLI input before any file is written
-        key, sep, value = item.partition("=")
-        if not sep:
-            raise OnboardError(f"--var expects KEY=VALUE, got {item!r}")
-        assignments[key] = value
     written = write_onboarding(destination, spec, force=args.force)
     result: dict[str, Any] = {
         "project_id": project_id,
