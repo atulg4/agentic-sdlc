@@ -94,17 +94,51 @@ def git_env(base: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
-def run(cmd: list[str]) -> str | None:
-    """The command's stdout, or None when it failed -- a failure is never an empty answer. A git
-    command runs with `git_env()`."""
+#: Variables that make the dynamic loader run code of the caller's choosing in any program.
+_LOADER_ENV_PREFIXES = ("LD_", "DYLD_")
+
+
+def _guard():
+    """The sibling commit guard module, or None when it is missing."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
     try:
+        import forge_commit_guard
+    except ImportError:
+        return None
+    return forge_commit_guard
+
+
+def run(cmd: list[str]) -> str | None:
+    """The command's stdout, or None when it failed -- a failure is never an empty answer.
+
+    Never a PATH lookup (Codex 4242095555, 4242095556): `git` and `gh` are the commit guard's
+    vetted programs (`_trusted_program`: a file only root can replace), so a `git` or `gh` an
+    earlier session dropped into a writable PATH entry can neither run here nor fabricate the
+    lease inventory this hook prints. `gh` runs as the guard runs it (`_gh`: allowlisted
+    environment, private config directory, pinned host). `git` runs with `git_env()` over this
+    process's environment without the loader's variables (`LD_*`, `DYLD_*`); unlike the guard's
+    plumbing probes it keeps the caller's PATH, HOME and SSH/credential settings, because the
+    fetch contacts the remote through them -- the helpers it may run are vetted first
+    (`fetch_blocker`). No trusted program, or no commit guard to vouch for one: None (fail
+    closed: the output says the read was unavailable)."""
+    guard = _guard()
+    if guard is None or cmd[:1] not in (["git"], ["gh"]):
+        return None
+    try:
+        if cmd[0] == "gh":
+            return guard._gh(cmd[1:], check=True, timeout=60).stdout.strip()
+        base = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith(_LOADER_ENV_PREFIXES)
+        }
         return subprocess.run(
-            cmd,
+            [guard._trusted_program("git"), *cmd[1:]],
             capture_output=True,
             text=True,
             check=True,
             timeout=60,
-            env=git_env() if cmd[:1] == ["git"] else None,
+            env=git_env(base),
         ).stdout.strip()
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return None

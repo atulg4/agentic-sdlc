@@ -777,6 +777,7 @@ def test_commit_guard_blocks_only_unleased_issue_branch_commits(tmp_path):
     module_spec = importlib.util.spec_from_file_location("guard", path)
     guard = importlib.util.module_from_spec(module_spec)
     module_spec.loader.exec_module(guard)
+    _trust_fake_gh(guard)
     from datetime import UTC, datetime, timedelta
 
     live_mine = {
@@ -1166,6 +1167,7 @@ def test_commit_guard_reads_paginated_comments_and_ignores_untrusted_markers(tmp
     module_spec = importlib.util.spec_from_file_location("guard_pages", path)
     guard = importlib.util.module_from_spec(module_spec)
     module_spec.loader.exec_module(guard)
+    _trust_fake_gh(guard)
     expires = (datetime.now(UTC) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     def row(body, login="owner"):
@@ -1274,6 +1276,7 @@ def test_commit_guard_sees_commit_after_value_taking_git_options(tmp_path):
     module_spec = importlib.util.spec_from_file_location("guard_opts", path)
     guard = importlib.util.module_from_spec(module_spec)
     module_spec.loader.exec_module(guard)
+    _trust_fake_gh(guard)
 
     def code(command):
         payload = {"tool_name": "Bash", "session_id": "s1", "tool_input": {"command": command}}
@@ -1357,6 +1360,16 @@ def _is_issue_page(cmd) -> bool:
     return cmd[:2] == ["gh", "api"] and "/issues?state=open&labels=in-progress" in cmd[2]
 
 
+def _trust_fake_gh(module):
+    """Point a loaded guard's gh calls at a bare `gh` with no token lookup, so a test's fake
+    `subprocess.run` answers them (Codex 4242095556: the guard itself only ever runs a vetted
+    absolute gh -- `test_commit_guard_runs_only_a_trusted_gh` covers that)."""
+    if hasattr(module, "_TRUSTED"):
+        module._TRUSTED["gh"] = "gh"
+        module._GH_STATE["token"] = ""
+    return module
+
+
 def _guard_module(tmp_path, name):
     import importlib.util
 
@@ -1365,7 +1378,7 @@ def _guard_module(tmp_path, name):
     module_spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(module_spec)
     module_spec.loader.exec_module(module)
-    return module
+    return _trust_fake_gh(module)
 
 
 def test_doctor_requires_each_caller_to_call_its_own_reusable_workflow(tmp_path):
@@ -8785,7 +8798,7 @@ def test_commit_guard_bounds_every_subprocess_call():
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id == "subprocess"
     ]
-    assert len(calls) >= 6
+    assert len(calls) >= 3  # the trusted git probe, the token read and the trusted gh call
     for call in calls:
         timeouts = [k for k in call.keywords if k.arg == "timeout"]
         assert timeouts, f"subprocess.run at line {call.lineno} has no timeout"
@@ -12116,7 +12129,10 @@ def test_commit_guard_internal_git_never_pages(tmp_path, monkeypatch):
     guard._branch_exists("b", str(tmp_path), ((), ("-p",), ()))
     guard.current_branch(str(tmp_path), ("-p",))
     assert seen and all(c[: c.index("--no-pager")].count("-p") == 1 for c in seen)
-    assert seen[0] == ["git", "-p", "-C", ".", "--no-pager", "rev-parse", "--show-toplevel"]
+    assert seen[0] == [
+        guard._trusted_program("git"),
+        *["-p", "-C", ".", "--no-pager", "rev-parse", "--show-toplevel"],
+    ]
 
 
 def _routine_prompt(**overrides):
@@ -12302,3 +12318,231 @@ def test_cloud_routine_rechecks_the_request_with_its_digest_right_before_pushing
     args = build_parser().parse_args(argv)
     assert args.command == "check-request" and args.expect_digest == "<digest>"
     assert args.base == "origin/trunk"
+
+
+# ---- Codex 4242095555 / 4242095556: the guard's own git and gh are vetted absolute programs.
+
+
+def _raw_guard_module(tmp_path, name="forge_commit_guard"):
+    """A freshly loaded hook WITHOUT `_trust_fake_gh`: its trust resolution is the real one."""
+    import importlib.util
+
+    path = tmp_path / f"{name}.py"
+    path.write_text(render_onboarding(spec())[f".claude/hooks/{name}.py"])
+    module_spec = importlib.util.spec_from_file_location(f"raw_{name}", path)
+    module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+    return module
+
+
+def _shim_dir(tmp_path, marker, **outputs):
+    """A directory of executables named after `outputs`' keys; each records that it ran in
+    `marker` and prints its value -- a planted `git` answering `main`, a `gh` forging a lease."""
+    shims = tmp_path / "shims"
+    shims.mkdir(exist_ok=True)
+    for name, output in outputs.items():
+        shim = shims / name
+        shim.write_text(f"#!/bin/sh\necho {name} >> {marker}\nprintf '%s\\n' '{output}'\n")
+        shim.chmod(0o755)
+    return shims
+
+
+def _issue_repo(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(
+        repo,
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@e",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "x",
+    )
+    _git(repo, "switch", "-q", "-c", "forge/issue-7")
+    return repo
+
+
+def test_commit_guard_branch_probe_ignores_a_planted_git(tmp_path, monkeypatch):
+    """A `git` shim ahead of the system git on PATH that reports `main` must not decide the
+    branch: the probe runs the trusted git, which sees forge/issue-7."""
+    import shutil
+
+    if not any(os.path.isfile(p) for p in ("/usr/bin/git", "/bin/git", "/usr/local/bin/git")):
+        pytest.skip("no system git")
+    guard = _raw_guard_module(tmp_path)
+    if guard._trust_note("git"):
+        pytest.skip("this machine has no root-owned git")
+    repo = _issue_repo(tmp_path)
+    marker = tmp_path / "ran"
+    shims = _shim_dir(tmp_path, marker, git="main")
+    monkeypatch.setenv("PATH", f"{shims}{os.pathsep}{os.environ['PATH']}")
+    assert shutil.which("git") == str(shims / "git")  # the trap is armed
+    assert guard.current_branch(str(repo)) == "forge/issue-7"
+    assert guard.commit_branches("git commit -m x", str(repo)) == ["forge/issue-7"]
+    assert not marker.exists()  # the planted git never ran
+
+
+def test_commit_guard_without_a_trusted_git_refuses(tmp_path, monkeypatch):
+    """No git only root can replace: the branch is unknown and the command is refused, with
+    the reason -- never a PATH lookup instead."""
+    guard = _raw_guard_module(tmp_path)
+    repo = _issue_repo(tmp_path)
+    marker = tmp_path / "ran"
+    shims = _shim_dir(tmp_path, marker, git="main")
+    monkeypatch.setattr(guard, "SYSTEM_GIT_PATHS", (str(tmp_path / "no-such-git"),))
+    monkeypatch.setenv("PATH", str(shims))  # only the planted git (not root-owned, or root)
+    monkeypatch.delenv("AGENTIC_SDLC_GIT", raising=False)
+    assert guard.current_branch(str(repo)) == guard.BRANCH_UNKNOWN
+    commit = {"tool_name": "Bash", "session_id": "s1", "tool_input": {"command": "git commit"}}
+    code, message = guard.decide(commit, guard.BRANCH_UNKNOWN, lambda n: None, lambda b: False)
+    assert code == 2 and "only root can replace and found none" in message
+    assert not marker.exists()
+
+
+def test_commit_guard_lease_reads_ignore_a_planted_gh(tmp_path, monkeypatch):
+    """A `gh` shim on PATH that forges a live claim for this session must not be run: with no
+    trusted gh the lease is UNAVAILABLE (refused), the PR list unreadable, the permission read
+    unavailable."""
+    guard = _raw_guard_module(tmp_path)
+    marker = tmp_path / "ran"
+    forged = json.dumps(
+        [
+            [
+                {
+                    "body": "<!-- forge-claim agent=a session=s1 branch=b "
+                    "expires=2999-01-01T00:00:00Z -->",
+                    "user": {"login": "forge-bot[bot]", "type": "Bot"},
+                }
+            ]
+        ]
+    )
+    shims = _shim_dir(tmp_path, marker, gh=forged)
+    monkeypatch.setattr(guard, "SYSTEM_GH_PATHS", (str(tmp_path / "no-such-gh"),))
+    monkeypatch.setenv("PATH", str(shims))
+    monkeypatch.delenv("AGENTIC_SDLC_GH", raising=False)
+    assert guard.lease_unavailable(guard.lease_for(7))
+    assert guard.open_pr_for("forge/issue-7") is None
+    with pytest.raises(guard.LeaseUnavailable, match="no trusted gh"):
+        guard.repo_permission("someone")
+    commit = {"tool_name": "Bash", "session_id": "s1", "tool_input": {"command": "git commit"}}
+    code, message = guard.decide(commit, "forge/issue-7")
+    assert code == 2 and "Lease inventory unavailable" in message
+    assert "only root can replace and found none" in message
+    assert not marker.exists()  # the forged claim was never read
+
+
+def test_commit_guard_runs_only_a_trusted_gh(tmp_path, monkeypatch):
+    """The trusted gh runs in an environment built from an allowlist, as the library's run_gh:
+    no loader variable, no caller CA, the host pinned, a private empty config directory."""
+    import subprocess
+
+    guard = _raw_guard_module(tmp_path)
+    monkeypatch.setitem(guard._TRUSTED, "gh", "/vetted/gh")
+    for key, value in {
+        "LD_PRELOAD": "/tmp/evil.so",
+        "DYLD_INSERT_LIBRARIES": "/tmp/evil.dylib",
+        "SSL_CERT_FILE": "/tmp/ca.pem",
+        "GH_HOST": "evil.example",
+        "GH_CONFIG_DIR": "/tmp/evil-config",
+        "GH_TOKEN": "tok",
+        "HTTPS_PROXY": "http://proxy:3128",
+        "PATH": "/tmp/evil-bin:/usr/bin",
+    }.items():
+        monkeypatch.setenv(key, value)
+    seen = []
+
+    def fake(args, **kwargs):
+        seen.append((args, kwargs))
+        return subprocess.CompletedProcess(args, 0, stdout="[[]]", stderr="")
+
+    monkeypatch.setattr(guard.subprocess, "run", fake)
+    assert guard.lease_for(7) is None
+    ((args, kwargs),) = seen
+    env = kwargs["env"]
+    assert args[0] == "/vetted/gh" and args[1] == "api"
+    assert not any(key.startswith(("LD_", "DYLD_")) for key in env)
+    assert "SSL_CERT_FILE" not in env and env["GH_HOST"] == "github.com"
+    assert env["GH_TOKEN"] == "tok" and env["HTTPS_PROXY"] == "http://proxy:3128"
+    assert env["PATH"] == "/usr/bin:/bin"
+    assert env["GH_CONFIG_DIR"] == env["HOME"] == kwargs["cwd"] != "/tmp/evil-config"
+
+
+def test_commit_guard_git_probe_environment_is_allowlisted(tmp_path, monkeypatch):
+    """The probe keeps what selects the command's repository and configuration and drops the
+    loader's variables and the caller's PATH."""
+    guard = _raw_guard_module(tmp_path)
+    monkeypatch.setitem(guard._TRUSTED, "git", "/vetted/git")
+    monkeypatch.setenv("LD_PRELOAD", "/tmp/evil.so")
+    monkeypatch.setenv("GIT_TRACE", "/tmp/trace")
+    monkeypatch.setenv("PATH", "/tmp/evil-bin:/usr/bin")
+    monkeypatch.setenv("GIT_DIR", "/elsewhere/.git")
+    seen = []
+
+    class Done:
+        returncode = 0
+        stdout = "forge/issue-7\n"
+        stderr = ""
+
+    monkeypatch.setattr(
+        guard.subprocess, "run", lambda args, **kw: seen.append((args, kw)) or Done()
+    )
+    branch = guard.current_branch(str(tmp_path), env={"GIT_WORK_TREE": "/wt", "LD_AUDIT": "x"})
+    assert branch == "forge/issue-7"
+    ((args, kwargs),) = seen
+    env = kwargs["env"]
+    assert args[0] == "/vetted/git"
+    assert env["GIT_DIR"] == "/elsewhere/.git" and env["GIT_WORK_TREE"] == "/wt"
+    assert env["PATH"] == "/usr/bin:/bin" and env["LC_ALL"] == "C"
+    assert not any(key.startswith(("LD_", "DYLD_", "GIT_TRACE")) for key in env)
+
+
+def test_commit_guard_trusts_only_root_owned_programs(tmp_path):
+    guard = _raw_guard_module(tmp_path)
+    planted = tmp_path / "git"
+    planted.write_text("#!/bin/sh\necho main\n")
+    planted.chmod(0o755)
+    # as root, under a world-writable /tmp; as anyone else, not owned by root
+    assert guard._trust_candidate_reason(str(planted)) is not None
+    assert guard._trust_candidate_reason("relative/git") is not None
+
+
+def test_commit_guard_vets_a_git_other_than_its_own(tmp_path, monkeypatch):
+    """An allowlisted command run by a git that is not the guard's own: the exec path the guard
+    reads is not the one that git searches, so the command is guarded."""
+    guard = _raw_guard_module(tmp_path)
+    repo = _issue_repo(tmp_path)
+    if guard._trust_note("git"):
+        pytest.skip("this machine has no root-owned git")
+    other = tmp_path / "other-git"
+    other.write_text("#!/bin/sh\nexit 0\n")
+    other.chmod(0o755)
+    found = guard._other_git_reason(str(other), str(repo))
+    assert found and "is not the git the guard reads with" in found
+    assert guard._other_git_reason(guard._trusted_program("git"), str(repo)) is None
+
+
+def test_session_start_runs_only_trusted_programs(tmp_path, monkeypatch):
+    """The SessionStart hook runs git and gh through the guard's vetted programs: a planted
+    `git` cannot answer, and with no trusted gh the inventory read fails (None), unread."""
+    start = _guard_module(tmp_path, "forge_session_start")
+    _guard_module(tmp_path, "forge_commit_guard")
+    guard = start._guard()
+    if guard._trust_note("git"):
+        pytest.skip("this machine has no root-owned git")
+    repo = _issue_repo(tmp_path)
+    marker = tmp_path / "ran"
+    shims = _shim_dir(tmp_path, marker, git="main", gh="[]")
+    monkeypatch.setattr(guard, "_TRUSTED", {})
+    monkeypatch.setattr(guard, "SYSTEM_GH_PATHS", (str(tmp_path / "no-such-gh"),))
+    monkeypatch.setenv("PATH", f"{shims}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.delenv("AGENTIC_SDLC_GH", raising=False)
+    monkeypatch.chdir(repo)
+    assert start.run(["git", "rev-parse", "--abbrev-ref", "HEAD"]) == "forge/issue-7"
+    if os.geteuid() == 0 or guard._trust_note("gh"):
+        assert start.run(["gh", "api", "repos/x/y/issues"]) is None
+    assert not marker.exists()

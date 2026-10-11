@@ -997,6 +997,52 @@ def test_check_diff_refuses_a_merge_commit_in_the_series(tmp_path, policy_file, 
     assert "is a merge commit" in capsys.readouterr().err
 
 
+def test_check_diff_caps_a_large_commit_that_a_later_one_shrank(tmp_path, policy_file, capsys):
+    """Codex 4242095558: 10,000 lines added in one commit and shrunk to one line in the next is a
+    one-line endpoint diff, but the push publishes the 10,000-line commit and its blob."""
+    repository = _repo(tmp_path, policy_file)
+    _commit(repository, {"x.py": "x = 1\n" * 10_000})
+    _commit(repository, {"x.py": "x = 2\n"}, "shrink it")
+    # the trap: the end state is a one-line change, well inside every cap
+    assert _git(repository, "diff", "--numstat", "main", "HEAD") == "1\t0\tx.py"
+    out = tmp_path / "decision.json"
+    assert _check_diff(repository, policy_file, "--output", str(out)) == 2
+    err = capsys.readouterr().err
+    assert "diff-line cap exceeded: 20001 > 100" in err  # 10,000 + (1 + 10,000)
+    assert "patch-byte cap exceeded" in err
+    diff = json.loads(out.read_text())["diff"]
+    assert diff["net"]["addedLines"] == 1 and diff["history"]["addedLines"] == 10_001
+    assert diff["addedLines"] == 10_001 and diff["patchBytes"] > 60_000
+
+
+def test_check_diff_sums_the_lines_of_every_commit(tmp_path, policy_file, capsys):
+    """Each commit alone is under max_diff_lines = 100 and so is the end state; together the
+    series publishes 181 changed lines, and the cap is applied to that sum."""
+    repository = _repo(tmp_path, policy_file)
+    _loosen(repository / "agentic-sdlc.toml", max_patch_bytes="100000")
+    _git(repository, "commit", "-qam", "patch bytes are not the point here")
+    _git(repository, "branch", "-f", "main", "HEAD")
+    _commit(repository, {"x.py": "".join(f"x{i} = {i}\n" for i in range(90))})
+    _commit(repository, {"x.py": "x = 2\n"}, "shrink it")
+    assert _check_diff(repository, policy_file) == 2
+    assert "diff-line cap exceeded: 181 > 100" in capsys.readouterr().err
+
+
+def test_check_diff_counts_a_binary_change_by_its_size(tmp_path, policy_file, capsys):
+    """`--numstat` reports a binary change as `-` lines; counted as zero it would pass any line
+    cap, so it counts fail-closed as its size in bytes."""
+    repository = _repo(tmp_path, policy_file)
+    (repository / "blob.bin").write_bytes(bytes(range(256))[:200])  # NULs: binary to git
+    _git(repository, "add", "blob.bin")
+    _git(repository, "commit", "-qm", "a blob")
+    assert _git(repository, "diff", "--numstat", "main", "HEAD") == "-\t-\tblob.bin"
+    out = tmp_path / "decision.json"
+    assert _check_diff(repository, policy_file, "--output", str(out)) == 2
+    assert "diff-line cap exceeded: 200 > 100" in capsys.readouterr().err
+    diff = json.loads(out.read_text())["diff"]
+    assert diff["net"]["addedLines"] == 200 and diff["history"]["addedLines"] == 200
+
+
 def test_check_diff_refuses_a_series_whose_net_change_is_empty(tmp_path, policy_file, capsys):
     repository = _repo(tmp_path, policy_file)
     _commit(repository, {"module.py": "VALUE = 2\n"})

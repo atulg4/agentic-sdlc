@@ -319,12 +319,14 @@ def _check_diff(args: argparse.Namespace) -> int:
             f"{policy.provider!r}, project {policy.project_id!r}); not concluding"
         )
     snapshot = collect_commit_diff(args.repository, base, args.head)
+    # Codex 4242095558: the caps apply to the larger of the end state and the per-commit sums,
+    # so a large commit a later one shrank still counts (`collect_commit_diff`).
     decision = evaluate_diff(
         snapshot.paths,
-        snapshot.added_lines,
-        snapshot.deleted_lines,
+        snapshot.cap_added_lines,
+        snapshot.cap_deleted_lines,
         policy,
-        patch_bytes=len(snapshot.patch),
+        patch_bytes=snapshot.cap_patch_bytes,
     )
     document = decision.as_dict()
     document["diff"] = {
@@ -332,9 +334,19 @@ def _check_diff(args: argparse.Namespace) -> int:
         "baseSha": base,
         "head": args.head,
         "files": len(snapshot.paths),
-        "addedLines": snapshot.added_lines,
-        "deletedLines": snapshot.deleted_lines,
-        "patchBytes": len(snapshot.patch),
+        "addedLines": snapshot.cap_added_lines,
+        "deletedLines": snapshot.cap_deleted_lines,
+        "patchBytes": snapshot.cap_patch_bytes,
+        "net": {
+            "addedLines": snapshot.added_lines,
+            "deletedLines": snapshot.deleted_lines,
+            "patchBytes": len(snapshot.patch),
+        },
+        "history": {
+            "addedLines": snapshot.history_added_lines,
+            "deletedLines": snapshot.history_deleted_lines,
+            "patchBytes": snapshot.history_patch_bytes,
+        },
         "paths": list(snapshot.paths),
     }
     _write(document, args.output)
