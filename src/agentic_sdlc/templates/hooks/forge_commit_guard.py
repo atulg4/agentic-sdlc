@@ -47,7 +47,9 @@ Indirect execution is guarded the same way: any other program that receives `git
 its program from stdin (`... | sh`, `bash <<< ...`, `bash -s`). `sh -c STRING` is parsed
 recursively, as are `$(...)`/backtick bodies. A shell script FILE is read and parsed the same
 way (Codex 4240526381): `bash x.sh`, `sh -e x.sh`, `bash < x.sh`, `source x.sh`, `. x.sh`, and
-`./x.sh` run directly (a `.sh`/`.bash` path, or one whose `#!` line names a shell). Its git is
+`./x.sh` run directly (a `.sh`/`.bash` path, or one whose `#!` line names a shell), and a bare
+command name PATH resolves to such a script (Codex 4240628980; one that names git nowhere in
+it or in what it runs is not read -- see `_git_free`). Its git is
 guarded exactly like inline git (`-C`/`cd` selectors, named refs, the raw-text proof, the
 PATH/GIT_* taint), scripts it runs are read in turn up to MAX_SUBST_DEPTH, and a script that is
 missing, not a regular file, binary, over MAX_SCRIPT_BYTES, unparseable or nested deeper is
@@ -640,10 +642,250 @@ def _shell_shebang(path: str) -> bool:
     return bool(words) and os.path.basename(words[0]) in SHELLS
 
 
-def _script_invocation(words: list[str], where: str) -> tuple[str, bool] | None:
+# ---- Bare command names (Codex 4240628980). `deploy` with no `/` runs whatever the shell finds
+# first on PATH, and an extensionless file there starting `#!/bin/sh` is a shell script like any
+# other. Every bare program word that is a plain literal name, not a shell builtin or keyword,
+# not git and not a `git-*` subcommand, is therefore resolved the way the shell resolves it --
+# the first regular, executable file named so in a PATH entry (an empty entry is the current
+# directory) -- and when that file's `#!` line names a shell it is read and analysed like
+# `./deploy`. A binary or a non-shell `#!` interpreter is out of scope (see SCOPE). PATH is the
+# hook's own environment, the one the Bash tool's shell inherits, widened by every PATH the
+# command (or a script it reads) assigns: `PATH=DIR:$PATH`, `export PATH=...` with a value
+# built only from literal text, `$PATH`, `$HOME`, `$PWD` and a leading `~` is resolved in each
+# of those PATHs too (all of them: which one is in effect where is not tracked). Any other
+# change of PATH -- `read PATH`, `PATH=$(...)`, `for PATH in`, zsh's `path[1]=`, `hash -p` --
+# leaves the search path unknown, and then every bare program is UNRESOLVED_REPO: refused on
+# every branch (`PATH+=...` is already unproven to the raw-text proof). Resolutions are cached
+# for one check.
+SHELL_BUILTINS = frozenset(
+    {"alias", "bg", "bind", "break", "builtin", "caller", "cd", "command", "compgen"}
+    | {"complete", "compopt", "continue", "declare", "dirs", "disown", "echo", "enable", "eval"}
+    | {"exec", "exit", "export", "false", "fc", "fg", "getopts", "hash", "help", "history"}
+    | {"jobs", "kill", "let", "local", "logout", "mapfile", "popd", "printf", "pushd", "pwd"}
+    | {"read", "readarray", "readonly", "return", "set", "shift", "shopt", "source", "suspend"}
+    | {"test", "times", "trap", "true", "type", "typeset", "ulimit", "umask", "unalias", "unset"}
+    | {"wait", ".", ":", "[", "[[", "]]", "time", "coproc", "select", "case", "for", "in"}
+)
+_PLAIN_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.+-]*")
+# A PATH value the guard can compute: literal text and these expansions only.
+_PATH_VALUE_VARS = re.compile(r"\$(?:\{(PATH|HOME|PWD)\}|(PATH|HOME|PWD)(?![A-Za-z0-9_]))")
+# A mention of PATH that is NOT a read of it (`$PATH`, `${PATH}`, `${PATH:-x}` only read).
+_PATH_READ = re.compile(r"\$\{?#?$")
+# The only things that can set the shell's PATH besides an assignment word: these builtins and
+# loops (`read PATH`, `printf -v PATH`, `for PATH in ...`, `eval PATH=...`, ...) and a `${PATH:=x}`
+# expansion. Any other program receiving the word (`echo`, `grep`, `printenv PATH`) cannot.
+PATH_WRITERS = frozenset(
+    {"read", "readarray", "mapfile", "printf", "getopts", "declare", "typeset", "local"}
+    | {"export", "readonly", "unset", "eval", "source", ".", "let", "for", "select", "builtin"}
+    | {"command", "exec", "vared", "zle", "typeset", "integer", "float"}
+)
+_PATH_SEARCH: list = []  # [None | list of PATH lists] while a check runs; [] outside one
+_EXEC_CACHE: dict = {}  # (name, where, PATHs) -> the shell scripts it resolves to
+
+
+def _path_value(value: str, where: str) -> list[str] | None:
+    """The PATH entries `value` (a cooked `PATH=` value) expands to, or None when it holds any
+    expansion other than `$PATH`/`$HOME`/`$PWD` (or a `~` that is not leading an entry)."""
+    session = os.environ.get("PATH", "")
+    home = os.environ.get("HOME", "")
+
+    def var(match: re.Match[str]) -> str:
+        name = match.group(1) or match.group(2)
+        return {"PATH": session, "HOME": home, "PWD": where}[name]
+
+    entries = []
+    for entry in _PATH_VALUE_VARS.sub(var, value).split(os.pathsep):
+        if entry.startswith("~") and (entry == "~" or entry.startswith("~/")):
+            entry = home + entry[1:]
+        if re.search(r"[$`~*?\[{]", entry):
+            return None
+        entries.append(entry)
+    return entries
+
+
+def _path_changes(text: str) -> int:
+    """How many mentions of PATH in `text` (quotes removed) may CHANGE it: every `_PATH_TAINT`
+    match except a read (`$PATH`, `${PATH}`, `${PATH:-x}`, `${#PATH}`)."""
+    text = re.sub(r"[\"'\\]", "", text)
+    return sum(1 for m in _PATH_TAINT.finditer(text) if not _PATH_READ.search(text[: m.start()]))
+
+
+def _path_searches(command: str, where: str) -> list[list[str]] | None:
+    """Every PATH `command` may run its bare programs under: the hook's own, plus each PATH the
+    command assigns (see the block comment above). None when it may change PATH any other way:
+    a mention in a segment that runs a PATH_WRITERS builtin, in a `${PATH:=x}` expansion or next
+    to a command substitution. A mention another program merely receives (`echo "PATH is"`,
+    `grep PATH f`, `printenv PATH`) changes nothing."""
+    searches = [os.environ.get("PATH", "").split(os.pathsep)]
+    if not _path_changes(command):
+        return searches
+    try:
+        segments = _segments(command)
+    except ValueError:
+        return None
+    for seg in segments:
+        words = list(seg)
+        while words and words[0] in SHELL_KEYWORDS:
+            words.pop(0)
+        set_builtin = bool(words) and words[0] in SET_BUILTINS and words[0] != "unset"
+        if set_builtin:
+            words.pop(0)
+            while words and words[0] in ("-x", "-g", "--"):
+                words.pop(0)
+        while words and _ASSIGNMENT.match(words[0].replace("+=", "=", 1)):
+            name, _, value = words.pop(0).partition("=")
+            if name.rstrip("+") != "PATH":
+                if _path_changes(name + "="):
+                    return None  # zsh `path=(...)`, `path[1]=...`
+                continue
+            entries = _path_value(("$PATH" if name == "PATH+" else "") + value, where)
+            if entries is None:
+                return None
+            searches.append(entries)
+        if set_builtin:
+            if _path_changes(" ".join(words)):
+                return None  # `export X PATH`, `declare -n p=PATH`
+            continue
+        if words[:1] == ["hash"] and any(w[:1] == "-" and "p" in w for w in words[1:]):
+            return None  # `hash -p FILE NAME` runs FILE for NAME
+        mentioned = [word for word in words if _path_changes(word)]
+        if mentioned and (
+            words[0] in PATH_WRITERS
+            or (words[0] in WRAPPERS and any(word in PATH_WRITERS for word in words))
+            or any(re.search(r"\$\(|`|\$\{PATH:?[=?+-]", word) for word in mentioned)
+        ):
+            return None
+    return searches
+
+
+def _exec_scripts(name: str, where: str) -> list[str] | None:
+    """The shell script FILES a bare program `name` resolves to, one per PATH it may run under
+    (empty: none of them is a shell script); None when the search path is unknown."""
+    searches = _PATH_SEARCH[0] if _PATH_SEARCH else [os.environ.get("PATH", "").split(os.pathsep)]
+    if searches is None:
+        return None
+    key = (name, where, tuple(tuple(search) for search in searches))
+    if key not in _EXEC_CACHE:
+        scripts: list[str] = []
+        for search in searches:
+            for entry in search:
+                candidate = os.path.join(where, entry or ".", name)
+                if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                    if _shell_shebang(candidate) and candidate not in scripts:
+                        scripts.append(candidate)
+                    break  # the shell runs the first one
+        _EXEC_CACHE[key] = scripts
+    return _EXEC_CACHE[key]
+
+
+# A PATH-resolved script that names git nowhere -- not in its own text, nor in any script it may
+# run by a literal path or bare name, nor in any file it sources by a literal name, followed
+# transitively (at most MAX_SCAN_FILES files) -- is not read further (Codex 4240628980): system
+# tools are shell scripts (`which`, `zgrep`, `ldd`, `mvn`, `gradle`, `gcloud`) whose text this
+# parser was never meant to prove, and refusing them on every branch would make the guard
+# unusable. One that does name git anywhere in that closure is analysed like `./deploy`, and
+# refused when it cannot be. Every word of a file that names a script counts (comments too):
+# over-reading, never under-.
+_GIT_IN_SCRIPT = re.compile(rb"(?<![\w.])git(?!\w)")
+_SCRIPT_WORD = re.compile(rb"[A-Za-z0-9_./+-]+")
+_SOURCED = re.compile(rb"(?:^|[\s;&|(])(?:\.|source)\s+[\"']?([A-Za-z0-9_./+-]+)")
+MAX_SCAN_BYTES = 4 * 1024 * 1024
+MAX_SCAN_FILES = 256
+_FILE_SCAN: dict = {}  # (path, where) -> (names git, files it may run) | None; one check
+
+
+def _scan_bytes(path: str) -> bytes | None:
+    """The first MAX_SCAN_BYTES of the regular file `path`; None when it is not one, cannot be
+    read or is larger."""
+    try:
+        if not os.path.isfile(path):
+            return None
+        with open(path, "rb") as handle:
+            data = handle.read(MAX_SCAN_BYTES + 1)
+    except OSError:
+        return None
+    return None if len(data) > MAX_SCAN_BYTES else data
+
+
+def _file_scan(path: str, where: str) -> tuple[bool, list[str] | None] | None:
+    """(does the file name git, every file it may run or source -- None when the search path is
+    unknown) for the regular file `path`; None when it cannot be read."""
+    if (path, where) in _FILE_SCAN:
+        return _FILE_SCAN[path, where]
+    data = _scan_bytes(path)
+    result: tuple[bool, list[str] | None] | None = None
+    if data is not None:
+        here = os.path.dirname(path)
+        sourced = {m.decode("ascii") for m in _SOURCED.findall(data)}
+        runs: list[str] | None = []
+        for token in {m.decode("ascii") for m in _SCRIPT_WORD.findall(data)}:
+            if "/" in token:
+                found = [token] if os.path.isabs(token) else [os.path.join(where, token)]
+                found += [] if os.path.isabs(token) else [os.path.join(here, token)]
+                found = [
+                    f
+                    for f in found
+                    if os.path.isfile(f)
+                    and (token in sourced or f.endswith(SCRIPT_SUFFIXES) or _shell_shebang(f))
+                ]
+            else:
+                scripts = _exec_scripts(token, where)
+                if scripts is None:
+                    runs = None
+                    break
+                found = list(scripts)
+                if token in sourced:  # `. NAME`: PATH, then the current directory; any file
+                    found += [
+                        f
+                        for f in (os.path.join(d, token) for d in (*_search_dirs(where), where))
+                        if os.path.isfile(f)
+                    ]
+            runs += [os.path.realpath(f) for f in found]
+        result = (bool(_GIT_IN_SCRIPT.search(data)), runs)
+    _FILE_SCAN[path, where] = result
+    return result
+
+
+def _git_free(path: str, where: str) -> bool:
+    """Does the shell script FILE `path`, run from `where`, name git nowhere (see above)?"""
+    start = os.path.realpath(path)
+    seen, queue = {start}, [start]
+    while queue:
+        scan = _file_scan(queue.pop(), where)
+        if scan is None or scan[0] or scan[1] is None:
+            return False
+        for run in scan[1]:
+            if run not in seen:
+                seen.add(run)
+                queue.append(run)
+        if len(seen) > MAX_SCAN_FILES:
+            return False
+    return True
+
+
+def _search_dirs(where: str) -> list[str]:
+    """Every directory of every PATH the check may run under (unknown: none)."""
+    searches = _PATH_SEARCH[0] if _PATH_SEARCH else [os.environ.get("PATH", "").split(os.pathsep)]
+    return [os.path.join(where, entry or ".") for search in searches or () for entry in search]
+
+
+def _widen_path_search(code: str, where: str) -> None:
+    """Add the PATHs a script's text assigns to the check's search (unknown stays unknown)."""
+    if not _PATH_SEARCH or _PATH_SEARCH[0] is None:
+        return
+    searches = _path_searches(code, where)
+    if searches is None:
+        _PATH_SEARCH[0] = None
+    else:
+        _PATH_SEARCH[0] += [s for s in searches if s not in _PATH_SEARCH[0]]
+
+
+def _script_invocation(words: list[str], where: str) -> tuple[str, bool | None] | None:
     """(script word, may be found on PATH) when `words` runs a shell script FILE: a shell with a
     script operand or `<` redirection, `source`/`.`, or a path (or `.sh`/`.bash` name) executed
-    directly that is a shell script. None for anything else (stdin shells included)."""
+    directly that is a shell script. A bare program name that PATH resolves to a shell script
+    (or that cannot be resolved: the search path is unknown) is (name, None). None for anything
+    else (stdin shells included)."""
     program = words[0]
     name = os.path.basename(program)
     if name in SHELLS:
@@ -654,15 +896,27 @@ def _script_invocation(words: list[str], where: str) -> tuple[str, bool] | None:
         return None
     if program.endswith(SCRIPT_SUFFIXES):
         return program, "/" not in program
-    if "/" in program and _shell_shebang(os.path.join(where, program)):
-        return program, False
+    if "/" in program:
+        return (program, False) if _shell_shebang(os.path.join(where, program)) else None
+    if (
+        _PLAIN_NAME.fullmatch(program)
+        and program not in SHELL_BUILTINS
+        and program not in SHELL_KEYWORDS
+        and not program.startswith("git-")
+    ):
+        scripts = _exec_scripts(program, where)  # Codex 4240628980
+        if scripts is None or not all(_git_free(script, where) for script in scripts):
+            return program, None
     return None
 
 
-def _script_paths(word: str, where: str, search_path: bool) -> list[str] | None:
+def _script_paths(word: str, where: str, search_path: bool | None) -> list[str] | None:
     """Every file the shell may run for script `word` from `where` (a bare name may come from
-    any absolute PATH entry too: all are read); None when the shell rewrites the word or the
-    directory first (an expansion, a glob, a brace or `~`)."""
+    any absolute PATH entry too: all are read; `search_path` None: a bare program, resolved as
+    `_exec_scripts` does); None when the shell rewrites the word or the directory first (an
+    expansion, a glob, a brace or `~`), or the search path is unknown."""
+    if search_path is None:
+        return None if re.search(r"[$`]", where) else _exec_scripts(word, where)
     if (
         not word
         or _SELECTOR_EXPANSION.search(word)
@@ -726,7 +980,7 @@ def _script_code(text: str) -> str:
     return "".join(out)
 
 
-def _script_texts(word: str, search_path: bool, where: str, depth: int) -> list[str] | None:
+def _script_texts(word: str, search_path: bool | None, where: str, depth: int) -> list[str] | None:
     """The analysable text (`_script_code`) of every file script `word` may be; None when any
     one cannot be read or parsed, or the script is nested deeper than MAX_SUBST_DEPTH."""
     paths = _script_paths(word, where, search_path)
@@ -753,6 +1007,7 @@ def _program_targets(code: str, depth: int, where: str) -> list[Target]:
     )
     if tainted:
         _TAINTED[:] = [True]  # kept for the rest of the check: over-guarding, never under-
+    _widen_path_search(code, where)  # Codex 4240628980: the PATHs the script assigns
     found = commit_targets(code, depth, where)
     if _raw_unproven(code, depth):
         found.append(_unresolved())
@@ -765,7 +1020,7 @@ def _program_targets(code: str, depth: int, where: str) -> list[Target]:
 
 
 def _script_targets(
-    script: tuple[str, bool], depth: int, where: str, chdirs: tuple[str, ...]
+    script: tuple[str, bool | None], depth: int, where: str, chdirs: tuple[str, ...]
 ) -> list[Target]:
     """The guarded git invocations of the shell script FILE `script` runs from `where` (see the
     block comment above), relative to the command's own directory changes `chdirs`."""
@@ -784,7 +1039,7 @@ def _script_targets(
     return found
 
 
-def _script_changes_branch(script: tuple[str, bool], depth: int, where: str) -> bool:
+def _script_changes_branch(script: tuple[str, bool | None], depth: int, where: str) -> bool:
     """Could the shell script FILE `script` move HEAD (an unreadable one could)?"""
     texts = _script_texts(script[0], script[1], where, depth)
     return texts is None or any(_changes_branch(code, depth + 1, where) for code in texts)
@@ -2105,10 +2360,14 @@ def commit_targets(command: str, depth: int = 0, cwd: str | None = None) -> list
             _ENV_TAINT.search(unquoted) or _PATH_TAINT.search(unquoted)
         )
         _TAINTED[:] = [True] if tainted else []
+        _PATH_SEARCH[:] = [_path_searches(command, cwd or os.getcwd())]
+        _EXEC_CACHE.clear()
+        _FILE_SCAN.clear()
         try:
             return _commit_targets_top(command, cwd, tainted)
         finally:
             _TAINTED.clear()
+            _PATH_SEARCH.clear()
     return _commit_targets_in(command, depth, cwd)
 
 

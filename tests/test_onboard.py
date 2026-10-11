@@ -3313,7 +3313,9 @@ def test_doctor_requires_the_automatic_callers_to_trigger_on_labeled_issues(tmp_
     write_onboarding(repo, spec())
     path = repo / ".github/workflows" / name
     path.write_text(
-        path.read_text().replace("  issues:\n    types: [labeled]\n", "  workflow_dispatch:\n")
+        path.read_text().replace(
+            "  issues:\n    types: [labeled, unlabeled]\n", "  workflow_dispatch:\n"
+        )
     )
     failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
     assert name in failed["automatic callers trigger on issue labels"].detail
@@ -10527,3 +10529,269 @@ def test_session_start_fetch_command_is_explicit_and_validates_the_remote(tmp_pa
     assert "--refmap=" in cmd and "--no-tags" in cmd and "--no-recurse-submodules" in cmd
     for bad in ("--upload-pack=x", "../up", "a b", "ext::x", "", "-o"):
         assert "not a plain name" in start.fetch_blocker(bad), bad
+
+
+# ---- Codex 4240628982: removing an approval label cancels a queued or running automatic run.
+
+
+def _actions_expr(text, action, label, labels, run_id=99):
+    """Evaluate one generated `${{ }}`/`if:` expression for an `issues` event (the subset the
+    generated callers use: ==, &&, ||, !, contains, format, null)."""
+    expr = " ".join(str(text).split())
+    if expr.startswith("${{"):
+        expr = expr[3:-2]
+    for old, new in (
+        ("github.event.issue.labels.*.name", "LABELS"),
+        ("github.event.issue.pull_request", "PR"),
+        ("github.event.issue.number", "NUM"),
+        ("github.event.label.name", "LABEL"),
+        ("github.event.action", "ACTION"),
+        ("github.run_id", "RUN"),
+        ("&&", " and "),
+        ("||", " or "),
+        ("!contains", "not contains"),
+        ("null", "None"),
+    ):
+        expr = expr.replace(old, new)
+    scope = {
+        "contains": lambda items, item: item in items,
+        "format": lambda pattern, *args: pattern.format(*args),
+        "LABELS": labels,
+        "LABEL": label,
+        "ACTION": action,
+        "PR": None,
+        "NUM": 7,
+        "RUN": run_id,
+    }
+    return eval(expr, scope)  # noqa: S307 - test-only evaluation of generated literals
+
+
+APPROVAL_SET = [IMPLEMENTATION_LABEL, "claude-ready", "human-review-required"]
+
+
+def test_auto_implement_label_removal_cancels_the_authorized_run():
+    rendered = render_onboarding(spec())[".github/workflows/agent-auto-implement.yml"]
+    doc = yaml.safe_load(rendered)
+    assert doc[True]["issues"]["types"] == ["labeled", "unlabeled"]
+    group, cancel = doc["concurrency"]["group"], doc["concurrency"]["cancel-in-progress"]
+    condition = doc["jobs"]["authorize"]["if"]
+    shared = "forge-auto-implement-7"
+    for label in APPROVAL_SET:
+        # applying an approval label joins the issue's group and queues (cancels nothing)
+        assert _actions_expr(group, "labeled", label, APPROVAL_SET) == shared
+        assert _actions_expr(cancel, "labeled", label, APPROVAL_SET) is False
+        assert _actions_expr(condition, "labeled", label, APPROVAL_SET) is True
+        # removing one cancels what is queued or running there, and starts nothing itself
+        rest = [other for other in APPROVAL_SET if other != label]
+        assert _actions_expr(group, "unlabeled", label, rest) == shared
+        assert _actions_expr(cancel, "unlabeled", label, rest) is True
+        assert _actions_expr(condition, "unlabeled", label, rest) is False
+        # even a payload that still lists it never starts work on `unlabeled`
+        assert _actions_expr(condition, "unlabeled", label, APPROVAL_SET) is False
+    # the lease's own `in-progress` label (and any other) never cancels the work
+    for action in ("labeled", "unlabeled"):
+        for label in ("in-progress", "bug"):
+            assert _actions_expr(group, action, label, APPROVAL_SET) == f"{shared}-run-99"
+            assert _actions_expr(condition, action, label, APPROVAL_SET) is False
+
+
+def test_auto_plan_label_removal_cancels_planning_but_a_second_label_does_not():
+    rendered = render_onboarding(spec())[".github/workflows/agent-auto-plan.yml"]
+    doc = yaml.safe_load(rendered)
+    assert doc[True]["issues"]["types"] == ["labeled", "unlabeled"]
+    group, cancel = doc["concurrency"]["group"], doc["concurrency"]["cancel-in-progress"]
+    condition = doc["jobs"]["preflight"]["if"]
+    labels = ["claude-ready", "human-review-required"]
+    shared = "forge-auto-plan-7"
+    assert _actions_expr(group, "labeled", "claude-ready", labels) == shared
+    assert _actions_expr(condition, "labeled", "claude-ready", labels) is True
+    # an issue opened with both labels: the second `labeled` run must not cancel planning
+    assert _actions_expr(group, "labeled", "human-review-required", labels) != shared
+    for label in labels:
+        rest = [other for other in labels if other != label]
+        assert _actions_expr(group, "unlabeled", label, rest) == shared
+        assert _actions_expr(cancel, "unlabeled", label, rest) is True
+        assert _actions_expr(condition, "unlabeled", label, rest) is False
+    assert _actions_expr(group, "unlabeled", "in-progress", labels) != shared
+
+
+@pytest.mark.parametrize("name", ["agent-auto-plan.yml", "agent-auto-implement.yml"])
+def test_doctor_requires_the_label_removal_cancellation(tmp_path, name):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    path = repo / ".github/workflows" / name
+    text = path.read_text()
+    weakened = text.replace(
+        "cancel-in-progress: ${{ github.event.action == 'unlabeled' }}",
+        "cancel-in-progress: false",
+    )
+    assert weakened != text
+    path.write_text(weakened)
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    detail = failed["managed workflows match the generated templates"].detail
+    assert name in detail and "concurrency" in detail
+    path.write_text(text.replace("types: [labeled, unlabeled]", "types: [labeled]"))
+    failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False))
+    assert name in failed["managed workflows match the generated templates"].detail
+
+
+def test_cloud_routine_reauthorizes_right_before_publishing():
+    doc = render_onboarding(spec(implementer="cloud-routine", runs_on=("ubuntu-latest",)))[
+        "docs/forge/cloud-implementer.md"
+    ]
+    claim = doc.index("1b. Claim it")
+    again = doc.index("4a. Re-authorize right before publishing")
+    publish = doc.index("5. Push the branch and open a DRAFT pull request")
+    assert claim < again < publish
+    assert "do\n   NOT push or open a PR" in doc
+    assert "runs it AGAIN right before pushing" in doc
+
+
+def test_authorization_failure_report_names_a_removed_label():
+    rendered = render_onboarding(spec())[".github/workflows/agent-auto-implement.yml"]
+    assert "a run is cancelled when an approval label is removed" in rendered
+
+
+# ---- Codex 4240628980: a bare command PATH resolves to a shell script is read like `./x.sh`.
+
+
+def _path_bin(tmp_path, monkeypatch, name="bin"):
+    directory = tmp_path / name
+    directory.mkdir(exist_ok=True)
+    monkeypatch.setenv("PATH", f"{directory}{os.pathsep}{os.environ['PATH']}")
+    return directory
+
+
+@pytest.mark.parametrize(
+    "shebang", ["#!/bin/sh", "#!/bin/bash", "#!/usr/bin/env bash", "#!/usr/bin/env -S bash -e"]
+)
+def test_commit_guard_reads_a_bare_command_that_is_a_shell_script_on_path(
+    tmp_path, monkeypatch, shebang
+):
+    guard, main_repo, issue_repo, decide = _script_guard_repos(tmp_path)
+    bindir = _path_bin(tmp_path, monkeypatch)
+    _script(bindir / "do-commit", f"{shebang}\ngit add -A && git commit -m x\n")
+    _script(bindir / "ship", f"{shebang}\ngit -C {issue_repo} commit -m x\n")
+    for command in ("do-commit", "do-commit && ls", "env FOO=1 do-commit", "ls | do-commit"):
+        assert decide(command, issue_repo) == 2, command  # no lease: refused
+        assert decide(command, issue_repo, leased=True) == 0, command
+    assert decide("ship", main_repo) == 2  # its `-C` names issue 7
+    assert decide("ship", main_repo, leased=True) == 0
+
+
+def test_commit_guard_passes_bare_commands_out_of_scope_or_without_git(tmp_path, monkeypatch):
+    guard, main_repo, issue_repo, decide = _script_guard_repos(tmp_path)
+    bindir = _path_bin(tmp_path, monkeypatch)
+    _script(bindir / "pytool", "#!/usr/bin/env python3\nimport os\nos.system('git commit')\n")
+    _script(bindir / "harmless", "#!/bin/sh\n# runs the tests\necho 'it''s fine'\nls -la\n")
+    _script(bindir / "unreadable-ok", "#!/bin/sh\necho 'unclosed\n")  # no git anywhere
+    _script(bindir / "not-exec", "#!/bin/sh\ngit commit -m x\n", mode=0o644)
+    for command in ("pytool", "harmless", "harmless && ls", "unreadable-ok", "not-exec"):
+        assert decide(command, issue_repo) == 0, command
+        assert not guard.is_git_commit(command, cwd=str(issue_repo)), command
+    # the first match on PATH is what the shell runs: a later git script is never reached
+    later = _path_bin(tmp_path, monkeypatch, "later")
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{later}{os.pathsep}/usr/bin:/bin")
+    _script(later / "harmless", "#!/bin/sh\ngit commit -m x\n")
+    assert decide("harmless", issue_repo) == 0
+    # builtins and keywords are never looked up on PATH
+    _script(bindir / "cd", "#!/bin/sh\ngit commit -m x\n")
+    assert decide("cd .", issue_repo) == 0
+
+
+def test_commit_guard_follows_a_git_free_wrapper_into_the_script_it_runs(tmp_path, monkeypatch):
+    guard, _, issue_repo, decide = _script_guard_repos(tmp_path)
+    bindir = _path_bin(tmp_path, monkeypatch)
+    _script(bindir / "inner-tool", "#!/bin/sh\ngit commit -m x\n")
+    _script(bindir / "outer", '#!/bin/sh\nset -e\ninner-tool "$@"\n')
+    _script(tmp_path / "lib" / "helpers", "do_it() { git commit -m x; }\n", mode=0o644)
+    _script(bindir / "sourcing", f"#!/bin/sh\n. {tmp_path / 'lib' / 'helpers'}\ndo_it\n")
+    for command in ("outer", "sourcing"):
+        assert decide(command, issue_repo) == 2, command
+        assert decide(command, issue_repo, leased=True) == 0, command
+
+
+def test_commit_guard_refuses_an_unparseable_bare_script_that_names_git(tmp_path, monkeypatch):
+    guard, main_repo, issue_repo, decide = _script_guard_repos(tmp_path)
+    bindir = _path_bin(tmp_path, monkeypatch)
+    _script(bindir / "broken", "#!/bin/sh\ngit status\necho 'unclosed\n")
+    for cwd in (main_repo, issue_repo):
+        assert guard.commit_branches("broken", str(cwd)) == [guard.UNRESOLVED_REPO]
+        assert decide("broken", cwd, leased=True) == 2
+
+
+def test_commit_guard_resolves_bare_commands_under_the_path_the_command_sets(tmp_path, monkeypatch):
+    guard, main_repo, issue_repo, decide = _script_guard_repos(tmp_path)
+    hidden = tmp_path / "hidden"
+    _script(hidden / "deploy", "#!/bin/sh\ngit commit -m x\n")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    for command in (
+        f"PATH={hidden}:$PATH deploy",
+        f'export PATH="{hidden}:$PATH"; deploy',
+        'export PATH="$HOME/hidden:$PATH" && deploy',
+        "PATH=~/hidden:$PATH deploy",
+        f"declare -x PATH={hidden}; deploy",
+    ):
+        assert decide(command, issue_repo) == 2, command
+        assert decide(command, issue_repo, leased=True) == 0, command
+    # a script that sets PATH and runs the bare name is followed the same way
+    wrapper = _script(tmp_path / "w.sh", f"PATH={hidden}:$PATH\ndeploy\n")
+    assert decide(f"bash {wrapper}", issue_repo) == 2
+    # a PATH this guard cannot compute leaves every bare program unresolved, on any branch
+    for command in (
+        "export PATH=$(mktemp -d):$PATH; deploy",
+        "read PATH; ls",
+        "hash -p /tmp/x ls; ls",
+        "path[1]=/tmp/x; ls",
+        f"PATH+=:{hidden}; deploy",  # `NAME+=` is not an assignment to the parser: unproven
+    ):
+        assert guard.UNRESOLVED_REPO in guard.commit_branches(command, str(main_repo)), command
+    # reading PATH, or printing/searching the word, changes nothing
+    for command in ('echo "PATH is $PATH"; ls', "grep -rn PATH . ; ls", "printenv PATH"):
+        assert decide(command, main_repo) == 0, command
+
+
+def test_commit_guard_resolves_each_bare_command_once_per_check(tmp_path, monkeypatch):
+    guard, _, issue_repo, _ = _script_guard_repos(tmp_path)
+    bindir = _path_bin(tmp_path, monkeypatch)
+    _script(bindir / "harmless", "#!/bin/sh\necho ok\n")
+    calls = []
+    real = guard._shell_shebang
+    monkeypatch.setattr(guard, "_shell_shebang", lambda p: calls.append(p) or real(p))
+    assert not guard.is_git_commit("harmless; harmless && harmless | harmless", str(issue_repo))
+    assert calls.count(str(bindir / "harmless")) == 1
+
+
+# ---- Codex 4240628986: confirm-cloud-routine never writes through a link.
+
+
+def test_confirm_cloud_routine_refuses_a_symlinked_or_irregular_policy(tmp_path):
+    from agentic_sdlc.onboard import confirm_cloud_routine
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(implementer="cloud-routine", runs_on=("ubuntu-latest",)))
+    policy = repo / "agentic-sdlc.toml"
+    outside = tmp_path / "outside.toml"
+    outside.write_text(policy.read_text())  # a VALID cloud-routine policy, outside the repo
+    before = outside.read_bytes()
+    policy.unlink()
+    policy.symlink_to(outside)
+    with pytest.raises(OnboardError, match="symlink"):
+        confirm_cloud_routine(repo)
+    assert outside.read_bytes() == before and policy.is_symlink()
+    policy.unlink()
+    policy.mkdir()
+    with pytest.raises(OnboardError, match="not a regular file"):
+        confirm_cloud_routine(repo)
+    policy.rmdir()
+    with pytest.raises(OnboardError, match="absent"):
+        confirm_cloud_routine(repo)
+    # a regular policy is replaced atomically (a new inode), its mode kept
+    policy.write_bytes(before)
+    policy.chmod(0o640)
+    inode = policy.stat().st_ino
+    assert confirm_cloud_routine(repo) == policy
+    assert "cloud_routine_confirmed = true" in policy.read_text()
+    assert policy.stat().st_ino != inode and (policy.stat().st_mode & 0o777) == 0o640
+    assert outside.read_bytes() == before
+    assert not [p for p in repo.iterdir() if p.name.endswith(".tmp")]

@@ -167,6 +167,27 @@ in silence. A definitive "unauthorized" (the job succeeds with `authorized=false
 `notify_failure` keeps its `authorized == 'true'` gate: it runs on your runners, which an
 unverified labeler must never reach.
 
+Authorization is read when a run starts, so REMOVING an approval label stops a run that is
+already queued or running (Codex 4240628982): both automatic callers trigger on `issues:
+[labeled, unlabeled]`, and the workflow-level `concurrency` puts every `labeled` event of a
+triggering label and every `unlabeled` event of a required label in one group per issue
+(`forge-auto-implement-<n>` / `forge-auto-plan-<n>`), with `cancel-in-progress` true only for
+the `unlabeled` run. A Triage user who removes a writer's label and re-applies it while the
+authorized run waits for a runner therefore cancels that run; the `unlabeled` run itself starts
+nothing (every label condition requires `github.event.action == 'labeled'`), and the re-applied
+label starts a run that re-authorizes from the label history -- and finds the Triage user.
+Every other label event, the lease's own `in-progress` label included, gets a group of its own
+and cancels nothing; for planning, applying `human-review-required` does not cancel the run its
+ready label started. A cancelled run reports like any other: `authorization_failed` (its
+message says that removing an approval label cancels a run) or `notify_failure`, and the
+reusable workflow's `release_lease_on_failure` releases a lease once `prepare` has succeeded.
+**Residual risk:** cancellation is asynchronous, so steps already executing finish their current
+work first, and a run cancelled between `claim` and the end of `prepare` keeps its lease until
+it expires. The pinned reusable workflow re-checks only `trigger_actor`'s permission, not the
+label history; a re-check of the label set inside it is left to the platform's maintainer.
+The cloud routine re-runs `sdlcctl authorize-labeler` right before pushing (step 4a of its
+prompt); its residual window is the seconds between that check and the push.
+
 ### Other managed files
 
 Every other file `onboard` writes is compared with what it renders for the repository's policy,
@@ -223,14 +244,17 @@ something that runs differently.
   it. "cloud implementer routine is scheduled" is therefore a manual TODO -- and the repository
   NOT READY -- until the owner creates the routine and records it with `sdlcctl
   confirm-cloud-routine` (sets `[automation] cloud_routine_confirmed = true`; only the boolean
-  `true` counts). `onboard --force` rewrites the policy and drops the confirmation: re-check the
+  `true` counts; the policy must be a regular file in the repository -- a symlinked or
+non-regular `agentic-sdlc.toml` is refused, and the file is replaced atomically, never written
+through a link). `onboard --force` rewrites the policy and drops the confirmation: re-check the
   routine against the regenerated document, then confirm again. The routine prompt runs `sdlcctl
   authorize-labeler --project owner/repo --issue N --label implementation-approved --label
   <ready> --label human-review-required` before claiming, the same check the Actions path runs:
   the most recent application of EACH of those labels (from the issue's label events) must be by
   a user with write/maintain/admin -- a 200 carrying that permission; a 404 or a lower role, or a
   label removed since, exits 3 (not authorized), and anything unreadable exits 2 (not verified);
-  only exit 0 claims. Without `--label` it reads the three labels from `--config` (default
+  only exit 0 claims, and the prompt runs the same command again right before pushing (exit
+  0 only; otherwise it releases the lease and stops). Without `--label` it reads the three labels from `--config` (default
   `agentic-sdlc.toml`); a policy it cannot read exits 2.
 - **Project id**: `[project].id` must equal, exactly, the `full_name` GitHub answers for `GET
   repos/{id}` -- its spelling, and after a rename or transfer (which the API follows as a
@@ -387,8 +411,16 @@ something that runs differently.
   `-C`/`--git-dir`/`GIT_DIR` selectors and are checked against the repository they name.
 - The commit guard reads the shell script files a command runs (Codex 4240526381): `bash x.sh`,
   `sh -e x.sh`, `bash < x.sh`, `source x.sh`, `. x.sh`, and `./x.sh` run directly (a `.sh`/`.bash`
-  path, or one whose `#!` line names a shell). The script (a regular UTF-8 file of at most
-  256 KiB, resolved from the directory the shell runs in, plus PATH for a bare name) is parsed
+  path, or one whose `#!` line names a shell), and a bare command name that PATH resolves to
+  such a script (Codex 4240628980: `deploy` where `~/bin/deploy` starts `#!/bin/sh`; the first
+  executable match, as the shell picks it, in the hook's PATH and in every PATH the command or a
+  script it reads assigns from literal text, `$PATH`, `$HOME`, `$PWD` or a leading `~`). A PATH
+  change the guard cannot compute (`read PATH`, `PATH=$(...)`, `for PATH in`, `hash -p`, zsh's
+  `path[1]=`) makes every bare program in that command unresolved -- refused on every branch --
+  so set PATH to literal directories. A PATH-resolved script that names git nowhere, nor in
+  anything it runs or sources by a literal name, is not parsed further: system tools that are
+  shell scripts (`which`, `zgrep`, `mvn`, `gradle`, `gcloud`) pass as before. The script (a
+  regular UTF-8 file of at most 256 KiB, resolved from the directory the shell runs in, plus PATH for a bare name) is parsed
   like an inline command, so `git commit` inside it on an unleased issue branch, or `git -C
   /path/to/forge/issue-7 commit` inside it run from main, is refused just as it would be inline;
   scripts it runs are read in turn, up to three levels. A script the guard cannot read (missing,
