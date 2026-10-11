@@ -1185,6 +1185,11 @@ class HistoryGh(FakeGh):
         self.before_read: dict[int, object] = {}
         self.on_read: dict[int, object] = {}
         self.clock = 10
+        #: the repository's open PRs (graphql rows); `on_pr_read[n]` runs right after the n-th
+        #: read of that inventory is answered
+        self.prs: list[dict] = []
+        self.pr_reads = 0
+        self.on_pr_read: dict[int, object] = {}
         for label in APPROVAL:
             self.label("labeled", label, "maintainer")
 
@@ -1213,6 +1218,19 @@ class HistoryGh(FakeGh):
         args = list(args)
         if github_answer(args) is not None:
             return github_answer(args)
+        if args[1] == "graphql" and "pullRequests" in " ".join(args):
+            self.calls.append(args)
+            info = {"hasNextPage": False, "endCursor": None}
+            page = {"pageInfo": info, "nodes": list(self.prs)}
+            answer = json.dumps({"data": {"repository": {"pullRequests": page}}})
+            self.pr_reads += 1
+            change = self.on_pr_read.get(self.pr_reads)
+            if change is not None:
+                change(self)
+            return answer
+        if args[1].split("?")[0].endswith("/timeline"):
+            self.calls.append(args)
+            return "[]"
         if args[1] == "graphql":
             self.calls.append(args)
             node = {"lastEditedAt": self.edited_at, "userContentEdits": {"nodes": []}}
@@ -1414,3 +1432,49 @@ def test_label_needs_authorize_labels(monkeypatch, policy_file):
     monkeypatch.setattr(cli, "run_gh", gh)
     argv = ["check-request", "--project", PROJECT, "--issue", "7", "--config", str(policy_file)]
     assert cli.main([*argv, "--label", "agent-ready"]) == 2
+
+
+# Codex 4243193102: the final gate reads the issue's open pull requests with each snapshot -- a
+# PR opened or linked after the claim already represents the work, so pushing would duplicate it.
+
+_PR = {"number": 20, "url": "https://x/pr/20", "title": "t", "body": "Fixes #7"}
+
+
+def test_final_gate_refuses_an_issue_that_has_an_open_pr(monkeypatch, policy_file, tmp_path):
+    body = VALID.format(deps="None")
+    gh = HistoryGh(body)
+    gh.prs = [dict(_PR)]
+    digest = cli.request_digest("Do the thing", body)
+    assert _final_gate(monkeypatch, policy_file, gh, digest, tmp_path) == cli.PULL_REQUEST_OPEN
+    result = json.loads((tmp_path / "gate.json").read_text())
+    assert result["ready"] is False and result["openPullRequests"] == ["https://x/pr/20"]
+
+
+def test_final_gate_refuses_a_pr_opened_between_its_reads(monkeypatch, policy_file, capsys):
+    body = VALID.format(deps="None")
+    gh = HistoryGh(body)
+    gh.on_pr_read[1] = lambda gh: gh.prs.append(dict(_PR))
+    digest = cli.request_digest("Do the thing", body)
+    assert _final_gate(monkeypatch, policy_file, gh, digest) == cli.PULL_REQUEST_OPEN == 9
+    assert gh.pr_reads == 2
+    err = capsys.readouterr().err
+    assert "gained an open pull request" in err and "PR OPEN: #7" in err
+
+
+def test_final_gate_reads_the_pr_inventory_twice_and_fails_closed_when_unreadable(
+    monkeypatch, policy_file
+):
+    body = VALID.format(deps="None")
+    digest = cli.request_digest("Do the thing", body)
+    gh = HistoryGh(body)
+    assert _final_gate(monkeypatch, policy_file, gh, digest) == 0
+    assert gh.pr_reads == 2
+
+    broken = HistoryGh(body)
+
+    def fail(args, input=None):
+        if "pullRequests" in " ".join(args):
+            raise OnboardError("gh api failed: HTTP 502")
+        return broken(args, input)
+
+    assert _final_gate(monkeypatch, policy_file, fail, digest) == 2

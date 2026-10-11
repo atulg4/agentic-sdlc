@@ -3806,3 +3806,38 @@ def test_release_settles_its_own_untrusted_claim_but_nobody_elses():
     assert len(_released(gh, "s1")) == 1
     release(PROJECT, 7, session="s3", gh=gh, now=NOW)  # no claim of s3 anywhere: nothing
     assert _released(gh, "s3") == []
+
+
+# Codex 4243193102: a PR a human or other automation opens (or links) for the issue after the
+# claim is durable work; every renewal re-reads the same open-PR inventory `claim` reads and
+# refuses -- before posting anything -- so the routine stops before pushing a duplicate.
+@pytest.mark.parametrize("how", ["closing-reference", "linked", "cross-referenced"])
+def test_renew_refuses_once_the_issue_has_an_open_pr(how):
+    mine = format_claim_marker(Lease(7, "me", "s1", "b", NOW + timedelta(minutes=5)))
+    gh = FakeGh().issue(7, labels=[IN_PROGRESS_LABEL], comments=[mine])
+    renew(PROJECT, 7, session="s1", ttl_minutes=60, gh=gh, now=NOW)  # no PR yet: renews
+    posted = sum(c[:3] == ("api", "-X", "POST") for c in gh.calls)
+    if how == "closing-reference":
+        gh.prs = [{"number": 20, "url": "https://x/pr/20", "body": "Fixes #7", "title": "t"}]
+    elif how == "linked":
+        gh.timeline[7] = [_link_event("connected", "CE_1")]
+        gh.link_subjects["CE_1"] = _pr_subject(20, repo=PROJECT)
+    else:
+        gh.timeline[7] = [_xref(20, repo=PROJECT)]
+    with pytest.raises(LeaseError, match="already has an open pull request.*not renewing"):
+        renew(PROJECT, 7, session="s1", ttl_minutes=60, gh=gh, now=NOW)
+    assert sum(c[:3] == ("api", "-X", "POST") for c in gh.calls) == posted
+
+
+def test_renew_refuses_when_the_open_pr_inventory_cannot_be_read():
+    mine = format_claim_marker(Lease(7, "me", "s1", "b", NOW + timedelta(minutes=5)))
+    gh = FakeGh().issue(7, labels=[IN_PROGRESS_LABEL], comments=[mine])
+
+    def faulty(args, input=None):
+        if tuple(args[:2]) == ("api", "graphql") and "pullRequests" in " ".join(args):
+            raise RuntimeError("gh: HTTP 502")
+        return gh(args, input)
+
+    with pytest.raises(LeaseError, match="open pull requests could not be read"):
+        renew(PROJECT, 7, session="s1", ttl_minutes=60, gh=faulty, now=NOW)
+    assert not any(c[:3] == ("api", "-X", "POST") for c in gh.calls)

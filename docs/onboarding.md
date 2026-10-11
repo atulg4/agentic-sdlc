@@ -15,6 +15,46 @@ setting the credentials below, installing the Publisher GitHub App, and register
 runner when `--runs-on` is `self-hosted,...`. Everything below is the manual procedure `onboard`
 automates.
 
+### Runners, required approvals and the executable trust mode
+
+- `--runs-on` defaults to `ubuntu-latest` (Codex 4243193108). The jobs it targets run
+  model-produced patches (the reusable implement/repair `verify` job applies the patch and runs
+  the setup, quality and test commands), and `ci.yml` runs every pull request's code; a
+  persistent self-hosted runner would let that code persist into later jobs that receive model
+  credentials and Publisher App secrets. Self-hosted labels (`--runs-on` or `--ci-runs-on`) are
+  refused unless `--ephemeral-runners` records the owner's acknowledgement
+  (`[automation] ephemeral_runners = true`) that every such runner is ephemeral (one job, then
+  discarded) or otherwise contained; `doctor` shows "self-hosted runners are acknowledged
+  ephemeral" as WARN for any self-hosted label without it.
+- `--required-approvals N` (0-10, `[policy] required_approvals`) is the ruleset's
+  `required_approving_review_count` (Codex 4243193100), and `doctor` holds the ruleset to at least
+  that. Unset with `--apply`, it is 1 when `GET repos/{repo}/collaborators?permission=push` (every
+  page; bots, the owner and the authenticated user excluded) finds another writer, else 0 -- an
+  author can never approve their own PR, so 1 for a solo owner would block every merge; offline,
+  or when the collaborators cannot be read, 0. At 0, `onboard` prints a WARNING and `doctor`
+  shows "ruleset requires a human approval" as WARN -- loudly in `cloud-routine` mode, where the
+  routine acts with the owner's identity, so the server-side human-merge boundary is not
+  enforced.
+- `--trust-mode strict|local` (`[automation] trust_mode`, default strict; `--force` keeps the
+  installed policy's) decides which git, gh and hook interpreter Forge will run. Strict: only
+  files root alone can replace (the file and every directory above it), no PATH search as root,
+  override variables refused as root. Local, for a developer's own machine: the first match on
+  PATH (then the system locations), the override honoured, and the file owned by root or the
+  current user with no group/other write bit -- environments stay allowlisted (no `LD_*`/`DYLD_*`,
+  a fresh gh config directory, the pinned host) and the hook interpreter stays an absolute path
+  chosen at onboard time and probed as CPython 3.11+ (with local, onboard also looks at the
+  first `python3` on PATH, so a Homebrew Python works). The mode is rendered into the commit
+  guard (and so the session-start hook). At run time GitHub Actions (`GITHUB_ACTIONS=true`) and
+  Claude Code cloud sessions (`CLAUDE_CODE_REMOTE=true`) are always strict; elsewhere the CLI uses
+  the mode of the policy it reads (`--config`, else `agentic-sdlc.toml`), strict without one.
+  `doctor` reports the mode ("executable trust mode"; WARN in local, since strict is what
+  protects agent contexts).
+
+**Migration:** re-run `sdlcctl onboard --force` (plus `--apply` for the ruleset). Repositories on
+self-hosted runners add `--runs-on <labels> --ephemeral-runners` or move to hosted runners; pass
+`--required-approvals 1` once a second reviewer exists. A policy written before these fields
+reads as `trust_mode = "strict"`, `ephemeral_runners = false`, `required_approvals = 0`.
+
 ### Credentials `doctor` requires
 
 Secrets are set with `gh secret set NAME --repo owner/repo`; variables with
@@ -274,7 +314,11 @@ gate, a cache step -- fails "ci.yml runs the policy gates as 'test'" and "manage
 the generated templates". Each gate command must be a single line (join several with `&&`) and
 must not contain `${{` (GitHub would evaluate it before the shell runs the command); `onboard`
 refuses such a command and `doctor` fails a policy holding one, rather than normalizing it into
-something that runs differently.
+something that runs differently. The Actions implement and repair paths verify a patch with
+`sdlcctl run-gates`, which runs each gate the way ci.yml's default `run:` shell does -- one
+`bash -e -c '<command>'` (`sh -e -c` without bash) from the repository root -- so `cd sub &&
+make test`, `VAR=x pytest` and `a && b` mean the same there as in CI (Codex 4243193109); only
+its environment differs (an allowlist, never the runner's credentials or control files).
 
 ### What `doctor` verifies exactly
 
@@ -350,7 +394,12 @@ through a link). `onboard --force` rewrites the policy and drops the confirmatio
   replacement/config switches above) -- nothing of the caller's, so `LD_PRELOAD`,
   `LD_LIBRARY_PATH`, `LD_AUDIT` or `DYLD_*` cannot load code into it (Codex 4241839908).
   `sdlcctl renew` also re-reads the issue and fails once it is closed or unreadable (Codex
-  4241614587), so every renewal is a state check. Step 2 runs `check-request --base
+  4241614587), so every renewal is a state check -- and re-reads the issue's open pull requests
+  (the inventory `claim` reads, linked and cross-referenced PRs included) and fails once one
+  exists or cannot be read (Codex 4243193102). A claim that fails (any non-zero exit) is
+  followed by a best-effort `sdlcctl release` of the same session before the routine moves on
+  (Codex 4243193105): a claim that lost the race and could not retract its marker would
+  otherwise leave it queued, to become authoritative when the holder releases. Step 2 runs `check-request --base
   origin/<default>` (the committed policy) and keeps the `content digest: sha256:...` it
   prints; step 4d, the final gate run immediately before the push with nothing in between,
   runs it again with `--expect-digest <digest> --authorize-labels` and the three approval
@@ -360,7 +409,9 @@ through a link). `onboard --force` rewrites the policy and drops the confirmatio
   reopened (Codex 4241614596), 6 when the issue is no longer open, 7 when an approval label was
   not last applied by a writer after the last edit (the `authorize-labeler` rule) -- then reads
   the issue and its history again and requires the update time, state, content digest, labels
-  and events unchanged. A changed title or body fails at once (5); any other change is judged
+  and events unchanged. Both reads also read the issue's open pull requests: any open PR in
+  either read exits 9 (Codex 4243193102: a PR opened or linked after the claim already
+  represents the work). A changed title or body fails at once (5); any other change is judged
   afresh from a new snapshot, at most 3 times, then exit 8. Separate digest and labeler checks
   let an edit plus a label re-apply, or a reopened dependency, land between them and pass both
   (Codex 4242264478). On anything but 0 the routine releases its lease and stops without

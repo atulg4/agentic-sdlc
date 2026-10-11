@@ -51,6 +51,11 @@ def spec(**overrides) -> OnboardSpec:
         forbidden_paths=("data/**", "*.png"),
         protected_paths=("comicmaestro/app.py",),
         publisher_bot_login="agentic-sdlc-publisher[bot]",
+        # The suite was written for the self-hosted MusicMaestro shape; GitHub-hosted is the
+        # default now (Codex 4243193108) and self-hosted needs the acknowledgement:
+        # tests/test_owner_defaults.py covers both.
+        runs_on=("self-hosted", "linux", "x64"),
+        ephemeral_runners=True,
     )
     base.update(overrides)
     return OnboardSpec(**base)
@@ -13298,3 +13303,27 @@ def test_onboard_cli_validates_and_records_the_publisher_bot(tmp_path):
     assert load_policy(repo / "agentic-sdlc.toml").publisher_bot_login == "my-forge[bot]"
     assert cli.main([*base, "--force"]) == 0  # kept without the flag
     assert load_policy(repo / "agentic-sdlc.toml").publisher_bot_login == "my-forge[bot]"
+
+
+# Codex 4243193105: a failed claim (any exit) may have left its marker queued when retracting it
+# failed; the routine releases the same session, best-effort, before moving on.
+def test_cloud_routine_releases_after_a_failed_claim():
+    files = render_onboarding(spec(implementer="cloud-routine", runs_on=("ubuntu-latest",)))
+    doc = files["docs/forge/cloud-implementer.md"]
+    step = " ".join(doc[doc.index("1b. Claim it") : doc.index("2. Check the request")].split())
+    assert "If the claim is refused (exit 2)" not in step
+    fails = step[step.index("If the claim fails (ANY non-zero exit)") :]
+    release = fails.index("sdlcctl release --project owner/comic --issue <n> --session <run id>")
+    assert release < fails.index("then skip that issue and take the next one")
+    assert "same <run id>" in fails and "best-effort" in fails
+    assert "sdlcctl release` with the same `--session`" in " ".join(files["AGENTS.md"].split())
+
+
+# Codex 4243193102: renewals and the final gate refuse once the issue has an open PR.
+def test_cloud_routine_stops_when_a_pr_appears_after_the_claim():
+    files = render_onboarding(spec(implementer="cloud-routine", runs_on=("ubuntu-latest",)))
+    doc = " ".join(files["docs/forge/cloud-implementer.md"].split())
+    step3a = doc[doc.index("3a. Renew the lease") : doc.index("4. Run each")]
+    assert "once the issue has an open pull request" in step3a
+    step4d = doc[doc.index("4d. The final gate") : doc.index("5. Push the checked commit")]
+    assert "Exit 9: a pull request for the issue was opened or linked meanwhile" in step4d

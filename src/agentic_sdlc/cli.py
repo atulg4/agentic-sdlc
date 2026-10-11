@@ -64,6 +64,7 @@ from .leases import (
     claim_inventory,
     issue_event_keys,
     issue_events,
+    open_prs_for_issue,
     publisher_bot_login_problem,
     release,
     render_claims,
@@ -78,14 +79,18 @@ from .missions import (
 )
 from .models import RiskLevel
 from .onboard import (
+    MAX_REQUIRED_APPROVALS,
     OnboardError,
     OnboardSpec,
     apply_repo_settings,
     canonical_project_id,
     confirm_cloud_routine,
     copy_variables,
+    default_required_approvals,
     doctor,
     installed_bot_login,
+    installed_trust_mode,
+    policy_trust_mode,
     registry_model_vars,
     repository_default_branch,
     repository_fork_exposed,
@@ -112,6 +117,7 @@ from .project_registry import (
 from .scaffold import ScaffoldError, scaffold_project
 from .spec_stage import merge_spec, parse_draft
 from .task_spec import TaskSpecError, check_task_spec, draft_request, parse_task, render_prompt
+from .trusted_exec import STRICT, TRUST_MODES, use_trust_mode
 from .usage_ledger import (
     EstimatorCalibration,
     TokenCounts,
@@ -457,6 +463,9 @@ LABELS_NOT_AUTHORIZED = 7
 #: `check-request --authorize-labels`: the issue (its labels, history or update time) kept changing
 #: while it was checked, so no single snapshot passed every check.
 REQUEST_UNSTABLE = 8
+#: `check-request --authorize-labels`: the issue has an open pull request (opened, linked or
+#: cross-referenced after the claim: Codex 4243193102) -- pushing would duplicate that work.
+PULL_REQUEST_OPEN = 9
 #: How many fresh snapshots `check-request --authorize-labels` judges before giving up on an issue
 #: that changes under it (a changed title or body is never retried: it fails at once).
 CHECK_REQUEST_ATTEMPTS = 3
@@ -483,6 +492,20 @@ def _issue_snapshot(document: dict[str, Any], events: list[dict]) -> dict[str, A
         "labels": sorted(name.casefold() for name in labels),
         "events": issue_event_keys(events),
     }
+
+
+def _open_pr_keys(project: str, issue: int) -> list[str]:
+    """The issue's open pull requests (`open_prs_for_issue`: the inventory `claim` reads,
+    linked and cross-referenced PRs included), as sorted URLs. Unreadable raises: never "none"."""
+    prs = open_prs_for_issue(project, issue, run_gh)
+    return sorted(str(pr.get("url") or f"#{pr.get('number')}") for pr in prs)
+
+
+def _refuse_open_prs(issue: int, prs: list[str], result: dict[str, Any]) -> tuple[int, str]:
+    listed = ", ".join(prs)
+    result.update(ready=False, openPullRequests=prs)
+    result["reasons"] = [f"the issue already has an open pull request: {listed}"]
+    return PULL_REQUEST_OPEN, f"PR OPEN: #{issue} already has an open pull request: {listed}"
 
 
 def _dependency_states(project: str, dependencies: Iterable[int]) -> dict[str, dict[str, str]]:
@@ -593,7 +616,10 @@ def _check_request(args: argparse.Namespace) -> int:
     approval set not last applied by a writer, removed, or applied before the last edit), then
     reads the issue, its history and every dependency again: the update time, state, content
     digest, labels, events and each dependency's state and update time must all be unchanged, or
-    the snapshot is stale. A changed title or body fails at
+    the snapshot is stale. Each of the two reads also reads the issue's open pull requests
+    (`open_prs_for_issue`, linked and cross-referenced ones included: Codex 4243193102); any open
+    PR in either read refuses (exit 9), and an unreadable inventory is an error (exit 2). A
+    changed title or body fails at
     once (exit 5); any other change is judged afresh from a new snapshot, at most
     `CHECK_REQUEST_ATTEMPTS` times, then exit 8 (it would not hold still)."""
     authorizing = bool(args.authorize_labels)
@@ -619,13 +645,26 @@ def _check_request(args: argparse.Namespace) -> int:
         code, result, message = _judge_request(args, policy, document, events, approval_labels)
         if code != 0 or events is None:
             break
+        # Codex 4243193102: a PR opened (or linked) for the issue since the claim is work this
+        # push would duplicate. The open-PR inventory is read with each snapshot, and is part of
+        # what must hold still between the two reads.
+        prs = _open_pr_keys(args.project, args.issue)
+        if prs:
+            code, message = _refuse_open_prs(args.issue, prs, result)
+            break
         # The dependencies are part of the snapshot (Codex 4242373526): one reopened between
         # the reads is a change like any other, judged afresh on the next attempt.
         before = _issue_snapshot(document, events)
         before["dependencies"] = result["dependencyStates"]
+        before["open pull requests"] = prs
         again = _read_issue(args.project, args.issue)
         after = _issue_snapshot(again, issue_events(args.project, args.issue, run_gh))
         after["dependencies"] = _dependency_states(args.project, result["dependencies"])
+        after["open pull requests"] = _open_pr_keys(args.project, args.issue)
+        if after["open pull requests"]:
+            _status(f"#{args.issue} gained an open pull request while it was checked")
+            code, message = _refuse_open_prs(args.issue, after["open pull requests"], result)
+            break
         if before == after:
             result["stable"] = {"updatedAt": after["updated_at"], "attempts": attempt}
             message += f" (stable across two reads at {after['updated_at']})"
@@ -1138,8 +1177,12 @@ def _onboard(args: argparse.Namespace) -> int:
         raise OnboardError(f"--publisher-bot-login {publisher_bot_login_problem(bot_login)}")
     if bot_login and args.apply:
         assignments.setdefault(LEASE_BOT_LOGINS_ENV, bot_login)
-    # Codex 4242753911: the hooks run an interpreter only root can replace, chosen now.
-    hook_python = trusted_hook_python(args.hook_python)
+    # The trust mode (strict: only executables root alone can replace; local: a developer's
+    # own machine). Not given: a forced re-onboard keeps the installed policy's, else strict.
+    trust = args.trust_mode or installed_trust_mode(destination) or STRICT
+    use_trust_mode(trust)  # this run's own gh (--apply) and git resolve under it too
+    # Codex 4242753911: the hooks run a vetted interpreter, chosen now and pinned by path.
+    hook_python = trusted_hook_python(args.hook_python, trust)
     # The policy must name the repository as GitHub spells it ($GITHUB_REPOSITORY, compared
     # exactly by prepare-request); --apply reads it anyway. Offline, doctor checks the spelling.
     project_id = canonical_project_id(args.project_id) if args.apply else args.project_id
@@ -1165,6 +1208,31 @@ def _onboard(args: argparse.Namespace) -> int:
             ) from exc
     else:
         fork_exposed = args.visibility == "public"
+    # Codex 4243193100: required approvals. Not given: with --apply, 1 when another collaborator
+    # with write access can approve (a solo owner cannot approve their own PR), else 0; offline, 0.
+    approvals = args.required_approvals
+    if approvals is None:
+        if args.apply:
+            approvals, why = default_required_approvals(project_id, run_gh)
+        else:
+            approvals, why = 0, "onboard ran without --apply, so collaborators were not read"
+        print(
+            f"NOTE: --required-approvals {approvals} ({why}).",
+            file=sys.stderr,
+        )
+    if approvals == 0:
+        print(
+            "WARNING: the ruleset will require no approving review, so GitHub does not enforce "
+            "the human-merge boundary"
+            + (
+                " -- in cloud-routine mode the routine acts as the owner and could merge its own "
+                "PR once CI passes"
+                if args.implementer == "cloud-routine"
+                else ""
+            )
+            + ". Pass --required-approvals N (N >= 1 needs a reviewer other than the PR's author).",
+            file=sys.stderr,
+        )
     spec = OnboardSpec(
         project_id=project_id,
         platform_repository=args.platform_repository,
@@ -1182,6 +1250,9 @@ def _onboard(args: argparse.Namespace) -> int:
         protected_paths=tuple(args.protected or ()),
         publisher_bot_login=bot_login,
         hook_python=hook_python,
+        trust_mode=trust,
+        ephemeral_runners=args.ephemeral_runners,
+        required_approvals=approvals,
     )
     written = write_onboarding(destination, spec, force=args.force)
     result: dict[str, Any] = {
@@ -1630,8 +1701,9 @@ def build_parser() -> argparse.ArgumentParser:
         "check-request",
         help="exit 0 only if the issue is an open, valid work request whose dependencies are "
         "all closed (3: invalid request, 4: a dependency is open, 5: content changed from "
-        "--expect-digest, 6: issue not open, 7: approval labels not authorized and 8: issue "
-        "kept changing (both with --authorize-labels), 2: could not verify)",
+        "--expect-digest, 6: issue not open, 7: approval labels not authorized, 8: issue "
+        "kept changing and 9: an open pull request for the issue (all three with "
+        "--authorize-labels), 2: could not verify)",
     )
     check_request.add_argument("--project", required=True, help="owner/name on GitHub")
     check_request.add_argument("--issue", type=int, required=True)
@@ -1656,7 +1728,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also require what authorize-labeler requires (exit 7 if not), all judged on one "
         "snapshot of the issue that a second read must find unchanged (exit 8 if it kept "
-        "changing; exit 5 if its title or body changed): the routine's one final gate",
+        "changing; exit 5 if its title or body changed) and no open pull request for the "
+        "issue in either read (exit 9): the routine's one final gate",
     )
     check_request.add_argument(
         "--label",
@@ -1914,7 +1987,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--implementer", choices=("route", "claude", "codex", "cloud-routine"), default="route"
     )
     onboard.add_argument(
-        "--runs-on", default="self-hosted,linux,x64", help="comma-separated runner labels"
+        "--runs-on",
+        default="ubuntu-latest",
+        help="comma-separated runner labels of the Forge jobs, which run model-produced patches "
+        "(default: GitHub-hosted ubuntu-latest); self-hosted labels need --ephemeral-runners",
+    )
+    onboard.add_argument(
+        "--ephemeral-runners",
+        action="store_true",
+        help="acknowledge that the self-hosted runners in --runs-on/--ci-runs-on are ephemeral "
+        "(one job, then discarded) or otherwise contained; required for any self-hosted label",
+    )
+    onboard.add_argument(
+        "--trust-mode",
+        choices=TRUST_MODES,
+        help="strict (default): git, gh and the hook python must be files only root can "
+        "replace; local: a developer's own machine (first on PATH, owned by root or you). "
+        "GitHub Actions and Claude Code cloud sessions are strict regardless. Default: the "
+        "installed policy's on --force, else strict",
+    )
+    onboard.add_argument(
+        "--required-approvals",
+        type=int,
+        choices=range(0, MAX_REQUIRED_APPROVALS + 1),
+        metavar="N",
+        help="approving reviews the ruleset requires (0-10). Default with --apply: 1 when "
+        "another collaborator with write access exists, else 0; offline: 0",
     )
     onboard.add_argument(
         "--ci-runs-on",
@@ -2053,9 +2151,34 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _policy_trust_mode(args: argparse.Namespace) -> str | None:
+    """The `[automation] trust_mode` of the policy this command reads -- `--config` when it
+    names a readable file, else `<destination>/agentic-sdlc.toml` (onboard, doctor), else
+    ./agentic-sdlc.toml -- or None when there is none. In an agent context (GitHub Actions, a
+    Claude Code cloud session) the mode is strict whatever this returns (`trust_mode`)."""
+    import tomllib
+
+    candidates = []
+    config = getattr(args, "config", None)
+    if isinstance(config, str) and config:
+        candidates.append(Path(config))
+    destination = getattr(args, "destination", None)
+    if isinstance(destination, str) and destination:
+        candidates.append(Path(destination) / "agentic-sdlc.toml")
+    candidates.append(Path("agentic-sdlc.toml"))
+    for path in candidates:
+        try:
+            document = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+            continue
+        return policy_trust_mode(document)
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        use_trust_mode(_policy_trust_mode(args))
         return int(args.handler(args))
     except (
         TaskSpecError,

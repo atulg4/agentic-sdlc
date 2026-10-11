@@ -1743,6 +1743,21 @@ def _require_open_issue(project: str, issue: int, gh: GhRunner) -> None:
         raise LeaseError(f"issue #{issue} is {state or 'in an unknown state'}; not renewing")
 
 
+def _require_no_open_pr(project: str, issue: int, gh: GhRunner) -> None:
+    """Raise LeaseError if `issue` has an open pull request (`open_prs_for_issue`), or if that
+    inventory cannot be read."""
+    try:
+        prs = open_prs_for_issue(project, issue, gh)
+    except Exception as exc:  # noqa: BLE001 -- an unreadable inventory is never "no open PR"
+        raise LeaseError(
+            f"issue #{issue}: its open pull requests could not be read "
+            f"({str(exc).strip()[:200]}); not renewing"
+        ) from exc
+    if prs:
+        urls = ", ".join(str(pr.get("url") or f"#{pr.get('number')}") for pr in prs)
+        raise LeaseError(f"issue #{issue} already has an open pull request: {urls}; not renewing")
+
+
 def renew(
     project: str,
     issue: int,
@@ -1756,11 +1771,16 @@ def renew(
     """Extend this session's live lease. Every renewal is also a state check (Codex
     4241614587): the cloud routine renews after implementing, after verifying and immediately
     before pushing, and an issue closed meanwhile must stop it -- so a renewal re-reads the issue
-    and refuses unless it is an open issue; an issue that cannot be read refuses too."""
+    and refuses unless it is an open issue; an issue that cannot be read refuses too. It also
+    re-reads the issue's open pull requests (Codex 4243193102: the same inventory `claim` reads,
+    linked and cross-referenced ones included): a PR a human or other automation opened for the
+    issue after the claim is durable work this run would duplicate, so the renewal refuses, and an
+    unreadable inventory refuses too (LeaseError), never "no PR"."""
     clock = _clock(now, clock)
     now = clock()
     _check_ttl(ttl_minutes)
     _require_open_issue(project, issue, gh)
+    _require_no_open_pr(project, issue, gh)
     existing = current_lease(project, issue, gh, now)
     if existing is None or existing.session != session:
         raise LeaseError(f"issue #{issue} is not leased by session {session}")
