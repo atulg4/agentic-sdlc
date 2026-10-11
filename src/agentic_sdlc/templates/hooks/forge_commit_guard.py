@@ -70,7 +70,14 @@ The repository a guarded command acts on must be resolvable before it runs (Code
 a selector the shell rewrites (`git -C "$DIR"`, `--git-dir=$X`, `--work-tree`, GIT_DIR=/
 GIT_WORK_TREE= set to an expansion, `cd $DIR`, `$(...)`, backticks, a glob, an ambiguous `~`)
 is refused outright, and a branch lookup that fails for any reason but "no repository there"
-(`git clone`/`git init` from a plain directory) is unknown and refuses, never "no branch".
+(`git clone`/`git init` from a plain directory) is unknown and refuses, never "no branch". So is
+git run through an ASSEMBLED program word (`G=git; "$G" -C DIR commit`, `$(which git)`,
+`${GIT:-git}`, `\\git`, `"git"`, `$HOME/bin/git`) or handed its command line by another program
+(`xargs`/`find -exec`/`parallel`/`eval`, a shell reading stdin, an interpreter whose code also
+selects a repository) (Codex 4240170620): its `-C`/`--git-dir`/GIT_DIR selectors are out of
+sight, so it is never mapped to the current checkout. Plain `git`, a literal path to git
+(`/usr/bin/git`) and the wrappers parsed above (`env`, `command`, `exec`, `nice`, `time`,
+`sudo`, ...) keep their selectors and are checked against the repository they name.
 
 Out of scope: programs that run git without naming it on the command line (a script file, a
 Makefile target) and direct writes into `.git/`.
@@ -180,6 +187,18 @@ GIT_PROGRAMS = frozenset({"git", "git.exe"})
 # bash`, `parallel sh`): handing work to a shell is unprovable (Codex 4206173667). `xargs` is NOT
 # a wrapper any more -- the arguments it appends from stdin or `-a FILE` are invisible here.
 FANOUT = frozenset({"xargs", "parallel", "find"})
+# Programs that only print, search or test their arguments -- they cannot run a `git` word they
+# are handed (`grep -rn git src`, `echo "git merge"`, `which git`). Any OTHER program receiving
+# `git` (`python -c`, `node -e`, `perl -e`, `gh`, ...) may run it, and when its text also selects
+# a repository (`-C`, `--git-dir`, `--work-tree`, GIT_DIR/GIT_WORK_TREE, `cwd=`, `chdir`, `cd`)
+# the guard cannot tell which one: UNRESOLVED_REPO (Codex 4240170620), never the current checkout.
+INERT_PROGRAMS = frozenset(
+    {"echo", "printf", "grep", "egrep", "fgrep", "rg", "cat", "head", "tail", "wc", "ls"}
+    | {"which", "type", "whereis", "test", "[", "[[", ":", "true", "false"}
+)
+_REPO_SELECTOR_TEXT = re.compile(
+    r"(?<![\w-])(?:-C|--git-dir|--work-tree|GIT_DIR|GIT_WORK_TREE|cwd|chdir|cd|pushd)(?![\w-])"
+)
 OPERATORS = frozenset({";", "&", "&&", "|", "||", "(", ")", ";;", "|&"})
 _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # Reserved words and grouping that may open a simple command without being its program:
@@ -549,11 +568,16 @@ def _commit_targets(argv: list[str], depth: int = 0, cwd: str | None = None) -> 
     if not words:
         return []
     unknown = [(tuple(chdirs), (), tuple(env))]
+    # Codex 4240170620: git run from text this parser does not read as git's own command line
+    # (a shell's stdin, xargs/find/parallel/eval, an interpreter's code) keeps its `-C`/
+    # `--git-dir`/GIT_DIR selectors out of sight: its repository is unresolved, never the
+    # current checkout with those selectors dropped.
+    unresolved = [_unresolved(tuple(chdirs))]
     program = os.path.basename(words[0])
     inner = _shell_command_string(words)
     if inner is not None:
         if depth >= MAX_SUBST_DEPTH:
-            return unknown
+            return unresolved
         return [
             ((*chdirs, *inner_dirs), opts, (*env, *inner_env))
             for inner_dirs, opts, inner_env in commit_targets(inner, depth + 1, _where(cwd, chdirs))
@@ -562,7 +586,7 @@ def _commit_targets(argv: list[str], depth: int = 0, cwd: str | None = None) -> 
     named = _mentioned_refs(unknown[0], " ".join(words[1:]))
     if program in SHELLS:  # `| sh`, `bash <<< ...`: the program arrives on stdin
         reads_stdin = _shell_reads_stdin(words)
-        return unknown + named if reads_stdin or any(_mentions_git(a) for a in args) else []
+        return unresolved + named if reads_stdin or any(_mentions_git(a) for a in args) else []
     if program.startswith("git-"):  # `git-commit`, `git-push`: a git subcommand run directly
         refs = _named_refs(program[4:], words[1:], _where(cwd, chdirs), unknown[0], False)
         return unknown + [_with_ref(unknown[0], ref) for ref in refs]
@@ -571,15 +595,24 @@ def _commit_targets(argv: list[str], depth: int = 0, cwd: str | None = None) -> 
             # `xargs git`, `find -exec git`, `eval git ...`: git's arguments (and so the refs
             # it updates) arrive from stdin or are assembled -- no destination can be known.
             # `python -c '...git'`: every issue ref the text names is a destination.
-            if (program in FANOUT or program in _EVAL_LIKE) and not _ref_free_fanout(words):
-                return [*unknown, *named, _with_ref(unknown[0], UNKNOWN_REF)]
+            if program in FANOUT or program in _EVAL_LIKE:
+                fanned = _fanout_git_target(words, chdirs, env) if program in FANOUT else None
+                base = [fanned] if fanned is not None else unresolved
+                if not _ref_free_fanout(words):
+                    return [_with_ref(unknown[0], UNKNOWN_REF), *base, *named]
+                return base + named
+            if program not in INERT_PROGRAMS and _REPO_SELECTOR_TEXT.search(" ".join(args)):
+                return unresolved + named  # `python -c "...['git', '-C', p, 'commit']"`
             return unknown + named
         if program in FANOUT and any(os.path.basename(a) in SHELLS for a in args):
-            return unknown + named  # `xargs sh`, `find -exec bash -c ...`
+            return unresolved + named  # `xargs sh`, `find -exec bash -c ...`
         return []
     unsafe = any(
         key not in SAFE_GIT_ENV and not key.startswith("LC_") for key in keys
     )  # GIT_EXTERNAL_DIFF=..., GIT_CONFIG_*=..., PAGER=... git log
+    # An exported GIT_*/PAGER/EDITOR setting elsewhere in the command (`_ENV_TAINT`): even a
+    # read-only subcommand is guarded, in the repository ITS selectors name (Codex 4240170620).
+    tainted = bool(_TAINTED)
     rest = words[1:]
     repo_opts: list[str] = []
     while rest:
@@ -605,7 +638,7 @@ def _commit_targets(argv: list[str], depth: int = 0, cwd: str | None = None) -> 
         if word.startswith("-"):
             continue  # --no-pager, --bare, ...
         target = [(tuple(chdirs), tuple(repo_opts), tuple(env))]
-        if unsafe or not _read_only(word, rest):
+        if unsafe or tainted or not _read_only(word, rest):
             # Codex 4239397967: the refs the command names are destinations too, not only the
             # checked-out branch (`git push origin HEAD:forge/issue-7` from main).
             refs = _named_refs(word, rest, _where(cwd, chdirs), target[0], unsafe)
@@ -620,6 +653,58 @@ def _commit_targets(argv: list[str], depth: int = 0, cwd: str | None = None) -> 
             return target
         return []
     return []  # `git`, `git --version`: no subcommand
+
+
+def _fanout_git_target(
+    words: list[str], chdirs: list[str], env: list[tuple[str, str]]
+) -> Target | None:
+    """`xargs git -C DIR log`, `find . -exec git log -- {} ;`: a fan-out running a LITERAL
+    `git [global options] SUB`, whose own selectors name its repository -- the words the fan-out
+    supplies land after SUB, where git reads no repository option. None (unresolved, Codex
+    4240170620) when they may land anywhere else: no literal subcommand (`xargs git`, `parallel
+    git ::: commit`), a placeholder or replace string before it (`xargs -I{} git -C {} commit`),
+    a per-file directory (`find -execdir`, `parallel --wd`), or a wrapper, shell or assignment
+    between the fan-out and git."""
+    program = os.path.basename(words[0])
+    index = next((i for i, w in enumerate(words) if os.path.basename(w) in GIT_PROGRAMS), None)
+    if index is None:
+        return None
+    for word in words[1:index]:
+        name = os.path.basename(word)
+        if _ASSIGNMENT.match(word) or name in WRAPPERS or name in SHELLS or name == "eval":
+            return None
+        if word in ("-execdir", "-okdir") or word.startswith(("--wd", "--workdir")):
+            return None
+        if program == "xargs" and (
+            word.startswith("--replace")
+            or (word.startswith("-") and not word.startswith("--") and set(word[1:]) & set("iI"))
+        ):
+            return None
+    rest = list(words[index + 1 :])
+    repo_opts: list[str] = []
+    while rest:
+        word = rest.pop(0)
+        if "{" in word or word in (":::", "::::", ":::+", "::::+", ";", "+"):
+            return None
+        if word in GIT_VALUE_OPTS:
+            if not rest or "{" in rest[0]:
+                return None
+            value = rest.pop(0)
+            if word in GIT_REPO_OPTS:
+                repo_opts += [word, value]
+            continue
+        if word.startswith(("--git-dir=", "--work-tree=")):
+            repo_opts.append(word)
+            continue
+        if word.startswith("-C") and len(word) > 2:
+            repo_opts += ["-C", word[2:]]
+            continue
+        if word.startswith("-"):
+            continue
+        if not _plain(word):
+            return None  # `xargs git < args`: a redirection, not a subcommand
+        return (tuple(chdirs), tuple(repo_opts), tuple(env))
+    return None
 
 
 def _mentions_git(text: str) -> bool:
@@ -1734,6 +1819,49 @@ def commit_targets(command: str, depth: int = 0, cwd: str | None = None) -> list
     one; an assembled program or subcommand is one with an unknown repository."""
     if depth == 0:
         _HELPER_NOTES.clear()
+        tainted = _mentions_git(command) and bool(
+            _ENV_TAINT.search(re.sub(r"[\"'\\]", "", command))
+        )
+        _TAINTED[:] = [True] if tainted else []
+        try:
+            return _commit_targets_top(command, cwd, tainted)
+        finally:
+            _TAINTED.clear()
+    return _commit_targets_in(command, depth, cwd)
+
+
+def _commit_targets_top(command: str, cwd: str | None, tainted: bool) -> list[Target]:
+    found = _commit_targets_in(command, 0, cwd)
+    if _raw_unproven(command):
+        # Codex 4240170620: an ASSEMBLED program or subcommand (`G=git; "$G" -C DIR commit`,
+        # `$(which git)`, `${GIT:-git}`, `\git`, `"git"`, `$HOME/bin/git`): what the shell runs,
+        # and with which `-C`/`--git-dir`/GIT_DIR selectors, cannot be known -- unresolved, never
+        # the current checkout with the selectors dropped.
+        found.append(_unresolved())
+        found += _mentioned_refs(((), (), ()), command)  # every issue ref it names, too
+    if tainted:
+        # git run under an exported GIT_*/PAGER/EDITOR setting: every git invocation was
+        # already guarded in the repository its own selectors name (`tainted` above); every
+        # `cd` prefix is checked too.
+        cds = _cd_words(command)
+        found += [(tuple(cds[:count]), (), ()) for count in range(len(cds) + 1)]
+        found += _mentioned_refs(((), (), ()), command)
+    return found
+
+
+def _cd_words(command: str) -> list[str]:
+    """The directory of every `cd` in `command`, in order (as `_commit_targets_in` reads them)."""
+    cds: list[str] = []
+    for _, seg in _segments_with_ops(command):
+        while seg and seg[0] in SHELL_KEYWORDS:
+            seg = seg[1:]
+        if seg and seg[0] == "cd":
+            operands = [w for w in seg[1:] if not w.startswith("-") or w == "-"]
+            cds.append(operands[-1] if operands else "~")
+    return cds
+
+
+def _commit_targets_in(command: str, depth: int, cwd: str | None) -> list[Target]:
     found: list[Target] = []
     cds: list[str] = []
     state = None  # the branch change in effect: None, UNKNOWN_BRANCH or (location, X, replace)
@@ -1756,14 +1884,14 @@ def commit_targets(command: str, depth: int = 0, cwd: str | None = None) -> list
         # over the joined words: shlex splits an unquoted `cd \`git commit\`` across words
         for body in _substitutions(" ".join(seg)):
             if depth >= MAX_SUBST_DEPTH:
-                subst += [((), (), ())] if _mentions_git(body) else []
+                subst += [_unresolved()] if _mentions_git(body) else []
                 if _mentions_git(body):
                     state = UNKNOWN_BRANCH
                 continue
             try:  # a substitution runs where the command runs: same `cd`s
                 subst += commit_targets(body, depth + 1, where)
             except ValueError:
-                subst += [((), (), ())] if _mentions_git(body) else []
+                subst += [_unresolved()] if _mentions_git(body) else []
             if _changes_branch(body, depth + 1):
                 state = UNKNOWN_BRANCH  # it ran before this command did
         found += _retarget([((*prefix, *dirs), o, e) for dirs, o, e in subst], state)
@@ -1794,14 +1922,6 @@ def commit_targets(command: str, depth: int = 0, cwd: str | None = None) -> list
         found += _retarget(own, state)
         if kind != "none":
             state = UNKNOWN_BRANCH
-    if depth == 0 and (
-        _raw_unproven(command)
-        or (_mentions_git(command) and _ENV_TAINT.search(re.sub(r"[\"'\\]", "", command)))
-    ):
-        # An assembled program/subcommand, or git run under an exported GIT_*/PAGER/EDITOR
-        # setting: unknown repository, so every `cd` prefix.
-        found += [(tuple(cds[:count]), (), ()) for count in range(len(cds) + 1)]
-        found += _mentioned_refs(((), (), ()), command)  # every issue ref it names, too
     return found
 
 
@@ -1825,9 +1945,16 @@ def is_git_commit(command: str, depth: int = 0, cwd: str | None = None) -> bool:
 # checkout. Such a target is UNRESOLVED_REPO and blocks; a probe that fails for any reason other
 # than "there is no repository there" is BRANCH_UNKNOWN and blocks too.
 UNRESOLVED_REPO = "\0unresolved-repo"
+_UNRESOLVED_KEY = "\0unresolved"  # a Target env entry: its repository cannot be known at all
+_TAINTED: list[bool] = []  # set while a top-level command carries an `_ENV_TAINT` assignment
 BRANCH_UNKNOWN = "\0branch-unknown"  # git could not report the branch: unknown, never "none"
 _SELECTOR_EXPANSION = re.compile(r"[$`*?\[]")
 _QUOTED_TILDE = re.compile(r"[\"'\\]~")
+
+
+def _unresolved(chdirs: tuple[str, ...] = ()) -> Target:
+    """A guarded git invocation whose repository cannot be known before the shell runs."""
+    return (chdirs, (), ((_UNRESOLVED_KEY, "1"),))
 
 
 def _unresolvable(value: str, word_start: bool, quoted_tilde: bool) -> bool:
@@ -1880,6 +2007,8 @@ def target_branch(target: Target, cwd: str | None, quoted_tilde: bool = False) -
     """The branch `git <repo options> ...` acts on, asked of git itself. UNRESOLVED_REPO when a
     repository selector cannot be resolved before the shell runs (Codex 4239868022)."""
     chdirs, opts, env = target
+    if _UNRESOLVED_KEY in dict(env):
+        return UNRESOLVED_REPO  # an assembled or indirect git (Codex 4240170620)
     named = dict(env).get(_REF_KEY)
     if named is not None:
         return named  # a ref the command names as a destination (Codex 4239397967)
@@ -1898,7 +2027,8 @@ def commit_branches(command: str, cwd: str | None) -> list[str]:
     try:
         targets = commit_targets(command, cwd=cwd)
     except ValueError:
-        targets = []
+        # unparseable here but maybe not to the shell (`$'it\\''`): nothing it selects is known
+        return [UNRESOLVED_REPO]
     if not targets:
         return [current_branch(cwd)]
     branches: list[str] = []
@@ -2227,9 +2357,12 @@ def _decide_branch(payload: dict, branch: str, lease_lookup, pr_lookup) -> tuple
             "Forge guard: this git command selects its repository through text the shell "
             'expands before git runs (`git -C "$DIR"`, `--git-dir=$X`, `--work-tree`, '
             "GIT_DIR=/GIT_WORK_TREE= set to an expansion, `cd $DIR`, `$(...)`, backticks, a glob "
-            "or an ambiguous `~`), so the branch it acts on -- and the lease it needs -- cannot be "
-            "checked. Spell the repository as a literal path (git -C /path/to/checkout commit) or "
-            "cd there in a separate command first."
+            "or an ambiguous `~`), or runs git through a name or program the guard cannot read "
+            '(`"$G"`, `$(which git)`, `${GIT:-git}`, `\\git`, a quoted `"git"`, xargs/find/eval, '
+            "a script piped to a shell, an interpreter's code that selects a repository), so the "
+            "branch it acts on -- and the lease it needs -- cannot be checked. Spell the program "
+            "as a plain `git` and the repository as a literal path (git -C /path/to/checkout "
+            "commit), or cd there in a separate command first."
         )
     if branch == BRANCH_UNKNOWN:
         return 2, (

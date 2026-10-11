@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -54,8 +55,23 @@ def spec(**overrides) -> OnboardSpec:
 
 _CONSUMER: dict[str, Path] = {}  # the consumer checkout the current test created
 CONSUMER_CONTENTS = "api repos/owner/comic/contents/"
+# Codex 4240170623: the workflow directory is enumerated through the Git Trees API (a commit's
+# tree, then `.github`, then `workflows`). By default the fake serves each tree from the SAME
+# answer the contents API would give for that directory, so a test that answers the contents
+# listing (or fails it) answers the tree listing too.
+CONSUMER_COMMITS = "api repos/owner/comic/commits/"
+CONSUMER_TREES = "api repos/owner/comic/git/trees/"
 PLATFORM_CONTENTS = "api repos/owner/agentic-sdlc/contents/"
 PLATFORM_WORKFLOWS = Path(__file__).resolve().parents[1] / ".github/workflows"
+
+
+def _writable(gh: FakeGh) -> None:
+    """Answer `GET repos/owner/comic` as a writable repository (`--apply` reads it first, Codex
+    4240170627). Added LAST: answers match by prefix in insertion order."""
+    gh.answers.pop("api repos/owner/comic", None)
+    gh.answers["api repos/owner/comic"] = json.dumps(
+        {"full_name": "owner/comic", "archived": False, "disabled": False}
+    )
 
 
 def _blob(data: bytes) -> str:
@@ -91,6 +107,65 @@ class FakeGh:
     def __call__(self, args, input=None):
         self.calls.append((tuple(args), input))
         key = " ".join(args)
+        if key.startswith((CONSUMER_COMMITS, CONSUMER_TREES)):
+            for prefix, value in self.answers.items():
+                if prefix.startswith((CONSUMER_COMMITS, CONSUMER_TREES)) and key.startswith(prefix):
+                    if isinstance(value, Exception):
+                        raise value
+                    return value
+            if any(
+                prefix.startswith((CONSUMER_COMMITS, CONSUMER_TREES)) and key.startswith(prefix)
+                for prefix in self.fail
+            ):
+                raise OnboardError("boom")
+            return self._git_object(key)
+        return self._answer(key)
+
+    def _git_object(self, key: str) -> str:
+        """A commit (`commits/{ref}`) or a tree (`git/trees/{sha}`) of the consumer, built from
+        the contents API's answer for the same directory at the same ref."""
+        from urllib.parse import quote, unquote
+
+        trees = self.__dict__.setdefault("trees", {})
+
+        def tree_sha(ref: str, rel: str) -> str:
+            sha = hashlib.sha1(f"{ref}\0{rel}".encode()).hexdigest()
+            trees[sha] = (ref, rel)
+            return sha
+
+        if key.startswith(CONSUMER_COMMITS):
+            ref = unquote(key[len(CONSUMER_COMMITS) :])
+            return json.dumps({"sha": "c" * 40, "commit": {"tree": {"sha": tree_sha(ref, "")}}})
+        sha = unquote(key[len(CONSUMER_TREES) :])
+        if sha not in trees:
+            raise OnboardError("gh: Not Found (HTTP 404)")
+        ref, rel = trees[sha]
+        raw = self._answer(CONSUMER_CONTENTS + f"{rel}?ref={quote(ref, safe='')}")
+        try:
+            listing = json.loads(raw)
+        except json.JSONDecodeError:
+            return raw
+        if not isinstance(listing, list):
+            return raw
+        kinds = {"file": ("blob", "100644"), "dir": ("tree", "040000")}
+        kinds |= {"symlink": ("blob", "120000"), "submodule": ("commit", "160000")}
+        entries = []
+        for entry in listing:
+            name = str(entry.get("name"))
+            kind, mode = kinds.get(entry.get("type"), (str(entry.get("type")), "100644"))
+            child = f"{rel}/{name}" if rel else name
+            sha_of = tree_sha(ref, child) if kind == "tree" else hashlib.sha1(child.encode())
+            entries.append(
+                {
+                    "path": name,
+                    "mode": mode,
+                    "type": kind,
+                    "sha": sha_of if isinstance(sha_of, str) else sha_of.hexdigest(),
+                }
+            )
+        return json.dumps({"sha": sha, "tree": entries, "truncated": False})
+
+    def _answer(self, key: str) -> str:
         if key.startswith(CONSUMER_CONTENTS):
             for prefix, value in self.answers.items():
                 if prefix.startswith(CONSUMER_CONTENTS) and key.startswith(prefix):
@@ -321,6 +396,7 @@ def test_resolve_platform_ref_accepts_sha_and_resolves_branches():
 
 def test_apply_repo_settings_creates_labels_ruleset_and_variables_idempotently():
     gh = FakeGh({"api repos/owner/comic/rulesets": "[]"})
+    _writable(gh)
     log = apply_repo_settings(spec(), gh, variables={"PUBLISHER_APP_CLIENT_ID": "Iv1"})
     label_calls = [c for c, _ in gh.calls if c[:2] == ("label", "create")]
     assert {c[2] for c in label_calls} >= {
@@ -354,6 +430,7 @@ def test_apply_repo_settings_creates_labels_ruleset_and_variables_idempotently()
             "api repos/owner/comic/rulesets": json.dumps([[{"id": 5, "name": RULESET_NAME}]]),
         }
     )
+    _writable(gh2)
     log2 = apply_repo_settings(spec(), gh2)
     assert not any(c[:3] == ("api", "-X", "POST") for c, _ in gh2.calls)
     assert any("already present" in line for line in log2)
@@ -509,6 +586,8 @@ def _healthy_gh() -> FakeGh:
                     "visibility": "private",
                     "allow_forking": False,
                     "has_issues": True,
+                    "archived": False,
+                    "disabled": False,
                 }
             ),
             "api /user/installations": _installs(7),
@@ -861,6 +940,7 @@ def test_incomplete_same_name_ruleset_is_updated_and_fails_doctor(tmp_path):
             "api repos/owner/comic/rulesets": json.dumps([[stale]]),
         }
     )
+    _writable(gh)
     log = apply_repo_settings(spec(), gh)
     put = [(c, i) for c, i in gh.calls if c[:3] == ("api", "-X", "PUT")]
     assert put and put[0][0][3] == "repos/owner/comic/rulesets/5"
@@ -920,6 +1000,8 @@ def test_doctor_flags_a_policy_branch_that_is_not_the_repo_default(tmp_path):
             "visibility": "private",
             "allow_forking": False,
             "has_issues": True,
+            "archived": False,
+            "disabled": False,
         }
     )
     report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
@@ -1262,6 +1344,7 @@ def test_rulesets_are_paginated_and_exclude_inherited_ones(tmp_path):
             "api repos/owner/comic/rulesets": json.dumps([[org_owned]]),
         }
     )
+    _writable(gh)
     log = apply_repo_settings(spec(), gh)
     assert any("already present" in line for line in log)
     assert not any(c[:3] in {("api", "-X", "POST"), ("api", "-X", "PUT")} for c, _ in gh.calls)
@@ -2035,6 +2118,8 @@ def test_doctor_accepts_a_public_repository_onboarded_with_hosted_ci(tmp_path):
             "visibility": "public",
             "private": False,
             "has_issues": True,
+            "archived": False,
+            "disabled": False,
         }
     )
     report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
@@ -2171,6 +2256,8 @@ def test_doctor_accepts_self_hosted_pr_jobs_when_fork_workflows_are_proven_off(t
             "visibility": "internal",
             "allow_forking": True,
             "has_issues": True,
+            "archived": False,
+            "disabled": False,
         }
     )
     report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
@@ -2476,6 +2563,7 @@ def test_ruleset_update_merges_forge_rules_without_weakening_existing_ones():
             "api repos/owner/comic/rulesets": json.dumps([[strong]]),
         }
     )
+    _writable(gh)
     apply_repo_settings(spec(), gh)
     body = json.loads(next(i for c, i in gh.calls if c[:3] == ("api", "-X", "PUT")))
     assert body == merged_ruleset(strong, spec())
@@ -4435,7 +4523,11 @@ def test_commit_guard_raw_proof_keeps_plain_non_commits(tmp_path, command):
 def test_commit_guard_checks_an_assembled_commit_after_cd(tmp_path):
     guard = _guard_module(tmp_path, "forge_commit_guard")
     targets = guard.commit_targets('cd ../wt && g"it" commit', cwd=str(tmp_path))
-    assert (("../wt",), (), ()) in targets and ((), (), ()) in targets
+    # the cooked parse still checks ../wt; the assembled program itself is unresolved (Codex
+    # 4240170620), never the hook's own checkout
+    assert (("../wt",), (), ()) in targets and guard._unresolved() in targets
+    assert ((), (), ()) not in targets
+    assert guard.UNRESOLVED_REPO in guard.commit_branches('cd ../wt && g"it" commit', None)
 
 
 # Codex 4205654958 / 4205654967: the shared POLICY_FIELDS validator (onboard and doctor).
@@ -5320,6 +5412,7 @@ def test_doctor_reports_unreadable_effective_rules_as_a_manual_todo(tmp_path):
 
 def test_apply_still_manages_only_the_repository_rulesets():
     gh = FakeGh({"api repos/owner/comic/rulesets": json.dumps([])})
+    _writable(gh)
     apply_repo_settings(spec(), gh)
     called = [" ".join(c) for c, _ in gh.calls]
     assert any("rulesets?includes_parents=false" in c for c in called)
@@ -5351,13 +5444,14 @@ def test_doctor_requires_the_canonical_project_id_spelling(tmp_path):
 def test_canonical_project_id_takes_githubs_spelling_of_the_same_repository():
     from agentic_sdlc.onboard import canonical_project_id
 
-    gh = FakeGh({"api repos/OWNER/Comic": json.dumps({"full_name": "owner/comic"})})
+    writable = {"archived": False, "disabled": False}  # Codex 4240170627: checked here too
+    gh = FakeGh({"api repos/OWNER/Comic": json.dumps({"full_name": "owner/comic", **writable})})
     assert canonical_project_id("OWNER/Comic", gh) == "owner/comic"
     # Codex 4239868019: a rename/transfer redirect answers with the CURRENT name, which is what
     # every run passes as $GITHUB_REPOSITORY: that is the canonical id, not the stale slug
-    renamed = FakeGh({"api repos/owner/old": json.dumps({"full_name": "owner/new"})})
+    renamed = FakeGh({"api repos/owner/old": json.dumps({"full_name": "owner/new", **writable})})
     assert canonical_project_id("owner/old", renamed) == "owner/new"
-    moved = FakeGh({"api repos/owner/comic": json.dumps({"full_name": "neworg/Comic"})})
+    moved = FakeGh({"api repos/owner/comic": json.dumps({"full_name": "neworg/Comic", **writable})})
     assert canonical_project_id("owner/comic", moved) == "neworg/Comic"
     # Unreadable is never a guess: --apply would write the id into the policy and configure by it.
     for answer in ("not json", "", OnboardError("gh: HTTP 502"), "[]", "{}", '{"full_name": 7}'):
@@ -6345,6 +6439,7 @@ def test_an_unreadable_answer_never_yields_ready(tmp_path, key, check, answer):
 def test_apply_aborts_before_any_mutation_when_the_ruleset_inventory_is_unreadable(answer):
     gh = FakeGh({"api repos/owner/comic/rulesets": answer})
     with pytest.raises(OnboardError, match="could not read the rulesets.*nothing was changed"):
+        _writable(gh)
         apply_repo_settings(spec(), gh, variables={"PUBLISHER_APP_CLIENT_ID": "Iv1"})
     # only reads: no label, no ruleset POST/PUT (a duplicate 'Protect main'), no variable
     assert all(c[0] == "api" and "-X" not in c for c, _ in gh.calls), gh.calls
@@ -6361,12 +6456,14 @@ def test_apply_aborts_before_any_mutation_when_the_existing_ruleset_is_unreadabl
         }
     )
     with pytest.raises(OnboardError, match=f"could not read ruleset '{RULESET_NAME}'"):
+        _writable(gh)
         apply_repo_settings(spec(), gh)
     assert all(c[0] == "api" and "-X" not in c for c, _ in gh.calls), gh.calls
 
 
 def test_apply_reads_an_explicit_empty_inventory_as_empty():
     gh = FakeGh({"api repos/owner/comic/rulesets": json.dumps([[]])})
+    _writable(gh)
     assert any("created" in line for line in apply_repo_settings(spec(), gh))
     assert sum(c[:3] == ("api", "-X", "POST") for c, _ in gh.calls) == 1
 
@@ -6614,10 +6711,10 @@ def test_platform_refs_are_encoded_as_one_path_component():
     assert gh.calls[0][0][1] == "repos/owner/agentic-sdlc/commits/feature%2Fonboarding"
     gh = FakeGh({"api repos/owner/agentic-sdlc/commits/50%25off": SHA + "\n"})
     assert resolve_platform_ref("owner/agentic-sdlc", "50%off", gh) == SHA
-    # a branch read through the contents API is one query value too
+    # a branch resolved to its tree (Codex 4240170623) is one path component too
     gh = FakeGh({"api repos/owner/comic/contents/.github/workflows?ref=release%2F1.0": "[]"})
     assert remote_workflow_files(gh, "owner/comic", "release/1.0") == ({}, "")
-    assert gh.calls[0][0][1].endswith("?ref=release%2F1.0")
+    assert gh.calls[0][0][1] == "repos/owner/comic/commits/release%2F1.0"
 
 
 @pytest.mark.parametrize(
@@ -8690,6 +8787,120 @@ def test_commit_guard_refuses_repository_selectors_it_cannot_resolve(
     assert code == 2 and "selects its repository through text the shell" in message, command
 
 
+# Codex 4240170620: an ASSEMBLED program word reached a fallback that mapped the command to the
+# hook's own checkout and dropped its `-C`/`--git-dir`/GIT_DIR selectors, so `G=git; "$G" -C
+# ../wt commit` run from main committed in an unleased issue checkout.
+@pytest.mark.parametrize(
+    "command",
+    [
+        'G=git; "$G" -C WT commit -m x',
+        "G=git; $G -C WT commit -m x",
+        '"$G" --git-dir WT/.git --work-tree WT commit -m x',
+        '"$(which git)" -C WT commit -m x',
+        "$(which git) -C WT commit -m x",
+        "`which git` -C WT commit -m x",
+        "${GIT:-git} -C WT commit -m x",
+        "$HOME/../wt/../repo/../../usr/bin/git -C WT commit -m x",
+        "\\git -C WT commit -m x",
+        '"git" -C WT commit -m x',
+        "'git' -C WT commit -m x",
+        "g'i't -C WT commit -m x",
+        'env "$G" -C WT commit -m x',
+        'command "$G" -C WT commit -m x',
+        'GIT_DIR=WT/.git "$G" commit -m x',
+        'cd WT && "$G" commit -m x',
+        "xargs git -C WT < args.txt",
+        "printf '%s\\n' -C WT commit | xargs git",
+        "xargs -I{} git -C {} commit -m x",
+        "xargs -i git -C {} commit -m x",
+        "find WT -maxdepth 0 -exec git -C {} commit -m x ;",
+        "find WT -name x -execdir git commit -m x ;",
+        "parallel git -C {} commit ::: WT",
+        "parallel git ::: -C WT commit",
+        "eval git -C WT commit -m x",
+        'echo "git -C WT commit -m x" | sh',
+        "bash <<< 'git -C WT commit -m x'",
+        "python3 -c \"import subprocess; subprocess.run(['git', '-C', 'WT', 'commit'])\"",
+        "python3 -c \"import os, subprocess; os.chdir('WT'); subprocess.run(['git', 'commit'])\"",
+        "node -e \"require('child_process').execSync('git commit', {cwd: 'WT'})\"",
+    ],
+)
+def test_commit_guard_refuses_assembled_or_indirect_git_with_unknown_repository(
+    tmp_path, monkeypatch, command
+):
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    repo = _branch_flow_repo(tmp_path)  # repo is on main, tmp/wt on forge/issue-9
+    monkeypatch.setenv("HOME", str(tmp_path / "repo"))
+    command = command.replace("WT", str(tmp_path / "wt"))
+    branches = guard.commit_branches(command, str(repo))
+    assert guard.UNRESOLVED_REPO in branches, (command, branches)
+    code, message = _flow_code(guard, command, repo, leased=(7, 9))  # every lease held
+    assert code == 2, command
+    assert "cannot be checked" in message or "cannot be known" in message, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git -C WT commit -m x",
+        "/usr/bin/git -C WT commit -m x",
+        "command git -C WT commit -m x",
+        "command -p git -C WT commit -m x",
+        "env git -C WT commit -m x",
+        "env -i A=1 git -C WT commit -m x",
+        "env GIT_DIR=WT/.git GIT_WORK_TREE=WT git commit -m x",
+        "exec git -C WT commit -m x",
+        "nice -n 5 git -C WT commit -m x",
+        "time git -C WT commit -m x",
+        "nohup git --git-dir=WT/.git --work-tree=WT commit -m x",
+        "timeout 60 git -C WT commit -m x",
+        "sh -c 'git -C WT commit -m x'",
+        "xargs git -C WT commit -m x < files.txt",
+        "find . -name x -exec git -C WT commit -m x {} +",
+        "export GIT_EDITOR=true; git -C WT commit -m x",
+        "export GIT_PAGER=cat; git -C WT log -1",
+    ],
+)
+def test_commit_guard_keeps_selectors_of_literal_and_wrapped_git(tmp_path, command):
+    """Plain `git`, a literal path to git and the parsed wrappers keep their selectors: checked
+    against the issue checkout they name, passing with its lease."""
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    repo = _branch_flow_repo(tmp_path)
+    command = command.replace("WT", str(tmp_path / "wt"))
+    branches = guard.commit_branches(command, str(repo))
+    assert "forge/issue-9" in branches and guard.UNRESOLVED_REPO not in branches, branches
+    code, message = _flow_code(guard, command, repo)
+    assert code == 2 and "issue #9" in message, command
+    assert _flow_code(guard, command, repo, leased=(9,))[0] == 0, command
+
+
+def test_commit_guard_unparseable_command_is_unresolved(tmp_path):
+    """Text the parser cannot split (bash may: `$'...'` with an escaped quote) selects nothing
+    known: unresolved, never the hook's own checkout."""
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    repo = _branch_flow_repo(tmp_path)
+    command = "git -C $'../w\\'t' commit -m x"
+    assert guard.is_git_commit(command, cwd=str(repo))
+    assert guard.commit_branches(command, str(repo)) == [guard.UNRESOLVED_REPO]
+    assert _flow_code(guard, command, repo, leased=(7, 9))[0] == 2
+
+
+def test_commit_guard_inert_programs_naming_git_keep_working(tmp_path):
+    """Printing or searching for `git` runs nothing: off an issue branch it passes as before."""
+    guard = _guard_module(tmp_path, "forge_commit_guard")
+    repo = _branch_flow_repo(tmp_path)
+    for command in (
+        "grep -rn -C 3 git src",
+        "echo 'git -C ../wt commit'",
+        "which git",
+        "python3 -c \"print('git')\"",
+        "xargs git log",
+        "find . -name '*.py' -exec git log -- {} ;",
+    ):
+        assert guard.UNRESOLVED_REPO not in guard.commit_branches(command, str(repo)), command
+        assert _flow_code(guard, command, repo)[0] == 0, command
+
+
 def test_commit_guard_cd_to_an_expansion_still_refuses(tmp_path):
     guard = _guard_module(tmp_path, "forge_commit_guard")
     repo = _branch_flow_repo(tmp_path)
@@ -9189,3 +9400,194 @@ def test_doctor_requires_the_generated_approval_label(tmp_path):
         lambda d: d["jobs"]["authorize"]["steps"][0]["env"].update({"APPROVAL_LABEL": "x"}),
     )
     assert "agent-auto-implement.yml" in (_drift(repo) or "")
+
+
+# ---------------------------------------------------------------- review regressions (PR 139, 8)
+# Codex review 5481796241.
+
+
+# Codex 4240170627: an archived repository is read-only -- claims, plan comments, publisher pushes
+# and draft PRs all fail -- so it is never READY, and `--apply` refuses it before any mutation.
+@pytest.mark.parametrize(
+    ("fields", "manual"),
+    [
+        ({"archived": True}, False),
+        ({"disabled": True}, False),
+        ({"archived": True, "disabled": True}, False),
+        ({"archived": None}, True),
+        ({"disabled": None}, True),
+        ({"archived": "false"}, True),
+        ({"disabled": 0}, True),
+    ],
+)
+def test_doctor_requires_a_writable_repository(tmp_path, fields, manual):
+    from agentic_sdlc.onboard import REPO_WRITABLE_CHECK
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    gh = _healthy_gh()
+    info = json.loads(gh.answers["api repos/owner/comic"])
+    for key, value in fields.items():
+        if value is None:
+            info.pop(key)
+        else:
+            info[key] = value
+    gh.answers["api repos/owner/comic"] = json.dumps(info)
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    failed = _failed(report)
+    assert set(failed) == {REPO_WRITABLE_CHECK}, report.render()
+    assert failed[REPO_WRITABLE_CHECK].manual is manual
+    assert not report.ok
+    if "archived" in fields and fields["archived"] is True:
+        assert "archived" in failed[REPO_WRITABLE_CHECK].detail
+        assert "Unarchive" in failed[REPO_WRITABLE_CHECK].detail
+
+
+def test_doctor_passes_the_writable_repository_check_only_on_explicit_false(tmp_path):
+    from agentic_sdlc.onboard import REPO_WRITABLE_CHECK
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", _healthy_gh())
+    check = next(c for c in report.checks if c.name == REPO_WRITABLE_CHECK)
+    assert check.ok and report.ok, report.render()
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        json.dumps({"full_name": "owner/comic", "archived": True, "disabled": False}),
+        json.dumps({"full_name": "owner/comic", "archived": False, "disabled": True}),
+        json.dumps({"full_name": "owner/comic"}),
+        "not json",
+    ],
+)
+def test_apply_refuses_an_archived_or_unconfirmed_repository_before_any_mutation(answer):
+    gh = FakeGh({"api repos/owner/comic/rulesets": "[]", "api repos/owner/comic": answer})
+    with pytest.raises(OnboardError, match="nothing was changed"):
+        apply_repo_settings(spec(), gh, variables={"PUBLISHER_APP_CLIENT_ID": "Iv1"})
+    assert all(c[0] == "api" and "-X" not in c for c, _ in gh.calls), gh.calls
+
+
+def test_onboard_apply_refuses_an_archived_repository_before_writing_files():
+    from agentic_sdlc.onboard import canonical_project_id
+
+    archived = {"full_name": "owner/comic", "archived": True, "disabled": False}
+    gh = FakeGh({"api repos/owner/comic": json.dumps(archived)})
+    with pytest.raises(OnboardError, match="archived.*nothing was changed"):
+        canonical_project_id("owner/comic", gh)
+    archived["archived"] = False
+    gh = FakeGh({"api repos/owner/comic": json.dumps(archived)})
+    assert canonical_project_id("owner/comic", gh) == "owner/comic"
+
+
+# Codex 4240170623: the contents API lists at most 1,000 entries of a directory, silently; the
+# workflow set is enumerated through the Git Trees API, which lists a tree in full or says
+# `truncated: true` -- and anything short of a complete, explicit listing fails closed.
+_T_ROOT, _T_GITHUB, _T_WORKFLOWS = "a" * 40, "b" * 40, "c" * 40
+
+
+def _tree_gh(workflow_entries: list[dict], *, truncated: object = False) -> FakeGh:
+    gh = _public_gh()
+    gh.answers[CONSUMER_COMMITS + "main"] = json.dumps(
+        {"sha": "d" * 40, "commit": {"tree": {"sha": _T_ROOT}}}
+    )
+    gh.answers[CONSUMER_TREES + _T_ROOT] = json.dumps(
+        {
+            "tree": [{"path": ".github", "mode": "040000", "type": "tree", "sha": _T_GITHUB}],
+            "truncated": False,
+        }
+    )
+    gh.answers[CONSUMER_TREES + _T_GITHUB] = json.dumps(
+        {
+            "tree": [{"path": "workflows", "mode": "040000", "type": "tree", "sha": _T_WORKFLOWS}],
+            "truncated": False,
+        }
+    )
+    listing: dict = {"tree": workflow_entries}
+    if truncated is not None:
+        listing["truncated"] = truncated
+    gh.answers[CONSUMER_TREES + _T_WORKFLOWS] = json.dumps(listing)
+    return gh
+
+
+def _wf_entry(name: str, mode: str = "100644") -> dict:
+    return {"path": name, "mode": mode, "type": "blob", "sha": "e" * 40}
+
+
+def test_remote_workflow_set_reads_past_the_contents_api_limit(tmp_path):
+    from agentic_sdlc.onboard import fork_runner_exposure, remote_workflow_files
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(fork_exposed=True))
+    names = [f"w{index:04d}.yml" for index in range(1200)]
+    files = {name: "on: push\njobs: {}\n" for name in names}
+    files["w1150.yml"] = SELF_HOSTED_PR  # past the first 1,000 entries
+    gh = _tree_gh([_wf_entry(n) for n in names])
+    _remote_workflows(gh, files)
+    # the contents API's listing stops at 1,000 entries without saying so
+    gh.answers[CONSUMER_CONTENTS + ".github/workflows?ref=main"] = json.dumps(
+        [{"name": n, "path": f".github/workflows/{n}", "type": "file"} for n in names[:1000]]
+    )
+    remote, why = remote_workflow_files(gh, "owner/comic", "main")
+    assert remote is not None and len(remote) == 1200, why
+    exposed = fork_runner_exposure(repo, gh, "owner/comic", "owner/agentic-sdlc", "main")
+    assert any("w1150.yml:lint" in item for item in exposed), exposed
+
+
+@pytest.mark.parametrize("truncated", [True, None, "false", 0])
+def test_remote_workflow_set_fails_closed_on_a_truncated_tree(tmp_path, truncated):
+    from agentic_sdlc.onboard import fork_runner_exposure, remote_workflow_files
+
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(fork_exposed=True))
+    gh = _tree_gh([_wf_entry("ci.yml")], truncated=truncated)
+    remote, why = remote_workflow_files(gh, "owner/comic", "main")
+    assert remote is None and "not listed in full" in why
+    exposed = fork_runner_exposure(repo, gh, "owner/comic", "owner/agentic-sdlc", "main")
+    assert any("unverifiable" in item and "fails closed" in item for item in exposed)
+    check = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))[PUBLIC_CHECK]
+    assert "unverifiable" in check.detail
+
+
+def test_remote_workflow_set_fails_closed_at_the_tree_api_limit(monkeypatch):
+    from agentic_sdlc import onboard
+
+    monkeypatch.setattr(onboard, "_TREE_ENTRY_LIMIT", 3)
+    gh = _tree_gh([_wf_entry(f"w{i}.yml") for i in range(3)])
+    remote, why = onboard.remote_workflow_files(gh, "owner/comic", "main")
+    assert remote is None and "API limit" in why
+
+
+@pytest.mark.parametrize(
+    ("key", "answer"),
+    [
+        (CONSUMER_COMMITS + "main", "not json"),
+        (CONSUMER_COMMITS + "main", json.dumps({"commit": {"tree": {}}})),
+        (CONSUMER_TREES + "a" * 40, "not json"),
+        (CONSUMER_TREES + "a" * 40, json.dumps({"tree": [], "truncated": False})),
+        (CONSUMER_TREES + "b" * 40, json.dumps({"tree": "x", "truncated": False})),
+        (CONSUMER_TREES + "c" * 40, json.dumps({"tree": ["x"], "truncated": False})),
+    ],
+)
+def test_remote_workflow_set_fails_closed_on_an_unreadable_tree(key, answer):
+    from agentic_sdlc.onboard import remote_workflow_files
+
+    gh = _tree_gh([_wf_entry("ci.yml")])
+    gh.answers[key] = answer
+    remote, _ = remote_workflow_files(gh, "owner/comic", "main")
+    assert remote is None
+
+
+def test_remote_workflow_set_skips_symlinks_and_directories():
+    from agentic_sdlc.onboard import remote_workflow_files
+
+    entries = [
+        _wf_entry("ci.yml"),
+        _wf_entry("link.yml", "120000"),
+        {"path": "sub.yml", "mode": "040000", "type": "tree", "sha": "f" * 40},
+    ]
+    gh = _tree_gh(entries)
+    _remote_workflows(gh, {"ci.yml": "on: push\njobs: {}\n"})
+    remote, why = remote_workflow_files(gh, "owner/comic", "main")
+    assert remote is not None and set(remote) == {"ci.yml"}, why

@@ -62,8 +62,10 @@ private repository, disable forking (or fork pull-request workflows) for it firs
 
 `doctor` checks "fork pull requests cannot reach self-hosted runners". A fork-safe repository
 passes. Otherwise it fails when any `pull_request*`-triggered job (in any workflow
-file on the default branch, read through the contents API -- the set GitHub runs, not this
-checkout's, which is checked in addition; an unreadable remote set fails closed) targets anything
+file on the default branch, enumerated through the Git Trees API -- the set GitHub runs, not this
+checkout's, which is checked in addition; the contents API stops listing a directory at 1,000
+entries without saying so, and a tree answer that is truncated, at the API's entry cap or
+unreadable fails closed, as does any unreadable file) targets anything
 but a single GitHub-hosted label, following the jobs of every local
 reusable workflow it calls (`./.github/workflows/x.yml`, with `with:` inputs substituted). A call
 to a third-party reusable workflow, a runner expression that is not a resolvable input, or a
@@ -355,6 +357,19 @@ something that runs differently.
   `session_id`, and only when that is a non-empty string: a payload whose id is missing, null,
   empty or not a string owns no lease, so guarded git on a leased issue branch is refused
   (fail closed) and the SessionStart hook reports no lease as this session's.
+- The commit guard never maps git it cannot read to the current checkout: an assembled program
+  word (`G=git; "$G" -C DIR commit`, `$(which git)`, `${GIT:-git}`, `\git`, `"git"`) or git
+  handed its command line by another program (`xargs`/`find -exec`/`parallel` without a literal
+  subcommand or with a placeholder before it, `eval`, a script piped to a shell, an interpreter
+  whose code also selects a repository) has an unresolved repository and is refused, whatever
+  lease the session holds. Plain `git`, a literal path to it (`/usr/bin/git`) and the wrappers
+  the guard parses (`env`, `command`, `exec`, `nice`, `time`, `timeout`, `sudo`, ...) keep their
+  `-C`/`--git-dir`/`GIT_DIR` selectors and are checked against the repository they name.
+- **Repository writable**: `doctor` requires `GET repos/{owner}/{repo}` to answer
+  `archived: false` and `disabled: false` explicitly. An archived repository's issues, pull
+  requests, comments, branches and labels are read-only (a disabled one accepts nothing), so
+  either one being true fails; a missing or non-boolean field is a manual TODO. `onboard --apply`
+  refuses such a repository before writing a file or changing a setting.
 
 ## Required repository state
 
