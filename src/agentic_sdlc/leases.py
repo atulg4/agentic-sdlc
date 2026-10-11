@@ -1470,8 +1470,9 @@ def claim(
     """Take the lease if free (or expired, or already ours). Never mutates on refusal.
 
     The lease's expiry is computed from the clock immediately before its marker is posted, and
-    arbitration reads the clock again (Codex 4241196647); after winning, the open-PR inventory
-    is read again and the claim retracted if a PR appeared meanwhile (Codex 4241196645)."""
+    arbitration reads the clock again (Codex 4241196647); after winning, the issue and its
+    open-PR inventory are read again and the claim retracted if a PR appeared or the issue was
+    closed meanwhile (Codex 4241196645, 4241532620)."""
     clock = _clock(now, clock)
     now = clock()
     _check_ttl(ttl_minutes)
@@ -1585,7 +1586,12 @@ def claim(
     # Codex 4241196645: the open-PR inventory above was read before the marker was posted; a
     # pull request opened in between is durable work this claim would duplicate. Read it again
     # now that the claim is authoritative, and retract on a PR -- or on an unreadable inventory.
+    # Codex 4241532620: the issue's state was read before the marker too; an issue closed in
+    # between must not be implemented, so it is re-read here as well (unreadable = retract).
     try:
+        late_state = json.loads(gh(["api", f"repos/{project}/issues/{issue}"]) or "{}")
+        if not isinstance(late_state, dict):
+            raise LeaseError(f"issue #{issue} could not be re-read after claiming")
         late = open_prs_for_issue(project, issue, gh)
     except Exception:
         # the read failure is what matters; the retraction is retried (bounded), never raised
@@ -1593,10 +1599,22 @@ def claim(
             project,
             issue,
             session,
-            "The open pull requests could not be re-read after claiming; retracting.",
+            "The issue or its open pull requests could not be re-read after claiming; retracting.",
             gh,
         )
         raise
+    if late_state.get("state") != "open":
+        state = late_state.get("state", "unknown")
+        _retract(
+            project,
+            issue,
+            session,
+            f"The issue is {state} now (it changed while claiming); retracting.",
+            gh,
+        )
+        return ClaimResult(
+            False, None, reason=f"issue #{issue} became {state} while it was being claimed"
+        )
     if late:
         urls = ", ".join(str(p.get("url") or f"#{p.get('number')}") for p in late)
         _retract(

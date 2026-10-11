@@ -2991,6 +2991,36 @@ def test_an_unreadable_recheck_of_open_pull_requests_retracts_the_claim():
     assert IN_PROGRESS_LABEL not in [lbl["name"] for lbl in gh.issues[7]["labels"]]
 
 
+# Codex 4241532620: the issue's state was read before the marker was posted; an issue closed in
+# between is found by a re-read after winning, and the claim is retracted.
+def test_an_issue_closed_while_claiming_retracts_the_claim():
+    gh = FakeGh().issue(7)
+    gh.before_post = lambda n: gh.issues[n].update(state="closed")
+    result = _claim(gh)
+    assert not result.ok and "closed" in result.reason and "while" in result.reason
+    assert current_lease(PROJECT, 7, gh, NOW) is None  # the marker was retracted
+    assert IN_PROGRESS_LABEL not in [lbl["name"] for lbl in gh.issues[7]["labels"]]
+    last = gh.issues[7]["comments"][-1]["body"]
+    assert last.startswith("<!-- forge-release") and "closed now" in last
+
+
+def test_an_unreadable_recheck_of_the_issue_retracts_the_claim():
+    gh = FakeGh().issue(7)
+    posted = {"done": False}
+
+    def flaky(args, input=None):
+        if tuple(args[:3]) == ("api", "-X", "POST"):
+            posted["done"] = True
+        if posted["done"] and list(args[:2]) == ["api", f"repos/{PROJECT}/issues/7"]:
+            raise RuntimeError("gh: Server Error (HTTP 502)")
+        return gh(args, input)
+
+    with pytest.raises(RuntimeError, match="HTTP 502"):
+        claim(PROJECT, 7, agent="me", session="s1", branch="b", ttl_minutes=60, gh=flaky, now=NOW)
+    assert current_lease(PROJECT, 7, gh, NOW) is None
+    assert IN_PROGRESS_LABEL not in [lbl["name"] for lbl in gh.issues[7]["labels"]]
+
+
 # Codex 4241196647: the TTL starts when the marker is posted, not when the operation began, and
 # arbitration reads a fresh clock: a marker already expired by then is retracted.
 def _slow(gh, clock, *, on_timeline=timedelta(0), on_first_post=timedelta(0)):

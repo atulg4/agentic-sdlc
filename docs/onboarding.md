@@ -309,18 +309,24 @@ through a link). `onboard --force` rewrites the policy and drops the confirmatio
   keep `lease_ttl_minutes` longer than the longest stage); and `sdlcctl check-diff --base
   origin/<default>` applies `inspect-diff`'s diff policy (forbidden paths, file/line/byte caps)
   to the COMMITTED change from its merge base to `HEAD` -- exactly what the push publishes,
-  never the working tree -- and exits 0 only when it passes and is non-empty. A routine created
-  from an earlier version of the document must be re-pasted.
+  never the working tree -- and exits 0 only when it passes and is non-empty. check-diff reads
+  history with replacement disabled (`--no-replace-objects`, `GIT_NO_REPLACE_OBJECTS=1`, grafts
+  off): a `refs/replace/*` object or graft could otherwise make it judge a benign tree while the
+  push publishes the original commit (Codex 4241532610). Each run pushes, never forced, to its
+  own branch `forge/issue-<N>-<stamp>` (`<stamp>` = `date -u +%Y%m%d%H%M%S`, chosen once before
+  the claim and passed to it as `--branch`), so a branch left behind by a run whose PR could not
+  be opened never blocks a retry (Codex 4241532615); an abandoned one can be deleted by hand.
+  A routine created from an earlier version of the document must be re-pasted.
 - **Cloud routine branch rules** (`cloud-routine` mode, Codex 4241196640): the routine pushes
-  `forge/issue-<N>` with the owner's credentials, so "effective rules on the cloud routine's
-  forge/issue-<N> branches allow its push" runs the publisher's branch-domain checks against that
-  namespace: every ruleset's branch targeting is judged over all issue numbers (one that targets
-  some and not others is a manual TODO), classic protection patterns matching it are reported for
-  each requirement (a push/creation allowlist is always a TODO: the pusher is a user, which doctor
-  cannot match), and the effective rules of `forge/issue-1` pass only for rule types that cannot
+  `forge/issue-<N>-<stamp>` with the owner's credentials, so "effective rules on the cloud
+  routine's forge/issue-<N>-<stamp> branches allow its push" runs the publisher's branch-domain
+  checks against that namespace: every ruleset's branch targeting is judged over all issue
+  numbers and stamps (one that targets some and not others is a manual TODO), classic
+  protection patterns matching it are reported for each requirement (a push/creation allowlist is always a TODO: the pusher is a user, which doctor
+  cannot match), and the effective rules of `forge/issue-1-1` pass only for rule types that cannot
   reject a new branch (deletion, non-fast-forward, linear history, tag names, required checks
-  not enforced on creation, a branch-name pattern proven for every issue number). Creation and
-  update restrictions, signatures, commit-metadata patterns (the owner's own message and
+  not enforced on creation, a branch-name pattern proven for every issue number and stamp).
+  Creation and update restrictions, signatures, commit-metadata patterns (the owner's own message and
   identity) and anything unknown or unreadable are owner TODOs.
 - **Project id**: `[project].id` must equal, exactly, the `full_name` GitHub answers for `GET
   repos/{id}` -- its spelling, and after a rename or transfer (which the API follows as a

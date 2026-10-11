@@ -11818,7 +11818,7 @@ def test_doctor_checks_the_cloud_routine_branch_rules(tmp_path):
     check = next(c for c in report.checks if c.name == CLOUD_BRANCH_RULES_CHECK)
     assert check.ok and "forge/issue-${ISSUE_NUMBER}" in check.detail
     paths = [c[1] for c, _ in gh.calls if "/rules/branches/" in c[1]]
-    assert "repos/owner/comic/rules/branches/forge%2Fissue-1" in paths
+    assert "repos/owner/comic/rules/branches/forge%2Fissue-1-1" in paths
     assert not any("/rules/branches/agent" in p for p in paths)  # no Actions publisher here
 
 
@@ -11833,7 +11833,10 @@ def test_doctor_checks_the_cloud_routine_branch_rules(tmp_path):
             _org_rule("required_status_checks", required_status_checks=[{"context": "x"}]),
             "rule 'required_status_checks' applies to forge/issue-1",
         ),
-        (_pattern_rule("branch_name_pattern", "starts_with", "agent/"), "'forge/issue-1' does not"),
+        (
+            _pattern_rule("branch_name_pattern", "starts_with", "agent/"),
+            "'forge/issue-1-1' does not",
+        ),
         (_pattern_rule("commit_message_pattern", "starts_with", "JIRA-"), "commit message"),
         (_pattern_rule("committer_email_pattern", "ends_with", "@corp"), "committer email"),
     ],
@@ -12143,7 +12146,7 @@ def test_cloud_routine_checks_the_diff_policy_right_before_pushing():
         prompt.index("4c. Check the diff policy"),
         prompt.index("sdlcctl check-diff"),
         prompt.index("5. Push the checked commit"),
-        prompt.index("git push origin HEAD:refs/heads/forge/issue-<n>"),
+        prompt.index("git push origin HEAD:refs/heads/<branch>"),
     ]
     assert order == sorted(order)
     # the command the prompt names exists and gates on its exit code
@@ -12208,3 +12211,25 @@ def test_cloud_routine_checks_the_request_and_its_dependencies_before_implementi
     from agentic_sdlc.cli import DEPENDENCY_OPEN, REQUEST_INVALID
 
     assert (REQUEST_INVALID, DEPENDENCY_OPEN) == (3, 4)  # the exit codes the prompt names
+
+
+def test_cloud_routine_pushes_a_run_specific_branch():
+    """Codex 4241532615: a fixed `forge/issue-<n>` left behind by a run whose PR could not be
+    opened would make every retry's non-forced push fail. Each run names its own branch once,
+    claims with it, creates it and pushes to it; doctor's branch rules cover that namespace."""
+    from agentic_sdlc.onboard import CLOUD_ROUTINE_BRANCH
+
+    files = render_onboarding(spec(implementer="cloud-routine", runs_on=("ubuntu-latest",)))
+    routine = files["docs/forge/cloud-implementer.md"]
+    assert "forge/issue-<n>-<stamp>" in routine and "date -u +%Y%m%d%H%M%S" in routine
+    assert "--branch <branch>" in routine
+    assert "create branch <branch> from" in routine
+    assert "git push origin HEAD:refs/heads/<branch>" in routine
+    assert (
+        "refs/heads/forge/issue-<n>`" not in routine and "--branch forge/issue-<n>`" not in routine
+    )
+    assert CLOUD_ROUTINE_BRANCH.template == "forge/issue-${ISSUE_NUMBER}-${RUN_STAMP}"
+    for sample in CLOUD_ROUTINE_BRANCH.samples:
+        assert re.fullmatch(r"forge/issue-\d+-\d+", sample)
+        # the commit guard and the lease PR heuristic both still read the issue number from it
+        assert re.search(r"(?:^|/)issue-(\d+)(?:$|[^0-9])", sample)
