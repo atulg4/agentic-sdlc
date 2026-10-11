@@ -19,6 +19,7 @@ import secrets
 import shlex
 import stat
 import subprocess
+import tempfile
 import tomllib
 import unicodedata
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -466,14 +467,75 @@ def gh_timeout() -> float:
 #: Variables that would let the caller re-point `gh` at another repository or another host (one
 #: it can answer from: `GH_HOST` + an enterprise token). Every call here names its repository
 #: explicitly (`repos/<owner>/<name>/...`, GraphQL `owner`/`name`), so none of them is needed,
-#: and the host is pinned to github.com. `GH_TOKEN`/`GITHUB_TOKEN` stay: they are the auth.
+#: and the host is pinned to github.com.
 _GH_REDIRECT_ENV = ("GH_REPO", "GH_HOST", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
 GH_PINNED_HOST = "github.com"
+#: Where `gh` finds its token: the first of these that is set (gh's own precedence).
+GH_TOKEN_ENV = ("GH_TOKEN", "GITHUB_TOKEN")
+#: The caller's variables the trusted `gh` still gets (Codex 4241839914): the egress proxy
+#: settings and nothing else. A proxy is safe to honour while the TLS trust store is not the
+#: caller's: `SSL_CERT_FILE` / `SSL_CERT_DIR` are dropped, so `api.github.com` is verified
+#: against the system store (root-owned, like the trusted executable itself) and a proxy the
+#: caller runs can only relay the encrypted stream -- it cannot read or fabricate an answer.
+#: Stripping the proxy instead would break every call where egress goes through one.
+GH_PROXY_ENV = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy")
+#: Variables that make the dynamic loader run code of the caller's choosing in any program.
+_LOADER_ENV_PREFIXES = ("LD_", "DYLD_")
+#: The fixed search path a trusted program runs with.
+SAFE_PATH = "/usr/bin:/bin"
 
 
-def _gh_env() -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if k not in _GH_REDIRECT_ENV}
-    env["GH_HOST"] = GH_PINNED_HOST
+def _gh_token(program: str, timeout: float) -> str:
+    """The token `gh` authenticates with: GH_TOKEN, else GITHUB_TOKEN, else what the user's own
+    `gh auth login` stored (`gh auth token`, a local read: no request is made). Empty when
+    there is none -- the call then runs unauthenticated and GitHub's answer decides."""
+    for key in GH_TOKEN_ENV:
+        value = os.environ.get(key, "")
+        if value:
+            return value
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in _GH_REDIRECT_ENV and not k.startswith(_LOADER_ENV_PREFIXES)
+    }
+    env["PATH"] = SAFE_PATH
+    try:
+        proc = subprocess.run(
+            [program, "auth", "token", "--hostname", GH_PINNED_HOST],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    token = proc.stdout.strip() if proc.returncode == 0 else ""
+    return token if token and not any(c.isspace() for c in token) else ""
+
+
+def _gh_env(config_dir: str, token: str) -> dict[str, str]:
+    """The whole environment of a trusted `gh` call, BUILT from an allowlist (Codex 4241839908,
+    4241839914), never inherited: no loader variable (`LD_PRELOAD`, `DYLD_*`, ...) injects code;
+    `GH_CONFIG_DIR` and HOME are `config_dir`, a fresh private empty directory, so no config of
+    the caller's (`http_unix_socket`, aliases, extensions, a stored host) applies; no custom CA
+    (`SSL_CERT_FILE`, `SSL_CERT_DIR`) can make a fabricated answer verify; the host is pinned;
+    the token is `token`; the proxy settings are the only caller variables kept
+    (`GH_PROXY_ENV`)."""
+    env = {key: os.environ[key] for key in GH_PROXY_ENV if os.environ.get(key)}
+    env.update(
+        PATH=SAFE_PATH,
+        HOME=config_dir,
+        GH_CONFIG_DIR=config_dir,
+        GH_HOST=GH_PINNED_HOST,
+        GH_PROMPT_DISABLED="1",
+        GH_NO_UPDATE_NOTIFIER="1",
+        GH_SPINNER_DISABLED="1",
+        NO_COLOR="1",
+        LC_ALL="C.UTF-8",
+    )
+    if token:
+        env["GH_TOKEN"] = token
     return env
 
 
@@ -484,22 +546,28 @@ def run_gh(args: Sequence[str], input: str | None = None) -> str:
     Never a bare `gh` (Codex 4241745403): a PATH lookup could find one this session planted to
     fabricate the label, permission, issue and dependency answers `authorize-labeler`,
     `check-request` and `claim`/`renew` decide on. The executable is `trusted_gh()`'s -- one only
-    root can replace -- and with none, the call fails closed (OnboardError: exit 2)."""
+    root can replace -- and with none, the call fails closed (OnboardError: exit 2). It runs in
+    `_gh_env`'s allowlisted environment with a fresh, private, empty config directory that is
+    removed afterwards (Codex 4241839914)."""
     try:
         program = trusted_gh()
     except UntrustedExecutableError as exc:
         raise OnboardError(str(exc)) from exc
     timeout = gh_timeout()
+    token = _gh_token(program, timeout)
     try:
-        proc = subprocess.run(
-            [program, *args],
-            check=False,
-            capture_output=True,
-            text=True,
-            input=input,
-            timeout=timeout,
-            env=_gh_env(),
-        )
+        with tempfile.TemporaryDirectory(prefix="agentic-sdlc-gh-") as config_dir:
+            os.chmod(config_dir, 0o700)
+            proc = subprocess.run(
+                [program, *args],
+                check=False,
+                capture_output=True,
+                text=True,
+                input=input,
+                timeout=timeout,
+                env=_gh_env(config_dir, token),
+                cwd=config_dir,
+            )
     except FileNotFoundError as exc:  # pragma: no cover - environment
         raise OnboardError("GitHub CLI `gh` is not installed") from exc
     except subprocess.TimeoutExpired as exc:
@@ -1014,6 +1082,9 @@ def render_cloud_routine_md(spec: OnboardSpec) -> str:
         f"sdlcctl check-request --project {spec.project_id} --issue <n> "
         f"--config agentic-sdlc.toml --base {base}"
     )
+    check_diff = (
+        f"sdlcctl check-diff --project {spec.project_id} --config agentic-sdlc.toml --base {base}"
+    )
     prompt = f"""Repository: {spec.project_id}. Every run:
 1. List open issues that carry ALL of: {_md_code(spec.ready_label)}, {_md_code(HUMAN_REVIEW_LABEL)},
    {_md_code(IMPLEMENTATION_LABEL)}
@@ -1049,7 +1120,7 @@ def render_cloud_routine_md(spec: OnboardSpec) -> str:
    (Codex 4241614590): `git fetch origin {spec.default_branch}`, then
    `{check_request}`.
    It prints `content digest: sha256:...`; keep that value as <digest> -- it names the request
-   exactly as checked here, and step 4e refuses to publish if the title or body changes after
+   exactly as checked here, and step 4d refuses to publish if the title or body changes after
    this (Codex 4241614582). Exit 0: continue. Exit 3: not a valid work request -- retire it
    so it cannot starve the queue (Codex 4241196636): comment the reason it printed,
    add label {_md_code(BLOCKED_LABEL)} (step 1 skips it from then on), then {release}; then go
@@ -1073,29 +1144,32 @@ def render_cloud_routine_md(spec: OnboardSpec) -> str:
    {spec.quality_command}
    {spec.test_command}
 4a. Renew the lease again, exactly as in step 3a (same command; on failure stop the same way).
-4b. Re-authorize right before publishing (Codex 4240628982: the labels may have been removed
-   and re-applied while you worked): run the step 1a command again. On anything but exit 0 do
-   NOT push or open a PR: {release}, and on exit 3 comment (once) that a
-   maintainer must re-apply the labels; then stop.
-4c. Check the diff policy on exactly what will be pushed (Codex 4241434509: the same
+4b. Check the diff policy on exactly what will be pushed (Codex 4241434509: the same
    `evaluate_diff` the Actions path applies -- forbidden paths, file, line and byte caps). Commit
    everything first; then `git fetch origin {spec.default_branch}` and
-   `sdlcctl check-diff --config agentic-sdlc.toml --base origin/{spec.default_branch}`.
-   It diffs the committed HEAD against its merge base with the default branch, under the
-   policy committed on origin/{spec.default_branch} (never your working-tree copy: Codex
-   4241614590). On any non-zero exit do NOT push or open a PR: comment the reasons it printed
-   on the issue, {release}, and stop. Make no commit after this check.
-4d. Verify the lease immediately before pushing: run the step 3a renew command once more (it
-   fails if the issue was closed meanwhile). On any non-zero exit do NOT push or open a PR;
-   stop as in step 3a.
-4e. Re-check the request last, immediately before pushing (Codex 4241614596, 4241614582: a
-   dependency may have been reopened, the issue closed, or the request edited and re-approved
-   while you worked):
+   `{check_diff}`.
+   It diffs the committed HEAD against its merge base with the default branch -- every commit
+   of the series, not only the end state (Codex 4241839922) -- under the policy committed on
+   the default branch (never your working-tree copy: Codex 4241614590), after proving that
+   origin/{spec.default_branch} is the commit GitHub reports as that branch's head (Codex
+   4241839926: a local ref can be re-pointed). On any non-zero exit do NOT push or open a PR:
+   comment the reasons it printed on the issue, {release}, and stop. Make no commit after this
+   check.
+4c. Verify the lease: run the step 3a renew command once more (it fails if the issue was closed
+   meanwhile). On any non-zero exit do NOT push or open a PR; stop as in step 3a.
+4d. Re-check the request (Codex 4241614596, 4241614582: a dependency may have been reopened,
+   the issue closed, or the request edited and re-approved while you worked):
    `{check_request} --expect-digest <digest>`.
-   Proceed to step 5 ONLY on exit 0. On any other exit do NOT push or open a PR: {release}
+   Continue ONLY on exit 0. On any other exit do NOT push or open a PR: {release}
    and stop. Exit 5 means the title or body changed since step 2: comment (once) that the
    request changed while it was being implemented and a later run will start over from the
    new text. Exit 4: a dependency was reopened. Exit 6: the issue is no longer open.
+4e. Re-authorize LAST, immediately before pushing (Codex 4240628982, 4241839918: the labels may
+   have been removed and re-applied, or applied by someone without write access, while you
+   worked -- even during the checks above): run the step 1a command again. Proceed to step 5
+   ONLY on exit 0. On anything else do NOT push or open a PR: {release}, and on exit 3 comment
+   (once) that a maintainer must re-apply the labels; then stop. Run nothing between this
+   check and the push.
 5. Push the checked commit at once -- `git push origin HEAD:refs/heads/<branch>`, never
    forced -- and
    open a DRAFT pull request titled "<issue title> (#<n>)" with a summary
@@ -1116,20 +1190,25 @@ definitive write/maintain/admin permission for whoever applied EACH label of the
 a writer approved (a 404 is unauthorized; any other failure is unverifiable and the issue is
 skipped) -- and requires the issue's title and body to have been last edited BEFORE each of
 those labels was last applied, so an edit after approval is never implemented unapproved (an
-edit time that cannot be read is unverifiable). It runs it AGAIN right before pushing,
-so a label removed and re-applied, or the issue edited, while the routine worked stops the
+edit time that cannot be read is unverifiable). It runs it AGAIN as the LAST gate,
+immediately before pushing and after every other check, so a label removed and re-applied, or
+the issue edited, while the routine worked -- even while it ran the other checks -- stops the
 push. The Actions path's other deterministic gates are commands too, and the routine is gated
 on their exit codes: `sdlcctl check-request` parses the issue with the same work-request
 validator and policy as `prepare-request` and requires every dependency issue to be closed;
 `sdlcctl check-diff` applies the same diff policy as `inspect-diff` (forbidden paths and the
-patch caps) to exactly the commit about to be pushed, under the policy COMMITTED on the default
-branch (an uncommitted, loosened `agentic-sdlc.toml` changes nothing), running a git only root
-can replace (never a `git` from a writable PATH entry); `sdlcctl renew` -- after
-implementation, after verification and immediately before pushing -- keeps the lease alive and
+patch caps) to exactly what is about to be pushed -- every path any commit of the series
+touches, not only the end state -- under the policy COMMITTED on the default branch (an
+uncommitted, loosened `agentic-sdlc.toml` changes nothing), whose head must be the commit
+GitHub reports (a re-pointed local `origin/<branch>` is refused), running a git only root
+can replace (never a `git` from a writable PATH entry) in an environment of its own;
+`sdlcctl renew` -- after implementation, after verification and immediately before pushing --
+keeps the lease alive and
 fails unless this run still holds it and the issue is still open, so the routine never pushes
-over another agent's lease or for a closed issue; and right before the push `check-request`
-runs once more with the content digest it printed in step 2, so a reopened dependency, a
-closed issue or an edited request (even one whose labels were re-applied) stops the push.
+over another agent's lease or for a closed issue; and before the final authorization
+`check-request` runs once more with the content digest it printed in step 2, so a reopened
+dependency, a closed issue or an edited request (even one whose labels were re-applied) stops
+the push.
 Keep `lease_ttl_minutes` longer than the longest stage. An issue whose body is not a valid
 work request is labelled {_md_code(BLOCKED_LABEL)} and its lease released; step 1 never
 selects a blocked issue.

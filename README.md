@@ -113,9 +113,15 @@ sdlcctl doctor --destination /path/to/consumer-repository   # exit 2 until READY
 with `sdlcctl authorize-labeler` -- whoever applied each approval label last must have write
 access -- before claiming, gates on `sdlcctl check-request` (valid request, dependencies
 closed), renews its lease between stages (a renewal fails once the issue is closed) and
-`sdlcctl check-diff` (the committed diff policy on the commit it pushes, run with a trusted git)
-and `check-request --expect-digest` (dependencies still closed, request unedited) before
-pushing; once the routine is scheduled on claude.ai,
+runs `sdlcctl check-diff --project` (the diff policy committed on the default branch -- whose
+head must be the one GitHub reports -- over every commit it pushes, run with a trusted git),
+`check-request --expect-digest` (dependencies still closed, request unedited) and, LAST,
+`authorize-labeler` again before pushing. Every `gh` and git those gates run gets an
+allowlisted environment (no `LD_*`/`DYLD_*`, a fixed PATH, a fresh empty `GH_CONFIG_DIR`, no
+`SSL_CERT_FILE`/`SSL_CERT_DIR`; the token comes from `GH_TOKEN`/`GITHUB_TOKEN` or `gh auth
+token`): an egress proxy set in `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` is still used, but its CA
+must be in the system trust store, not in an environment variable; once the routine is
+scheduled on claude.ai,
 record it with `sdlcctl confirm-cloud-routine` -- `doctor` stays NOT READY until then, under
 `--local` too). Planning always runs Claude Code: every generated plan caller invokes the
 platform's `reusable-plan.yml` (`anthropics/claude-code-action`), so the generated policy records
