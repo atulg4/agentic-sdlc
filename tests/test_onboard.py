@@ -10340,7 +10340,8 @@ def test_run_gh_times_out_and_fails_closed(tmp_path, monkeypatch):
     bin_dir.mkdir()
     (bin_dir / "gh").write_text("#!/bin/sh\nexec sleep 30\n")
     (bin_dir / "gh").chmod(0o755)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    # the resolver is what picks the executable (Codex 4241745403): hand it the stalling one
+    monkeypatch.setattr(onboard, "trusted_gh", lambda: str(bin_dir / "gh"))
     monkeypatch.setenv(onboard.GH_TIMEOUT_ENV, "1")
     started = time.monotonic()
     with pytest.raises(OnboardError, match="did not answer within 1s"):
@@ -10366,6 +10367,7 @@ def test_gh_timeout_is_always_finite(monkeypatch, value, expected):
     import subprocess
 
     monkeypatch.setattr(onboard.subprocess, "run", fake_run)
+    monkeypatch.setattr(onboard, "trusted_gh", lambda: "/trusted/gh")
     with pytest.raises(OnboardError, match="did not answer"):
         onboard.run_gh(["api", "x"])
     assert seen["timeout"] == expected

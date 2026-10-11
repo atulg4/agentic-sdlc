@@ -41,6 +41,7 @@ from .missions import MissionError, load_registry
 from .openai_compatible import PROVIDERS as OPENAI_COMPATIBLE_PROVIDERS
 from .openai_compatible import ROUTED_MIN_CONTEXT_WINDOW
 from .policy import load_policy
+from .trusted_exec import UntrustedExecutableError, trusted_gh
 
 GhRunner = Callable[..., str]  # (args: Sequence[str], input: str | None = None) -> stdout
 
@@ -462,18 +463,42 @@ def gh_timeout() -> float:
     return value if 1 <= value <= 3600 else GH_TIMEOUT_SECONDS
 
 
+#: Variables that would let the caller re-point `gh` at another repository or another host (one
+#: it can answer from: `GH_HOST` + an enterprise token). Every call here names its repository
+#: explicitly (`repos/<owner>/<name>/...`, GraphQL `owner`/`name`), so none of them is needed,
+#: and the host is pinned to github.com. `GH_TOKEN`/`GITHUB_TOKEN` stay: they are the auth.
+_GH_REDIRECT_ENV = ("GH_REPO", "GH_HOST", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
+GH_PINNED_HOST = "github.com"
+
+
+def _gh_env() -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k not in _GH_REDIRECT_ENV}
+    env["GH_HOST"] = GH_PINNED_HOST
+    return env
+
+
 def run_gh(args: Sequence[str], input: str | None = None) -> str:
     """Run `gh` and return stdout; raises OnboardError with stderr on failure, and when the call
-    does not finish within `gh_timeout()` seconds."""
+    does not finish within `gh_timeout()` seconds.
+
+    Never a bare `gh` (Codex 4241745403): a PATH lookup could find one this session planted to
+    fabricate the label, permission, issue and dependency answers `authorize-labeler`,
+    `check-request` and `claim`/`renew` decide on. The executable is `trusted_gh()`'s -- one only
+    root can replace -- and with none, the call fails closed (OnboardError: exit 2)."""
+    try:
+        program = trusted_gh()
+    except UntrustedExecutableError as exc:
+        raise OnboardError(str(exc)) from exc
     timeout = gh_timeout()
     try:
         proc = subprocess.run(
-            ["gh", *args],
+            [program, *args],
             check=False,
             capture_output=True,
             text=True,
             input=input,
             timeout=timeout,
+            env=_gh_env(),
         )
     except FileNotFoundError as exc:  # pragma: no cover - environment
         raise OnboardError("GitHub CLI `gh` is not installed") from exc
