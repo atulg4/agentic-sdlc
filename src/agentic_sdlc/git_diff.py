@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from dataclasses import dataclass
@@ -20,17 +21,39 @@ class GitDiff:
     patch: bytes
 
 
+#: A file that never exists: pointing GIT_GRAFT_FILE at it disables `.git/info/grafts`.
+_NO_GRAFTS = os.devnull + ".no-grafts"
+
+
+def _object_env() -> dict[str, str]:
+    """The environment every diff read runs in: history as the object store holds it. Git
+    otherwise substitutes `refs/replace/*` objects and grafts when it reads a commit or tree,
+    while a push publishes the ORIGINAL objects -- so a replace ref could make a guard inspect a
+    benign tree and pass a commit it never saw (Codex 4241532610)."""
+    env = dict(os.environ)
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    env["GIT_GRAFT_FILE"] = _NO_GRAFTS
+    env.pop("GIT_REPLACE_REF_BASE", None)
+    return env
+
+
 def _run(arguments: list[str], repository: Path) -> subprocess.CompletedProcess[bytes]:
+    if arguments[:1] != ["git"]:
+        raise GitDiffError(f"not a git command: {arguments[:1]!r}")
+    # `--no-replace-objects` on the command line as well as in the environment: either alone
+    # disables replacement; both together survive a caller that rewrites one of them.
+    arguments = ["git", "--no-replace-objects", *arguments[1:]]
     result = subprocess.run(
         arguments,
         cwd=repository,
+        env=_object_env(),
         capture_output=True,
         check=False,
         timeout=120,
     )
     if result.returncode != 0:
         message = result.stderr.decode("utf-8", errors="replace")[-1000:]
-        raise GitDiffError(f"{' '.join(arguments[:2])} failed: {message}")
+        raise GitDiffError(f"git {arguments[2]} failed: {message}")
     return result
 
 

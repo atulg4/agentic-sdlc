@@ -1006,9 +1006,13 @@ def render_cloud_routine_md(spec: OnboardSpec) -> str:
    commented so on this issue, comment that a maintainer must review it and re-apply the
    labels, then take the next issue.
    Any other exit: authorization could not be verified -- do not claim, take the next issue.
-1b. Claim it before touching code:
+1b. Claim it before touching code. First name this run's branch ONCE: <branch> is
+   `forge/issue-<n>-<stamp>`, where <stamp> is the UTC time now as digits only
+   (`date -u +%Y%m%d%H%M%S`). It is new for every run, so a branch an earlier run pushed (say
+   its PR could not be opened) never blocks this one (Codex 4241532615); never push to or
+   reuse another run's branch. Then claim:
    `sdlcctl claim --project {spec.project_id} --issue <n> --agent cloud-routine
-    --session <run id> --branch forge/issue-<n>`.
+    --session <run id> --branch <branch>`.
    If the claim is refused (exit 2), skip that issue and take the next one.
 2. Check the request deterministically (the same validator and dependency rule as the Actions
    implement path: Codex 4241434511):
@@ -1020,7 +1024,7 @@ def render_cloud_routine_md(spec: OnboardSpec) -> str:
    NOT block it: it becomes ready once its dependencies close) and go back to step 1a with the
    next candidate. Any other exit: it could not be verified -- {release} and go back to step 1a
    with the next candidate.
-3. `git fetch origin {spec.default_branch}` and create branch `forge/issue-<n>` from
+3. `git fetch origin {spec.default_branch}` and create branch <branch> from
    `origin/{spec.default_branch}`. Implement the smallest change that satisfies the acceptance
    criteria, tests first, and commit it. Never touch `forbidden_paths` from agentic-sdlc.toml;
    stay within max_changed_files={spec.max_changed_files} and
@@ -1048,7 +1052,8 @@ def render_cloud_routine_md(spec: OnboardSpec) -> str:
    and stop. Make no commit after this check.
 4d. Verify the lease immediately before pushing: run the step 3a renew command once more. On
    any non-zero exit do NOT push or open a PR; stop as in step 3a.
-5. Push the checked commit at once -- `git push origin HEAD:refs/heads/forge/issue-<n>` -- and
+5. Push the checked commit at once -- `git push origin HEAD:refs/heads/<branch>`, never
+   forced -- and
    open a DRAFT pull request titled "<issue title> (#<n>)" with a summary
    and test plan; link the issue. Then {release} (the open PR now marks the
    work); on any failure, release it too so another run can retry.
@@ -3175,7 +3180,12 @@ class PublisherCommit:
 _PUBLISHER_SAMPLES = {
     "ISSUE_NUMBER": ("1", "2", "42", "12345"),
     "GITHUB_RUN_ID": ("1", "9876543210"),
+    # the cloud routine's branch stamp: `date -u +%Y%m%d%H%M%S` (CLOUD_ROUTINE_BRANCH)
+    "RUN_STAMP": ("1", "20261011093000"),
 }
+#: The variables a WORKFLOW's publisher template may use (`_publisher_value`); RUN_STAMP is the
+#: cloud routine's own and never appears in a workflow.
+_WORKFLOW_VARIABLES = frozenset({"ISSUE_NUMBER", "GITHUB_RUN_ID"})
 _SHELL_VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 _GIT_IDENTITY_ENV = frozenset(
     {
@@ -3196,7 +3206,7 @@ def _publisher_value(template: str) -> PublisherValue | None:
     literals = tuple(parts[0::3])
     names = tuple(braced or bare for braced, bare in zip(parts[1::3], parts[2::3], strict=True))
     if any(ch in lit for lit in literals for ch in "$`\\") or any(
-        n not in _PUBLISHER_SAMPLES for n in names
+        n not in _WORKFLOW_VARIABLES for n in names
     ):
         return None
     return PublisherValue(literals, names)
@@ -4069,16 +4079,19 @@ def classic_publisher_branch_problems(
     return problems
 
 
-# ---- Codex 4241196640: in cloud-routine mode the routine itself pushes `forge/issue-<N>` with
-# the repository owner's credentials (a user, not an App). A ruleset or classic protection rule
+# ---- Codex 4241196640: in cloud-routine mode the routine itself pushes
+# `forge/issue-<N>-<stamp>` with the repository owner's credentials (a user, not an App). A
+# ruleset or classic protection rule
 # targeting that namespace is invisible in the default branch's rules, so the same branch-domain
 # checks run against the routine's branch; the actor is a user, so an App allowlist or bypass
 # cannot be matched against it: a push restriction is an owner TODO, as is any rule doctor
 # cannot evaluate. The routine's commit message and identity are the owner's: unknowable here.
 CLOUD_BRANCH_RULES_CHECK = (
-    "effective rules on the cloud routine's forge/issue-<N> branches allow its push"
+    "effective rules on the cloud routine's forge/issue-<N>-<stamp> branches allow its push"
 )
-CLOUD_ROUTINE_BRANCH = PublisherValue(("forge/issue-", ""), ("ISSUE_NUMBER",))
+#: `forge/issue-<n>-<stamp>`: a run-specific name (Codex 4241532615), so a branch left behind by
+#: a run whose PR could not be opened never makes a later run's non-forced push fail.
+CLOUD_ROUTINE_BRANCH = PublisherValue(("forge/issue-", "-", ""), ("ISSUE_NUMBER", "RUN_STAMP"))
 CLOUD_ROUTINE_WHO = "the cloud routine"
 CLOUD_ROUTINE_NAMESPACE = "forge/**"
 CLOUD_ROUTINE_PUSHER = (
@@ -4107,9 +4120,9 @@ def _branch_ruleset_details(
 def _cloud_branch_rules_check(
     gh: GhRunner, project_id: str, listed: object, effective_branch: str
 ) -> Check:
-    """CLOUD_BRANCH_RULES_CHECK: rulesets (by their branch targeting over every issue number),
-    classic protection patterns and the effective rules of one `forge/issue-<N>` branch, judged
-    for the cloud routine's push. Anything unreadable is a manual TODO."""
+    """CLOUD_BRANCH_RULES_CHECK: rulesets (branch targeting over every issue number and stamp),
+    classic protection patterns and the effective rules of one `forge/issue-<N>-<stamp>` branch,
+    judged for the cloud routine's push. Anything unreadable is a manual TODO."""
     problems: list[str] = []
     who, namespace = CLOUD_ROUTINE_WHO, CLOUD_ROUTINE_NAMESPACE
     if isinstance(listed, Unreadable):
@@ -4167,10 +4180,10 @@ def _cloud_branch_rules_check(
 
 
 def cloud_branch_rule_problems(rules: Sequence[dict], branch: str) -> list[str]:
-    """What in the EFFECTIVE rules of `branch` (one `forge/issue-<N>` branch the cloud routine
+    """What in the EFFECTIVE rules of `branch` (one `forge/issue-<N>-<stamp>` branch the routine
     creates and pushes as the owner) can reject that push. Only rules that cannot reject a new
     branch carrying new commits pass, plus a branch-name pattern proven for every issue number
-    and required checks not enforced on creation; everything else is reported, and the
+    and stamp and required checks not enforced on creation; everything else is reported, and the
     commit-metadata patterns (the owner's own message and identity) are owner TODOs."""
     problems: list[str] = []
     for rule in rules:

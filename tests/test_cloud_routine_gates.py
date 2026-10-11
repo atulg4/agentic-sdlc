@@ -154,6 +154,35 @@ def test_check_diff_runs_no_external_diff_or_textconv(tmp_path, policy_file):
     assert not marker.exists()
 
 
+def test_check_diff_ignores_replace_refs(tmp_path, policy_file, capsys):
+    """A `refs/replace/*` object must not stand in for the commit a push publishes (Codex
+    4241532610): with HEAD replaced by a benign commit, check-diff still judges the original."""
+    repository = _repo(tmp_path)
+    _commit(repository, {".github/workflows/x.yml": "on: push\n"})
+    forbidden = _git(repository, "rev-parse", "HEAD")
+    _git(repository, "switch", "-q", "-c", "decoy", "main")
+    _commit(repository, {"module.py": "VALUE = 2\n"})
+    benign = _git(repository, "rev-parse", "HEAD")
+    _git(repository, "switch", "-q", "forge/issue-7")
+    _git(repository, "replace", forbidden, benign)
+    # git itself now shows the benign tree for HEAD -- the trap
+    assert _git(repository, "diff", "--name-only", "main", "HEAD") == "module.py"
+    assert _check_diff(repository, policy_file) == 2
+    assert "forbidden paths changed: .github/workflows/x.yml" in capsys.readouterr().err
+
+
+def test_check_diff_ignores_grafts(tmp_path, policy_file, capsys):
+    """A graft that re-parents HEAD onto itself hides its change the same way."""
+    repository = _repo(tmp_path)
+    _commit(repository, {".github/workflows/x.yml": "on: push\n"})
+    head = _git(repository, "rev-parse", "HEAD")
+    grafts = repository / ".git" / "info" / "grafts"
+    grafts.parent.mkdir(parents=True, exist_ok=True)
+    grafts.write_text(f"{head}\n", encoding="utf-8")  # HEAD becomes a root commit
+    assert _check_diff(repository, policy_file) == 2
+    assert "forbidden paths changed: .github/workflows/x.yml" in capsys.readouterr().err
+
+
 # ------------------------------------------------------------- check-request (Codex 4241434511)
 
 VALID = """## Summary
