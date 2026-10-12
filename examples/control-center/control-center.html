@@ -340,8 +340,16 @@
       let deliveries = 0;
       state.db.doc("snapshots/current").onSnapshot(
         async (snap) => {
-          if (!snap?.exists) return;
           const delivery = ++deliveries;
+          if (!snap?.exists) {
+            // A deleted snapshot is a delivery too: it clears the view and
+            // supersedes any older digest verification still in flight.
+            state.snapshot = null;
+            state.snapshotMeta = null;
+            state.error = "";
+            render();
+            return;
+          }
           const body = snap.data() || {};
           const problem = validateSnapshot(body.document) || await digestMismatch(body.document);
           if (delivery !== deliveries) return; // a newer delivery superseded this one
@@ -396,7 +404,7 @@
         return JSON.stringify(entry);
       }
       if (typeof entry === "string") {
-        return JSON.stringify(entry).replace(/[\u0080-\uffff]/g,
+        return JSON.stringify(entry).replace(/[\u007f-\uffff]/g,
           (ch) => "\\u" + ch.charCodeAt(0).toString(16).padStart(4, "0"));
       }
       if (Array.isArray(entry)) return "[" + entry.map(encode).join(",") + "]";

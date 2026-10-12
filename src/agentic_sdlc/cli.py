@@ -175,8 +175,9 @@ def _write(data: Any, output: str | None) -> None:
 
 def _write_group(documents: list[tuple[Any, str | None]]) -> None:
     """Write a document set as a group: every file target is staged next to
-    its destination before any destination is replaced, so a failed write
-    never leaves the set describing two different exports."""
+    its destination before any destination is replaced, and a replacement
+    failure restores the destinations already replaced, so a failure never
+    leaves the set describing two different exports."""
 
     staged: list[tuple[Path, Path]] = []
     try:
@@ -184,6 +185,8 @@ def _write_group(documents: list[tuple[Any, str | None]]) -> None:
             if not output:
                 continue
             destination = Path(output)
+            if destination.is_dir():
+                raise OSError(f"output names an existing directory: {destination}")
             temp = destination.with_name(destination.name + f".staged-{os.getpid()}")
             temp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             staged.append((temp, destination))
@@ -191,8 +194,32 @@ def _write_group(documents: list[tuple[Any, str | None]]) -> None:
         for temp, _ in staged:
             temp.unlink(missing_ok=True)
         raise
-    for temp, destination in staged:
-        os.replace(temp, destination)
+    replaced: list[tuple[Path | None, Path]] = []
+    try:
+        for temp, destination in staged:
+            backup: Path | None = None
+            if destination.exists():
+                backup = destination.with_name(destination.name + f".backup-{os.getpid()}")
+                os.replace(destination, backup)
+            # Track the backup before replacing: a failure between the two
+            # moves must still restore this destination from its backup.
+            replaced.append((backup, destination))
+            os.replace(temp, destination)
+    except BaseException:
+        # Restore every destination this group already replaced, newest
+        # first, then drop the staging litter: the set on disk must read as
+        # one export, the previous one.
+        for backup, destination in reversed(replaced):
+            if backup is not None:
+                os.replace(backup, destination)
+            else:
+                destination.unlink(missing_ok=True)
+        for temp, _ in staged:
+            temp.unlink(missing_ok=True)
+        raise
+    for backup, _ in replaced:
+        if backup is not None:
+            backup.unlink(missing_ok=True)
     for data, output in documents:
         if not output:
             _write(data, None)
