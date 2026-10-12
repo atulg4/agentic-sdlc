@@ -2409,6 +2409,14 @@ def test_doctor_rejects_a_ci_gate_whose_failure_is_ignored(tmp_path, mutate):
         # Tilde expansion makes `set`'s arguments unreadable (Codex 4252987836).
         ("HOME=-n; set ~; pytest", "bash", False),
         ("cd ~/repo && pytest", "bash", True),
+        # A trap handler can turn a later failure into success (Codex 4253116046).
+        ("trap exit\\ 0 ERR; pytest", "bash", False),
+        # `-o NAME` consumes its name before `-n` (Codex 4253116041).
+        ("set -eo pipefail -n; pytest", "bash", False),
+        ("set -eo pipefail; pytest", "bash", True),
+        # A quoted control word is a plain word to bash (Codex 4253116034).
+        ('if ! true; then "fi"; pytest; fi; true', "bash", False),
+        ('echo "if x"; pytest', "bash", True),
         ("set -o pipefail; echo ok; pytest | tee out", None, True),
         # `o` anywhere in a cluster takes the option name (Codex 4251046345).
         ("set +ou pipefail; pytest | tee out", "bash", False),

@@ -6703,23 +6703,48 @@ _SET_OPTION_NAMES = {
 }  # fmt: skip
 
 
+#: Words that open, close or continue a compound command; quoted, they are plain words.
+_SHELL_CONTROL_WORDS = {
+    "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac",
+    "select", "function", "{", "}", "!",
+}  # fmt: skip
+
+
+def _quotes_a_control_word(line: str) -> bool:
+    """Whether `line` quotes or escapes a control word (`"fi"`, `'done'`, `\\fi`): the POSIX
+    tokenizing the parser uses drops that quoting and would read it as the keyword."""
+    lexer = shlex.shlex(line, posix=False, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return True
+    for token in tokens:
+        bare = token.replace("\\", "").replace('"', "").replace("'", "")
+        if bare != token and bare in _SHELL_CONTROL_WORDS:
+            return True
+    return False
+
+
 def _set_enables_noexec(arguments: list[str]) -> bool:
     """Whether a `set` call may turn on `noexec` (`-n`, `-o noexec`): bash then reads every later
     command without running it. Judged on any option-looking word, so an unreadable call fails
     closed."""
-    for index, word in enumerate(arguments):
+    index = 0
+    while index < len(arguments):
+        word = arguments[index]
         if word in {"--", "-"} or len(word) < 2 or word[0] not in "-+":
             # `set -- -n` assigns positional parameters (Codex 4252615565).
             return False
         if word[0] == "-" and "n" in word[1:]:
             return True
-        if (
-            word[0] == "-"
-            and "o" in word[1:]
-            and index + 1 < len(arguments)
-            and arguments[index + 1] == "noexec"
-        ):
-            return True
+        if "o" in word[1:]:
+            # `-o NAME` takes the next word as its option name, so `set -eo pipefail -n` still
+            # reaches `-n` (Codex 4253116041).
+            index += 1
+            if word[0] == "-" and index < len(arguments) and arguments[index] == "noexec":
+                return True
+        index += 1
     return False
 
 
@@ -6833,6 +6858,10 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
         except ValueError:  # unbalanced quotes: no command we can vouch for
             opaque = True
             continue
+        if _quotes_a_control_word(line):
+            # shlex drops quoting, so a quoted `"fi"` would close an `if` the shell keeps open:
+            # nothing from this line on is proven to run (Codex 4253116034).
+            terminated = True
         if "'" in line or '"' in line:
             # shlex drops quoting, so a quoted `"fi"` would read as the `if` closer: from the
             # first quoted line on, no `set` is trusted to turn an option ON (Codex 4251422334).
@@ -6941,6 +6970,11 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                     invocation = None
                 if _effective_command(argv)[:1] == ["enable"]:
                     wrappers_untrusted = True
+                if (_effective_command(argv) or [""])[0] == "trap":
+                    # An ERR/EXIT/DEBUG handler can turn a later failure into success (`trap
+                    # 'exit 0' ERR`): no command after a trap is proven enforced (Codex
+                    # 4253116046).
+                    ends_script = True
                 if (
                     invocation is None
                     and may_run_in_parent
