@@ -3242,6 +3242,96 @@ def test_a_foreign_payload_behind_a_valid_record_is_still_rejected():
         canonical_repository(records, "acme/forge")
 
 
+def test_nested_repository_references_participate_in_ownership_checks():
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        incidents=load_incident_document(
+            _incidents(
+                _incident(
+                    incidentId="other/group/assets#7:untriaged",
+                    projectId="forge",
+                    kind="triage-needed",
+                    severity="advisory",
+                    evidenceRef="other/group/assets#7",
+                )
+            )
+        ),
+    )
+    assert any(
+        "references repository other/group/assets" in warning
+        for warning in snapshot.get("forge").warnings
+    )
+
+
+def test_a_pull_detail_from_another_repository_is_rejected():
+    foreign = {
+        "number": 7,
+        "title": "foreign",
+        "state": "open",
+        "draft": False,
+        "mergeable_state": "dirty",
+        "base": {"repo": {"full_name": "other/repo"}},
+    }
+    with pytest.raises(ControlCenterError, match="belongs to other/repo"):
+        incidents_from_change_requests(
+            [foreign], project_id="forge", repository="acme/forge", observed_at=NOW
+        )
+    local = dict(foreign, base={"repo": {"full_name": "ACME/forge"}})
+    incidents = incidents_from_change_requests(
+        [local], project_id="forge", repository="acme/forge", observed_at=NOW
+    )
+    assert [item["kind"] for item in incidents] == ["merge-conflict"]
+
+
+def test_proven_approval_restates_the_spec_hold_as_dispatch_blocked():
+    stale = _incident(
+        incidentId="acme/forge#7:released-spec-without-dispatch-labels",
+        kind="awaiting-human-approval",
+        severity="degraded",
+        backlogItemId="acme/forge#7",
+    )
+    approved = _ledger(
+        *_chain(
+            TO_PLANNED + ("approved",),
+            workUnit={"projectId": "forge", "workUnitId": "wu-1", "issueRef": "acme/forge#7"},
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=approved.projections(),
+        backlog=load_backlog_document(
+            _document(_backlog(itemId="acme/forge#7", issueRef="acme/forge#7"))
+        ),
+        incidents=load_incident_document(_incidents(stale)),
+    )
+    kept = snapshot.get("forge").incidents
+    assert [item.kind for item in kept] == ["dispatch-blocked"]
+    assert "Approval is proven" in kept[0].summary
+    document_incident = snapshot.get("forge").as_dict()["incidents"][0]
+    assert any(
+        action["actionId"] == "re-run-dispatch" for action in document_incident["remediations"]
+    )
+
+
+def test_the_console_catalogue_matches_the_declared_catalogue():
+    import re as _re
+    from pathlib import Path
+
+    from agentic_sdlc.control_center import REMEDIATION_CATALOGUE
+
+    html = Path("examples/control-center/control-center.html").read_text(encoding="utf-8")
+    match = _re.search(r"const REMEDIATIONS = (\{.*?\n\});", html, _re.S)
+    assert match is not None, "the console must embed the declared catalogue"
+    embedded = json.loads(match.group(1))
+    expected = {
+        kind: [action.as_dict() for action in actions]
+        for kind, actions in REMEDIATION_CATALOGUE.items()
+    }
+    assert embedded == expected
+
+
 def test_non_repository_evidence_references_never_warn():
     snapshot = build_control_center_snapshot(
         generated_at=NOW,
