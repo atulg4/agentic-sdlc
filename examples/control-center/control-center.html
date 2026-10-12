@@ -460,11 +460,22 @@
     if (!isObj(value)) return "That is not a snapshot document.";
     if (value.schemaVersion !== SCHEMA) return `Unsupported snapshot schemaVersion: ${value.schemaVersion}. This page renders version ${SCHEMA}.`;
     if (!Array.isArray(value.projects)) return "The snapshot has no projects array.";
+    // Collection budgets are enforced BEFORE anything allocates over or
+    // iterates a collection: a store-rewritten snapshot with a huge array
+    // must be rejected in constant-ish work, not after freezing the viewer.
+    // The budgets mirror the producer's (5000 backlog items, 2000 incidents
+    // per document).
+    const BUDGETS = { backlog: 5000, active: 5000, attention: 5000, incidents: 2000, warnings: 5000, repositories: 500, capabilities: 100, environments: 100 };
+    if (value.projects.length > 500) return "The snapshot holds more than 500 projects.";
     const seenProjects = new Set();
     const seenIncidents = new Set();
     const seenItems = new Set();
-    const arrayField = (owner, key, where) =>
-      owner[key] === undefined || Array.isArray(owner[key]) ? "" : `${where}.${key} must be an array.`;
+    const arrayField = (owner, key, where, budget) => {
+      if (owner[key] === undefined) return "";
+      if (!Array.isArray(owner[key])) return `${where}.${key} must be an array.`;
+      if (budget && owner[key].length > budget) return `${where}.${key} holds more than ${budget} entries.`;
+      return "";
+    };
     for (const project of value.projects) {
       if (!isObj(project) || typeof project.projectId !== "string" || !project.projectId) {
         return "Every project needs a projectId.";
@@ -473,12 +484,14 @@
       seenProjects.add(project.projectId);
       const where = `project ${project.projectId}`;
       for (const key of ["backlog", "active", "attention", "incidents", "warnings", "repositories", "capabilities", "environments"]) {
-        const problem = arrayField(project, key, where);
+        const problem = arrayField(project, key, where, BUDGETS[key]);
         if (problem) return problem;
       }
       if (project.counts !== undefined && !isObj(project.counts)) return `${where}.counts must be an object.`;
-      for (const unit of [...(project.active || []), ...(project.attention || [])]) {
-        if (!isObj(unit)) return `${where} has a work unit that is not an object.`;
+      for (const list of [project.active || [], project.attention || []]) {
+        for (const unit of list) {
+          if (!isObj(unit)) return `${where} has a work unit that is not an object.`;
+        }
       }
       for (const incident of project.incidents || []) {
         if (!isObj(incident)) return `${where} has an incident that is not an object.`;
@@ -494,7 +507,7 @@
         if (!["blocker", "degraded", "advisory"].includes(incident.severity)) {
           return `${where} has an incident with an unknown severity.`;
         }
-        const problem = arrayField(incident, "remediations", `${where} incident`);
+        const problem = arrayField(incident, "remediations", `${where} incident`, 16);
         if (problem) return problem;
         for (const action of incident.remediations || []) {
           if (!isObj(action)) return `${where} has a remediation entry that is not an object.`;
@@ -515,6 +528,7 @@
         }
         if (node.url && !/^https:\/\//.test(node.url)) return `${where} backlog node ${node.itemId || ""} url must be https.`;
         if (node.children !== undefined && !Array.isArray(node.children)) return `${where} backlog node ${node.itemId || ""} children must be an array.`;
+        if (node.children && node.children.length > 5000) return `${where} backlog node ${node.itemId || ""} holds more than 5000 children.`;
         visited += 1;
         if (visited > 10000) return `${where} backlog is too large or cyclic to render.`;
         for (const child of node.children || []) stack.push([child, depth + 1]);
