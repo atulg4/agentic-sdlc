@@ -1125,16 +1125,20 @@
   }
 
   const SNAPSHOT_RECIPE = [
+    "# fail closed: any failed request aborts before a partial snapshot is built",
+    "set -euo pipefail",
     "gh api --paginate 'repos/OWNER/REPO/issues?state=all&per_page=100' \\",
     "  --jq '.[]' | jq -s '.' > issues.json",
     "# the pulls LIST omits mergeable_state: fetch each pull's detail",
     "gh api --paginate 'repos/OWNER/REPO/pulls?state=open&per_page=100' --jq '.[].number' |",
-    "  while read n; do gh api \"repos/OWNER/REPO/pulls/$n\"; done | jq -s '.' > pulls.json",
+    "  while read n; do gh api \"repos/OWNER/REPO/pulls/$n\" || exit 1; done |",
+    "  jq -s '.' > pulls.json",
     "gh api --paginate 'repos/OWNER/REPO/issues/109/sub_issues?per_page=100' \\",
     "  --jq '.[]' | jq -s '.' > sub-109.json",
     "",
     "sdlcctl github-backlog --issues issues.json --pulls pulls.json \\",
     "  --sub-issues 109=sub-109.json \\",
+    "  --config agentic-sdlc.toml \\",
     "  --project-id PROJECT --repository OWNER/REPO \\",
     "  --backlog-output backlog.json --incidents-output incidents.json",
     "",

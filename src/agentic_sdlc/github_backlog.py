@@ -9,13 +9,16 @@ command instead of maintained by hand.
 Every inference here is table-driven and documented, because a console that
 guesses is worse than one that says *unknown*:
 
-- :data:`LABEL_STATES` maps a label set to a factory state, highest precedence
-  first. An issue matching no row carries no declared state at all, and the
-  Control Center reports it as unknown rather than inventing ``intake``.
+- :func:`label_states` maps a label set to a factory state, highest precedence
+  first, for a project's configured label names (:class:`LifecycleLabels`;
+  :data:`LABEL_STATES` is the default-named table). An issue matching no row
+  carries no declared state at all, and the Control Center reports it as
+  unknown rather than inventing ``intake``.
 - :data:`CLOSED_STATES` maps GitHub's close reason to a terminal state. "Closed
   as completed" means completed; "closed as not planned" means cancelled.
-- :data:`DISPATCH_RULES` encodes the label preconditions Forge's own dispatch
-  triggers require. A row that fires becomes an :class:`Incident`, which is how
+- :func:`dispatch_rules` encodes the label preconditions Forge's own dispatch
+  triggers require, again per configured names (:data:`DISPATCH_RULES` is the
+  default table). A row that fires becomes an :class:`Incident`, which is how
   "approved but nothing is running it" becomes visible and remediable.
 """
 
@@ -36,7 +39,26 @@ from .control_center import (
     ControlCenterError,
 )
 
+
+def _require(condition: bool, message: str) -> None:
+    if not condition:
+        raise ControlCenterError(message)
+
+
 _PARENT_URL = re.compile(r"/issues/(\d+)/?$")
+
+#: The OWNER/REPO shape every GitHub repository identifier must carry; a bare
+#: or slashless value would generate references no registry entry or ledger
+#: issue reference can ever match.
+_REPOSITORY = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/[A-Za-z0-9._-]+")
+
+
+def _require_repository(repository: Any) -> None:
+    _require(
+        isinstance(repository, str) and bool(_REPOSITORY.fullmatch(repository)),
+        f"repository must be an OWNER/REPO pair: {repository!r}",
+    )
+
 
 #: The only pull states GitHub emits; anything else is malformed provider data.
 PULL_STATES = frozenset({"open", "closed"})
@@ -63,16 +85,67 @@ EPIC_TITLE = re.compile(r"^\s*(?:[A-Z][A-Za-z]*\s+)?EPIC\b", re.I)
 #: Label sets that declare a factory state, most specific first. The first row
 #: whose ``required`` labels are all present and whose ``absent`` labels are all
 #: missing decides the state.
-LABEL_STATES: tuple[tuple[frozenset[str], frozenset[str], str], ...] = (
-    # An unreleased spec wins over a stale approval: the spec stage re-drafts
-    # without clearing implementation-approved, and the safety gate blocks
-    # planning and implementation until the draft is released.
-    (frozenset({"spec-drafted"}), frozenset({"spec-approved"}), "specified"),
-    (frozenset({"implementation-approved", "agent-ready"}), frozenset(), "approved"),
-    (frozenset({"implementation-approved"}), frozenset({"agent-ready"}), "approved"),
-    (frozenset({"spec-drafted"}), frozenset({"implementation-approved"}), "specified"),
-    (frozenset({"human-review-required"}), frozenset({"spec-drafted"}), "triaged"),
-)
+#: The platform-fixed spec stage labels; the policy does not rename these.
+SPEC_DRAFTED_LABEL = "spec-drafted"
+SPEC_APPROVED_LABEL = "spec-approved"
+
+
+@dataclass(frozen=True)
+class LifecycleLabels:
+    """The automation label names a project's policy configures.
+
+    ``agentic-sdlc.toml`` can rename the ready, human-review and
+    implementation labels (``ready_label``, ``human_review_label``,
+    ``implementation_label``); the generated workflows then fire on those
+    names, so the adapter must evaluate the same names rather than the
+    defaults. Names are compared casefolded, matching GitHub's own
+    ``contains()`` comparison, and must stay distinct from each other and
+    from the platform-fixed spec labels.
+    """
+
+    ready: str = "agent-ready"
+    human_review: str = "human-review-required"
+    implementation: str = "implementation-approved"
+
+    def __post_init__(self) -> None:
+        names = []
+        for field in ("ready", "human_review", "implementation"):
+            value = getattr(self, field)
+            _require(
+                isinstance(value, str) and bool(value.strip()),
+                f"lifecycle label {field} must be a non-empty string",
+            )
+            object.__setattr__(self, field, value.strip().lower())
+            names.append(getattr(self, field))
+        names.extend((SPEC_DRAFTED_LABEL, SPEC_APPROVED_LABEL))
+        _require(
+            len(set(names)) == len(names),
+            "lifecycle labels must be distinct from each other and from the spec labels",
+        )
+
+
+DEFAULT_LABELS = LifecycleLabels()
+
+
+def label_states(
+    labels: LifecycleLabels = DEFAULT_LABELS,
+) -> tuple[tuple[frozenset[str], frozenset[str], str], ...]:
+    """The declared-state table for a project's configured label names."""
+
+    return (
+        # An unreleased spec wins over a stale approval: the spec stage
+        # re-drafts without clearing the implementation approval, and the
+        # safety gate blocks planning and implementation until the draft is
+        # released.
+        (frozenset({SPEC_DRAFTED_LABEL}), frozenset({SPEC_APPROVED_LABEL}), "specified"),
+        (frozenset({labels.implementation, labels.ready}), frozenset(), "approved"),
+        (frozenset({labels.implementation}), frozenset({labels.ready}), "approved"),
+        (frozenset({SPEC_DRAFTED_LABEL}), frozenset({labels.implementation}), "specified"),
+        (frozenset({labels.human_review}), frozenset({SPEC_DRAFTED_LABEL}), "triaged"),
+    )
+
+
+LABEL_STATES: tuple[tuple[frozenset[str], frozenset[str], str], ...] = label_states()
 
 #: GitHub's close reason, mapped to the terminal state it actually means. A
 #: missing or unrecognised reason maps to nothing: the API permits a null
@@ -114,124 +187,126 @@ class DispatchRule:
         return self.required <= labels and not (self.missing & labels)
 
 
-#: The label preconditions the bundled ``agent-auto-plan`` and
-#: ``agent-auto-implement`` triggers enforce. Each unmet row is why an approved
-#: item is sitting still, which is precisely what an operator needs told.
-DISPATCH_RULES: tuple[DispatchRule, ...] = (
-    DispatchRule(
-        rule_id="spec-awaiting-human-review",
-        required=frozenset({"spec-drafted"}),
-        missing=frozenset({"spec-approved"}),
-        kind="awaiting-spec-review",
-        severity="degraded",
-        summary=(
-            "Specification draft held for human spec review: planning and "
-            "implementation stay blocked until spec-drafted is removed or "
-            "spec-approved is added"
+def dispatch_rules(labels: LifecycleLabels = DEFAULT_LABELS) -> tuple[DispatchRule, ...]:
+    """The label preconditions the bundled ``agent-auto-plan`` and
+    ``agent-auto-implement`` triggers enforce, evaluated against a project's
+    configured label names. Each unmet row is why an approved item is sitting
+    still, which is precisely what an operator needs told."""
+
+    ready = labels.ready
+    review = labels.human_review
+    approve = labels.implementation
+    return (
+        DispatchRule(
+            rule_id="spec-awaiting-human-review",
+            required=frozenset({SPEC_DRAFTED_LABEL}),
+            missing=frozenset({SPEC_APPROVED_LABEL}),
+            kind="awaiting-spec-review",
+            severity="degraded",
+            summary=(
+                "Specification draft held for human spec review: planning and "
+                f"implementation stay blocked until {SPEC_DRAFTED_LABEL} is removed or "
+                f"{SPEC_APPROVED_LABEL} is added"
+            ),
         ),
-    ),
-    DispatchRule(
-        rule_id="approved-without-dispatch-labels",
-        required=frozenset({"implementation-approved"}),
-        missing=frozenset({"agent-ready", "human-review-required"}),
-        kind="dispatch-blocked",
-        severity="blocker",
-        summary=(
-            "Approved for implementation but carrying neither agent-ready nor "
-            "human-review-required, so no trigger fires"
+        DispatchRule(
+            rule_id="approved-without-dispatch-labels",
+            required=frozenset({approve}),
+            missing=frozenset({ready, review}),
+            kind="dispatch-blocked",
+            severity="blocker",
+            summary=(
+                f"Approved for implementation but carrying neither {ready} nor "
+                f"{review}, so no trigger fires"
+            ),
         ),
-    ),
-    DispatchRule(
-        rule_id="approved-without-agent-ready",
-        required=frozenset({"implementation-approved", "human-review-required"}),
-        missing=frozenset({"agent-ready"}),
-        kind="dispatch-blocked",
-        severity="blocker",
-        summary="Approved for implementation but not labelled agent-ready, so no trigger fires",
-    ),
-    DispatchRule(
-        rule_id="approved-without-human-review",
-        required=frozenset({"implementation-approved", "agent-ready"}),
-        missing=frozenset({"human-review-required"}),
-        kind="dispatch-blocked",
-        severity="blocker",
-        summary=(
-            "Approved and agent-ready but missing human-review-required, which both "
-            "bundled triggers require, so nothing fires"
+        DispatchRule(
+            rule_id="approved-without-agent-ready",
+            required=frozenset({approve, review}),
+            missing=frozenset({ready}),
+            kind="dispatch-blocked",
+            severity="blocker",
+            summary=f"Approved for implementation but not labelled {ready}, so no trigger fires",
         ),
-    ),
-    DispatchRule(
-        rule_id="agent-ready-without-human-review",
-        required=frozenset({"agent-ready"}),
-        missing=frozenset({"human-review-required"}),
-        kind="dispatch-blocked",
-        severity="degraded",
-        summary="Labelled agent-ready without human-review-required; both labels are required",
-    ),
-    # With agent-ready also present, the plan-ordering advisory below is the
-    # actionable message, so this row yields to it.
-    DispatchRule(
-        rule_id="spec-without-approval",
-        required=frozenset({"spec-drafted", "human-review-required"}),
-        missing=frozenset({"implementation-approved", "agent-ready"}),
-        kind="awaiting-human-approval",
-        severity="degraded",
-        summary="Specification drafted and waiting on a human implementation approval",
-    ),
-    DispatchRule(
-        rule_id="eligible-awaiting-dispatch-evidence",
-        required=frozenset({"implementation-approved", "human-review-required", "agent-ready"}),
-        missing=frozenset(),
-        kind="awaiting-dispatch-evidence",
-        severity="advisory",
-        summary=(
-            "Every dispatch label is present, but the bundled implementation trigger "
-            "fires only on the implementation-approved label event: confirm a run "
-            "started, and re-apply implementation-approved to re-kick if none did"
+        DispatchRule(
+            rule_id="approved-without-human-review",
+            required=frozenset({approve, ready}),
+            missing=frozenset({review}),
+            kind="dispatch-blocked",
+            severity="blocker",
+            summary=(
+                f"Approved and {ready} but missing {review}, which both "
+                "bundled triggers require, so nothing fires"
+            ),
         ),
-    ),
-    # An unreleased draft is caught by the spec-review rule above, so only
-    # implementation-approved blocks this row: a released spec (spec-drafted
-    # plus spec-approved) still has the plan-trigger ordering hazard.
-    DispatchRule(
-        rule_id=PLAN_EVIDENCE_RULE,
-        required=frozenset({"agent-ready", "human-review-required"}),
-        missing=frozenset({"implementation-approved"}),
-        kind="awaiting-dispatch-evidence",
-        severity="advisory",
-        summary=(
-            "Both planning labels are present, but the bundled plan trigger fires "
-            "only on the agent-ready label event: confirm a plan run started, and "
-            "re-apply agent-ready to re-kick if none did"
+        DispatchRule(
+            rule_id="agent-ready-without-human-review",
+            required=frozenset({ready}),
+            missing=frozenset({review}),
+            kind="dispatch-blocked",
+            severity="degraded",
+            summary=f"Labelled {ready} without {review}; both labels are required",
         ),
-    ),
-    DispatchRule(
-        rule_id=RELEASED_SPEC_RULE,
-        required=frozenset({"spec-drafted", "spec-approved"}),
-        missing=frozenset({"implementation-approved", "agent-ready", "human-review-required"}),
-        kind="awaiting-human-approval",
-        severity="degraded",
-        summary=(
-            "Specification released, but no dispatch label follows it: the work "
-            "waits on an implementation approval and the dispatch labels"
+        # With the ready label also present, the plan-ordering advisory below
+        # is the actionable message, so this row yields to it.
+        DispatchRule(
+            rule_id="spec-without-approval",
+            required=frozenset({SPEC_DRAFTED_LABEL, review}),
+            missing=frozenset({approve, ready}),
+            kind="awaiting-human-approval",
+            severity="degraded",
+            summary="Specification drafted and waiting on a human implementation approval",
         ),
-    ),
-    DispatchRule(
-        rule_id="untriaged",
-        required=frozenset(),
-        missing=frozenset(
-            {"human-review-required", "implementation-approved", "agent-ready", "spec-drafted"}
+        DispatchRule(
+            rule_id="eligible-awaiting-dispatch-evidence",
+            required=frozenset({approve, review, ready}),
+            missing=frozenset(),
+            kind="awaiting-dispatch-evidence",
+            severity="advisory",
+            summary=(
+                "Every dispatch label is present, but the bundled implementation trigger "
+                f"fires only on the {approve} label event: confirm a run "
+                f"started, and re-apply {approve} to re-kick if none did"
+            ),
         ),
-        kind="triage-needed",
-        severity="advisory",
-        summary="Not triaged: no lifecycle label, so no stage owns this item",
-    ),
-)
+        # An unreleased draft is caught by the spec-review rule above, so only
+        # the implementation approval blocks this row: a released spec (drafted
+        # plus approved) still has the plan-trigger ordering hazard.
+        DispatchRule(
+            rule_id=PLAN_EVIDENCE_RULE,
+            required=frozenset({ready, review}),
+            missing=frozenset({approve}),
+            kind="awaiting-dispatch-evidence",
+            severity="advisory",
+            summary=(
+                "Both planning labels are present, but the bundled plan trigger fires "
+                f"only on the {ready} label event: confirm a plan run started, and "
+                f"re-apply {ready} to re-kick if none did"
+            ),
+        ),
+        DispatchRule(
+            rule_id=RELEASED_SPEC_RULE,
+            required=frozenset({SPEC_DRAFTED_LABEL, SPEC_APPROVED_LABEL}),
+            missing=frozenset({approve, ready, review}),
+            kind="awaiting-human-approval",
+            severity="degraded",
+            summary=(
+                "Specification released, but no dispatch label follows it: the work "
+                "waits on an implementation approval and the dispatch labels"
+            ),
+        ),
+        DispatchRule(
+            rule_id="untriaged",
+            required=frozenset(),
+            missing=frozenset({review, approve, ready, SPEC_DRAFTED_LABEL}),
+            kind="triage-needed",
+            severity="advisory",
+            summary="Not triaged: no lifecycle label, so no stage owns this item",
+        ),
+    )
 
 
-def _require(condition: bool, message: str) -> None:
-    if not condition:
-        raise ControlCenterError(message)
+DISPATCH_RULES: tuple[DispatchRule, ...] = dispatch_rules()
 
 
 def _issue_labels(issue: Mapping[str, Any]) -> frozenset[str]:
@@ -257,7 +332,11 @@ def _issue_labels(issue: Mapping[str, Any]) -> frozenset[str]:
     return frozenset(names)
 
 
-def _declared_state(issue: Mapping[str, Any], labels: frozenset[str]) -> str:
+def _declared_state(
+    issue: Mapping[str, Any],
+    labels: frozenset[str],
+    states: tuple[tuple[frozenset[str], frozenset[str], str], ...],
+) -> str:
     """Resolve a declared state, or return "" so the console reports unknown."""
 
     if _issue_state(issue) == "closed":
@@ -265,7 +344,7 @@ def _declared_state(issue: Mapping[str, Any], labels: frozenset[str]) -> str:
         if not isinstance(reason, str):
             return ""
         return CLOSED_STATES.get(reason, "")
-    for required, absent, state in LABEL_STATES:
+    for required, absent, state in states:
         if required <= labels and not (absent & labels):
             return state
     return ""
@@ -289,16 +368,20 @@ def backlog_document_from_issues(
     repository: str,
     parents: Mapping[int, int] | None = None,
     source: str = "github-issues",
+    labels: LifecycleLabels | None = None,
 ) -> dict[str, Any]:
     """Build a backlog document from GitHub issue payloads.
 
     ``parents`` maps a child issue number to its parent's, as returned by the
     sub-issue endpoints. Pull requests are skipped: GitHub returns them from the
-    issues endpoint, but a change request is not a backlog item.
+    issues endpoint, but a change request is not a backlog item. ``labels``
+    carries the project's configured lifecycle label names; the defaults match
+    the platform's.
     """
 
     _require(bool(project_id), "project_id is required")
-    _require(bool(repository), "repository is required")
+    _require_repository(repository)
+    states = label_states(labels or DEFAULT_LABELS)
     links = dict(parents or {})
     rows = [issue for issue in issues if "pull_request" not in issue]
     numbers = {int(issue["number"]) for issue in rows}
@@ -321,7 +404,7 @@ def backlog_document_from_issues(
             # Kept even when the parent is outside this export: the read model
             # roots the child and warns "parent outside this snapshot".
             item["parentId"] = f"{repository}#{parent}"
-        state = _declared_state(issue, labels)
+        state = _declared_state(issue, labels, states)
         if state:
             item["declaredState"] = state
         url = issue.get("html_url")
@@ -347,17 +430,23 @@ def incidents_from_issues(
     project_id: str,
     repository: str,
     observed_at: str,
+    labels: LifecycleLabels | None = None,
 ) -> list[dict[str, Any]]:
-    """Report, per open issue, which declared dispatch precondition is unmet."""
+    """Report, per open issue, which declared dispatch precondition is unmet.
 
+    ``labels`` carries the project's configured lifecycle label names; the
+    defaults match the platform's."""
+
+    _require_repository(repository)
+    rules = dispatch_rules(labels or DEFAULT_LABELS)
     incidents: list[dict[str, Any]] = []
     for issue in issues:
         if "pull_request" in issue or _issue_state(issue) == "closed":
             continue
         number = int(issue["number"])
-        labels = _issue_labels(issue)
-        for rule in DISPATCH_RULES:
-            if not rule.matches(labels):
+        issue_labels = _issue_labels(issue)
+        for rule in rules:
+            if not rule.matches(issue_labels):
                 continue
             incidents.append(
                 {
@@ -397,6 +486,7 @@ def incidents_from_change_requests(
     mean something else is owed first, and unknown is never fabricated.
     """
 
+    _require_repository(repository)
     checks = dict(failing or {})
     incidents: list[dict[str, Any]] = []
     for pull in pulls:

@@ -110,13 +110,17 @@ inputs never mention is an error, not an empty page.
 adapter that turns GitHub payloads into the backlog and incident documents:
 
 ```bash
+# fail closed: any failed request aborts before a partial snapshot is built
+set -euo pipefail
+
 # paginate: one page caps issues at 100 and pulls at 30
 gh api --paginate 'repos/OWNER/REPO/issues?state=all&per_page=100' \
   --jq '.[]' | jq -s '.' > issues.json
 
 # the pulls LIST response omits mergeable_state: fetch each pull's detail
 gh api --paginate 'repos/OWNER/REPO/pulls?state=open&per_page=100' --jq '.[].number' |
-  while read n; do gh api "repos/OWNER/REPO/pulls/$n"; done | jq -s '.' > pulls.json
+  while read n; do gh api "repos/OWNER/REPO/pulls/$n" || exit 1; done |
+  jq -s '.' > pulls.json
 
 gh api --paginate 'repos/OWNER/REPO/issues/109/sub_issues?per_page=100' \
   --jq '.[]' | jq -s '.' > sub-109.json
@@ -124,9 +128,16 @@ gh api --paginate 'repos/OWNER/REPO/issues/109/sub_issues?per_page=100' \
 sdlcctl github-backlog \
   --issues issues.json --pulls pulls.json --sub-issues 109=sub-109.json \
   --failing 148=test \
+  --config agentic-sdlc.toml \
   --project-id forge --repository OWNER/REPO \
   --backlog-output backlog.json --incidents-output incidents.json
 ```
+
+`--config` points at the project's `agentic-sdlc.toml`, whose `ready_label`,
+`human_review_label` and `implementation_label` rename the automation labels
+the generated workflows fire on; the adapter then evaluates those names.
+Without it, the platform defaults (`agent-ready`, `human-review-required`,
+`implementation-approved`) apply. The spec labels are platform-fixed.
 
 A change request without a mergeability verdict in its payload is never
 reported as "ready and waiting": unknown is not a state, so feed the command

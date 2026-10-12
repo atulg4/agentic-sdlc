@@ -638,7 +638,10 @@ def _load_backlog_item(raw: Any, index: int) -> BacklogItem:
         title=_text(entry, "title", label, required=True),
         project_id=_identifier(entry, "projectId", label),
         parent_id=_identifier(entry, "parentId", label, required=False),
-        work_unit_id=_identifier(entry, "workUnitId", label, required=False),
+        # Work-unit ids follow the LEDGER's identifier contract (any bounded
+        # non-empty string), not the tracker-reference character set: a unit
+        # the ledger accepted must stay addressable from here.
+        work_unit_id=_text(entry, "workUnitId", label),
         issue_ref=_identifier(entry, "issueRef", label, required=False),
         declared_state=declared,
         labels=_string_tuple(entry.get("labels"), f"{label}.labels"),
@@ -801,7 +804,8 @@ def _load_incident(raw: Any, index: int) -> Incident:
         severity=IncidentSeverity(severity),
         summary=_text(entry, "summary", label, required=True),
         detail=_text(entry, "detail", label),
-        work_unit_id=_identifier(entry, "workUnitId", label, required=False),
+        # Same ledger-aligned contract as the backlog item's workUnitId.
+        work_unit_id=_text(entry, "workUnitId", label),
         backlog_item_id=_identifier(entry, "backlogItemId", label, required=False),
         observed_at=_timestamp(entry, "observedAt", label),
         evidence_ref=_text(entry, "evidenceRef", label),
@@ -1326,7 +1330,12 @@ def build_control_center_snapshot(
                 item_status[item.item_id] = status
         retained: list[Incident] = []
         for incident in project_incidents:
-            proven = item_status.get(incident.backlog_item_id)
+            # A named work unit is direct ledger evidence; the backlog-item
+            # join is the fallback for incidents that only name the item
+            # (e.g. when no backlog document was supplied at all).
+            proven = statuses.get(incident.work_unit_id) if incident.work_unit_id else None
+            if proven is None:
+                proven = item_status.get(incident.backlog_item_id)
             if incident.kind in _LEDGER_RETIREMENT and proven is not None:
                 # Label-derived incidents are outranked by durable ledger
                 # proof that their gate was already passed: a label removed
