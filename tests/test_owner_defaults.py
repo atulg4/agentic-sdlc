@@ -134,7 +134,7 @@ def test_local_resolution_takes_the_first_match_on_path_and_refuses_an_unsafe_on
 
 
 def test_a_user_owned_hook_interpreter_is_accepted_in_local_and_refused_in_strict(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, no_agent_context
 ):
     python = _interpreter(tmp_path / "homebrew" / "bin")
     assert hook_python_problem(str(python), LOCAL) == ""
@@ -241,7 +241,9 @@ def test_the_policy_records_the_three_choices_and_doctor_accepts_them(tmp_path):
     )
 
 
-def test_cli_onboard_records_the_trust_mode_and_keeps_it_on_force(tmp_path, monkeypatch):
+def test_cli_onboard_records_the_trust_mode_and_keeps_it_on_force(
+    tmp_path, monkeypatch, no_agent_context
+):
     from agentic_sdlc import cli
 
     python = _interpreter(tmp_path / "homebrew" / "bin")
@@ -259,6 +261,9 @@ def test_cli_onboard_records_the_trust_mode_and_keeps_it_on_force(tmp_path, monk
     assert tomllib.loads((repo / "agentic-sdlc.toml").read_text())["automation"]["trust_mode"] == (
         LOCAL
     )
+    # Codex 4244145211: in an agent context local mode cannot pin a user-owned interpreter
+    monkeypatch.setenv("CLAUDE_CODE_REMOTE", "true")
+    assert cli.main([*base, "--trust-mode", "local", "--force"]) == 2
 
 
 def test_the_cli_reads_the_policy_trust_mode(tmp_path, monkeypatch, no_agent_context):
