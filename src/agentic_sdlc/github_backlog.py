@@ -36,6 +36,7 @@ from .control_center import (
     MAX_INCIDENTS,
     PLAN_EVIDENCE_RULE,
     RELEASED_SPEC_RULE,
+    SPEC_WITHOUT_APPROVAL_RULE,
     ControlCenterError,
 )
 
@@ -284,7 +285,7 @@ def dispatch_rules(labels: LifecycleLabels = DEFAULT_LABELS) -> tuple[DispatchRu
         # With the ready label also present, the plan-ordering advisory below
         # is the actionable message, so this row yields to it.
         DispatchRule(
-            rule_id="spec-without-approval",
+            rule_id=SPEC_WITHOUT_APPROVAL_RULE,
             required=frozenset({SPEC_DRAFTED_LABEL, review}),
             missing=frozenset({approve, ready}),
             kind="awaiting-human-approval",
@@ -522,6 +523,13 @@ def incidents_from_change_requests(
 
     _require_repository(repository)
     checks = dict(failing or {})
+    for key in checks:
+        # Dictionary equality would let True or 1.0 match change request 1,
+        # fabricating a failing-check blocker _record_number already rejects.
+        _require(
+            isinstance(key, int) and not isinstance(key, bool) and key > 0,
+            f"failing-check key must be a positive integer: {key!r}",
+        )
     incidents: list[dict[str, Any]] = []
     for pull in pulls:
         state_field = pull.get("state")
@@ -724,8 +732,15 @@ def parent_links(
             and not isinstance(group[1], Mapping)
         ):
             # The explicit (payload, parent_number) pair; any other tuple is an
-            # ordinary payload of child records.
+            # ordinary payload of child records. The declared parent passes
+            # the same validation as every child number: True would alias
+            # issue #1 and corrupt the tree rather than reject the link.
             payload, declared = group
+            _require(
+                declared is None
+                or (isinstance(declared, int) and not isinstance(declared, bool) and declared > 0),
+                f"declared parent number must be a positive integer: {declared!r}",
+            )
         for entry in payload:
             # The shared validator, not a type check: bool is an int, so a
             # record with number true would alias issue #1.

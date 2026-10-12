@@ -2987,6 +2987,77 @@ def test_approval_proof_does_not_retire_a_released_spec_label_loss():
     assert snapshot.get("forge").incidents == ()
 
 
+def test_a_malformed_declared_parent_is_a_controlled_error():
+    for bad in (True, 0, -2):
+        with pytest.raises(ControlCenterError, match="declared parent number"):
+            parent_links(([{"number": 2}], bad))
+
+
+def test_a_malformed_failing_key_is_a_controlled_error():
+    # Dictionary equality would let True or 1.0 match change request 1.
+    for bad in (True, 1.0, 0, "1"):
+        with pytest.raises(ControlCenterError, match="failing-check key"):
+            incidents_from_change_requests(
+                [
+                    {
+                        "number": 1,
+                        "title": "green",
+                        "state": "open",
+                        "draft": False,
+                        "mergeable_state": "clean",
+                    }
+                ],
+                project_id="forge",
+                repository="acme/forge",
+                observed_at=NOW,
+                failing={bad: "test"},
+            )
+
+
+def test_approval_proof_does_not_retire_the_spec_approval_hold():
+    # spec-without-approval also reports missing dispatch labels: an approved
+    # unit still lacks the ready label, so only dispatch proof retires it.
+    stale = _incident(
+        incidentId="acme/forge#7:spec-without-approval",
+        kind="awaiting-human-approval",
+        severity="degraded",
+        backlogItemId="acme/forge#7",
+    )
+    backlog = load_backlog_document(
+        _document(_backlog(itemId="acme/forge#7", issueRef="acme/forge#7"))
+    )
+    approved = _ledger(
+        *_chain(
+            TO_PLANNED + ("approved",),
+            workUnit={"projectId": "forge", "workUnitId": "wu-1", "issueRef": "acme/forge#7"},
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=approved.projections(),
+        backlog=backlog,
+        incidents=load_incident_document(_incidents(stale)),
+    )
+    assert [item.incident_id for item in snapshot.get("forge").incidents] == [
+        "acme/forge#7:spec-without-approval"
+    ]
+    dispatched = _ledger(
+        *_chain(
+            TO_PLANNED + ("approved", "dispatched"),
+            workUnit={"projectId": "forge", "workUnitId": "wu-1", "issueRef": "acme/forge#7"},
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=dispatched.projections(),
+        backlog=backlog,
+        incidents=load_incident_document(_incidents(stale)),
+    )
+    assert snapshot.get("forge").incidents == ()
+
+
 def test_a_malformed_issue_state_is_a_controlled_error():
     for bad in (False, 1, "merged", ""):
         with pytest.raises(ControlCenterError, match="state must be"):

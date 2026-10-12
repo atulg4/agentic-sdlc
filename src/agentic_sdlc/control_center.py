@@ -92,6 +92,11 @@ PLAN_EVIDENCE_RULE = "plan-ready-awaiting-dispatch-evidence"
 #: holds until dispatch itself is proven.
 RELEASED_SPEC_RULE = "released-spec-without-dispatch-labels"
 
+#: The adapter rule id for a drafted spec held on its implementation approval
+#: AND the dispatch labels. Approval proof alone must not retire it either:
+#: the ready label is still missing, so neither bundled trigger can fire.
+SPEC_WITHOUT_APPROVAL_RULE = "spec-without-approval"
+
 #: States that PROVE dispatch happened: each is reachable only through a
 #: dispatched run. ``blocked``, ``cancelled`` and ``superseded`` are reachable
 #: from pre-dispatch states too, so they prove nothing and retire nothing.
@@ -1367,11 +1372,13 @@ def build_control_center_snapshot(
                 # cancelled) retires nothing.
                 if incident.incident_id.endswith(":" + PLAN_EVIDENCE_RULE):
                     proven_states = PLAN_PROVEN_STATES
-                elif incident.incident_id.endswith(":" + RELEASED_SPEC_RULE):
-                    # This rule reports missing dispatch labels, not the
-                    # approval wait its kind shares: an approved unit still
+                elif incident.incident_id.endswith(
+                    (":" + RELEASED_SPEC_RULE, ":" + SPEC_WITHOUT_APPROVAL_RULE)
+                ):
+                    # These rules report missing dispatch labels, not only the
+                    # approval wait their kind shares: an approved unit still
                     # cannot fire without the label events, so only dispatch
-                    # proof retires it.
+                    # proof retires them.
                     proven_states = DISPATCH_PROVEN_STATES
                 else:
                     proven_states = _LEDGER_RETIREMENT[incident.kind]
