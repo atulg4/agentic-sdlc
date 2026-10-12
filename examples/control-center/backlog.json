@@ -16,15 +16,17 @@
       "itemId": "atulg4/agentic-sdlc#132",
       "kind": "task",
       "labels": [
+        "agent-ready",
         "cloud-ready",
         "enhancement",
         "human-review-required",
         "implementation-approved",
+        "spec-approved",
         "spec-drafted"
       ],
       "projectId": "forge",
       "title": "P2: Evaluate Jev reranking of optional context while preserving mandatory evidence and provenance",
-      "updatedAt": "2026-09-26T05:18:54Z",
+      "updatedAt": "2026-10-12T08:15:46Z",
       "url": "https://github.com/atulg4/agentic-sdlc/issues/132"
     },
     {
@@ -33,15 +35,17 @@
       "itemId": "atulg4/agentic-sdlc#131",
       "kind": "task",
       "labels": [
+        "agent-ready",
         "cloud-ready",
         "enhancement",
         "human-review-required",
         "implementation-approved",
+        "spec-approved",
         "spec-drafted"
       ],
       "projectId": "forge",
       "title": "P2: Add Jev task and mission-fit advice alongside Forge's deterministic executor router",
-      "updatedAt": "2026-09-26T05:18:53Z",
+      "updatedAt": "2026-10-12T08:15:45Z",
       "url": "https://github.com/atulg4/agentic-sdlc/issues/131"
     },
     {
@@ -50,15 +54,17 @@
       "itemId": "atulg4/agentic-sdlc#130",
       "kind": "task",
       "labels": [
+        "agent-ready",
         "cloud-ready",
         "enhancement",
         "human-review-required",
         "implementation-approved",
+        "spec-approved",
         "spec-drafted"
       ],
       "projectId": "forge",
       "title": "P2: Use Jev to advise on unknown failures without changing exact-head retry or repair authority",
-      "updatedAt": "2026-09-26T05:18:51Z",
+      "updatedAt": "2026-10-12T08:15:43Z",
       "url": "https://github.com/atulg4/agentic-sdlc/issues/130"
     },
     {
@@ -67,15 +73,17 @@
       "itemId": "atulg4/agentic-sdlc#129",
       "kind": "task",
       "labels": [
+        "agent-ready",
         "cloud-ready",
         "enhancement",
         "human-review-required",
         "implementation-approved",
+        "spec-approved",
         "spec-drafted"
       ],
       "projectId": "forge",
       "title": "P1: Benchmark Jev in shadow mode with calibrated decisions and honest end-to-end cost accounting",
-      "updatedAt": "2026-09-26T05:18:50Z",
+      "updatedAt": "2026-10-12T08:15:41Z",
       "url": "https://github.com/atulg4/agentic-sdlc/issues/129"
     },
     {
@@ -84,15 +92,17 @@
       "itemId": "atulg4/agentic-sdlc#128",
       "kind": "task",
       "labels": [
+        "agent-ready",
         "cloud-ready",
         "enhancement",
         "human-review-required",
         "implementation-approved",
+        "spec-approved",
         "spec-drafted"
       ],
       "projectId": "forge",
       "title": "P1: Add an optional Jev decision adapter with strict schemas, egress controls and bounded cost",
-      "updatedAt": "2026-09-26T05:18:49Z",
+      "updatedAt": "2026-10-12T08:15:40Z",
       "url": "https://github.com/atulg4/agentic-sdlc/issues/128"
     },
     {
@@ -101,15 +111,17 @@
       "itemId": "atulg4/agentic-sdlc#127",
       "kind": "epic",
       "labels": [
+        "agent-ready",
         "cloud-ready",
         "enhancement",
         "human-review-required",
         "implementation-approved",
+        "spec-approved",
         "spec-drafted"
       ],
       "projectId": "forge",
       "title": "EPIC P1: Evaluate Jev as a policy-bounded decision adviser for Forge",
-      "updatedAt": "2026-09-26T05:18:44Z",
+      "updatedAt": "2026-10-12T08:15:38Z",
       "url": "https://github.com/atulg4/agentic-sdlc/issues/127"
     },
     {
@@ -178,14 +190,16 @@
       "itemId": "atulg4/agentic-sdlc#110",
       "kind": "epic",
       "labels": [
+        "agent-ready",
         "cloud-ready",
         "human-review-required",
         "implementation-approved",
+        "spec-approved",
         "spec-drafted"
       ],
       "projectId": "forge",
       "title": "EPIC: Launch Marketing Maestro \u2014 AI marketing factory for any Forge-managed product",
-      "updatedAt": "2026-09-26T05:21:28Z",
+      "updatedAt": "2026-10-12T08:15:37Z",
       "url": "https://github.com/atulg4/agentic-sdlc/issues/110"
     },
     {
@@ -194,14 +208,16 @@
       "itemId": "atulg4/agentic-sdlc#109",
       "kind": "epic",
       "labels": [
+        "agent-ready",
         "cloud-ready",
         "human-review-required",
         "implementation-approved",
+        "spec-approved",
         "spec-drafted"
       ],
       "projectId": "forge",
       "title": "EPIC: Forge as an open, general-purpose AI software factory",
-      "updatedAt": "2026-09-26T05:18:43Z",
+      "updatedAt": "2026-10-12T08:15:36Z",
       "url": "https://github.com/atulg4/agentic-sdlc/issues/109"
     },
     {
@@ -226,15 +242,17 @@
       "itemId": "atulg4/agentic-sdlc#107",
       "kind": "task",
       "labels": [
+        "agent-ready",
         "cloud-ready",
         "human-review-required",
         "implementation-approved",
+        "spec-approved",
         "spec-drafted"
       ],
       "parentId": "atulg4/agentic-sdlc#109",
       "projectId": "forge",
       "title": "P1: Real-time multi-project Forge Control Center with backlog lifecycle, cost and effectiveness views",
-      "updatedAt": "2026-09-26T05:18:41Z",
+      "updatedAt": "2026-10-12T08:15:34Z",
       "url": "https://github.com/atulg4/agentic-sdlc/issues/107"
     },
     {
@@ -243,15 +261,17 @@
       "itemId": "atulg4/agentic-sdlc#106",
       "kind": "task",
       "labels": [
+        "agent-ready",
         "cloud-ready",
         "human-review-required",
         "implementation-approved",
+        "spec-approved",
         "spec-drafted"
       ],
       "parentId": "atulg4/agentic-sdlc#109",
       "projectId": "forge",
       "title": "P1: Outcome effectiveness, learning ledger and value-per-agent-hour scoring",
-      "updatedAt": "2026-09-26T05:18:40Z",
+      "updatedAt": "2026-10-12T08:15:32Z",
       "url": "https://github.com/atulg4/agentic-sdlc/issues/106"
     },
     {
@@ -343,14 +363,16 @@
       "itemId": "atulg4/agentic-sdlc#51",
       "kind": "task",
       "labels": [
+        "agent-ready",
         "cloud-ready",
         "human-review-required",
         "implementation-approved",
+        "spec-approved",
         "spec-drafted"
       ],
       "projectId": "forge",
       "title": "P0: Event-driven autonomous intake dispatcher for Forge-managed work",
-      "updatedAt": "2026-09-26T05:21:23Z",
+      "updatedAt": "2026-10-12T08:15:31Z",
       "url": "https://github.com/atulg4/agentic-sdlc/issues/51"
     },
     {
@@ -359,15 +381,17 @@
       "itemId": "atulg4/agentic-sdlc#46",
       "kind": "task",
       "labels": [
+        "agent-ready",
         "cloud-ready",
         "human-review-required",
         "implementation-approved",
+        "spec-approved",
         "spec-drafted"
       ],
       "parentId": "atulg4/agentic-sdlc#109",
       "projectId": "forge",
       "title": "P0: Forge scheduler \u2014 ETA, critical path, parallelism, capacity, and blocking reasons",
-      "updatedAt": "2026-09-26T05:21:18Z",
+      "updatedAt": "2026-10-12T08:14:57Z",
       "url": "https://github.com/atulg4/agentic-sdlc/issues/46"
     },
     {
@@ -376,14 +400,16 @@
       "itemId": "atulg4/agentic-sdlc#45",
       "kind": "task",
       "labels": [
+        "agent-ready",
         "cloud-ready",
         "human-review-required",
         "implementation-approved",
+        "spec-approved",
         "spec-drafted"
       ],
       "projectId": "forge",
       "title": "P0: Forge dashboard \u2014 responsive portfolio, mission progress, quality, cost, and next actions",
-      "updatedAt": "2026-09-26T05:21:12Z",
+      "updatedAt": "2026-10-12T08:14:55Z",
       "url": "https://github.com/atulg4/agentic-sdlc/issues/45"
     },
     {
@@ -392,15 +418,17 @@
       "itemId": "atulg4/agentic-sdlc#44",
       "kind": "task",
       "labels": [
+        "agent-ready",
         "cloud-ready",
         "human-review-required",
         "implementation-approved",
+        "spec-approved",
         "spec-drafted"
       ],
       "parentId": "atulg4/agentic-sdlc#109",
       "projectId": "forge",
       "title": "P1: Forge mobile control plane \u2014 mission status, approvals, budgets, and natural-language steering",
-      "updatedAt": "2026-09-26T05:21:06Z",
+      "updatedAt": "2026-10-12T08:14:54Z",
       "url": "https://github.com/atulg4/agentic-sdlc/issues/44"
     },
     {
@@ -409,15 +437,17 @@
       "itemId": "atulg4/agentic-sdlc#43",
       "kind": "task",
       "labels": [
+        "agent-ready",
         "cloud-ready",
         "human-review-required",
         "implementation-approved",
+        "spec-approved",
         "spec-drafted"
       ],
       "parentId": "atulg4/agentic-sdlc#109",
       "projectId": "forge",
       "title": "P0: Forge planning intelligence \u2014 risk-adaptive frontier planning and independent plan critique",
-      "updatedAt": "2026-09-26T06:36:11Z",
+      "updatedAt": "2026-10-12T08:14:52Z",
       "url": "https://github.com/atulg4/agentic-sdlc/issues/43"
     },
     {
@@ -426,15 +456,17 @@
       "itemId": "atulg4/agentic-sdlc#42",
       "kind": "task",
       "labels": [
+        "agent-ready",
         "cloud-ready",
         "human-review-required",
         "implementation-approved",
+        "spec-approved",
         "spec-drafted"
       ],
       "parentId": "atulg4/agentic-sdlc#109",
       "projectId": "forge",
       "title": "P0: Forge Benchmark Lab \u2014 empirical agent bakeoffs and quality/cost frontier",
-      "updatedAt": "2026-09-26T06:36:08Z",
+      "updatedAt": "2026-10-12T08:14:51Z",
       "url": "https://github.com/atulg4/agentic-sdlc/issues/42"
     },
     {
@@ -443,15 +475,17 @@
       "itemId": "atulg4/agentic-sdlc#41",
       "kind": "task",
       "labels": [
+        "agent-ready",
         "cloud-ready",
         "human-review-required",
         "implementation-approved",
+        "spec-approved",
         "spec-drafted"
       ],
       "parentId": "atulg4/agentic-sdlc#109",
       "projectId": "forge",
       "title": "P0: Forge reliability kernel \u2014 typed failures, retries, checkpoints, and resumable missions",
-      "updatedAt": "2026-09-26T06:36:05Z",
+      "updatedAt": "2026-10-12T08:14:50Z",
       "url": "https://github.com/atulg4/agentic-sdlc/issues/41"
     },
     {
@@ -460,15 +494,17 @@
       "itemId": "atulg4/agentic-sdlc#40",
       "kind": "task",
       "labels": [
+        "agent-ready",
         "cloud-ready",
         "human-review-required",
         "implementation-approved",
+        "spec-approved",
         "spec-drafted"
       ],
       "parentId": "atulg4/agentic-sdlc#109",
       "projectId": "forge",
       "title": "P1: Multi-provider adapters for Vertex, Bedrock, DeepSeek, Kimi and direct APIs",
-      "updatedAt": "2026-09-26T06:36:01Z",
+      "updatedAt": "2026-10-12T08:14:48Z",
       "url": "https://github.com/atulg4/agentic-sdlc/issues/40"
     },
     {
@@ -477,15 +513,17 @@
       "itemId": "atulg4/agentic-sdlc#39",
       "kind": "task",
       "labels": [
+        "agent-ready",
         "cloud-ready",
         "human-review-required",
         "implementation-approved",
+        "spec-approved",
         "spec-drafted"
       ],
       "parentId": "atulg4/agentic-sdlc#109",
       "projectId": "forge",
       "title": "P1: ChatGPT-plan Codex subscription-cloud executor",
-      "updatedAt": "2026-09-26T06:35:58Z",
+      "updatedAt": "2026-10-12T08:14:47Z",
       "url": "https://github.com/atulg4/agentic-sdlc/issues/39"
     },
     {
@@ -494,15 +532,17 @@
       "itemId": "atulg4/agentic-sdlc#38",
       "kind": "task",
       "labels": [
+        "agent-ready",
         "cloud-ready",
         "human-review-required",
         "implementation-approved",
+        "spec-approved",
         "spec-drafted"
       ],
       "parentId": "atulg4/agentic-sdlc#109",
       "projectId": "forge",
       "title": "P0: Quality evidence engine and learning store",
-      "updatedAt": "2026-09-26T06:35:55Z",
+      "updatedAt": "2026-10-12T08:14:46Z",
       "url": "https://github.com/atulg4/agentic-sdlc/issues/38"
     },
     {
@@ -538,14 +578,16 @@
       "itemId": "atulg4/agentic-sdlc#35",
       "kind": "epic",
       "labels": [
+        "agent-ready",
         "cloud-ready",
         "human-review-required",
         "implementation-approved",
+        "spec-approved",
         "spec-drafted"
       ],
       "projectId": "forge",
       "title": "FORGE Epic: Adaptive intelligence, cloud execution, quality learning, and autonomous governance",
-      "updatedAt": "2026-09-26T05:21:01Z",
+      "updatedAt": "2026-10-12T08:14:44Z",
       "url": "https://github.com/atulg4/agentic-sdlc/issues/35"
     },
     {
@@ -554,14 +596,16 @@
       "itemId": "atulg4/agentic-sdlc#33",
       "kind": "task",
       "labels": [
+        "agent-ready",
         "cloud-ready",
         "human-review-required",
         "implementation-approved",
+        "spec-approved",
         "spec-drafted"
       ],
       "projectId": "forge",
       "title": "Add explicit implementer model pin and risk-based Sol escalation",
-      "updatedAt": "2026-09-26T06:35:51Z",
+      "updatedAt": "2026-10-12T08:14:43Z",
       "url": "https://github.com/atulg4/agentic-sdlc/issues/33"
     },
     {
@@ -570,15 +614,17 @@
       "itemId": "atulg4/agentic-sdlc#22",
       "kind": "task",
       "labels": [
+        "agent-ready",
         "cloud-ready",
         "enhancement",
         "human-review-required",
         "implementation-approved",
+        "spec-approved",
         "spec-drafted"
       ],
       "projectId": "forge",
       "title": "P0: Provider-neutral agent message bus over Pub/Sub-compatible transports",
-      "updatedAt": "2026-09-26T05:18:38Z",
+      "updatedAt": "2026-10-12T08:14:41Z",
       "url": "https://github.com/atulg4/agentic-sdlc/issues/22"
     },
     {

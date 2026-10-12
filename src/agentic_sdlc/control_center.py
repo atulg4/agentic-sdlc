@@ -57,6 +57,7 @@ STATE_BASIS_UNKNOWN = "state unknown: no ledger events and no declared state"
 
 MAX_TEXT_LENGTH = 512
 MAX_BACKLOG_ITEMS = 5000
+MAX_BACKLOG_DEPTH = 32
 MAX_INCIDENTS = 2000
 
 #: A tracker reference charset: ``owner/repo#123`` and ``owner/repo!123`` both
@@ -569,13 +570,24 @@ def load_backlog_document(document: Any) -> tuple[BacklogItem, ...]:
 
 
 def _detect_backlog_cycles(by_id: Mapping[str, BacklogItem]) -> None:
-    """Reject a parent chain that loops, which no renderer could terminate on."""
+    """Reject a looping or excessively deep parent chain.
+
+    Tree construction and serialization recurse along the parent chain, so a
+    chain deeper than :data:`MAX_BACKLOG_DEPTH` is rejected here, before any
+    traversal can hit the interpreter's recursion limit.
+    """
 
     for item_id in by_id:
         seen = {item_id}
         cursor = by_id[item_id].parent_id
+        depth = 1
         while cursor and cursor in by_id:
             _require(cursor not in seen, f"backlog parent cycle through {item_id}")
+            depth += 1
+            _require(
+                depth <= MAX_BACKLOG_DEPTH,
+                f"backlog parent chain through {item_id} exceeds {MAX_BACKLOG_DEPTH} levels",
+            )
             seen.add(cursor)
             cursor = by_id[cursor].parent_id
 
@@ -1217,17 +1229,25 @@ def build_control_center_snapshot(
 def read_control_center_inputs(
     *,
     registry_path: str | None = None,
-    backlog_path: str | None = None,
-    incidents_path: str | None = None,
+    backlog_paths: Sequence[str] = (),
+    incidents_paths: Sequence[str] = (),
 ) -> tuple[ProjectRegistry, tuple[BacklogItem, ...], tuple[Incident, ...]]:
-    """Read every declared Control Center input, each one optional."""
+    """Read every declared Control Center input.
+
+    ``backlog_paths`` and ``incidents_paths`` take one document per exported
+    project, so a portfolio snapshot is built from each adapter's output
+    directly, with no hand-merged JSON. Duplicate item or incident identifiers
+    across documents are rejected by the snapshot builder.
+    """
 
     registry = read_optional_project_registry(registry_path)
-    return (
-        registry,
-        read_optional_backlog_document(backlog_path),
-        read_optional_incident_document(incidents_path),
-    )
+    backlog: list[BacklogItem] = []
+    for path in backlog_paths:
+        backlog.extend(read_backlog_document(path))
+    incidents: list[Incident] = []
+    for path in incidents_paths:
+        incidents.extend(read_incident_document(path))
+    return registry, tuple(backlog), tuple(incidents)
 
 
 def secret_bearing_control_center_fields() -> tuple[str, ...]:

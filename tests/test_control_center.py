@@ -729,7 +729,7 @@ def test_an_untriaged_issue_is_only_an_advisory():
     assert incidents[0]["severity"] == "advisory"
 
 
-def test_a_fully_labelled_issue_raises_no_dispatch_incident():
+def test_a_fully_labelled_issue_raises_only_the_dispatch_evidence_advisory():
     incidents = incidents_from_issues(
         [
             _issue(
@@ -742,7 +742,9 @@ def test_a_fully_labelled_issue_raises_no_dispatch_incident():
         repository="acme/forge",
         observed_at=NOW,
     )
-    assert incidents == []
+    assert len(incidents) == 1
+    assert incidents[0]["severity"] == "advisory"
+    assert "confirm a run" in incidents[0]["summary"]
 
 
 def test_closed_issues_raise_no_dispatch_incident():
@@ -1027,10 +1029,16 @@ def test_only_ready_merge_states_wait_on_the_merge_authority():
     incidents = incidents_from_change_requests(
         pulls, project_id="forge", repository="acme/forge", observed_at=NOW
     )
-    assert [item["incidentId"] for item in incidents] == [
-        "acme/forge!1:awaiting-merge",
-        "acme/forge!2:awaiting-merge",
-    ]
+    by_id = {item["incidentId"]: item for item in incidents}
+    assert by_id["acme/forge!1:awaiting-merge"]["kind"] == "awaiting-human-merge"
+    assert by_id["acme/forge!2:awaiting-merge"]["kind"] == "awaiting-human-merge"
+    for number, state in ((3, "blocked"), (4, "behind"), (5, "unstable")):
+        entry = by_id[f"acme/forge!{number}:merge-state-{state}"]
+        assert entry["kind"] == "unclassified"
+        assert entry["severity"] == "degraded"
+        assert state in entry["summary"]
+    assert "acme/forge!6:merge-state-unknown" not in by_id
+    assert len(incidents) == 5
 
 
 def test_a_missing_close_reason_declares_no_terminal_state():
@@ -1115,3 +1123,51 @@ def test_every_declared_remediation_command_parses_against_the_cli():
             parser.parse_args(argv[1:])
         except SystemExit as error:  # argparse rejects by exiting
             raise AssertionError(f"catalogue command does not parse: {command}") from error
+
+
+def test_a_parent_chain_deeper_than_the_budget_is_rejected():
+    items = [_backlog(itemId="n0")]
+    items += [_backlog(itemId=f"n{index}", parentId=f"n{index - 1}") for index in range(1, 40)]
+    with pytest.raises(ControlCenterError, match="exceeds 32 levels"):
+        load_backlog_document(_document(*items))
+
+
+def test_a_parent_chain_within_the_budget_loads_and_serializes():
+    items = [_backlog(itemId="n0", kind="epic")]
+    items += [_backlog(itemId=f"n{index}", parentId=f"n{index - 1}") for index in range(1, 30)]
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW, registry=REGISTRY, backlog=load_backlog_document(_document(*items))
+    )
+    view = snapshot.get("forge")
+    assert view.backlog[0].descendant_count == 29
+    assert snapshot.as_document()["snapshotSha256"]
+
+
+def test_portfolio_inputs_combine_one_document_per_project(tmp_path):
+    for name, project in (("a", "forge"), ("b", "ghost")):
+        (tmp_path / f"backlog-{name}.json").write_text(
+            json.dumps(_document(_backlog(itemId=f"{project}#1", projectId=project))),
+            encoding="utf-8",
+        )
+        (tmp_path / f"incidents-{name}.json").write_text(
+            json.dumps(_incidents(_incident(incidentId=f"i-{project}", projectId=project))),
+            encoding="utf-8",
+        )
+    registry, backlog, incidents = read_control_center_inputs(
+        backlog_paths=(str(tmp_path / "backlog-a.json"), str(tmp_path / "backlog-b.json")),
+        incidents_paths=(
+            str(tmp_path / "incidents-a.json"),
+            str(tmp_path / "incidents-b.json"),
+        ),
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW, registry=registry, backlog=backlog, incidents=incidents
+    )
+    assert {view.project_id for view in snapshot.projects} == {"forge", "ghost"}
+    assert snapshot.totals["incidents"] == 2
+
+
+def test_the_adapter_rejects_an_export_beyond_the_item_budget():
+    issues = [_issue(number, f"issue {number}") for number in range(1, 5002)]
+    with pytest.raises(ControlCenterError, match="5000-item budget"):
+        backlog_document_from_issues(issues, project_id="forge", repository="acme/forge")
