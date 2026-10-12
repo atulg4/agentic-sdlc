@@ -287,7 +287,7 @@ jobs:
           printf 'selected_auth_mode=%s\n' "$(jq -r '.authMode // ""' .agentic-input/selected-executor.json)" >> "$GITHUB_OUTPUT"
       - name: Store validated spec request
         if: steps.check.outputs.needs_draft == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: agent-spec-input-${{ github.run_id }}
           path: |
@@ -300,7 +300,7 @@ jobs:
           retention-days: 3
       - name: Store pinned policy engine for the credential-free merge
         if: steps.check.outputs.needs_draft == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: spec-policy-engine-${{ github.run_id }}
           path: .agentic-platform/src/agentic_sdlc/
@@ -431,7 +431,7 @@ jobs:
           set -euo pipefail
           test -s .agentic-input/spec-draft.md
       - name: Store draft
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: agent-spec-draft-${{ github.run_id }}
           path: .agentic-input/spec-draft.md
