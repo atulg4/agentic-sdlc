@@ -54,9 +54,10 @@ _PARENT_REPOSITORY = re.compile(r"^https://api\.github\.com/repos/([^/\s]+/[^/\s
 _REPOSITORY_URL = re.compile(r"^https://api\.github\.com/repos/([^/\s]+/[^/\s]+)/?$")
 #: A GitHub issue's own web address, exactly: the exported link must identify
 #: the validated repository and number, never an arbitrary https destination.
+#: Pull records never reach the backlog, so /pull/ is NOT accepted: an issue
+#: payload must not link its title to the same-numbered change request.
 _ISSUE_URL = re.compile(
-    r"https://github\.com/(?P<name>[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)"
-    r"/(?:issues|pull)/(?P<number>\d+)"
+    r"https://github\.com/(?P<name>[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/issues/(?P<number>\d+)"
 )
 
 #: The OWNER/REPO shape every GitHub repository identifier must carry; a bare
@@ -517,6 +518,16 @@ def backlog_document_from_issues(
         _issue_repository(issue, repository)
     rows = [issue for issue in issues if "pull_request" not in issue]
     numbers = {_record_number(issue, "issue") for issue in rows}
+    # No-drop: a sub-issue listing naming a child the issues payload does not
+    # carry would silently vanish from the export, concealing a partial
+    # issues file, so it is a controlled error rather than a dropped edge.
+    missing_children = sorted(child for child in links if child not in numbers)
+    _require(
+        not missing_children,
+        "sub-issue children missing from the issues export: "
+        + ", ".join(f"#{child}" for child in missing_children)
+        + "; export the children too, or narrow --sub-issues",
+    )
     parent_of_children = {parent for parent in links.values() if parent in numbers}
 
     items: list[dict[str, Any]] = []
