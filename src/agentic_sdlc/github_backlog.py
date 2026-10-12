@@ -345,7 +345,10 @@ def dispatch_rules(labels: LifecycleLabels = DEFAULT_LABELS) -> tuple[DispatchRu
             missing=frozenset({approve, ready}),
             kind="awaiting-human-approval",
             severity="degraded",
-            summary="Specification drafted and waiting on a human implementation approval",
+            summary=(
+                "Specification drafted and waiting on a human implementation "
+                f"approval: dispatch needs {approve} and {ready}"
+            ),
         ),
         DispatchRule(
             rule_id="eligible-awaiting-dispatch-evidence",
@@ -382,7 +385,7 @@ def dispatch_rules(labels: LifecycleLabels = DEFAULT_LABELS) -> tuple[DispatchRu
             severity="degraded",
             summary=(
                 "Specification released, but no dispatch label follows it: the work "
-                "waits on an implementation approval and the dispatch labels"
+                f"waits on {approve} with {ready} and {review}"
             ),
         ),
         DispatchRule(
@@ -442,8 +445,26 @@ def _declared_state(
 
 def _kind(issue: Mapping[str, Any], labels: frozenset[str], has_children: bool) -> str:
     title = str(issue.get("title") or "")
-    summary = issue.get("sub_issues_summary") or {}
-    owns_children = has_children or bool(isinstance(summary, Mapping) and summary.get("total"))
+    summary = issue.get("sub_issues_summary")
+    total = 0
+    if summary is not None:
+        # Fail closed like every other malformed field: a truthy non-count
+        # ("0", true, -1) must not silently classify a childless issue as a
+        # story and corrupt the exported hierarchy.
+        number = issue.get("number")
+        _require(
+            isinstance(summary, Mapping),
+            f"issue {number!r}: sub_issues_summary must be an object",
+        )
+        assert isinstance(summary, Mapping)
+        raw_total = summary.get("total", 0)
+        _require(
+            type(raw_total) is int and raw_total >= 0,
+            f"issue {number!r}: sub_issues_summary.total must be a non-negative "
+            f"integer: {raw_total!r}",
+        )
+        total = raw_total
+    owns_children = has_children or total > 0
     if EPIC_TITLE.match(title) or "epic" in labels:
         return "epic"
     if owns_children:
@@ -771,9 +792,11 @@ def parent_links(
 
     ``repository`` pins the export's repository: GitHub supports sub-issues
     from OTHER repositories, and such a child's bare number could collide with
-    an unrelated local issue, so with the repository given every record whose
-    ``repository_url`` or ``parent_issue_url`` names a different repository is
-    rejected rather than silently treated as local.
+    an unrelated local issue, so with the repository given every record must
+    PROVE it is local with a recognized matching ``repository_url`` - a record
+    without one is rejected, not presumed local, because a partial foreign
+    payload could otherwise reparent the same-numbered local issue - and a
+    ``parent_issue_url`` naming a different repository is rejected too.
     """
 
     links: dict[int, int] = {}
@@ -781,14 +804,10 @@ def parent_links(
     def require_local(entry: Mapping[str, Any], number: int) -> None:
         if repository is None:
             return
-        for key, pattern in (
-            ("repository_url", _REPOSITORY_URL),
-            ("parent_issue_url", _PARENT_REPOSITORY),
-        ):
-            url = entry.get(key)
-            if not isinstance(url, str):
-                continue
-            match = pattern.search(url)
+        _issue_repository(entry, repository)
+        url = entry.get("parent_issue_url")
+        if isinstance(url, str):
+            match = _PARENT_REPOSITORY.search(url)
             if match is not None and match.group(1).lower() != repository.lower():
                 _require(
                     False,
