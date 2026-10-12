@@ -5,6 +5,7 @@ from __future__ import annotations
 import fnmatch
 import re
 import tomllib
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,7 +13,64 @@ from .models import PolicyDecision, RiskLevel, TaskSpec
 from .spec_stage import spec_review_block
 
 _PROJECT_ID = re.compile(r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+$")
-_BRANCH = re.compile(r"^[A-Za-z0-9._/-]+$")
+#: Characters Git accepts in a branch name that a sink downstream cannot carry. The platform's
+#: reusable-implement.yml expands the default branch with `${{ ... }}` inside a double-quoted
+#: shell word (`gh pr create --base "..."`), where these are shell syntax, not text; the cloud
+#: routine prompt also quotes its git commands in backticks.
+_BRANCH_SHELL_UNSAFE = '"$`'
+
+
+def git_branch_format_problem(name: str) -> str:
+    """Why `git check-ref-format --branch NAME` would refuse `name` ('' = it would not), by git's
+    own rules, so the answer does not depend on a git binary being installed."""
+    if not name:
+        return "must not be empty"
+    if name == "HEAD":
+        # `@` alone is accepted (git does too). Revision syntax reads a bare `@` as HEAD, so
+        # every command Forge renders names the branch fully qualified (`refs/heads/<name>` for
+        # a fetch, `origin/<name>` for a revision), never bare (Codex 4242643519).
+        return "must not be 'HEAD'"
+    if name.startswith("-"):
+        return "must not start with '-'"
+    if name.startswith("/") or name.endswith("/") or "//" in name:
+        return "must not start or end with '/' or contain '//'"
+    if ".." in name or "@{" in name:
+        return "must not contain '..' or '@{'"
+    if name.endswith("."):
+        return "must not end with '.'"
+    if any(part.startswith(".") or part.endswith(".lock") for part in name.split("/")):
+        return "must not have a path component starting with '.' or ending with '.lock'"
+    if any(ord(c) < 0x20 or c == "\x7f" or c in " ~^:?*[\\" for c in name):
+        return "must not contain spaces, control characters or any of ~^:?*[\\"
+    return ""
+
+
+def branch_name_problem(name: str) -> str:
+    """Why `name` cannot be the policy's default branch ('' = it can): any name Git accepts as a
+    branch (`git check-ref-format --branch`), except the few characters a downstream sink cannot
+    carry. Every sink Forge renders itself quotes or escapes the name: TOML and YAML strings,
+    shell words (`shlex.quote`), GitHub branch-filter globs (backslash escapes), ruleset
+    conditions (`~DEFAULT_BRANCH`, matched literally) and REST paths (percent-encoding)."""
+    if not isinstance(name, str):
+        return "must be a string"
+    if any(unicodedata.category(c) in {"Cc", "Cs", "Zl", "Zp"} for c in name):
+        # A line or paragraph separator breaks a YAML or prompt line; a lone surrogate is not
+        # encodable as UTF-8.
+        return "must not contain control characters or line separators"
+    problem = git_branch_format_problem(name)
+    if problem:
+        return f"is not a valid Git branch name: {problem}"
+    unsafe = sorted({c for c in name if c in _BRANCH_SHELL_UNSAFE})
+    if unsafe:
+        return (
+            "must not contain " + " ".join(repr(c) for c in unsafe) + ": the platform's "
+            "reusable-implement.yml passes the default branch to `gh pr create --base` inside a "
+            'double-quoted shell word, where `"`, `$` and a backtick are shell syntax (and '
+            "the cloud routine prompt quotes git commands in backticks)"
+        )
+    return ""
+
+
 _BASELINE_FORBIDDEN_PATHS = (
     ".github/**",
     ".github/workflows/**",
@@ -56,6 +114,14 @@ class ProjectPolicy:
     protected_paths: tuple[str, ...]
     low_risk_paths: tuple[str, ...]
     forbidden_task_patterns: tuple[str, ...]
+    lease_ttl_minutes: int = 240
+    #: `[automation] publisher_bot_login`: the Publisher App's bot (`<app-slug>[bot]`), the only
+    #: App bot besides github-actions[bot] whose lease markers count; '' = none.
+    publisher_bot_login: str = ""
+
+
+#: A GitHub App bot login (leases.PUBLISHER_BOT_LOGIN; policy cannot import leases).
+_BOT_LOGIN = re.compile(r"^[a-z0-9][a-z0-9-]*\[bot\]$")
 
 
 def _table(document: dict[str, object], name: str) -> dict[str, object]:
@@ -118,8 +184,9 @@ def load_policy_bytes(raw: bytes) -> ProjectPolicy:
         raise ValueError("project.provider must be github or gitlab")
     if not _PROJECT_ID.fullmatch(project_id):
         raise ValueError("project.id must use namespace/name format")
-    if not _BRANCH.fullmatch(default_branch):
-        raise ValueError("project.default_branch contains unsupported characters")
+    problem = branch_name_problem(default_branch)
+    if problem:
+        raise ValueError(f"project.default_branch {problem}")
 
     ready_label = _string(automation, "ready_label", "agent-ready")
     human_review_label = _string(
@@ -134,6 +201,11 @@ def load_policy_bytes(raw: bytes) -> ProjectPolicy:
     )
     if len({ready_label, human_review_label, implementation_label}) != 3:
         raise ValueError("automation approval labels must be distinct")
+    publisher_bot_login = automation.get("publisher_bot_login", "")
+    if not isinstance(publisher_bot_login, str) or (
+        publisher_bot_login and not _BOT_LOGIN.fullmatch(publisher_bot_login)
+    ):
+        raise ValueError("automation.publisher_bot_login must be empty or `<app-slug>[bot]`")
 
     human_merge_required = policy.get("human_merge_required", True)
     if type(human_merge_required) is not bool:
@@ -163,11 +235,19 @@ def load_policy_bytes(raw: bytes) -> ProjectPolicy:
         protected_paths=_patterns(policy, "protected_paths"),
         low_risk_paths=_patterns(policy, "low_risk_paths", ("docs/**", "**/*.md")),
         forbidden_task_patterns=forbidden_task_patterns,
+        lease_ttl_minutes=_integer(automation, "lease_ttl_minutes", 240, maximum=7 * 24 * 60),
+        publisher_bot_login=publisher_bot_login,
     )
 
 
-def _matches(path: str, patterns: tuple[str, ...]) -> bool:
+def _matches(path: str, patterns: tuple[str, ...], *, casefold: bool = False) -> bool:
+    """`path` matches one of `patterns` (fnmatch: `*` crosses `/`). `casefold` for the paths a
+    change must NOT touch: `LOGO.PNG` is the `*.png` media a forbidden list names, on every
+    filesystem that ignores case and in every reviewer's eyes."""
     normalized = path.removeprefix("./")
+    if casefold:
+        normalized = normalized.casefold()
+        return any(fnmatch.fnmatchcase(normalized, pattern.casefold()) for pattern in patterns)
     return any(fnmatch.fnmatch(normalized, pattern) for pattern in patterns)
 
 
@@ -225,11 +305,15 @@ def evaluate_diff(
     if patch_bytes > policy.max_patch_bytes:
         reasons.append(f"patch-byte cap exceeded: {patch_bytes} > {policy.max_patch_bytes}")
 
-    forbidden = sorted(path for path in paths if _matches(path, policy.forbidden_paths))
+    forbidden = sorted(
+        path for path in paths if _matches(path, policy.forbidden_paths, casefold=True)
+    )
     if forbidden:
         reasons.append("forbidden paths changed: " + ", ".join(forbidden))
 
-    protected = sorted(path for path in paths if _matches(path, policy.protected_paths))
+    protected = sorted(
+        path for path in paths if _matches(path, policy.protected_paths, casefold=True)
+    )
     if protected:
         gates.append("architect-security-review")
 

@@ -456,3 +456,56 @@ def test_routed_bundle_stays_within_the_required_context_window(
         )
 
     assert ROUTED_MIN_CONTEXT_WINDOW * BYTES_PER_TOKEN_ESTIMATE >= ROUTED_BUNDLE_BYTES
+
+
+def test_git_calls_use_the_trusted_git_in_an_allowlisted_environment(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Codex 4243659475: no bare `git` from PATH, and never the caller's whole environment (the
+    routed run holds provider keys and a GitHub token)."""
+    patch = _repository_with_patch(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GH_TOKEN", "gh-secret")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "provider-secret")
+    monkeypatch.setenv("LD_PRELOAD", "/tmp/evil.so")
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "elsewhere"))
+    monkeypatch.setattr(openai_compatible, "trusted_git", lambda: "/trusted/git")
+    real_run = subprocess.run
+    seen: list[tuple[list[str], dict[str, str]]] = []
+
+    def recording_run(arguments, **kwargs):  # noqa: ANN001, ANN003, ANN202
+        seen.append((list(arguments), dict(kwargs["env"])))
+        return real_run(["git", *arguments[1:]], **kwargs)
+
+    monkeypatch.setattr(openai_compatible.subprocess, "run", recording_run)
+    monkeypatch.setattr(openai_compatible, "chat_completion", lambda **kwargs: _response(patch))
+
+    openai_compatible.generate_and_apply_patch(
+        provider="deepseek",
+        model="deepseek-reasoner",
+        prompt_path=tmp_path / "prompt.md",
+        output_patch=tmp_path / "routed.patch",
+        output_message=tmp_path / "message.md",
+    )
+
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+    assert {tuple(argv[1:3]) for argv, _ in seen} >= {("ls-files",), ("apply", "--check")}
+    for argv, env in seen:
+        assert argv[0] == "/trusted/git"
+        assert env["PATH"] == "/usr/bin:/bin"
+        leaked = {"GH_TOKEN", "DEEPSEEK_API_KEY", "LD_PRELOAD", "GIT_DIR", "HOME"} & set(env)
+        assert leaked == set()
+
+
+def test_no_trusted_git_fails_closed(monkeypatch, tmp_path: Path) -> None:
+    from agentic_sdlc.trusted_git import UntrustedGitError
+
+    _repository_with_patch(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    def untrusted() -> str:
+        raise UntrustedGitError("no trusted git")
+
+    monkeypatch.setattr(openai_compatible, "trusted_git", untrusted)
+    with pytest.raises(AdapterError, match="no trusted git"):
+        openai_compatible._tracked_files()

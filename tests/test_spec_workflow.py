@@ -112,6 +112,7 @@ def test_level_three_scaffold_installs_the_spec_stage(tmp_path: Path) -> None:
         platform_repository="owner/agentic-sdlc",
         platform_ref="e" * 40,
         automation_level=3,
+        publisher_bot_login="consumer-publisher[bot]",
     )
 
     spec = repository / ".github/workflows/agent-auto-spec.yml"

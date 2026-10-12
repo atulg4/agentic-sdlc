@@ -1,0 +1,65 @@
+name: Agent plan
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: GitHub issue number
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  preflight:
+    runs-on: RUNS_ON_YAML
+    permissions: {}
+    steps:
+      - name: Require Claude subscription OAuth token
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$CLAUDE_CODE_OAUTH_TOKEN"
+
+  plan:
+    needs: preflight
+    permissions:
+      contents: read
+      issues: write
+      id-token: write
+    uses: REUSABLE_PLAN_USES
+    with:
+      runs_on: RUNS_ON_JSON
+      issue_number: ${{ inputs.issue_number }}
+      trigger_actor: ${{ github.actor }}
+      config_path: agentic-sdlc.toml
+      platform_ref: PLATFORM_COMMIT_SHA
+      platform_repository: PLATFORM_REPOSITORY
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      PLATFORM_READ_TOKEN: ${{ secrets.PLATFORM_READ_TOKEN }}
+
+  notify_failure:
+    needs: [preflight, plan]
+    if: >-
+      ${{ always() &&
+      (needs.preflight.result == 'failure' || needs.preflight.result == 'cancelled' ||
+       needs.plan.result == 'failure' || needs.plan.result == 'cancelled') }}
+    runs-on: RUNS_ON_YAML
+    permissions:
+      issues: write
+    steps:
+      - name: Report planning failure
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number(process.env.ISSUE_NUMBER),
+              body: `Agent planning did not complete. Inspect the bounded run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
