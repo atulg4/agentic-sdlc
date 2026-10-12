@@ -6618,35 +6618,40 @@ _PIPEFAIL_SHELLS = {"bash"}
 #: substitution, brace expansion and pathname globs.
 _SHELL_EXPANSION_CHARS = set("$`{}*?[]")
 
-#: Builtins that change shell options themselves, or run a handler string that may.
+#: Builtins that change shell options themselves, run a handler string that may (`trap`, also
+#: behind a redirection: Codex 4251826068), or can disable `set` and its wrappers (`enable`).
 _SHELL_OPTION_COMMANDS = {"set", "shopt", "trap", "enable"}
-#: Whole words that name an option-changing builtin, wherever they sit in a command.
-#: `trap` behind a redirection (Codex 4251826068); `enable` can disable the `command`/`builtin`
-#: wrappers a later `set` relies on (Codex 4251826084).
-#: Option names themselves are NOT here: `pytest -k pipefail` names one inertly (Codex
-#: 4252316092); a `set`/`shopt` call that spells one is caught by its builtin's name.
-_SHELL_OPTION_WORDS = {"set", "shopt", "trap", "enable"}
+
+
+def _effective_command(argv: list[str]) -> list[str]:
+    """`argv` from the word bash runs as the command: past leading redirections (`>/x`,
+    `2>/dev/null`), `time`'s options (`time -p`) and the `builtin`/`command` wrappers with
+    theirs."""
+    words = list(argv)
+    while words:
+        head = words[0]
+        if head and set(head) <= set("<>&|") and ("<" in head or ">" in head):
+            del words[:2]  # the operator and its target
+        elif head.isdigit() and len(words) > 1 and set(words[1]) <= set("<>&|"):
+            words.pop(0)  # `2` of `2>/dev/null`
+        elif head.startswith("-") or head in _BUILTIN_WRAPPERS:
+            words.pop(0)
+        else:
+            break
+    return words
 
 
 def _may_change_shell_options(argv: list[str]) -> bool:
     """Whether a command that `_set_invocation` cannot read may still change errexit or
-    pipefail. Judged on the command after its `builtin`/`command` wrappers: it is `set`, `shopt`
-    or `trap` (a trap handler runs in the parent: Codex 4251422330), its name is an expansion
-    (`s$x`, `command $x`: Codex 4251246556/4251422308), or a whole word of it is `set`,
-    `shopt`, `pipefail` or `errexit` (a redirected or timed `set`). A word merely CONTAINING an
-    option name -- `pytest tests/test_pipefail.py` -- changes nothing (Codex 4251422319)."""
-    words = list(argv)
-    while words and words[0] in _BUILTIN_WRAPPERS:
-        words.pop(0)
-        while words and words[0].startswith("-"):
-            words.pop(0)
+    pipefail, judged on the command bash actually runs (`_effective_command`): it is `set`,
+    `shopt`, `trap` (a handler runs in the parent: Codex 4251422330) or `enable` (it can disable
+    `set` or its wrappers: Codex 4251826084), or its name is an expansion (`s$x`, `command $x`:
+    Codex 4251246556/4251422308). The same words as ARGUMENTS -- `pytest -k set`,
+    `pytest -k pipefail` -- change nothing (Codex 4252463247/4252316092)."""
+    words = _effective_command(argv)
     if not words:
         return False
-    return bool(
-        set(words[0]) & _SHELL_EXPANSION_CHARS
-        or words[0] in _SHELL_OPTION_COMMANDS
-        or any(word in _SHELL_OPTION_WORDS for word in argv)
-    )
+    return bool(set(words[0]) & _SHELL_EXPANSION_CHARS or words[0] in _SHELL_OPTION_COMMANDS)
 
 
 #: Prefixes that run the next word as the shell builtin itself, in the current shell.
@@ -6915,7 +6920,7 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                     # `set -o pipefail $x`: $x may expand to `+o pipefail`; so may a brace or a
                     # pathname expansion, `+o {pipefail,pipefail}` (Codex 4251046343).
                     invocation = None
-                if "enable" in argv:
+                if _effective_command(argv)[:1] == ["enable"]:
                     wrappers_untrusted = True
                 if invocation is None and _may_change_shell_options(argv):
                     # Anything else that could touch errexit or pipefail -- a redirected or

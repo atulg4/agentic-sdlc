@@ -2390,6 +2390,11 @@ def test_doctor_rejects_a_ci_gate_whose_failure_is_ignored(tmp_path, mutate):
         ("set -n | cat; pytest", "bash", True),
         # `a && b &` backgrounds the whole and-or list (Codex 4252316108).
         ("true; pytest && true &", "bash", False),
+        # Only the command bash runs counts, past redirections, `time -p` and wrappers; the same
+        # words as arguments are inert (Codex 4252463247).
+        ("2>/dev/null set +e +o pipefail; pytest | tee out", "bash", False),
+        ("command -p set +o pipefail; pytest | tee out", "bash", False),
+        ("echo set; echo trap; echo enable; pytest | tee out", "bash", True),
         ("set -o pipefail; echo ok; pytest | tee out", None, True),
         # `o` anywhere in a cluster takes the option name (Codex 4251046345).
         ("set +ou pipefail; pytest | tee out", "bash", False),
@@ -2484,10 +2489,11 @@ def test_doctor_accepts_a_piped_gate_naming_an_option_in_a_path(tmp_path):
     assert "ci.yml runs the policy gates as 'test'" not in _failed(report)
 
 
-def test_doctor_accepts_a_piped_gate_with_an_option_name_as_an_argument(tmp_path):
-    # Codex 4252316092: `-k pipefail` is pytest's selector, not a shell option change.
+@pytest.mark.parametrize("selector", ["pipefail", "set", "trap", "enable", "shopt"])
+def test_doctor_accepts_a_piped_gate_with_an_option_name_as_an_argument(tmp_path, selector):
+    # Codex 4252316092/4252463247: `-k set` is pytest's selector, not a shell option change.
     repo = _repo(tmp_path)
-    write_onboarding(repo, spec(test_command="pytest -k pipefail | tee out.txt"))
+    write_onboarding(repo, spec(test_command=f"pytest -k {selector} | tee out.txt"))
     report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
     assert "ci.yml runs the policy gates as 'test'" not in _failed(report)
 
