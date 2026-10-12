@@ -68,6 +68,11 @@ _REPOSITORY_ID = re.compile(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+")
 #: GitLab's own full-path cap; the bound that keeps every registry-valid
 #: repository identifier referenceable within the read model's text budget.
 MAX_REPOSITORY_LENGTH = 255
+#: Per-project collection budgets, shared with the Control Center console's
+#: snapshot validator: a registry-valid project always serializes into a
+#: renderable snapshot.
+MAX_PROJECT_REPOSITORIES = 500
+MAX_PROJECT_ENVIRONMENTS = 100
 _ENVIRONMENT_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 _GROUP = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 _SECRET_KEY = re.compile(r"credential|secret|token|password|passphrase|apikey|api_key", re.I)
@@ -332,6 +337,10 @@ def _load_project(raw: Any, index: int) -> ProjectProfile:
     _require(isinstance(repositories_raw, list), f"{label}: repositories must be an array")
     assert isinstance(repositories_raw, list)
     _require(bool(repositories_raw), f"{label}: at least one repository is required")
+    _require(
+        len(repositories_raw) <= MAX_PROJECT_REPOSITORIES,
+        f"{label}: at most {MAX_PROJECT_REPOSITORIES} repositories are supported",
+    )
     repositories = tuple(
         _load_repository(item, f"{label}: repository[{position}]")
         for position, item in enumerate(repositories_raw)
@@ -349,6 +358,10 @@ def _load_project(raw: Any, index: int) -> ProjectProfile:
     environments_raw = entry.get("environments", [])
     _require(isinstance(environments_raw, list), f"{label}: environments must be an array")
     assert isinstance(environments_raw, list)
+    _require(
+        len(environments_raw) <= MAX_PROJECT_ENVIRONMENTS,
+        f"{label}: at most {MAX_PROJECT_ENVIRONMENTS} environments are supported",
+    )
     environments = tuple(
         _load_environment(item, f"{label}: environment[{position}]")
         for position, item in enumerate(environments_raw)

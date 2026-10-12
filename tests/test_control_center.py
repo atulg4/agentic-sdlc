@@ -679,8 +679,14 @@ def test_parent_links_reject_two_parents_for_one_child():
     with pytest.raises(ControlCenterError, match="two parents"):
         parent_links(
             [
-                {"number": 2, "parent_issue_url": ".../repos/acme/forge/issues/1"},
-                {"number": 2, "parent_issue_url": ".../repos/acme/forge/issues/3"},
+                {
+                    "number": 2,
+                    "parent_issue_url": "https://api.github.com/repos/acme/forge/issues/1",
+                },
+                {
+                    "number": 2,
+                    "parent_issue_url": "https://api.github.com/repos/acme/forge/issues/3",
+                },
             ]
         )
 
@@ -1079,7 +1085,12 @@ def test_a_child_contradicting_the_declared_parent_is_rejected():
     with pytest.raises(ControlCenterError, match="declared for"):
         parent_links(
             (
-                [{"number": 2, "parent_issue_url": ".../repos/acme/forge/issues/9"}],
+                [
+                    {
+                        "number": 2,
+                        "parent_issue_url": "https://api.github.com/repos/acme/forge/issues/9",
+                    }
+                ],
                 1,
             )
         )
@@ -4432,3 +4443,96 @@ def test_the_console_derives_work_units_from_the_validated_state_counts():
     assert "for (const key of Object.keys(byState)) workUnits += byState[key];" in html
     # The commit-ready draft form enforces the registry's shared length cap.
     assert "at most 255 characters - the registry rejects longer ones" in html
+
+
+def test_api_references_must_carry_the_github_origin():
+    evil_repo = _issue(1, "spoof")
+    evil_repo["repository_url"] = "https://evil.example/repos/acme/forge"
+    with pytest.raises(ControlCenterError, match="not a recognized repository URL"):
+        _export(evil_repo)
+    evil_parent = [
+        {
+            "number": 7,
+            "repository_url": "https://api.github.com/repos/acme/forge",
+            "parent_issue_url": "https://evil.example/repos/acme/forge/issues/1",
+        }
+    ]
+    with pytest.raises(ControlCenterError, match="not a recognized GitHub issue URL"):
+        parent_links((evil_parent, 2), repository="acme/forge")
+    with pytest.raises(ControlCenterError, match="not a recognized GitHub issue URL"):
+        parent_links(evil_parent)
+
+
+def test_registry_projects_carry_the_shared_collection_budgets():
+    from agentic_sdlc.project_registry import ProjectRegistryError
+
+    def _project(**overrides):
+        entry = {
+            "projectId": "forge",
+            "displayName": "Forge",
+            "group": "platform",
+            "defaultBranch": "main",
+            "repositories": [{"provider": "github", "identifier": "acme/forge", "role": "primary"}],
+            "environments": [{"name": "production", "kind": "production"}],
+            "capabilities": ["planning"],
+        }
+        entry.update(overrides)
+        return {"schemaVersion": 1, "projects": [entry]}
+
+    crowded = [{"provider": "github", "identifier": "acme/forge", "role": "primary"}] + [
+        {"provider": "github", "identifier": f"acme/forge-{index}", "role": "mirror"}
+        for index in range(501)
+    ]
+    with pytest.raises(ProjectRegistryError, match="at most 500 repositories"):
+        load_project_registry(_project(repositories=crowded))
+    many_environments = [{"name": f"env-{index}", "kind": "staging"} for index in range(101)]
+    with pytest.raises(ProjectRegistryError, match="at most 100 environments"):
+        load_project_registry(_project(environments=many_environments))
+
+
+def test_the_snapshot_enforces_per_project_collection_budgets():
+    first = load_backlog_document(
+        _document(
+            *(_backlog(itemId=f"acme/forge#{index}", issueRef="") for index in range(1, 2502))
+        )
+    )
+    second = load_backlog_document(
+        _document(
+            *(_backlog(itemId=f"acme/forge#{index}", issueRef="") for index in range(2502, 5003))
+        )
+    )
+    with pytest.raises(ControlCenterError, match="combines more than 5000 backlog items"):
+        build_control_center_snapshot(
+            generated_at=NOW, registry=REGISTRY, backlog=(*first, *second)
+        )
+    incident_groups = [
+        load_incident_document(
+            _incidents(
+                *(
+                    _incident(incidentId=f"i-{base}-{index}", backlogItemId="")
+                    for index in range(1000)
+                )
+            )
+        )
+        for base in range(3)
+    ]
+    with pytest.raises(ControlCenterError, match="combines more than 2000 incidents"):
+        build_control_center_snapshot(
+            generated_at=NOW,
+            registry=REGISTRY,
+            incidents=(item for group in incident_groups for item in group),
+        )
+    crowded_ledger = _ledger(
+        *(
+            _event(
+                eventId=f"wu-event-{index}",
+                idempotencyKey=f"wu-key-{index}",
+                workUnit={"projectId": "forge", "workUnitId": f"wu-{index}"},
+            )
+            for index in range(5001)
+        )
+    )
+    with pytest.raises(ControlCenterError, match="5000-unit budget"):
+        build_control_center_snapshot(
+            generated_at=NOW, registry=REGISTRY, projections=crowded_ledger.projections()
+        )

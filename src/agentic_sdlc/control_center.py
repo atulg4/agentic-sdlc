@@ -74,6 +74,9 @@ MAX_SOURCES = 1200
 #: console: a snapshot that would exceed it is truncated WITH a marker, so
 #: every producer-valid snapshot stays renderable and the truncation shows.
 MAX_WARNINGS = 5000
+#: Work units per project, shared with the console's active/attention
+#: budgets: merged ledger exports beyond it fail with a reason.
+MAX_WORK_UNITS = 5000
 
 
 def _bounded_warnings(entries: Sequence[str]) -> tuple[str, ...]:
@@ -1485,6 +1488,14 @@ def build_control_center_snapshot(
         statuses = by_project_units.get(project_id, {})
         items = by_project_backlog.get(project_id, [])
         project_incidents = tuple(by_project_incidents.get(project_id, ()))
+        # Backlog items and incidents are already bounded per project where
+        # the inputs merge; work units gain the same shared console budget
+        # here, so a snapshot the producer emits is always renderable.
+        _require(
+            len(statuses) <= MAX_WORK_UNITS,
+            f"project {project_id} holds {len(statuses)} work units, more than the "
+            f"read model's {MAX_WORK_UNITS}-unit budget; narrow the ledger export",
+        )
         by_issue_ref, reference_warnings = _index_by_issue_ref(statuses)
         tree, tree_warnings = _build_backlog_tree(items, statuses, by_issue_ref)
         view_warnings = list(reference_warnings) + list(tree_warnings)

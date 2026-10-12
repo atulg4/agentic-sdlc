@@ -46,9 +46,12 @@ def _require(condition: bool, message: str) -> None:
         raise ControlCenterError(message)
 
 
+#: API references are ANCHORED to GitHub's own origin: a trailing-path match
+#: alone would let https://evil.example/repos/acme/forge/issues/1 pass the
+#: ownership checks and supply hierarchy edges or repository identity.
 _PARENT_URL = re.compile(r"/issues/(\d+)/?$")
-_PARENT_REPOSITORY = re.compile(r"/repos/([^/\s]+/[^/\s]+)/issues/\d+/?$")
-_REPOSITORY_URL = re.compile(r"/repos/([^/\s]+/[^/\s]+)/?$")
+_PARENT_REPOSITORY = re.compile(r"^https://api\.github\.com/repos/([^/\s]+/[^/\s]+)/issues/\d+/?$")
+_REPOSITORY_URL = re.compile(r"^https://api\.github\.com/repos/([^/\s]+/[^/\s]+)/?$")
 #: A GitHub issue's own web address, exactly: the exported link must identify
 #: the validated repository and number, never an arbitrary https destination.
 _ISSUE_URL = re.compile(
