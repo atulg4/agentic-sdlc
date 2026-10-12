@@ -108,10 +108,13 @@ DISPATCH_PROVEN_STATES = frozenset(
     }
 )
 
-#: States that prove a plan ran: the planning outcomes plus everything that
-#: proves dispatch, which presupposes a plan.
+#: States that retire the plan-ordering advisory: a plan provably ran and the
+#: next gate is visible elsewhere. ``approved`` is deliberately NOT here: an
+#: approved unit whose implementation-approved label went missing can only be
+#: re-triggered by that label event, so its label-derived incident must stay
+#: visible until dispatch itself is proven.
 PLAN_PROVEN_STATES = DISPATCH_PROVEN_STATES | frozenset(
-    {FactoryState.PLANNED, FactoryState.APPROVAL_PENDING, FactoryState.APPROVED}
+    {FactoryState.PLANNED, FactoryState.APPROVAL_PENDING}
 )
 
 #: States in which something is executing *right now*. Backlog-shaped states
@@ -132,6 +135,10 @@ EXECUTING_STATES = frozenset(
         FactoryState.ROLLING_BACK,
     }
 )
+
+#: Review states are entered when verification or repair completes, before any
+#: review run starts, so they count as running only with activity evidence.
+REVIEW_GATE_STATES = frozenset({FactoryState.REVIEWING, FactoryState.RE_REVIEWING})
 
 
 class ControlCenterError(ValueError):
@@ -1299,7 +1306,9 @@ def build_control_center_snapshot(
         active = tuple(
             status
             for status in ordered
-            if status.state in EXECUTING_STATES and not status.needs_attention
+            if status.state in EXECUTING_STATES
+            and not status.needs_attention
+            and (status.state not in REVIEW_GATE_STATES or status.activity)
         )
         attention = tuple(status for status in ordered if status.needs_attention)
 

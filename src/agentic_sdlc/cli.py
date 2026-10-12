@@ -540,6 +540,12 @@ def _control_center(args: argparse.Namespace) -> int:
         sources.append(f"ledger:{args.ledger}")
     sources.extend(f"backlog:{path}" for path in args.backlog)
     sources.extend(f"incidents:{path}" for path in args.incidents)
+    if args.output:
+        output = Path(args.output).resolve()
+        inputs = [args.registry, args.ledger, *args.backlog, *args.incidents]
+        for declared in inputs:
+            if declared and Path(declared).resolve() == output:
+                raise ControlCenterError(f"--output would overwrite an input: {declared}")
     generated_at = args.generated_at or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     snapshot = build_control_center_snapshot(
         generated_at=generated_at,
@@ -558,13 +564,19 @@ def _json_file(path: str) -> Any:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
-def _record_array(value: Any, label: str) -> list[dict[str, Any]]:
-    """Require a JSON array whose every element is an object."""
+def _record_array(value: Any, label: str, *, require_number: bool = False) -> list[dict[str, Any]]:
+    """Require a JSON array whose every element is an object.
+
+    With ``require_number``, each record must also carry an integer ``number``,
+    which the adapter indexes without a fallback.
+    """
     if not isinstance(value, list):
         raise ControlCenterError(f"{label} must hold a JSON array")
     for index, entry in enumerate(value):
         if not isinstance(entry, dict):
             raise ControlCenterError(f"{label}[{index}] must be an object")
+        if require_number and not isinstance(entry.get("number"), int):
+            raise ControlCenterError(f"{label}[{index}] must carry an integer number")
     return value
 
 
@@ -591,7 +603,7 @@ def _sub_issue_group(entry: str) -> tuple[Any, int | None]:
 
 
 def _github_backlog(args: argparse.Namespace) -> int:
-    issues = _record_array(_json_file(args.issues), "--issues")
+    issues = _record_array(_json_file(args.issues), "--issues", require_number=True)
     links = parent_links(*(_sub_issue_group(entry) for entry in args.sub_issues))
     backlog = backlog_document_from_issues(
         issues,
@@ -611,7 +623,7 @@ def _github_backlog(args: argparse.Namespace) -> int:
     if args.failing and not args.pulls:
         raise ControlCenterError("--failing names change-request checks, so it requires --pulls")
     if args.pulls:
-        pulls = _record_array(_json_file(args.pulls), "--pulls")
+        pulls = _record_array(_json_file(args.pulls), "--pulls", require_number=True)
         failing = _failing_checks(args.failing)
         present = {
             int(pull["number"])
