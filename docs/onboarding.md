@@ -51,7 +51,15 @@ automates.
   first `python3` on PATH, so a Homebrew Python works). The mode is rendered into the commit
   guard (and so the session-start hook). At run time GitHub Actions (`GITHUB_ACTIONS=true`) and
   Claude Code cloud sessions (`CLAUDE_CODE_REMOTE=true`) are always strict; elsewhere the CLI uses
-  the mode of the policy it reads (`--config`, else `agentic-sdlc.toml`), strict without one.
+  the mode of the policy it reads (`--config`, else `agentic-sdlc.toml`), strict without one --
+  except the publication-decision commands (`check-diff`, `check-request`, `authorize-labeler`,
+  `claim`, `renew`, `release`, `confirm-cloud-routine`: the gates the cloud routine and the
+  Actions workflows run), which are ALWAYS strict and never consult the `AGENTIC_SDLC_GIT` /
+  `AGENTIC_SDLC_GH` overrides (a set one is reported on stderr and ignored). Neither a policy
+  file (the working tree is the agent's to edit) nor the environment (an agent's shell can unset
+  `CLAUDE_CODE_REMOTE`) may loosen how they pick git and gh; `local` only affects the
+  developer-facing commands (`onboard`, `doctor`, `inspect-diff`, `run-gates`, `claims`, ...)
+  and the hooks.
   `doctor` reports the mode ("executable trust mode"; WARN in local, since strict is what
   protects agent contexts).
 
@@ -399,7 +407,8 @@ through a link). `onboard --force` rewrites the policy and drops the confirmatio
   with no group/other write bit and not writable by this user -- taken from the system
   locations (`/usr/bin/git` first) and, for a non-root user, from absolute PATH entries that
   pass the same test; running as root only the system locations count. `AGENTIC_SDLC_GIT` may
-  name another git, vetted the same way (refused as root). No trusted git exits 2. Git runs
+  name another git for `inspect-diff`, vetted the same way (refused as root); check-diff, a
+  publication decision, ignores it (Codex 4244027559). No trusted git exits 2. Git runs
   with an environment built from an allowlist (fixed `PATH=/usr/bin:/bin`, `LC_ALL=C`, the
   replacement/config switches above) -- nothing of the caller's, so `LD_PRELOAD`,
   `LD_LIBRARY_PATH`, `LD_AUDIT` or `DYLD_*` cannot load code into it (Codex 4241839908).

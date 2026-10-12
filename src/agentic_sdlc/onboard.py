@@ -2798,8 +2798,9 @@ def trust_mode_check(mode: str) -> Check:
             True,
             '[automation] trust_mode = "local": git, gh and the hook interpreter may be any '
             "the user owns (first on PATH). Strict mode -- only executables root alone can "
-            "replace -- is what protects agent contexts; GitHub Actions and Claude Code cloud "
-            "sessions use it regardless"
+            "replace -- is what protects agent contexts; GitHub Actions, Claude Code cloud "
+            "sessions and the publication-decision commands (check-diff, check-request, "
+            "authorize-labeler, claim, renew, release) use it regardless"
             + (f" (this run is one: {context})" if context else "")
             + ". The pinned hook interpreter must exist wherever the hooks run",
             warning=True,

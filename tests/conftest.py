@@ -35,6 +35,7 @@ def _no_policy_trust_mode(monkeypatch):
     from agentic_sdlc import trusted_exec
 
     monkeypatch.setattr(trusted_exec, "_POLICY_MODE", None)
+    monkeypatch.setattr(trusted_exec, "_GATE", False)
 
 
 @pytest.fixture

@@ -136,6 +136,12 @@ Three owner choices are recorded in `agentic-sdlc.toml` and checked by `doctor`:
   everything else (allowlisted environments, a fresh gh config, an absolute probed hook
   interpreter). GitHub Actions (`GITHUB_ACTIONS=true`) and Claude Code cloud sessions
   (`CLAUDE_CODE_REMOTE=true`) are strict whatever the policy says; `doctor` reports the mode.
+  The publication-decision commands -- `check-diff`, `check-request`, `authorize-labeler`,
+  `claim`, `renew`, `release` and `confirm-cloud-routine`, what the cloud routine and the
+  Actions workflows run as gates -- are ALWAYS strict and ignore `AGENTIC_SDLC_GIT` /
+  `AGENTIC_SDLC_GH`, whatever the policy or the environment says (the agent can edit a
+  working-tree policy and unset `CLAUDE_CODE_REMOTE`). `local` only shapes the developer-facing
+  commands (`onboard`, `doctor`, `inspect-diff`, `run-gates`, `claims`, ...) and the hooks.
 
 **Migrating an onboarded repository:** re-run `sdlcctl onboard --force` (with `--apply` to update
 the ruleset). A repository on self-hosted runners must add `--runs-on <labels>
