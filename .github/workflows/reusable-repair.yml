@@ -119,7 +119,7 @@ jobs:
           mkdir -p .agentic-repair
           git show "${BASE_SHA}:${CONFIG_PATH}" > .agentic-repair/trusted-policy.toml
       - name: Restore exact independent-review artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: independent-review-${{ inputs.review_run_id }}
           path: .agentic-repair/review
@@ -171,7 +171,7 @@ jobs:
           persist-credentials: false
           token: ${{ secrets.PLATFORM_READ_TOKEN || github.token }}
       - name: Store trusted repair inputs
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: repair-input-${{ github.run_id }}
           path: |
@@ -181,7 +181,7 @@ jobs:
           include-hidden-files: true
           retention-days: 3
       - name: Store pinned policy engine
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: repair-policy-engine-${{ github.run_id }}
           path: .agentic-platform/src/agentic_sdlc/
@@ -204,12 +204,12 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Restore trusted repair inputs
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: repair-input-${{ github.run_id }}
           path: .agentic-repair
       - name: Restore pinned policy engine
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: repair-policy-engine-${{ github.run_id }}
           path: .agentic-platform/src/agentic_sdlc
@@ -291,7 +291,7 @@ jobs:
             --request-number "$PR_NUMBER" \
             --output .agentic-output/manifest.json
       - name: Store untrusted repair patch
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: repair-patch-${{ github.run_id }}
           path: .agentic-output/
@@ -313,17 +313,17 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Restore trusted repair inputs
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: repair-input-${{ github.run_id }}
           path: .agentic-repair
       - name: Restore pinned policy engine
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: repair-policy-engine-${{ github.run_id }}
           path: .agentic-platform/src/agentic_sdlc
       - name: Restore generated repair patch
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: repair-patch-${{ github.run_id }}
           path: ${{ runner.temp }}/repair-patch
@@ -379,7 +379,7 @@ jobs:
               --repository . \
               --output "${RUNNER_TEMP}/verified-repair/gates.json"
       - name: Store verified repair patch
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: verified-repair-${{ github.run_id }}
           path: ${{ runner.temp }}/verified-repair/
@@ -409,7 +409,7 @@ jobs:
           persist-credentials: true
           token: ${{ steps.publisher-token.outputs.token }}
       - name: Restore verified repair only
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: verified-repair-${{ github.run_id }}
           path: ${{ runner.temp }}/verified-repair
