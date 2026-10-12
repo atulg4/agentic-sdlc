@@ -1286,3 +1286,83 @@ def test_a_blocker_incident_is_never_retired_by_ledger_evidence():
         incidents=load_incident_document(_incidents(blocker)),
     )
     assert len(snapshot.get("forge").incidents) == 1
+
+
+def test_a_released_spec_still_gets_the_plan_ordering_advisory():
+    incidents = incidents_from_issues(
+        [
+            _issue(
+                1,
+                "released, plan-ready",
+                ["agent-ready", "human-review-required", "spec-drafted", "spec-approved"],
+            )
+        ],
+        project_id="forge",
+        repository="acme/forge",
+        observed_at=NOW,
+    )
+    assert len(incidents) == 1
+    assert "plan run" in incidents[0]["summary"]
+
+
+def test_planning_evidence_retires_the_plan_advisory_but_not_the_implement_one():
+    from agentic_sdlc.control_center import PLAN_EVIDENCE_RULE
+
+    plan_advisory = _incident(
+        incidentId=f"acme/forge#7:{PLAN_EVIDENCE_RULE}",
+        kind="dispatch-blocked",
+        severity="advisory",
+        backlogItemId="acme/forge#7",
+    )
+    implement_advisory = _incident(
+        incidentId="acme/forge#7:eligible-awaiting-dispatch-evidence",
+        kind="dispatch-blocked",
+        severity="advisory",
+        backlogItemId="acme/forge#7",
+    )
+    ledger = _ledger(
+        *_chain(
+            TO_PLANNED,
+            workUnit={"projectId": "forge", "workUnitId": "wu-1", "issueRef": "acme/forge#7"},
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        backlog=load_backlog_document(
+            _document(_backlog(itemId="acme/forge#7", issueRef="acme/forge#7"))
+        ),
+        incidents=load_incident_document(_incidents(plan_advisory, implement_advisory)),
+    )
+    view = snapshot.get("forge")
+    assert [item.incident_id for item in view.incidents] == [
+        "acme/forge#7:eligible-awaiting-dispatch-evidence"
+    ]
+
+
+def test_the_plan_advisory_stays_while_the_ledger_shows_pre_planning_state():
+    from agentic_sdlc.control_center import PLAN_EVIDENCE_RULE
+
+    plan_advisory = _incident(
+        incidentId=f"acme/forge#7:{PLAN_EVIDENCE_RULE}",
+        kind="dispatch-blocked",
+        severity="advisory",
+        backlogItemId="acme/forge#7",
+    )
+    ledger = _ledger(
+        *_chain(
+            ("intake", "triaged", "specified"),
+            workUnit={"projectId": "forge", "workUnitId": "wu-1", "issueRef": "acme/forge#7"},
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        backlog=load_backlog_document(
+            _document(_backlog(itemId="acme/forge#7", issueRef="acme/forge#7"))
+        ),
+        incidents=load_incident_document(_incidents(plan_advisory)),
+    )
+    assert len(snapshot.get("forge").incidents) == 1

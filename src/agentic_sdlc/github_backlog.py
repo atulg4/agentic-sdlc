@@ -31,6 +31,7 @@ from .control_center import (
     INCIDENT_SCHEMA_VERSION,
     MAX_BACKLOG_ITEMS,
     MAX_INCIDENTS,
+    PLAN_EVIDENCE_RULE,
     ControlCenterError,
 )
 
@@ -134,10 +135,12 @@ DISPATCH_RULES: tuple[DispatchRule, ...] = (
         severity="degraded",
         summary="Labelled agent-ready without human-review-required; both labels are required",
     ),
+    # With agent-ready also present, the plan-ordering advisory below is the
+    # actionable message, so this row yields to it.
     DispatchRule(
         rule_id="spec-without-approval",
         required=frozenset({"spec-drafted", "human-review-required"}),
-        missing=frozenset({"implementation-approved"}),
+        missing=frozenset({"implementation-approved", "agent-ready"}),
         kind="awaiting-human-approval",
         severity="degraded",
         summary="Specification drafted and waiting on a human implementation approval",
@@ -154,10 +157,13 @@ DISPATCH_RULES: tuple[DispatchRule, ...] = (
             "started, and re-apply implementation-approved to re-kick if none did"
         ),
     ),
+    # An unreleased draft is caught by the spec-review rule above, so only
+    # implementation-approved blocks this row: a released spec (spec-drafted
+    # plus spec-approved) still has the plan-trigger ordering hazard.
     DispatchRule(
-        rule_id="plan-ready-awaiting-dispatch-evidence",
+        rule_id=PLAN_EVIDENCE_RULE,
         required=frozenset({"agent-ready", "human-review-required"}),
-        missing=frozenset({"implementation-approved", "spec-drafted"}),
+        missing=frozenset({"implementation-approved"}),
         kind="dispatch-blocked",
         severity="advisory",
         summary=(
