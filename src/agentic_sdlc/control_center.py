@@ -47,6 +47,7 @@ from .project_registry import (
     EMPTY_PROJECT_REGISTRY,
     ProjectRegistry,
     read_optional_project_registry,
+    read_project_registry,
 )
 
 CONTROL_CENTER_SCHEMA_VERSION = 1
@@ -1431,7 +1432,13 @@ def read_control_center_inputs(
     across documents are rejected by the snapshot builder.
     """
 
-    registry = read_optional_project_registry(registry_path)
+    if registry_path is None or not str(registry_path).strip():
+        registry = read_optional_project_registry(None)
+    else:
+        # An explicitly named registry that cannot be read is a deployment
+        # error: a typo must fail the snapshot, never publish an empty or
+        # wholly unregistered portfolio.
+        registry = read_project_registry(registry_path)
     backlog: list[BacklogItem] = []
     for path in backlog_paths:
         backlog.extend(read_backlog_document(path))

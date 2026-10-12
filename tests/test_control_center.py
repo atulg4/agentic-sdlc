@@ -787,10 +787,16 @@ def test_every_dispatch_rule_names_a_declared_incident_kind():
 def test_change_request_incidents_distinguish_conflict_ci_and_merge_wait():
     incidents = incidents_from_change_requests(
         [
-            {"number": 1, "title": "conflicted", "mergeable_state": "dirty"},
-            {"number": 2, "title": "red", "mergeable_state": "blocked"},
-            {"number": 3, "title": "ready", "mergeable_state": "clean"},
-            {"number": 4, "title": "draft", "draft": True, "mergeable_state": "clean"},
+            {"number": 1, "title": "conflicted", "state": "open", "mergeable_state": "dirty"},
+            {"number": 2, "title": "red", "state": "open", "mergeable_state": "blocked"},
+            {"number": 3, "title": "ready", "state": "open", "mergeable_state": "clean"},
+            {
+                "number": 4,
+                "title": "draft",
+                "state": "open",
+                "draft": True,
+                "mergeable_state": "clean",
+            },
         ],
         project_id="forge",
         repository="acme/forge",
@@ -826,7 +832,7 @@ def test_combining_incident_groups_produces_a_loadable_document():
             observed_at=NOW,
         ),
         incidents_from_change_requests(
-            [{"number": 9, "title": "ready", "mergeable_state": "clean"}],
+            [{"number": 9, "title": "ready", "state": "open", "mergeable_state": "clean"}],
             project_id="forge",
             repository="acme/forge",
             observed_at=NOW,
@@ -974,8 +980,20 @@ def test_an_approval_with_neither_dispatch_label_is_a_blocker():
 def test_a_draft_change_request_is_never_a_blocker():
     incidents = incidents_from_change_requests(
         [
-            {"number": 1, "title": "wip", "draft": True, "mergeable_state": "dirty"},
-            {"number": 2, "title": "wip red", "draft": True, "mergeable_state": "blocked"},
+            {
+                "number": 1,
+                "title": "wip",
+                "state": "open",
+                "draft": True,
+                "mergeable_state": "dirty",
+            },
+            {
+                "number": 2,
+                "title": "wip red",
+                "state": "open",
+                "draft": True,
+                "mergeable_state": "blocked",
+            },
         ],
         project_id="forge",
         repository="acme/forge",
@@ -987,7 +1005,7 @@ def test_a_draft_change_request_is_never_a_blocker():
 
 def test_a_change_request_without_a_mergeability_verdict_is_not_ready():
     incidents = incidents_from_change_requests(
-        [{"number": 1, "title": "list payload only"}],
+        [{"number": 1, "title": "list payload only", "state": "open"}],
         project_id="forge",
         repository="acme/forge",
         observed_at=NOW,
@@ -997,7 +1015,7 @@ def test_a_change_request_without_a_mergeability_verdict_is_not_ready():
 
 def test_a_failing_check_is_reported_even_without_a_mergeability_verdict():
     incidents = incidents_from_change_requests(
-        [{"number": 1, "title": "red"}],
+        [{"number": 1, "title": "red", "state": "open"}],
         project_id="forge",
         repository="acme/forge",
         observed_at=NOW,
@@ -1033,12 +1051,12 @@ def test_a_declared_parent_agreeing_with_the_reference_links_once():
 
 def test_only_ready_merge_states_wait_on_the_merge_authority():
     pulls = [
-        {"number": 1, "title": "clean", "mergeable_state": "clean"},
-        {"number": 2, "title": "hooks", "mergeable_state": "has_hooks"},
-        {"number": 3, "title": "blocked", "mergeable_state": "blocked"},
-        {"number": 4, "title": "behind", "mergeable_state": "behind"},
-        {"number": 5, "title": "unstable", "mergeable_state": "unstable"},
-        {"number": 6, "title": "unknown", "mergeable_state": "unknown"},
+        {"number": 1, "title": "clean", "state": "open", "mergeable_state": "clean"},
+        {"number": 2, "title": "hooks", "state": "open", "mergeable_state": "has_hooks"},
+        {"number": 3, "title": "blocked", "state": "open", "mergeable_state": "blocked"},
+        {"number": 4, "title": "behind", "state": "open", "mergeable_state": "behind"},
+        {"number": 5, "title": "unstable", "state": "open", "mergeable_state": "unstable"},
+        {"number": 6, "title": "unknown", "state": "open", "mergeable_state": "unknown"},
     ]
     incidents = incidents_from_change_requests(
         pulls, project_id="forge", repository="acme/forge", observed_at=NOW
@@ -1070,7 +1088,15 @@ def test_a_non_boolean_draft_flag_is_a_controlled_error():
     for bad in ("false", 1, [], {}):
         with pytest.raises(ControlCenterError, match="draft must be a boolean"):
             incidents_from_change_requests(
-                [{"number": 1, "title": "odd draft", "draft": bad, "mergeable_state": "dirty"}],
+                [
+                    {
+                        "number": 1,
+                        "title": "odd draft",
+                        "state": "open",
+                        "draft": bad,
+                        "mergeable_state": "dirty",
+                    }
+                ],
                 project_id="forge",
                 repository="acme/forge",
                 observed_at=NOW,
@@ -1516,7 +1542,7 @@ def test_failing_checks_must_name_change_requests_in_the_pull_payload(tmp_path):
     issues = tmp_path / "issues.json"
     issues.write_text(json.dumps([]), encoding="utf-8")
     pulls = tmp_path / "pulls.json"
-    pulls.write_text(json.dumps([{"number": 7, "title": "x"}]), encoding="utf-8")
+    pulls.write_text(json.dumps([{"number": 7, "title": "x", "state": "open"}]), encoding="utf-8")
     assert (
         cli_main(
             [
@@ -1919,6 +1945,78 @@ def test_the_retry_remediation_supplies_a_retry_state_input():
     assert "--state <retry-state-file>" in command
 
 
+def test_an_explicitly_named_registry_must_exist(tmp_path):
+    # A typo'd --registry must fail the snapshot, never publish an empty or
+    # wholly unregistered portfolio; only an OMITTED registry is optional.
+    from agentic_sdlc.cli import main as cli_main
+    from agentic_sdlc.control_center import read_control_center_inputs
+    from agentic_sdlc.project_registry import ProjectRegistryError
+
+    missing = tmp_path / "missing-registry.json"
+    with pytest.raises(ProjectRegistryError, match="unable to read project registry"):
+        read_control_center_inputs(registry_path=str(missing))
+    registry, backlog, incidents = read_control_center_inputs()
+    assert registry.project_ids() == ()
+    assert (
+        cli_main(
+            [
+                "control-center",
+                "--registry",
+                str(missing),
+                "--output",
+                str(tmp_path / "snapshot.json"),
+            ]
+        )
+        == 2
+    )
+    assert not (tmp_path / "snapshot.json").exists()
+
+
+def test_an_absent_issue_or_pull_state_is_a_controlled_error():
+    # Without an explicit state the adapter has no evidence the record is
+    # open, so it fails closed instead of fabricating current work.
+    for record in (
+        {"number": 1, "title": "no state", "labels": []},
+        {"number": 1, "title": "null state", "labels": [], "state": None},
+    ):
+        with pytest.raises(ControlCenterError, match="state must be"):
+            incidents_from_issues(
+                [record], project_id="forge", repository="acme/forge", observed_at=NOW
+            )
+        with pytest.raises(ControlCenterError, match="state must be"):
+            backlog_document_from_issues([record], project_id="forge", repository="acme/forge")
+    for pull in (
+        {"number": 1, "title": "no state", "mergeable_state": "clean"},
+        {"number": 1, "title": "null state", "state": None, "mergeable_state": "clean"},
+    ):
+        with pytest.raises(ControlCenterError, match="state must be"):
+            incidents_from_change_requests(
+                [pull], project_id="forge", repository="acme/forge", observed_at=NOW
+            )
+
+
+def test_review_labelled_work_missing_the_ready_label_is_reported():
+    incidents = incidents_from_issues(
+        [_issue(1, "stalled", ["human-review-required"])],
+        project_id="forge",
+        repository="acme/forge",
+        observed_at=NOW,
+    )
+    assert [item["incidentId"] for item in incidents] == [
+        "acme/forge#1:review-required-without-agent-ready"
+    ]
+    assert incidents[0]["kind"] == "dispatch-blocked"
+    assert incidents[0]["severity"] == "degraded"
+    # A drafted spec stays the spec rules' concern, not this rule's.
+    spec = incidents_from_issues(
+        [_issue(2, "spec", ["human-review-required", "spec-drafted"])],
+        project_id="forge",
+        repository="acme/forge",
+        observed_at=NOW,
+    )
+    assert [item["incidentId"] for item in spec] == ["acme/forge#2:spec-awaiting-human-review"]
+
+
 def test_the_config_cannot_be_overwritten_by_an_output(tmp_path):
     from agentic_sdlc.cli import main as cli_main
 
@@ -2035,12 +2133,15 @@ def test_a_malformed_repository_is_a_controlled_error():
 
 def test_configured_label_names_drive_the_dispatch_rules():
     issues = [_issue(1, "renamed ready", ["claude-ready", "human-review-required"])]
-    # With the platform defaults, claude-ready is an unknown label: no
-    # dispatch rule fires and nothing warns that the plan trigger is waiting.
-    assert (
-        incidents_from_issues(issues, project_id="forge", repository="acme/forge", observed_at=NOW)
-        == []
+    # With the platform defaults, claude-ready is an unknown label: the item
+    # reads as review-labelled work missing its ready label, not as the plan
+    # advisory the project's real labels would produce.
+    defaults = incidents_from_issues(
+        issues, project_id="forge", repository="acme/forge", observed_at=NOW
     )
+    assert [item["incidentId"] for item in defaults] == [
+        "acme/forge#1:review-required-without-agent-ready"
+    ]
     configured = LifecycleLabels(ready="claude-ready")
     incidents = incidents_from_issues(
         issues,
@@ -2406,7 +2507,7 @@ def test_adapter_outputs_are_staged_as_a_pair(tmp_path):
 
 def test_a_conflicted_pull_with_a_failing_check_reports_both_blockers():
     incidents = incidents_from_change_requests(
-        [{"number": 7, "title": "both", "mergeable_state": "dirty"}],
+        [{"number": 7, "title": "both", "state": "open", "mergeable_state": "dirty"}],
         project_id="forge",
         repository="acme/forge",
         observed_at=NOW,
@@ -2421,7 +2522,7 @@ def test_a_conflicted_pull_with_a_failing_check_reports_both_blockers():
 def test_a_malformed_mergeability_value_is_a_controlled_error():
     with pytest.raises(ControlCenterError, match="mergeable_state must be a string"):
         incidents_from_change_requests(
-            [{"number": 1, "title": "bad", "mergeable_state": []}],
+            [{"number": 1, "title": "bad", "state": "open", "mergeable_state": []}],
             project_id="forge",
             repository="acme/forge",
             observed_at=NOW,
@@ -2637,7 +2738,7 @@ def test_scratch_paths_never_collide_with_sibling_outputs(tmp_path):
 
 def test_a_failing_check_on_a_behind_branch_reports_both_requirements():
     incidents = incidents_from_change_requests(
-        [{"number": 7, "title": "both", "mergeable_state": "behind"}],
+        [{"number": 7, "title": "both", "state": "open", "mergeable_state": "behind"}],
         project_id="forge",
         repository="acme/forge",
         observed_at=NOW,
@@ -2723,7 +2824,7 @@ def test_combined_per_project_incidents_respect_the_budget():
 
 def test_an_unstable_state_is_not_double_counted_with_its_failing_check():
     incidents = incidents_from_change_requests(
-        [{"number": 7, "title": "red", "mergeable_state": "unstable"}],
+        [{"number": 7, "title": "red", "state": "open", "mergeable_state": "unstable"}],
         project_id="forge",
         repository="acme/forge",
         observed_at=NOW,
@@ -2787,7 +2888,7 @@ def test_a_triage_incident_survives_approval_without_labels():
 def test_an_over_budget_failing_check_aggregate_is_rejected():
     with pytest.raises(ControlCenterError, match="too many failing check names"):
         incidents_from_change_requests(
-            [{"number": 7, "title": "red", "mergeable_state": "blocked"}],
+            [{"number": 7, "title": "red", "state": "open", "mergeable_state": "blocked"}],
             project_id="forge",
             repository="acme/forge",
             observed_at=NOW,
