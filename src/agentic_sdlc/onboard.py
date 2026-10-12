@@ -6904,6 +6904,7 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                 elif argv[0] == "eval":
                     out.evals = True
                 invocation = _set_invocation(tuple(argv))
+                ends_script = False  # applied after this command is recorded, as `exit` is
                 # Whether this command may run in the parent shell at all: not piped,
                 # backgrounded or in a subshell (Codex 4252316098: `set -n | cat` leaves the
                 # parent running).
@@ -6923,7 +6924,7 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                     )
                 ):
                     # `set -n` reads the rest without running it (Codex 4252099381).
-                    terminated = True
+                    ends_script = True
                 if invocation is not None and not invocation[1]:
                     invocation = None  # `command -v set ...`: not a call we can read
                 if invocation is not None and wrappers_untrusted and argv[0] in _BUILTIN_WRAPPERS:
@@ -6936,6 +6937,17 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                     invocation = None
                 if _effective_command(argv)[:1] == ["enable"]:
                     wrappers_untrusted = True
+                if (
+                    invocation is None
+                    and may_run_in_parent
+                    and _may_change_shell_options(argv)
+                    and (
+                        "noexec" in argv or any(set(word) & _SHELL_EXPANSION_CHARS for word in argv)
+                    )
+                ):
+                    # `shopt -s -o noexec` (or an expansion that may spell it) reads the rest
+                    # without running it (Codex 4252760388).
+                    ends_script = True
                 if invocation is None and _may_change_shell_options(argv):
                     # Anything else that could touch errexit or pipefail -- a redirected or
                     # timed `set`, `shopt`, a `trap` string, a command run through a variable
@@ -6990,10 +7002,9 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                         "piped": following in {"|", "|&"} and not pipefail,
                     }
                 )
-                program = (
-                    argv[1] if argv[0] in {"builtin", "command"} and len(argv) > 1 else argv[0]
-                )
-                if program in _SHELL_TERMINATORS:
+                # `command -p exit 0` exits too (Codex 4252760408).
+                program = (_effective_command(argv) or [""])[0]
+                if ends_script or program in _SHELL_TERMINATORS:
                     # Fails closed: wherever it sits (a condition, a branch, a function body, a
                     # subshell), it may end the script, so later commands are not proven to run.
                     terminated = True
@@ -7030,8 +7041,18 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
             # `a && b &` backgrounds the whole and-or list (Codex 4252316108).
             background = False
         r["background"] = background
+    # A failure before a later `||` in the same and-or list can be recovered by it -- `pytest &&
+    # true || true` exits 0 -- so no member before the list's last `||` is enforced (Codex
+    # 4252760398).
+    recoverable = False
+    for r in reversed(records):
+        if r["following"] == "||":
+            recoverable = True
+        elif r["following"] not in {"&&", "|", "|&"}:
+            recoverable = False
+        r["recoverable"] = recoverable
     for index, r in enumerate(records):
-        base = r["reached"] and not r["background"] and not r["piped"]
+        base = r["reached"] and not r["background"] and not r["piped"] and not r["recoverable"]
         if index >= last and (index == len(records) - 1 or r["following"] in {"&&", "|", "|&"}):
             enforced = base
         else:
