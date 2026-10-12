@@ -1850,13 +1850,23 @@ def test_a_digit_shaped_impossible_timestamp_is_rejected():
         build_control_center_snapshot(generated_at="2026-99-99T99:99:99Z", registry=REGISTRY)
 
 
-def test_a_cross_project_parent_across_documents_is_rejected():
+def test_a_parent_absent_from_its_own_project_is_a_warned_orphan():
+    # Identity is project-scoped, so a same-spelled item in ANOTHER project is
+    # an unrelated record, never proof of a cross-project edge: the child
+    # roots itself with the missing-parent warning instead of rejecting the
+    # whole snapshot. Explicit cross-project parents are still rejected where
+    # one document declares both items (load_backlog_document pins that).
     first = load_backlog_document(_document(_backlog(itemId="child", parentId="x")))
     second = load_backlog_document(
         _document(_backlog(itemId="x", projectId="ghost", title="Other"))
     )
-    with pytest.raises(ControlCenterError, match="parent in another project"):
-        build_control_center_snapshot(generated_at=NOW, registry=REGISTRY, backlog=first + second)
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW, registry=REGISTRY, backlog=first + second
+    )
+    view = snapshot.get("forge")
+    assert [node.item.item_id for node in view.backlog] == ["child"]
+    assert view.backlog[0].parent_missing
+    assert any("parent" in warning and "x" in warning for warning in view.warnings)
 
 
 def test_a_null_issue_record_is_a_controlled_error(tmp_path):
@@ -4652,3 +4662,29 @@ def test_the_console_requires_collections_and_bounds_its_views():
     assert '("github:" + match[1]).toLowerCase()' in html
     assert ".limit(bound).onSnapshot(" in html
     assert "}, 1000);" in html
+
+
+def test_supplied_documents_require_their_collection_fields():
+    with pytest.raises(ControlCenterError, match="requires an items array"):
+        load_backlog_document({"schemaVersion": BACKLOG_SCHEMA_VERSION})
+    with pytest.raises(ControlCenterError, match="requires an incidents array"):
+        load_incident_document({"schemaVersion": INCIDENT_SCHEMA_VERSION})
+    # Intentional empties stay representable, explicitly.
+    assert load_backlog_document({"schemaVersion": BACKLOG_SCHEMA_VERSION, "items": []}) == ()
+    assert load_incident_document({"schemaVersion": INCIDENT_SCHEMA_VERSION, "incidents": []}) == ()
+
+
+def test_the_console_matches_the_producers_identity_and_unit_contracts():
+    from pathlib import Path
+
+    html = Path("examples/control-center/control-center.html").read_text(encoding="utf-8")
+    # Duplicate checks are project-scoped, like the producer's.
+    assert "Duplicate backlog itemId in ${where}" in html
+    assert "Duplicate incidentId in ${where}" in html
+    # String collections are validated per entry before any renderer folds.
+    assert "entries must be strings" in html
+    # Visible units are bounded by the validated state counts.
+    assert "lists more visible work units than its state counts hold" in html
+    # Notes outside the bounded subscription are backfilled exactly.
+    assert "async function backfillNotes(document_)" in html
+    assert "backfillNotes(document_);" in html
