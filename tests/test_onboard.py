@@ -2361,6 +2361,18 @@ def test_doctor_rejects_a_ci_gate_whose_failure_is_ignored(tmp_path, mutate):
         ("$SETTER +o pipefail; pytest | tee out", "bash", False),
         ("set -o pipefail >/dev/null; pytest | tee out", None, True),
         ("set -o pipefail; echo ok; pytest | tee out", None, True),
+        # `o` anywhere in a cluster takes the option name (Codex 4251046345).
+        ("set +ou pipefail; pytest | tee out", "bash", False),
+        ("set -ou pipefail; pytest | tee out", None, True),
+        # Brace and pathname expansion make `set`'s arguments unreadable (Codex 4251046343).
+        ("set -o pipefail; set +o {pipefail,pipefail}; pytest | tee out", None, False),
+        ("set -o pipefail; set +o pipefai?; pytest | tee out", None, False),
+        # A `set` an and-or list may skip never turns an option ON (Codex 4251046350).
+        ("set +o pipefail; true || set -o pipefail; pytest | tee out", "bash", False),
+        ("set +o pipefail; true && set -o pipefail; pytest | tee out", "bash", False),
+        # `a | b &` backgrounds the whole pipeline (Codex 4251046354).
+        ("true; pytest | true &", "bash", False),
+        ("pytest | true & wait", "bash", False),
     ],
 )
 def test_shell_parse_enforces_a_piped_command_only_with_pipefail(script, shell, enforced):

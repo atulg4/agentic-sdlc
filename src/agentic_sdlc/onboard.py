@@ -6614,6 +6614,10 @@ _ERREXIT_SHELLS = {None, "bash", "sh"}
 _PIPEFAIL_SHELLS = {"bash"}
 
 
+#: Characters that make bash expand a word before `set` sees it: parameter/command
+#: substitution, brace expansion and pathname globs.
+_SHELL_EXPANSION_CHARS = set("$`{}*?[]")
+
 #: Words that name, or spell the arguments of, the builtins that change shell options.
 _SHELL_OPTION_WORDS = {"set", "shopt"}
 
@@ -6671,13 +6675,15 @@ def _set_options(arguments: list[str]) -> dict[str, bool]:
         if word in {"--", "-"} or len(word) < 2 or word[0] not in "-+" or not word[1:].isalpha():
             break
         on = word[0] == "-"
-        for position, flag in enumerate(word[1:]):
-            if flag == "e":
-                changes["errexit"] = on
-            elif flag == "o" and position == len(word) - 2 and index + 1 < len(arguments):
-                index += 1
-                if arguments[index] in {"errexit", "pipefail"}:
-                    changes[arguments[index]] = on
+        flags = word[1:]
+        if "e" in flags:
+            changes["errexit"] = on
+        if "o" in flags and index + 1 < len(arguments):
+            # Wherever `o` sits in the cluster (`+ou pipefail`), it takes the next word as its
+            # option name (Codex 4251046345).
+            index += 1
+            if arguments[index] in {"errexit", "pipefail"}:
+                changes[arguments[index]] = on
         index += 1
     return changes
 
@@ -6822,9 +6828,11 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                 if invocation is not None and not invocation[1]:
                     invocation = None  # `command -v set ...`: not a call we can read
                 if invocation is not None and any(
-                    "$" in word or "`" in word for word in invocation[0]
+                    set(word) & _SHELL_EXPANSION_CHARS for word in invocation[0]
                 ):
-                    invocation = None  # `set -o pipefail $x`: $x may expand to `+o pipefail`
+                    # `set -o pipefail $x`: $x may expand to `+o pipefail`; so may a brace or a
+                    # pathname expansion, `+o {pipefail,pipefail}` (Codex 4251046343).
+                    invocation = None
                 if invocation is None and _may_change_shell_options(argv):
                     # Anything else that could touch errexit or pipefail -- a redirected or
                     # timed `set`, `shopt`, a `trap` string, a command run through a variable
@@ -6849,8 +6857,8 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                         and not in_function
                         and not started_in_subshell
                         and not any("(" in word or ")" in word for word in argv)
-                        and previous not in {"|", "|&"}
-                        and following not in {"|", "|&", "&"}
+                        and previous not in {"|", "|&", "&&", "||"}
+                        and following not in {"|", "|&", "&", "||"}
                     )
                     for option, on in _set_options(arguments).items():
                         if on and not in_parent:
@@ -6892,8 +6900,17 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
     last = len(records) - 1
     while last > 0 and records[last]["previous"] in {"&&", "||", "|", "|&"}:
         last -= 1
+    # `a | b &` backgrounds the WHOLE pipeline and reports 0 for it: every member, not only the
+    # last, is unenforced (Codex 4251046354).
+    background = False
+    for r in reversed(records):
+        if r["following"] == "&":
+            background = True
+        elif r["following"] not in {"|", "|&"}:
+            background = False
+        r["background"] = background
     for index, r in enumerate(records):
-        base = r["reached"] and r["following"] != "&" and not r["piped"]
+        base = r["reached"] and not r["background"] and not r["piped"]
         if index >= last and (index == len(records) - 1 or r["following"] in {"&&", "|", "|&"}):
             enforced = base
         else:
