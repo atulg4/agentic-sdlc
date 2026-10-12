@@ -264,7 +264,9 @@ def backlog_document_from_issues(
             "issueRef": f"{repository}#{number}",
             "labels": sorted(labels),
         }
-        if parent is not None and parent in numbers:
+        if parent is not None:
+            # Kept even when the parent is outside this export: the read model
+            # roots the child and warns "parent outside this snapshot".
             item["parentId"] = f"{repository}#{parent}"
         state = _declared_state(issue, labels)
         if state:

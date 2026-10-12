@@ -84,22 +84,33 @@ AWAITING_HUMAN_STATES = frozenset(
 #: name is shared here rather than guessed from text.
 PLAN_EVIDENCE_RULE = "plan-ready-awaiting-dispatch-evidence"
 
-#: States that precede any planning evidence: a ledger projection past these
-#: proves a plan ran, which retires the plan-ordering advisory.
-PRE_PLANNING_STATES = frozenset({FactoryState.INTAKE, FactoryState.TRIAGED, FactoryState.SPECIFIED})
-
-#: States that prove dispatch happened: everything past the approval gates.
-#: A label-only "confirm a run started" advisory is retired once a joined
-#: ledger projection shows one of these.
-PRE_DISPATCH_STATES = frozenset(
+#: States that PROVE dispatch happened: each is reachable only through a
+#: dispatched run. ``blocked``, ``cancelled`` and ``superseded`` are reachable
+#: from pre-dispatch states too, so they prove nothing and retire nothing.
+DISPATCH_PROVEN_STATES = frozenset(
     {
-        FactoryState.INTAKE,
-        FactoryState.TRIAGED,
-        FactoryState.SPECIFIED,
-        FactoryState.PLANNED,
-        FactoryState.APPROVAL_PENDING,
-        FactoryState.APPROVED,
+        FactoryState.DISPATCHED,
+        FactoryState.IMPLEMENTING,
+        FactoryState.VERIFYING,
+        FactoryState.REVIEWING,
+        FactoryState.REPAIR_NEEDED,
+        FactoryState.REPAIRING,
+        FactoryState.RE_REVIEWING,
+        FactoryState.READY_FOR_HUMAN_MERGE,
+        FactoryState.MERGED,
+        FactoryState.DEPLOYING,
+        FactoryState.DEPLOYMENT_VERIFYING,
+        FactoryState.LIVE,
+        FactoryState.ROLLING_BACK,
+        FactoryState.ROLLED_BACK,
+        FactoryState.FAILED,
     }
+)
+
+#: States that prove a plan ran: the planning outcomes plus everything that
+#: proves dispatch, which presupposes a plan.
+PLAN_PROVEN_STATES = DISPATCH_PROVEN_STATES | frozenset(
+    {FactoryState.PLANNED, FactoryState.APPROVAL_PENDING, FactoryState.APPROVED}
 )
 
 #: States in which something is executing *right now*. Backlog-shaped states
@@ -113,7 +124,6 @@ EXECUTING_STATES = frozenset(
         FactoryState.IMPLEMENTING,
         FactoryState.VERIFYING,
         FactoryState.REVIEWING,
-        FactoryState.REPAIR_NEEDED,
         FactoryState.REPAIRING,
         FactoryState.RE_REVIEWING,
         FactoryState.DEPLOYING,
@@ -1210,14 +1220,16 @@ def build_control_center_snapshot(
                 and incident.severity is IncidentSeverity.ADVISORY
                 and proven is not None
             ):
-                # The plan advisory is moot once a plan ran (PLANNED or
-                # later); the implementation advisory needs dispatch itself.
-                threshold = (
-                    PRE_PLANNING_STATES
+                # The plan advisory is moot once a plan provably ran; the
+                # implementation advisory needs dispatch itself. A state that
+                # does not imply the threshold (blocked, cancelled) retires
+                # nothing.
+                proven_states = (
+                    PLAN_PROVEN_STATES
                     if incident.incident_id.endswith(":" + PLAN_EVIDENCE_RULE)
-                    else PRE_DISPATCH_STATES
+                    else DISPATCH_PROVEN_STATES
                 )
-                if proven.state not in threshold:
+                if proven.state in proven_states:
                     continue
             retained.append(incident)
         project_incidents = tuple(retained)

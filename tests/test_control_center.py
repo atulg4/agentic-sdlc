@@ -51,6 +51,8 @@ from agentic_sdlc.project_registry import load_project_registry
 
 NOW = "2026-10-11T21:30:00Z"
 
+EMPTY = load_project_registry({"schemaVersion": 1, "projects": []})
+
 REGISTRY = load_project_registry(
     {
         "schemaVersion": 1,
@@ -134,6 +136,7 @@ _STAGE_FOR = {
     "blocked": "blocked",
     "merged": "merge",
     "live": "live",
+    "repair-needed": "repair",
 }
 
 
@@ -680,9 +683,15 @@ def test_parent_links_reject_two_parents_for_one_child():
         )
 
 
-def test_a_parent_outside_the_exported_set_is_left_unlinked():
+def test_a_parent_outside_the_exported_set_is_kept_and_flagged_downstream():
     document = _export(_issue(2, "child"), parents={2: 99})
-    assert "parentId" not in document["items"][0]
+    assert document["items"][0]["parentId"] == "acme/forge#99"
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW, registry=EMPTY, backlog=load_backlog_document(document)
+    )
+    view = snapshot.get("forge")
+    assert view.backlog[0].parent_missing
+    assert any("outside this snapshot" in warning for warning in view.warnings)
 
 
 def test_labels_declare_the_state_through_the_published_table():
@@ -1366,3 +1375,68 @@ def test_the_plan_advisory_stays_while_the_ledger_shows_pre_planning_state():
         incidents=load_incident_document(_incidents(plan_advisory)),
     )
     assert len(snapshot.get("forge").incidents) == 1
+
+
+def test_a_blocked_unit_retires_no_ordering_advisory():
+    from agentic_sdlc.control_center import PLAN_EVIDENCE_RULE
+
+    plan_advisory = _incident(
+        incidentId=f"acme/forge#7:{PLAN_EVIDENCE_RULE}",
+        kind="dispatch-blocked",
+        severity="advisory",
+        backlogItemId="acme/forge#7",
+    )
+    implement_advisory = _incident(
+        incidentId="acme/forge#7:eligible-awaiting-dispatch-evidence",
+        kind="dispatch-blocked",
+        severity="advisory",
+        backlogItemId="acme/forge#7",
+    )
+    ledger = _ledger(
+        *_chain(
+            ("intake", "triaged", "specified", "blocked"),
+            workUnit={"projectId": "forge", "workUnitId": "wu-1", "issueRef": "acme/forge#7"},
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        backlog=load_backlog_document(
+            _document(_backlog(itemId="acme/forge#7", issueRef="acme/forge#7"))
+        ),
+        incidents=load_incident_document(_incidents(plan_advisory, implement_advisory)),
+    )
+    assert len(snapshot.get("forge").incidents) == 2
+
+
+def test_a_repair_needed_unit_is_not_running():
+    ledger = _ledger(*_chain(TO_IMPLEMENTING + ("verifying", "repair-needed")))
+    view = build_control_center_snapshot(
+        generated_at=NOW, registry=REGISTRY, projections=ledger.projections()
+    ).get("forge")
+    assert view.active == ()
+    assert view.health == "idle"
+
+
+def test_failing_checks_require_the_pull_payload(tmp_path):
+    from agentic_sdlc.cli import main as cli_main
+
+    issues = tmp_path / "issues.json"
+    issues.write_text(json.dumps([]), encoding="utf-8")
+    assert (
+        cli_main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--failing",
+                "148=test",
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+            ]
+        )
+        == 2
+    )
