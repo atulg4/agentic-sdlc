@@ -1850,3 +1850,127 @@ def test_adapter_outputs_must_not_overwrite_inputs(tmp_path):
         == 2
     )
     assert json.loads(issues.read_text(encoding="utf-8")) == []
+
+
+def test_a_conflicted_pull_with_a_failing_check_reports_both_blockers():
+    incidents = incidents_from_change_requests(
+        [{"number": 7, "title": "both", "mergeable_state": "dirty"}],
+        project_id="forge",
+        repository="acme/forge",
+        observed_at=NOW,
+        failing={7: "test"},
+    )
+    assert [item["kind"] for item in incidents] == [
+        "merge-conflict",
+        "deterministic-ci-failed",
+    ]
+
+
+def test_a_malformed_mergeability_value_is_a_controlled_error():
+    with pytest.raises(ControlCenterError, match="mergeable_state must be a string"):
+        incidents_from_change_requests(
+            [{"number": 1, "title": "bad", "mergeable_state": []}],
+            project_id="forge",
+            repository="acme/forge",
+            observed_at=NOW,
+        )
+
+
+def test_sub_issue_records_without_numbers_are_a_controlled_error(tmp_path):
+    from agentic_sdlc.cli import main as cli_main
+
+    issues = tmp_path / "issues.json"
+    issues.write_text(json.dumps([]), encoding="utf-8")
+    bad = tmp_path / "sub.json"
+    bad.write_text(json.dumps([{"parent_issue_url": "x"}]), encoding="utf-8")
+    assert (
+        cli_main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--sub-issues",
+                f"1={bad}",
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+            ]
+        )
+        == 2
+    )
+
+
+def test_ledger_proof_retires_a_stale_triage_incident():
+    stale = _incident(
+        incidentId="acme/forge#7:untriaged",
+        kind="triage-needed",
+        severity="advisory",
+        backlogItemId="acme/forge#7",
+    )
+    ledger = _ledger(
+        *_chain(
+            TO_IMPLEMENTING,
+            workUnit={"projectId": "forge", "workUnitId": "wu-1", "issueRef": "acme/forge#7"},
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        backlog=load_backlog_document(
+            _document(_backlog(itemId="acme/forge#7", issueRef="acme/forge#7"))
+        ),
+        incidents=load_incident_document(_incidents(stale)),
+    )
+    assert snapshot.get("forge").incidents == ()
+
+
+def test_a_triage_incident_stays_while_the_ledger_shows_only_intake():
+    stale = _incident(
+        incidentId="acme/forge#7:untriaged",
+        kind="triage-needed",
+        severity="advisory",
+        backlogItemId="acme/forge#7",
+    )
+    ledger = _ledger(
+        *_chain(
+            ("intake",),
+            workUnit={"projectId": "forge", "workUnitId": "wu-1", "issueRef": "acme/forge#7"},
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        backlog=load_backlog_document(
+            _document(_backlog(itemId="acme/forge#7", issueRef="acme/forge#7"))
+        ),
+        incidents=load_incident_document(_incidents(stale)),
+    )
+    assert len(snapshot.get("forge").incidents) == 1
+
+
+def test_approval_proof_retires_a_stale_approval_wait():
+    stale = _incident(
+        incidentId="acme/forge#7:spec",
+        kind="awaiting-human-approval",
+        severity="degraded",
+        backlogItemId="acme/forge#7",
+    )
+    ledger = _ledger(
+        *_chain(
+            TO_PLANNED + ("approved",),
+            workUnit={"projectId": "forge", "workUnitId": "wu-1", "issueRef": "acme/forge#7"},
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        backlog=load_backlog_document(
+            _document(_backlog(itemId="acme/forge#7", issueRef="acme/forge#7"))
+        ),
+        incidents=load_incident_document(_incidents(stale)),
+    )
+    assert snapshot.get("forge").incidents == ()
