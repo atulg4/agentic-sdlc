@@ -36,6 +36,7 @@ from agentic_sdlc.control_center import (
 from agentic_sdlc.event_ledger import (
     EventLedger,
     FactoryState,
+    LedgerError,
     LifecycleStage,
     load_lifecycle_event,
 )
@@ -1895,6 +1896,27 @@ def test_adapter_outputs_must_not_overwrite_inputs(tmp_path):
         == 2
     )
     assert json.loads(issues.read_text(encoding="utf-8")) == []
+
+
+def test_the_work_unit_id_bound_is_shared_with_the_ledger():
+    # One contract on both sides: an id the ledger accepts (<= 512) loads in
+    # backlog items and incidents, and an id the ledger rejects is rejected
+    # here with the same bound, so no valid ledger unit becomes unaddressable.
+    longest = "w" * 512
+    load_backlog_document(_document(_backlog(itemId="acme/forge#7", workUnitId=longest)))
+    over = "w" * 513
+    with pytest.raises(ControlCenterError, match="at most 512"):
+        load_backlog_document(_document(_backlog(itemId="acme/forge#7", workUnitId=over)))
+    with pytest.raises(LedgerError, match="at most 512"):
+        _ledger(*_chain(("intake",), work_unit=over))
+
+
+def test_the_retry_remediation_supplies_a_retry_state_input():
+    actions = remediations_for("infrastructure-failure")
+    command = next(
+        action.command for action in actions if action.action_id == "decide-infrastructure-retry"
+    )
+    assert "--state <retry-state-file>" in command
 
 
 def test_the_config_cannot_be_overwritten_by_an_output(tmp_path):

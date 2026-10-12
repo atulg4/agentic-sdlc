@@ -1042,7 +1042,15 @@
     const repository = fields.repository.value.trim();
     if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(projectId)) return "A project ID must start with a letter or digit and hold only lowercase letters, digits, dot, dash or underscore.";
     if (!displayName) return "A display name is required.";
-    if (!/^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)+$/.test(repository)) return "A repository looks like owner/name.";
+    if (fields.provider.value === "github") {
+      // The bundled github-backlog adapter requires exactly OWNER/REPO, so a
+      // draft this form calls commit-ready must satisfy the same shape.
+      if (!/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(repository)) {
+        return "A GitHub repository is exactly owner/name - no nested paths.";
+      }
+    } else if (!/^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)+$/.test(repository)) {
+      return "A repository looks like group/name (nested groups are allowed).";
+    }
     const group = fields.group.value.trim();
     if (group && !/^[a-z0-9][a-z0-9._-]{0,63}$/.test(group)) {
       return "A group uses only lowercase letters, digits, dot, dash or underscore — the registry will reject anything else.";
