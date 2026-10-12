@@ -12,8 +12,9 @@ The interpreter must be CI's too (Codex 4243659485): before any gate runs, the `
 gate environment's PATH is asked its version, and a major.minor other than the policy's
 `[ci] python_version` (what ci.yml's setup-python installs) is reported as a warning, as is an
 unset version or a missing python3. A warning, not a failure: the platform's reusable-implement
-`verify` job installs no Python yet, so failing closed would fail every verification whose
-policy pins a version other than the runner's preinstalled one. A malformed version still fails.
+`verify` job installs `[ci] python_version` with setup-python before `run-gates`, but other
+callers (and a policy without the version) run whatever interpreter they have. A malformed
+version still fails.
 """
 
 from __future__ import annotations

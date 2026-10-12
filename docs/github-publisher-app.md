@@ -42,22 +42,27 @@ access is explicitly limited.
 ## Runtime Boundary
 
 `reusable-implement.yml` mints a Publisher App installation token
-(`actions/create-github-app-token`) in three places, each in its own job and
-each requesting only what that job needs. No owner or repository list is
-supplied, so every token is scoped to the current repository; each expires
-after about one hour and is revoked when its job ends.
+(`actions/create-github-app-token`) in five jobs, each requesting only what
+that job needs. No owner or repository list is supplied, so every token is
+scoped to the current repository; each expires after about one hour and is
+revoked when its job ends.
 
 | Job | When | Permissions requested | Used for |
 |---|---|---|---|
 | `prepare` | Every run, as the job's last steps, after the approval, dependency and duplicate-PR checks pass | Issues: write, Pull requests: read | `sdlcctl claim`: reads the issue's lease history and its open/linked pull requests, then posts the claim marker comment and adds the `in-progress` label (the Actions claim assigns no one). A held lease or an open PR for the issue refuses the run. |
-| `publish_draft` | After the patch is generated, verified and attested | Contents: read, Issues: write, Pull requests: write | Opens the draft pull request, posts its issue comment, and releases the lease (`sdlcctl release`: release marker and label cleanup). |
-| `release_lease_on_failure` | Only when `prepare` succeeded and a later job did not | Issues: write | Releases the lease so another agent can retry. |
+| `renew_lease_before_verify`, `renew_lease_before_attest` | After patch generation, and after verification | Issues: write, Pull requests: read | `sdlcctl renew`: extends this run's lease. It fails, and stops the run, when the issue is closed, has an open PR, or this run no longer holds a live lease. |
+| `publish_draft` | After the patch is generated, verified and attested | Contents: read, Issues: write, Pull requests: write | `sdlcctl renew` immediately before the branch is pushed (no push and no PR unless it succeeds), then opens the draft pull request, posts its issue comment, and releases the lease (`sdlcctl release`: release marker and label cleanup). |
+| `release_lease_on_failure` | Whenever a claim may have been posted (prepare's `claim` output is not `not-started` or `refused`) and the run did not end with `publish_draft`'s own successful release: a failed, cancelled or interrupted job anywhere, `prepare` included, or a failed release after the PR was opened | Issues: write | Releases the lease so another agent can retry. Runs on `lease_cleanup_runs_on` (default `ubuntu-latest`), not `runs_on`, so a lost self-hosted runner cannot keep it from running. |
 
-The `prepare` and `release_lease_on_failure` tokens never reach the pull
-request: they cannot open, edit or merge one, and neither job pushes. The
-native job token pushes the already attested branch in `publish_draft`; the App
-token never pushes. The AI and verification jobs (`generate_patch`, `verify`,
-`attest_patch`) never receive the App key or any installation token.
+The `prepare`, renewal and `release_lease_on_failure` tokens never reach the
+pull request: they cannot open, edit or merge one, and none of those jobs
+pushes. The native job token pushes the already attested branch in
+`publish_draft`; the App token never pushes. The AI and verification jobs
+(`generate_patch`, `verify`, `attest_patch`) never receive the App key or any
+installation token, which is why the stage-boundary renewals are jobs of their
+own. Every lease command after `prepare` runs from `RUNNER_TEMP`, with the
+policy engine and the protected-base policy `prepare` stored as artifacts,
+never from the checkout a patch is applied to.
 
 The lease markers count only because the App's bot is a trusted marker author:
 `sdlcctl` and the commit-guard hook accept markers from the Publisher App bot
@@ -66,8 +71,9 @@ named EXACTLY -- `[automation] publisher_bot_login` in the policy (set with
 also sets the `FORGE_LEASE_BOT_LOGINS` repository variable; the commit guard
 carries it as rendered at onboard time), or `FORGE_LEASE_BOT_LOGINS` in the
 environment, which wins -- and `github-actions[bot]`, besides users with write
-access. With no `--config`, no `./agentic-sdlc.toml` and no variable (the
-failure-cleanup job's `release` runs in an empty workspace), the lease commands
+access. The workflow's lease jobs run next to the protected-base policy
+`prepare` stored. With no `--config`, no `./agentic-sdlc.toml` and no variable,
+the lease commands
 read the policy committed on the default branch; `release` additionally
 releases its own session's claims whoever posted them, so it never reports
 success over a claim it did not trust. No App bot is trusted on its slug alone: with no login configured,

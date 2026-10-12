@@ -3487,6 +3487,12 @@ _APP_POLICY = (
 def _workflow_release_argv(job: str, env: dict[str, str]) -> list[str]:
     """The `python3 -m agentic_sdlc release ...` arguments of `job` in the platform's
     reusable-implement.yml, exactly as written there, with the shell variables expanded."""
+    return _workflow_lease_argv(job, "release", env)
+
+
+def _workflow_lease_argv(job: str, subcommand: str, env: dict[str, str]) -> list[str]:
+    """The `python3 -m agentic_sdlc <subcommand> ...` arguments of `job` in the platform's
+    reusable-implement.yml, exactly as written there, with the shell variables expanded."""
     import re
     import shlex
     from pathlib import Path
@@ -3497,14 +3503,18 @@ def _workflow_release_argv(job: str, env: dict[str, str]) -> list[str]:
     section = text.split(f"\n  {job}:\n", 1)[1]
     command, lines = "", iter(section.splitlines())
     for line in lines:
-        if "-m agentic_sdlc release" in line:
+        if line.startswith("  ") and not line.startswith("   "):
+            break  # the next job: the call must be in `job` itself
+        if f"-m agentic_sdlc {subcommand}" in line:
             command = line
             while command.rstrip().endswith("\\"):
                 command = command.rstrip()[:-1] + " " + next(lines).strip()
             break
-    assert command, f"no release call in {job}"
+    assert command, f"no {subcommand} call in {job}"
     expanded = re.sub(r"\$\{(\w+)\}|\$(\w+)", lambda m: env[m.group(1) or m.group(2)], command)
-    words = shlex.split(expanded.split(" || ", 1)[0])
+    # never `|| true`: a failed lease call must surface (the cleanup job retries a release)
+    assert " || " not in expanded, command
+    words = shlex.split(expanded)
     return words[words.index("agentic_sdlc") + 1 :]
 
 
@@ -3529,10 +3539,11 @@ def _released(gh: FakeGh, session: str) -> list[dict]:
 def test_the_failure_cleanup_release_call_releases_the_publisher_claim(
     committed, tmp_path, monkeypatch, capsys
 ):
-    """The exact `release_lease_on_failure` invocation (no --config, no env, empty
-    workspace): the committed policy names the Publisher bot; if it cannot be read (an
-    issues-only token on a private repository) or there is none, `release` still releases
-    its own session's claim rather than reporting success over a claim it ignored."""
+    """The exact `release_lease_on_failure` invocation (no --config: it reads the lease policy
+    prepare stored, ./agentic-sdlc.toml where it runs) when that file is missing: the committed
+    policy names the Publisher bot; if it cannot be read (an issues-only token on a private
+    repository) or there is none, `release` still releases its own session's claim rather than
+    reporting success over a claim it ignored."""
     from agentic_sdlc import cli, leases
 
     monkeypatch.delenv(leases.LEASE_BOT_LOGINS_ENV, raising=False)
@@ -3543,6 +3554,7 @@ def test_the_failure_cleanup_release_call_releases_the_publisher_claim(
         "ISSUE_NUMBER": "7",
         "GITHUB_RUN_ID": "4242",
         "GITHUB_SERVER_URL": "https://github.com",
+        "note": "Run did not produce a draft PR: https://github.com/o/r/actions/runs/4242",
     }
     argv = _workflow_release_argv("release_lease_on_failure", env)
     assert "--config" not in argv and argv[argv.index("--session") + 1] == "run-4242"
@@ -3570,22 +3582,86 @@ def test_the_failure_cleanup_release_call_releases_the_publisher_claim(
         leases.use_policy_bot_logins("")
 
 
-def test_the_draft_release_call_works_from_the_checked_out_base(tmp_path, monkeypatch):
-    """`publish_draft`'s release runs in the checked-out base: ./agentic-sdlc.toml names the
-    bot, so the trusted path releases it (label and all) with no extra read."""
+@pytest.mark.parametrize("job", ["publish_draft", "release_lease_on_failure"])
+def test_the_workflow_release_calls_work_from_the_stored_lease_policy(job, tmp_path, monkeypatch):
+    """Both workflow releases run in the directory holding the lease policy prepare stored
+    (./agentic-sdlc.toml): it names the bot, so the trusted path releases it (label and all)
+    with no extra read."""
+    from agentic_sdlc import cli, leases
+
+    monkeypatch.delenv(leases.LEASE_BOT_LOGINS_ENV, raising=False)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "agentic-sdlc.toml").write_text(_APP_POLICY)
+    env = {
+        "GITHUB_REPOSITORY": PROJECT,
+        "ISSUE_NUMBER": "7",
+        "GITHUB_RUN_ID": "77",
+        "note": "Draft pull request opened by this run: https://github.com/o/r/pull/9",
+    }
+    argv = _workflow_release_argv(job, env)
+    gh = _app_claimed(datetime.now(UTC), "run-77")
+    monkeypatch.setattr(cli, "run_gh", gh)
+    try:
+        assert cli.main(argv) == 0
+        assert len(_released(gh, "run-77")) == 1
+        assert "pull/9" in _released(gh, "run-77")[0]["body"]
+        assert IN_PROGRESS_LABEL not in [lbl["name"] for lbl in gh.issues[7]["labels"]]
+        assert not any("contents/" in " ".join(c) for c in gh.calls)
+    finally:
+        leases.use_policy_bot_logins("")
+
+
+_WORKFLOW_RENEWALS = ["renew_lease_before_verify", "renew_lease_before_attest", "publish_draft"]
+
+
+@pytest.mark.parametrize("job", _WORKFLOW_RENEWALS)
+def test_the_workflow_renewals_renew_this_runs_publisher_claim(job, tmp_path, monkeypatch):
+    """Each stage-boundary renewal (and the one immediately before publishing), exactly as
+    written in reusable-implement.yml, run where it runs (the stored lease policy as
+    ./agentic-sdlc.toml, passed explicitly): it extends the Publisher bot's claim of this run."""
     from agentic_sdlc import cli, leases
 
     monkeypatch.delenv(leases.LEASE_BOT_LOGINS_ENV, raising=False)
     monkeypatch.chdir(tmp_path)
     (tmp_path / "agentic-sdlc.toml").write_text(_APP_POLICY)
     env = {"GITHUB_REPOSITORY": PROJECT, "ISSUE_NUMBER": "7", "GITHUB_RUN_ID": "77"}
-    argv = _workflow_release_argv("publish_draft", env)
-    gh = _app_claimed(datetime.now(UTC), "run-77")
+    argv = _workflow_lease_argv(job, "renew", env)
+    assert argv[argv.index("--config") + 1] == "agentic-sdlc.toml"
+    assert argv[argv.index("--session") + 1] == "run-77"
+    wall = datetime.now(UTC)
+    gh = _app_claimed(wall, "run-77")
     monkeypatch.setattr(cli, "run_gh", gh)
     try:
         assert cli.main(argv) == 0
-        assert len(_released(gh, "run-77")) == 1
-        assert not any("contents/" in " ".join(c) for c in gh.calls)
+        leases.use_policy_bot_logins(_APP)
+        held = current_lease(PROJECT, 7, gh, wall)
+        assert held is not None and held.session == "run-77"
+        assert held.expires > wall + timedelta(hours=1)  # extended past the original claim
+    finally:
+        leases.use_policy_bot_logins("")
+
+
+@pytest.mark.parametrize("job", _WORKFLOW_RENEWALS)
+@pytest.mark.parametrize("why", ["closed", "taken over"])
+def test_the_workflow_renewals_stop_the_run(job, why, tmp_path, monkeypatch):
+    """A renewal that fails (issue closed, or another session holds the lease) exits non-zero
+    and posts nothing, so the job fails before the next stage -- in publish_draft, before
+    the push and the pull request."""
+    from agentic_sdlc import cli, leases
+
+    monkeypatch.delenv(leases.LEASE_BOT_LOGINS_ENV, raising=False)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "agentic-sdlc.toml").write_text(_APP_POLICY)
+    env = {"GITHUB_REPOSITORY": PROJECT, "ISSUE_NUMBER": "7", "GITHUB_RUN_ID": "77"}
+    argv = _workflow_lease_argv(job, "renew", env)
+    gh = _app_claimed(datetime.now(UTC), "run-77" if why == "closed" else "run-1")
+    if why == "closed":
+        gh.issues[7]["state"] = "closed"
+    monkeypatch.setattr(cli, "run_gh", gh)
+    before = len(gh.issues[7]["comments"])
+    try:
+        assert cli.main(argv) == 2
+        assert len(gh.issues[7]["comments"]) == before
     finally:
         leases.use_policy_bot_logins("")
 

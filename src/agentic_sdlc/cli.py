@@ -1346,7 +1346,7 @@ COMMITTED_POLICY_PATH = "agentic-sdlc.toml"
 def _committed_lease_policy(project: str) -> ProjectPolicy | None:
     """The policy committed at `COMMITTED_POLICY_PATH` on `project`'s default branch, read with
     the trusted `gh` (Codex 4242925440): a lease command run where no policy file is at hand
-    -- the failure-cleanup job's `release` runs in an empty workspace with no `--config` --
+    -- e.g. a `release` with no `--config` in a directory holding no agentic-sdlc.toml --
     still learns the Publisher bot whose claim it has to release. None only when GitHub
     answers 404 for that file (the repository commits no policy) -- the status of the
     response as `run_gh` parsed it (`gh_http_status`), never a "404" anywhere in the message,

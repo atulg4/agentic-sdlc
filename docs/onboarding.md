@@ -256,9 +256,9 @@ event of a required label and every `edited` event in one group per issue
 `unlabeled` and `edited` runs. Closing the issue cancels a queued or running implementation or
 planning run the same way (Codex 4242753923, 4242925431): the `closed` run joins the issue's
 group with `cancel-in-progress` and starts nothing itself (`authorize` / `preflight` require
-`labeled`, although a closed issue keeps its labels). The reusable workflow does not yet re-read the issue state just before publishing, so
-a close that lands after the patch is generated but before the cancel takes effect can still
-publish a draft PR. A Triage user who removes a writer's label and re-applies it while the
+`labeled`, although a closed issue keeps its labels). The reusable workflow also renews its lease after generation, after verification and
+immediately before pushing, and `renew` refuses once the issue is closed, so a close that lands
+before that last renewal stops the run without publishing. A Triage user who removes a writer's label and re-applies it while the
 authorized run waits for a runner therefore cancels that run; the `unlabeled` run itself starts
 nothing (every label condition requires `github.event.action == 'labeled'`), and the re-applied
 label starts a run that re-authorizes from the label history -- and finds the Triage user.
@@ -266,10 +266,10 @@ Every other label event, the lease's own `in-progress` label included, gets a gr
 and cancels nothing; for planning, applying the second planning label queues behind the run the
 first one started (a `labeled` run never cancels), and `dedupe` keeps it from planning twice. A cancelled run reports like any other: `authorization_failed` (its
 message says that removing an approval label cancels a run) or `notify_failure`, and the
-reusable workflow's `release_lease_on_failure` releases a lease once `prepare` has succeeded.
+reusable workflow's `release_lease_on_failure` releases the lease of any run whose claim may
+have been posted, a cancelled or failed `prepare` included.
 **Residual risk:** cancellation is asynchronous, so steps already executing finish their current
-work first, and a run cancelled between `claim` and the end of `prepare` keeps its lease until
-it expires. The pinned reusable workflow re-checks only `trigger_actor`'s permission, not the
+work first. The pinned reusable workflow re-checks only `trigger_actor`'s permission, not the
 label history; a re-check of the label set inside it is left to the platform's maintainer.
 The cloud routine re-authorizes the labels in its LAST gate, immediately before pushing and
 after check-diff and the lease check: step 4d of its prompt runs ONE command, `sdlcctl
