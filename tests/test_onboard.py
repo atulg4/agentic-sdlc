@@ -2377,6 +2377,13 @@ def test_doctor_rejects_a_ci_gate_whose_failure_is_ignored(tmp_path, mutate):
         ("! tee /dev/null | pytest", "bash", False),
         ("! pytest | tee /dev/null", "bash", False),
         ("if true | pytest; then echo; fi", "bash", False),
+        # After an option change the parser cannot read, no `set` proves an option ON
+        # (Codex 4252099401/4252099389).
+        ("trap set\\ +e\\ +o\\ pipefail DEBUG; set -e -o pipefail; pytest | true", "bash", False),
+        ("set +e +o pipefail; enable -n set; set -e -o pipefail; pytest | true", "bash", False),
+        # `set -n` reads the rest without running it (Codex 4252099381).
+        ("set -n; pytest", "bash", False),
+        ("set -o noexec; pytest", "bash", False),
         ("set -o pipefail; echo ok; pytest | tee out", None, True),
         # `o` anywhere in a cluster takes the option name (Codex 4251046345).
         ("set +ou pipefail; pytest | tee out", "bash", False),

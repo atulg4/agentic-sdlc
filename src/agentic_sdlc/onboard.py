@@ -6688,6 +6688,19 @@ _SET_OPTION_NAMES = {
 }  # fmt: skip
 
 
+def _set_enables_noexec(arguments: list[str]) -> bool:
+    """Whether a `set` call may turn on `noexec` (`-n`, `-o noexec`): bash then reads every later
+    command without running it. Judged on any option-looking word, so an unreadable call fails
+    closed."""
+    for index, word in enumerate(arguments):
+        if len(word) > 1 and word[0] == "-" and word[1:].isalpha():
+            if "n" in word[1:]:
+                return True
+            if "o" in word[1:] and index + 1 < len(arguments) and arguments[index + 1] == "noexec":
+                return True
+    return False
+
+
 def _set_options(arguments: list[str]) -> tuple[dict[str, bool], bool]:
     """The `errexit`/`pipefail` changes a `set` call's arguments make, parsed as bash does: options
     (`-e`, `+e`, `-o NAME`, `+o NAME`, clustered as in `-euo pipefail`) until `--`, `-` or the first
@@ -6889,6 +6902,10 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                     # every way to spell `set +o pipefail` cannot be done; failing closed can.
                     errexit = False
                     pipefail = False
+                    # A DEBUG trap re-runs before every later command, and `enable -n set`
+                    # disables `set` itself (Codex 4252099401/4252099389): after any option
+                    # change the parser cannot read, no later `set` proves an option ON.
+                    opaque = True
                 if invocation is not None:
                     arguments, plain = invocation
                     # Turning an option ON counts only when the parent shell surely runs this
@@ -6910,6 +6927,9 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                         and following not in {"|", "|&", "&", "||"}
                     )
                     changes, trusted = _set_options(arguments)
+                    if _set_enables_noexec(arguments):
+                        # `set -n` reads the rest without running it (Codex 4252099381).
+                        terminated = True
                     for option, on in changes.items():
                         if on and not (in_parent and trusted):
                             continue
