@@ -175,7 +175,11 @@ def test_gates_run_when_python3_matches_ci_python_version(monkeypatch, tmp_path:
     assert report["passed"] is True
 
 
-def test_gates_fail_closed_when_python3_is_another_version(monkeypatch, tmp_path: Path) -> None:
+def test_gates_warn_but_run_when_python3_is_another_version(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    # A warning, not a failure: the platform's verify job installs no Python yet, so failing
+    # closed would fail every verification whose policy pins another version.
     _fake_python3(tmp_path / "bin", "3.11.9")
     monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:/usr/bin:/bin")
     marker = tmp_path / "ran"
@@ -185,18 +189,21 @@ def test_gates_fail_closed_when_python3_is_another_version(monkeypatch, tmp_path
         f'[commands]\ntest = "touch {marker}"\n\n[verification]\ngates = ["test"]\n',
         encoding="utf-8",
     )
-    with pytest.raises(GateError, match=r"Python 3\.11\.9.*python_version is 3\.12\.4"):
-        run_gates(config, tmp_path)
-    assert not marker.exists()  # no gate ran
+    run_gates(config, tmp_path)
+    assert marker.exists()  # the gate ran
+    err = capsys.readouterr().err
+    assert "::warning::" in err
+    assert "Python 3.11.9" in err and "python_version is 3.12.4" in err
 
 
-def test_gates_fail_closed_without_python3_when_a_version_is_required(
-    monkeypatch, tmp_path: Path
+def test_gates_warn_without_python3_when_a_version_is_set(
+    monkeypatch, tmp_path: Path, capsys
 ) -> None:
     (tmp_path / "empty").mkdir()
     monkeypatch.setenv("PATH", str(tmp_path / "empty"))
-    with pytest.raises(GateError, match="no python3"):
-        run_gates(_python_config(tmp_path / "policy.toml", "3.12"), tmp_path)
+    run_gates(_python_config(tmp_path / "policy.toml", "3.12"), tmp_path)
+    err = capsys.readouterr().err
+    assert "::warning::" in err and "no python3" in err
 
 
 def test_gates_only_warn_when_ci_python_version_is_unset(
