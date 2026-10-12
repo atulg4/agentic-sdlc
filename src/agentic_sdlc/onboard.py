@@ -1401,6 +1401,15 @@ settings); it installs the platform at exactly the commit this repository's work
 prompt checks the install (`sdlcctl --version` must print `commit {spec.platform_ref}`) and
 stops the run before anything is claimed when it does not.
 
+**Trust boundary** (Codex 4244027563): the routine's agent runs as the same user that owns this
+install -- in Claude Code cloud environments, root -- so it can replace `sdlcctl` (or the git
+and gh it calls) after step 0 has checked the version. Installing elsewhere does not change
+that: no location is out of reach of an agent running as root, and as root ownership cannot
+tell a system file from one the session wrote. The `sdlcctl` gates, like the hooks, are a
+guardrail against mistakes and casual misuse, not a sandbox. What enforces the workflow is
+server-side: the `Protect main` ruleset (no bypass) and its required review (at
+`required_approvals = 0` the human-merge boundary is not enforced; `doctor` says so).
+
 ## Routine prompt
 
 Suggested routine prompt (create it with the `schedule` skill or the claude.ai routines UI):
