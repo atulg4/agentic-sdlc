@@ -65,6 +65,9 @@ PROJECT_CAPABILITIES = frozenset(
 
 _PROJECT_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 _REPOSITORY_ID = re.compile(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+")
+#: GitLab's own full-path cap; the bound that keeps every registry-valid
+#: repository identifier referenceable within the read model's text budget.
+MAX_REPOSITORY_LENGTH = 255
 _ENVIRONMENT_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 _GROUP = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 _SECRET_KEY = re.compile(r"credential|secret|token|password|passphrase|apikey|api_key", re.I)
@@ -268,6 +271,14 @@ def _load_repository(raw: Any, label: str) -> ProjectRepository:
     provider = _text(entry, "provider", label)
     _require(provider in SCM_PROVIDERS, f"{label}: unknown provider: {provider}")
     identifier = _pattern(_text(entry, "identifier", label), _REPOSITORY_ID, f"{label}: identifier")
+    # The shared reference contract: a repository identifier stays within 255
+    # characters (GitLab's own full-path cap), so a tracker reference built
+    # from it (identifier plus #N/!N and a rule suffix) always fits the read
+    # model's 512-character text budget.
+    _require(
+        len(identifier) <= MAX_REPOSITORY_LENGTH,
+        f"{label}: identifier must be at most {MAX_REPOSITORY_LENGTH} characters",
+    )
     role = _text(entry, "role", label, required=False) or "primary"
     _require(role in REPOSITORY_ROLES, f"{label}: unknown role: {role}")
     return ProjectRepository(

@@ -49,6 +49,12 @@ def _require(condition: bool, message: str) -> None:
 _PARENT_URL = re.compile(r"/issues/(\d+)/?$")
 _PARENT_REPOSITORY = re.compile(r"/repos/([^/\s]+/[^/\s]+)/issues/\d+/?$")
 _REPOSITORY_URL = re.compile(r"/repos/([^/\s]+/[^/\s]+)/?$")
+#: A GitHub issue's own web address, exactly: the exported link must identify
+#: the validated repository and number, never an arbitrary https destination.
+_ISSUE_URL = re.compile(
+    r"https://github\.com/(?P<name>[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)"
+    r"/(?:issues|pull)/(?P<number>\d+)"
+)
 
 #: The OWNER/REPO shape every GitHub repository identifier must carry; a bare
 #: or slashless value would generate references no registry entry or ledger
@@ -531,8 +537,25 @@ def backlog_document_from_issues(
         if state:
             item["declaredState"] = state
         url = issue.get("html_url")
-        if isinstance(url, str) and url.startswith("https://"):
-            item["url"] = url
+        if url is not None and url != "":
+            # The console turns the issue title into this link, so the URL
+            # must IDENTIFY the validated issue: a payload carrying a correct
+            # repository_url and number but a foreign html_url could
+            # otherwise present any site as the local issue.
+            _require(isinstance(url, str), f"issue {number!r}: html_url must be a string")
+            assert isinstance(url, str)
+            match = _ISSUE_URL.fullmatch(url.strip())
+            _require(
+                match is not None,
+                f"issue {number!r}: html_url is not a recognized GitHub issue URL: {url}",
+            )
+            assert match is not None
+            _require(
+                match.group("name").lower() == repository.lower()
+                and int(match.group("number")) == number,
+                f"issue {number!r}: html_url does not identify {repository}#{number}: {url}",
+            )
+            item["url"] = url.strip()
         updated = issue.get("updated_at")
         if isinstance(updated, str) and updated:
             item["updatedAt"] = updated
