@@ -23,6 +23,12 @@ from .capacity_metrics import (
     build_capacity_report,
     load_capacity_inputs,
 )
+from .context_builder import (
+    DEFAULT_PACKET_BYTES,
+    ContextBuilderError,
+    build_context_packet,
+    verification_from_dict,
+)
 from .dashboard_efficiency import build_infrastructure_blocker_panel
 from .event_ledger import EventLedger, LedgerError, LifecycleStage, load_lifecycle_event
 from .events import EventError, normalize_event
@@ -54,7 +60,7 @@ from .infra_recovery import (
     retry_state_from_comments,
     write_retry_state,
 )
-from .knowledge import KnowledgeError, load_sources
+from .knowledge import KnowledgeError, load_sources, record_from_dict
 from .leases import (
     DEFAULT_TTL_MINUTES,
     LEASE_BOT_LOGINS_ENV,
@@ -803,6 +809,58 @@ def _dispatch_mission(args: argparse.Namespace) -> int:
         input_refs=tuple(args.input_ref),
     )
     _write(envelope, args.output)
+    return 0
+
+
+def _context_packet(args: argparse.Namespace) -> int:
+    policy = load_policy(args.config)
+    registry = load_registry(args.missions, policy)
+    sources = {source.source_id: source for source in load_sources(args.knowledge)}
+    request = json.loads(Path(args.request).read_text(encoding="utf-8"))
+    if not isinstance(request, dict):
+        raise ContextBuilderError("packet request must be a JSON object")
+
+    def _request_text(key: str) -> str:
+        value = request.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ContextBuilderError(f"packet request field {key} must be a non-empty string")
+        return value
+
+    task_entry = request.get("task")
+    if not isinstance(task_entry, dict):
+        raise ContextBuilderError("packet request task must be an object")
+    labels = task_entry.get("labels", [])
+    if not isinstance(labels, list) or not all(isinstance(item, str) for item in labels):
+        raise ContextBuilderError("packet request task labels must be an array of strings")
+    title = task_entry.get("title")
+    body = task_entry.get("body")
+    if not isinstance(title, str) or not isinstance(body, str):
+        raise ContextBuilderError("packet request task title and body must be strings")
+    task = parse_task(title, body, tuple(labels))
+
+    records_entry = request.get("records", [])
+    if not isinstance(records_entry, list):
+        raise ContextBuilderError("packet request records must be an array")
+    records = tuple(record_from_dict(entry) for entry in records_entry)
+    failures = request.get("retrievalFailures", [])
+    if not isinstance(failures, list) or not all(isinstance(item, str) for item in failures):
+        raise ContextBuilderError("packet request retrievalFailures must be an array of strings")
+    verification = None
+    if request.get("verification") is not None:
+        verification = verification_from_dict(request["verification"])
+
+    packet = build_context_packet(
+        registry.get(_request_text("missionId")),
+        task,
+        policy,
+        work_ref=_request_text("workRef"),
+        records=records,
+        sources=sources,
+        verification=verification,
+        budget_bytes=request.get("budgetBytes", DEFAULT_PACKET_BYTES),
+        retrieval_failures=tuple(failures),
+    )
+    _write(packet.as_dict(), args.output)
     return 0
 
 
@@ -1801,6 +1859,14 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch.add_argument("--output")
     dispatch.set_defaults(handler=_dispatch_mission)
 
+    packet = commands.add_parser("context-packet")
+    packet.add_argument("--config", required=True)
+    packet.add_argument("--missions")
+    packet.add_argument("--knowledge", required=True)
+    packet.add_argument("--request", required=True)
+    packet.add_argument("--output")
+    packet.set_defaults(handler=_context_packet)
+
     executors = commands.add_parser("validate-executors")
     executors.add_argument("--executors", required=True)
     executors.add_argument("--output")
@@ -2243,6 +2309,7 @@ def main(argv: list[str] | None = None) -> int:
         TaskSpecError,
         ArtifactError,
         CapacityError,
+        ContextBuilderError,
         EventError,
         ExecutorError,
         GateError,
