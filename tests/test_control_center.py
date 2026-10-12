@@ -2153,6 +2153,113 @@ def test_approval_proof_retires_a_stale_approval_wait():
     assert snapshot.get("forge").incidents == ()
 
 
+def test_approval_proof_does_not_retire_a_released_spec_label_loss():
+    # The released-spec rule reports MISSING dispatch labels, which an
+    # approved unit still needs before anything can fire: approval proof
+    # leaves it standing, and only dispatch proof retires it.
+    stale = _incident(
+        incidentId="acme/forge#7:released-spec-without-dispatch-labels",
+        kind="awaiting-human-approval",
+        severity="degraded",
+        backlogItemId="acme/forge#7",
+    )
+    backlog = load_backlog_document(
+        _document(_backlog(itemId="acme/forge#7", issueRef="acme/forge#7"))
+    )
+    approved = _ledger(
+        *_chain(
+            TO_PLANNED + ("approved",),
+            workUnit={"projectId": "forge", "workUnitId": "wu-1", "issueRef": "acme/forge#7"},
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=approved.projections(),
+        backlog=backlog,
+        incidents=load_incident_document(_incidents(stale)),
+    )
+    kept = snapshot.get("forge").incidents
+    assert [item.incident_id for item in kept] == [
+        "acme/forge#7:released-spec-without-dispatch-labels"
+    ]
+    dispatched = _ledger(
+        *_chain(
+            TO_PLANNED + ("approved", "dispatched"),
+            workUnit={"projectId": "forge", "workUnitId": "wu-1", "issueRef": "acme/forge#7"},
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=dispatched.projections(),
+        backlog=backlog,
+        incidents=load_incident_document(_incidents(stale)),
+    )
+    assert snapshot.get("forge").incidents == ()
+
+
+def test_a_malformed_issue_state_is_a_controlled_error():
+    for bad in (False, 1, "merged", ""):
+        with pytest.raises(ControlCenterError, match="state must be"):
+            incidents_from_issues(
+                [{"number": 1, "title": "odd", "state": bad, "labels": []}],
+                project_id="forge",
+                repository="acme/forge",
+                observed_at=NOW,
+            )
+        with pytest.raises(ControlCenterError, match="state must be"):
+            backlog_document_from_issues(
+                [{"number": 1, "title": "odd", "state": bad, "labels": []}],
+                project_id="forge",
+                repository="acme/forge",
+            )
+
+
+def test_scratch_paths_never_collide_with_sibling_outputs(tmp_path):
+    # An output deliberately named like another output's staging or backup
+    # path must survive the group write intact.
+    import os
+
+    from agentic_sdlc.cli import main as cli_main
+
+    for tag in ("staged", "backup"):
+        base = tmp_path / tag
+        base.mkdir()
+        issues = base / "issues.json"
+        issues.write_text(json.dumps([]), encoding="utf-8")
+        backlog_out = base / "out.json"
+        backlog_out.write_text("old backlog", encoding="utf-8")
+        incidents_out = base / f"out.json.{tag}-{os.getpid()}-0"
+        incidents_out.write_text("old incidents", encoding="utf-8")
+        assert (
+            cli_main(
+                [
+                    "github-backlog",
+                    "--issues",
+                    str(issues),
+                    "--project-id",
+                    "forge",
+                    "--repository",
+                    "acme/forge",
+                    "--backlog-output",
+                    str(backlog_out),
+                    "--incidents-output",
+                    str(incidents_out),
+                ]
+            )
+            == 0
+        )
+        assert json.loads(backlog_out.read_text(encoding="utf-8"))["items"] == []
+        assert json.loads(incidents_out.read_text(encoding="utf-8"))["incidents"] == []
+        leftovers = {entry.name for entry in base.iterdir()} - {
+            issues.name,
+            backlog_out.name,
+            incidents_out.name,
+        }
+        assert leftovers == set()
+
+
 def test_a_failing_check_on_a_behind_branch_reports_both_requirements():
     incidents = incidents_from_change_requests(
         [{"number": 7, "title": "both", "mergeable_state": "behind"}],

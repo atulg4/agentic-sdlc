@@ -179,6 +179,23 @@ def _write_group(documents: list[tuple[Any, str | None]]) -> None:
     failure restores the destinations already replaced, so a failure never
     leaves the set describing two different exports."""
 
+    destinations = {Path(output).resolve() for _, output in documents if output}
+    taken: set[Path] = set()
+
+    def _scratch(destination: Path, tag: str) -> Path:
+        # Staging and backup paths must stay disjoint from every destination
+        # and every existing file: a sibling output that happens to be named
+        # like a scratch path must never be overwritten or unlinked by this
+        # group's bookkeeping.
+        counter = 0
+        while True:
+            candidate = destination.with_name(f"{destination.name}.{tag}-{os.getpid()}-{counter}")
+            resolved = candidate.resolve()
+            if resolved not in destinations and resolved not in taken and not candidate.exists():
+                taken.add(resolved)
+                return candidate
+            counter += 1
+
     staged: list[tuple[Path, Path]] = []
     try:
         for data, output in documents:
@@ -187,7 +204,7 @@ def _write_group(documents: list[tuple[Any, str | None]]) -> None:
             destination = Path(output)
             if destination.is_dir():
                 raise OSError(f"output names an existing directory: {destination}")
-            temp = destination.with_name(destination.name + f".staged-{os.getpid()}")
+            temp = _scratch(destination, "staged")
             temp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             staged.append((temp, destination))
     except BaseException:
@@ -199,7 +216,7 @@ def _write_group(documents: list[tuple[Any, str | None]]) -> None:
         for temp, destination in staged:
             backup: Path | None = None
             if destination.exists():
-                backup = destination.with_name(destination.name + f".backup-{os.getpid()}")
+                backup = _scratch(destination, "backup")
                 os.replace(destination, backup)
             # Track the backup before replacing: a failure between the two
             # moves must still restore this destination from its backup.
