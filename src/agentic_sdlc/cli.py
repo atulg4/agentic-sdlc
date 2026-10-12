@@ -52,6 +52,7 @@ from .git_diff import (
     resolve_commit,
 )
 from .github_backlog import (
+    LifecycleLabels,
     backlog_document_from_issues,
     incident_document,
     incidents_from_change_requests,
@@ -206,6 +207,10 @@ def _write_group(documents: list[tuple[Any, str | None]]) -> None:
                 raise OSError(f"output names an existing directory: {destination}")
             temp = _scratch(destination, "staged")
             temp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            if destination.exists():
+                # The replacement must not reset deliberate permissions: a
+                # 0660 shared output stays group-writable, a 0600 one private.
+                temp.chmod(destination.stat().st_mode & 0o7777)
             staged.append((temp, destination))
     except BaseException:
         for temp, _ in staged:
@@ -1123,6 +1128,16 @@ def _sub_issue_group(entry: str) -> tuple[Any, int | None]:
 
 
 def _github_backlog(args: argparse.Namespace) -> int:
+    labels = None
+    if args.config:
+        # The policy can rename the automation labels; the generated workflows
+        # then fire on those names, so the adapter must evaluate the same ones.
+        policy = load_policy(args.config)
+        labels = LifecycleLabels(
+            ready=policy.ready_label,
+            human_review=policy.human_review_label,
+            implementation=policy.implementation_label,
+        )
     issues = _record_array(_json_file(args.issues), "--issues", require_number=True)
     links = parent_links(*(_sub_issue_group(entry) for entry in args.sub_issues))
     backlog = backlog_document_from_issues(
@@ -1130,6 +1145,7 @@ def _github_backlog(args: argparse.Namespace) -> int:
         project_id=args.project_id,
         repository=args.repository,
         parents=links,
+        labels=labels,
     )
     observed_at = args.observed_at or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     groups = [
@@ -1138,6 +1154,7 @@ def _github_backlog(args: argparse.Namespace) -> int:
             project_id=args.project_id,
             repository=args.repository,
             observed_at=observed_at,
+            labels=labels,
         )
     ]
     if args.failing and not args.pulls:
@@ -2126,6 +2143,7 @@ def build_parser() -> argparse.ArgumentParser:
     control_center.set_defaults(handler=_control_center)
 
     github_backlog = commands.add_parser("github-backlog")
+    github_backlog.add_argument("--config")
     github_backlog.add_argument("--issues", required=True)
     github_backlog.add_argument("--project-id", required=True)
     github_backlog.add_argument("--repository", required=True)

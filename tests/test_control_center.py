@@ -41,6 +41,7 @@ from agentic_sdlc.event_ledger import (
 )
 from agentic_sdlc.github_backlog import (
     DISPATCH_RULES,
+    LifecycleLabels,
     backlog_document_from_issues,
     incident_document,
     incidents_from_change_requests,
@@ -836,7 +837,7 @@ def test_combining_incident_groups_produces_a_loadable_document():
 def test_the_adapter_requires_a_project_and_a_repository():
     with pytest.raises(ControlCenterError, match="project_id is required"):
         backlog_document_from_issues([], project_id="", repository="acme/forge")
-    with pytest.raises(ControlCenterError, match="repository is required"):
+    with pytest.raises(ControlCenterError, match="OWNER/REPO"):
         backlog_document_from_issues([], project_id="forge", repository="")
 
 
@@ -1894,6 +1895,205 @@ def test_adapter_outputs_must_not_overwrite_inputs(tmp_path):
         == 2
     )
     assert json.loads(issues.read_text(encoding="utf-8")) == []
+
+
+def test_a_malformed_repository_is_a_controlled_error():
+    for bad in ("typo", "owner/", "/repo", "owner repo", "owner/repo/extra", ""):
+        with pytest.raises(ControlCenterError, match="OWNER/REPO"):
+            backlog_document_from_issues([], project_id="forge", repository=bad)
+        with pytest.raises(ControlCenterError, match="OWNER/REPO"):
+            incidents_from_issues([], project_id="forge", repository=bad, observed_at=NOW)
+        with pytest.raises(ControlCenterError, match="OWNER/REPO"):
+            incidents_from_change_requests([], project_id="forge", repository=bad, observed_at=NOW)
+
+
+def test_configured_label_names_drive_the_dispatch_rules():
+    issues = [_issue(1, "renamed ready", ["claude-ready", "human-review-required"])]
+    # With the platform defaults, claude-ready is an unknown label: no
+    # dispatch rule fires and nothing warns that the plan trigger is waiting.
+    assert (
+        incidents_from_issues(issues, project_id="forge", repository="acme/forge", observed_at=NOW)
+        == []
+    )
+    configured = LifecycleLabels(ready="claude-ready")
+    incidents = incidents_from_issues(
+        issues,
+        project_id="forge",
+        repository="acme/forge",
+        observed_at=NOW,
+        labels=configured,
+    )
+    assert [item["incidentId"] for item in incidents] == [
+        "acme/forge#1:plan-ready-awaiting-dispatch-evidence"
+    ]
+    assert "claude-ready" in incidents[0]["summary"]
+    document = backlog_document_from_issues(
+        [_issue(2, "approved", ["implementation-approved", "claude-ready"])],
+        project_id="forge",
+        repository="acme/forge",
+        labels=configured,
+    )
+    assert document["items"][0]["declaredState"] == "approved"
+
+
+def test_lifecycle_label_names_are_validated():
+    with pytest.raises(ControlCenterError, match="non-empty string"):
+        LifecycleLabels(ready="")
+    with pytest.raises(ControlCenterError, match="non-empty string"):
+        LifecycleLabels(ready=None)  # type: ignore[arg-type]
+    with pytest.raises(ControlCenterError, match="distinct"):
+        LifecycleLabels(ready="same", human_review="SAME")
+    with pytest.raises(ControlCenterError, match="distinct"):
+        LifecycleLabels(ready="spec-drafted")
+
+
+def test_the_cli_reads_configured_labels_from_the_policy(tmp_path):
+    from agentic_sdlc.cli import main as cli_main
+
+    config = tmp_path / "agentic-sdlc.toml"
+    config.write_text(
+        "\n".join(
+            (
+                "version = 1",
+                "[project]",
+                'id = "acme/forge"',
+                'provider = "github"',
+                'default_branch = "main"',
+                "[automation]",
+                'ready_label = "claude-ready"',
+                'human_review_label = "human-review-required"',
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    issues = tmp_path / "issues.json"
+    issues.write_text(
+        json.dumps(
+            [
+                {
+                    "number": 1,
+                    "title": "renamed ready",
+                    "state": "open",
+                    "labels": ["claude-ready", "human-review-required"],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    incidents_out = tmp_path / "incidents.json"
+    backlog_out = tmp_path / "backlog.json"
+    assert (
+        cli_main(
+            [
+                "github-backlog",
+                "--config",
+                str(config),
+                "--issues",
+                str(issues),
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+                "--backlog-output",
+                str(backlog_out),
+                "--incidents-output",
+                str(incidents_out),
+            ]
+        )
+        == 0
+    )
+    written = json.loads(incidents_out.read_text(encoding="utf-8"))
+    assert [item["incidentId"] for item in written["incidents"]] == [
+        "acme/forge#1:plan-ready-awaiting-dispatch-evidence"
+    ]
+
+
+def test_staged_replacement_preserves_destination_mode(tmp_path):
+    import stat
+
+    from agentic_sdlc.cli import main as cli_main
+
+    issues = tmp_path / "issues.json"
+    issues.write_text(json.dumps([]), encoding="utf-8")
+    backlog_out = tmp_path / "backlog.json"
+    backlog_out.write_text("old", encoding="utf-8")
+    backlog_out.chmod(0o600)
+    assert (
+        cli_main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+                "--backlog-output",
+                str(backlog_out),
+            ]
+        )
+        == 0
+    )
+    assert json.loads(backlog_out.read_text(encoding="utf-8"))["items"] == []
+    assert stat.S_IMODE(backlog_out.stat().st_mode) == 0o600
+
+
+def test_a_ledger_style_work_unit_id_is_accepted_and_joins():
+    # The ledger accepts any bounded non-empty string as a work-unit id, so
+    # the Control Center must address the same ids from backlog items and
+    # incidents instead of applying the tracker-reference character set.
+    unit = "wu@2026/10#12:alpha β"
+    ledger = _ledger(
+        *_chain(
+            TO_IMPLEMENTING,
+            work_unit=unit,
+            workUnit={"projectId": "forge", "workUnitId": unit, "issueRef": "acme/forge#7"},
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        backlog=load_backlog_document(_document(_backlog(itemId="acme/forge#7", workUnitId=unit))),
+        incidents=load_incident_document(
+            _incidents(
+                _incident(
+                    incidentId="acme/forge#7:ci",
+                    kind="deterministic-ci-failed",
+                    severity="blocker",
+                    workUnitId=unit,
+                )
+            )
+        ),
+    )
+    view = snapshot.get("forge")
+    assert view.backlog[0].state == "implementing"
+    assert not any("unknown work unit" in warning for warning in view.warnings)
+
+
+def test_direct_work_unit_evidence_retires_without_a_backlog():
+    # An incident naming only a work unit must retire on that unit's own
+    # ledger state even when no backlog document was supplied at all.
+    stale = _incident(
+        incidentId="acme/forge#7:blocked",
+        kind="dispatch-blocked",
+        severity="blocker",
+        workUnitId="wu-1",
+    )
+    ledger = _ledger(
+        *_chain(
+            TO_IMPLEMENTING,
+            workUnit={"projectId": "forge", "workUnitId": "wu-1", "issueRef": "acme/forge#7"},
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        incidents=load_incident_document(_incidents(stale)),
+    )
+    assert snapshot.get("forge").incidents == ()
 
 
 def test_a_non_string_pull_state_is_a_controlled_error():
