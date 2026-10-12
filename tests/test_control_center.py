@@ -1896,6 +1896,39 @@ def test_adapter_outputs_must_not_overwrite_inputs(tmp_path):
     assert json.loads(issues.read_text(encoding="utf-8")) == []
 
 
+def test_adapter_outputs_are_staged_as_a_pair(tmp_path):
+    # A failed incident write must not leave a freshly replaced backlog next
+    # to a stale incident file: the pair would describe two different exports.
+    from agentic_sdlc.cli import main as cli_main
+
+    issues = tmp_path / "issues.json"
+    issues.write_text(json.dumps([]), encoding="utf-8")
+    backlog_out = tmp_path / "backlog.json"
+    backlog_out.write_text("stale backlog", encoding="utf-8")
+    incidents_out = tmp_path / "missing-directory" / "incidents.json"
+    assert (
+        cli_main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+                "--backlog-output",
+                str(backlog_out),
+                "--incidents-output",
+                str(incidents_out),
+            ]
+        )
+        == 2
+    )
+    assert backlog_out.read_text(encoding="utf-8") == "stale backlog"
+    assert not incidents_out.exists()
+    assert not list(tmp_path.glob("*.staged-*"))
+
+
 def test_a_conflicted_pull_with_a_failing_check_reports_both_blockers():
     incidents = incidents_from_change_requests(
         [{"number": 7, "title": "both", "mergeable_state": "dirty"}],

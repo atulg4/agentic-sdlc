@@ -173,6 +173,31 @@ def _write(data: Any, output: str | None) -> None:
         sys.stdout.write(rendered)
 
 
+def _write_group(documents: list[tuple[Any, str | None]]) -> None:
+    """Write a document set as a group: every file target is staged next to
+    its destination before any destination is replaced, so a failed write
+    never leaves the set describing two different exports."""
+
+    staged: list[tuple[Path, Path]] = []
+    try:
+        for data, output in documents:
+            if not output:
+                continue
+            destination = Path(output)
+            temp = destination.with_name(destination.name + f".staged-{os.getpid()}")
+            temp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            staged.append((temp, destination))
+    except BaseException:
+        for temp, _ in staged:
+            temp.unlink(missing_ok=True)
+        raise
+    for temp, destination in staged:
+        os.replace(temp, destination)
+    for data, output in documents:
+        if not output:
+            _write(data, None)
+
+
 def _validate_task(args: argparse.Namespace) -> int:
     body = Path(args.task).read_text(encoding="utf-8")
     task = parse_task(args.title, body, tuple(args.label))
@@ -1118,9 +1143,10 @@ def _github_backlog(args: argparse.Namespace) -> int:
     incidents_document = incident_document(*groups) if args.incidents_output else None
     if incidents_document is not None:
         load_incident_document(incidents_document)
-    _write(backlog, args.backlog_output)
+    documents: list[tuple[Any, str | None]] = [(backlog, args.backlog_output)]
     if incidents_document is not None:
-        _write(incidents_document, args.incidents_output)
+        documents.append((incidents_document, args.incidents_output))
+    _write_group(documents)
     return 0
 
 
