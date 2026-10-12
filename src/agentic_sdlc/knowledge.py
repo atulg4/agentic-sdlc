@@ -36,6 +36,7 @@ __all__ = [
     "check_adapter_conformance",
     "load_sources",
     "pack_invalidation_reasons",
+    "record_from_dict",
     "render_evidence_for_prompt",
     "resolve_anchor",
 ]
@@ -209,6 +210,63 @@ def _validate_record(record: EvidenceRecord) -> None:
     for link in record.links:
         if link.kind not in LINK_KINDS:
             raise KnowledgeError(f"evidence link kind is unknown: {link.kind}")
+
+
+def record_from_dict(document: Mapping[str, Any]) -> EvidenceRecord:
+    """Rebuild one evidence record from its ``as_dict`` document, fully validated.
+
+    The inverse of :meth:`EvidenceRecord.as_dict`, for evidence that crossed a
+    file or process boundary. The payload hash is re-verified, so a document
+    whose content was altered in transit is rejected rather than trusted.
+    """
+    if not isinstance(document, Mapping):
+        raise KnowledgeError("evidence record must be an object")
+
+    def _text(key: str, default: str = "") -> str:
+        value = document.get(key, default)
+        if not isinstance(value, str):
+            raise KnowledgeError(f"evidence record field {key} must be a string")
+        return value
+
+    anchors = document.get("anchors", [])
+    if (
+        not isinstance(anchors, Sequence)
+        or isinstance(anchors, str)
+        or not all(isinstance(item, str) for item in anchors)
+    ):
+        raise KnowledgeError("evidence record anchors must be an array of strings")
+    raw_links = document.get("links", [])
+    if not isinstance(raw_links, Sequence) or isinstance(raw_links, str):
+        raise KnowledgeError("evidence record links must be an array of objects")
+    links = []
+    for entry in raw_links:
+        if (
+            not isinstance(entry, Mapping)
+            or not isinstance(entry.get("kind"), str)
+            or not isinstance(entry.get("target"), str)
+        ):
+            raise KnowledgeError("evidence record links must be objects with kind and target")
+        links.append(EvidenceLink(kind=entry["kind"], target_evidence_id=entry["target"]))
+    record = EvidenceRecord(
+        source_id=_text("sourceId"),
+        source_type=_text("sourceType"),
+        external_id=_text("externalId"),
+        locator=_text("locator"),
+        scope=_text("scope"),
+        content_sha256=_text("contentSha256"),
+        revision=_text("revision"),
+        payload=_text("payload"),
+        classification=_text("classification", "internal"),
+        author=_text("author"),
+        created_at=_text("createdAt"),
+        updated_at=_text("updatedAt"),
+        retrieved_at=_text("retrievedAt"),
+        freshness=_text("freshness", "unknown"),
+        anchors=tuple(anchors),
+        links=tuple(links),
+    )
+    _validate_record(record)
+    return record
 
 
 def sanitize_payload(text: str) -> str:
