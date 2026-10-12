@@ -70,6 +70,7 @@ set. Each kind maps to declared `RemediationAction` descriptors in
 | `review-gate-failed` | the independent reviewer withheld approval |
 | `merge-conflict` | the change request conflicts with its base |
 | `dependency-wait` | an upstream unit has not finished |
+| `awaiting-dispatch-evidence` | every label is present; confirm the trigger actually fired |
 | `awaiting-spec-review` | a drafted specification waits for its human release |
 | `awaiting-human-approval` | the plan needs a person |
 | `triage-needed` | no lifecycle label owns the item yet |

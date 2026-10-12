@@ -160,7 +160,7 @@ DISPATCH_RULES: tuple[DispatchRule, ...] = (
         rule_id="eligible-awaiting-dispatch-evidence",
         required=frozenset({"implementation-approved", "human-review-required", "agent-ready"}),
         missing=frozenset(),
-        kind="dispatch-blocked",
+        kind="awaiting-dispatch-evidence",
         severity="advisory",
         summary=(
             "Every dispatch label is present, but the bundled implementation trigger "
@@ -175,7 +175,7 @@ DISPATCH_RULES: tuple[DispatchRule, ...] = (
         rule_id=PLAN_EVIDENCE_RULE,
         required=frozenset({"agent-ready", "human-review-required"}),
         missing=frozenset({"implementation-approved"}),
-        kind="dispatch-blocked",
+        kind="awaiting-dispatch-evidence",
         severity="advisory",
         summary=(
             "Both planning labels are present, but the bundled plan trigger fires "
@@ -225,8 +225,11 @@ def _issue_labels(issue: Mapping[str, Any]) -> frozenset[str]:
     names: set[str] = set()
     for entry in raw:
         name = entry.get("name") if isinstance(entry, Mapping) else entry
-        if isinstance(name, str) and name.strip():
-            names.add(name.strip().lower())
+        _require(
+            isinstance(name, str) and bool(name.strip()),
+            f"issue {issue.get('number')}: every label must be a string or carry a string name",
+        )
+        names.add(name.strip().lower())
     return frozenset(names)
 
 
@@ -416,8 +419,11 @@ def incidents_from_change_requests(
                     "evidenceRef": ref,
                 }
             )
-            continue
+            # No continue: the branch can also be behind or otherwise impeded,
+            # and both remediation requirements are real.
         if state == "dirty":
+            continue
+        if number in checks and state in READY_MERGE_STATES:
             continue
         if state in READY_MERGE_STATES:
             incidents.append(
