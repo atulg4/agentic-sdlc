@@ -2406,6 +2406,9 @@ def test_doctor_rejects_a_ci_gate_whose_failure_is_ignored(tmp_path, mutate):
         # `shopt -s -o noexec` and `command -p exit` end the script (Codex 4252760388/-408).
         ("shopt -s -o noexec; pytest", "bash", False),
         ("command -p exit 0; pytest", "bash", False),
+        # Tilde expansion makes `set`'s arguments unreadable (Codex 4252987836).
+        ("HOME=-n; set ~; pytest", "bash", False),
+        ("cd ~/repo && pytest", "bash", True),
         ("set -o pipefail; echo ok; pytest | tee out", None, True),
         # `o` anywhere in a cluster takes the option name (Codex 4251046345).
         ("set +ou pipefail; pytest | tee out", "bash", False),
@@ -2445,6 +2448,17 @@ def test_shell_parse_enforces_a_piped_command_only_with_pipefail(script, shell, 
     pytest_runs = [flag for argv, flag in commands if argv == ("pytest",)]
     # A command the parser cannot isolate (`); pytest`) is never enforced: that fails closed too.
     assert any(pytest_runs) is enforced, commands
+
+
+@pytest.mark.parametrize(
+    "script",
+    ["command eval 'set +o pipefail'; pytest | tee out", "builtin eval x; pytest"],
+)
+def test_shell_parse_sees_eval_behind_builtin_wrappers(script):
+    # Codex 4252987831: `command eval ...` evaluates in the current shell; doctor rejects it.
+    from agentic_sdlc.onboard import _shell_parse
+
+    assert _shell_parse(script, "bash").evals
 
 
 @pytest.mark.parametrize(

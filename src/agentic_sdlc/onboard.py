@@ -6615,8 +6615,9 @@ _PIPEFAIL_SHELLS = {"bash"}
 
 
 #: Characters that make bash expand a word before `set` sees it: parameter/command
-#: substitution, brace expansion and pathname globs.
-_SHELL_EXPANSION_CHARS = set("$`{}*?[]")
+#: substitution, brace expansion, pathname globs and tilde expansion (`set ~` with HOME=-n:
+#: Codex 4252987836).
+_SHELL_EXPANSION_CHARS = set("$`{}*?[]~")
 
 #: Builtins that change shell options themselves, run a handler string that may (`trap`, also
 #: behind a redirection: Codex 4251826068), or can disable `set` and its wrappers (`enable`).
@@ -6892,16 +6893,19 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                 argv = []
             following = ";" if token is None else token
             if argv:
-                if argv[0] in _SHELL_DECLARERS:
-                    for word in argv[1:]:
+                # Judged on the command bash runs: `command eval ...` evaluates too (Codex
+                # 4252987831).
+                effective = _effective_command(argv) or [""]
+                if effective[0] in _SHELL_DECLARERS:
+                    for word in effective[1:]:
                         found = _ASSIGNMENT_WORD.match(word) or _NAME_WORD.match(word)
                         if found:
                             out.assigned.add(found.group(1) if found.groups() else word)
-                elif argv[0] == "alias":
-                    out.aliases |= {w.split("=", 1)[0] for w in argv[1:] if "=" in w}
-                elif argv[0] in {"source", "."}:
-                    out.sourced.append(argv[1] if len(argv) > 1 else "")
-                elif argv[0] == "eval":
+                elif effective[0] == "alias":
+                    out.aliases |= {w.split("=", 1)[0] for w in effective[1:] if "=" in w}
+                elif effective[0] in {"source", "."}:
+                    out.sourced.append(effective[1] if len(effective) > 1 else "")
+                elif effective[0] == "eval":
                     out.evals = True
                 invocation = _set_invocation(tuple(argv))
                 ends_script = False  # applied after this command is recorded, as `exit` is
