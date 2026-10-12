@@ -129,7 +129,12 @@ def _issue_state(issue: Mapping[str, Any]) -> str:
 
 
 #: An epic is declared by title convention or by owning sub-issues.
-EPIC_TITLE = re.compile(r"^\s*(?:[A-Z][A-Za-z]*\s+)?EPIC\b", re.I)
+#: Case-sensitive on the marker: an ordinary sentence mentioning "epic"
+#: ("Fix epic timeout handling") is not a hierarchy declaration. The
+#: documented conventions are an all-caps EPIC marker ("EPIC: ...",
+#: "EPIC P1: ...") or a capitalized "Epic:" with its colon, each optionally
+#: after one project-prefix word ("FORGE Epic: ...").
+EPIC_TITLE = re.compile(r"^\s*(?:[A-Z][A-Za-z0-9]*\s+)?(?:EPIC\b|Epic:)")
 
 #: Label sets that declare a factory state, most specific first. The first row
 #: whose ``required`` labels are all present and whose ``absent`` labels are all
@@ -595,18 +600,23 @@ def incidents_from_change_requests(
         if draft:
             continue
         number = _record_number(pull, "change request")
+        # A detail payload names its own target repository, and the adapter
+        # REQUIRES it: without base.repo.full_name there is no evidence the
+        # record belongs to this repository at all, and one naming another
+        # repository must not attribute its blockers to a same-numbered
+        # local change request.
         base = pull.get("base")
-        if isinstance(base, Mapping):
-            base_repo = base.get("repo")
-            full_name = base_repo.get("full_name") if isinstance(base_repo, Mapping) else None
-            if isinstance(full_name, str) and full_name.strip():
-                # A detail payload names its own target repository: a file
-                # fetched for another repository must not attribute its
-                # blockers to a same-numbered local change request.
-                _require(
-                    full_name.lower() == repository.lower(),
-                    f"change request {number} belongs to {full_name}, not repository {repository}",
-                )
+        base_repo = base.get("repo") if isinstance(base, Mapping) else None
+        full_name = base_repo.get("full_name") if isinstance(base_repo, Mapping) else None
+        _require(
+            isinstance(full_name, str) and bool(full_name.strip()),
+            f"change request {number}: base.repo.full_name is required",
+        )
+        assert isinstance(full_name, str)
+        _require(
+            full_name.lower() == repository.lower(),
+            f"change request {number} belongs to {full_name}, not repository {repository}",
+        )
         ref = f"{repository}!{number}"
         title = str(pull.get("title") or "")[:512]
         state = pull.get("mergeable_state")

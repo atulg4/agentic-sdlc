@@ -485,6 +485,15 @@
         if (typeof incident.incidentId !== "string" || !incident.incidentId) return `${where} has an incident without a string incidentId.`;
         if (seenIncidents.has(incident.incidentId)) return `Duplicate incidentId: ${incident.incidentId}.`;
         seenIncidents.add(incident.incidentId);
+        // Closed enums: kind and severity feed chip classes and the
+        // plan-draft instruction block, so a store-rewritten snapshot must
+        // not smuggle arbitrary text through them.
+        if (typeof incident.kind !== "string" || !Object.prototype.hasOwnProperty.call(REMEDIATIONS, incident.kind)) {
+          return `${where} has an incident with an undeclared kind.`;
+        }
+        if (!["blocker", "degraded", "advisory"].includes(incident.severity)) {
+          return `${where} has an incident with an unknown severity.`;
+        }
         const problem = arrayField(incident, "remediations", `${where} incident`);
         if (problem) return problem;
         for (const action of incident.remediations || []) {
