@@ -860,7 +860,7 @@
         incident.observedAt ? el("span", { text: "observed " + incident.observedAt }) : null,
       ),
     );
-    for (const action of incident.remediations || []) card.append(remediationNode(action));
+    for (const action of declaredRemediations(incident.kind)) card.append(remediationNode(action));
     card.append(noteNode(incident, note, contradicted));
     return card;
   }
@@ -880,6 +880,222 @@
     }
     return el("span", { class: "mono", text: reference });
   }
+
+  // The DECLARED remediation catalogue, mirrored from Python's
+  // REMEDIATION_CATALOGUE (a test pins the two equal). Actions render from
+  // this table by incident kind, never from document fields: a snapshot in
+  // the shared store is viewer-writable, and a rewritten snapshotSha256
+  // would otherwise let it present arbitrary text, commands and authority
+  // levels as Forge-declared actions.
+  const REMEDIATIONS = {
+  "awaiting-dispatch-evidence": [
+    {
+      "actionId": "confirm-the-run",
+      "authority": "operator",
+      "command": "",
+      "description": "Every precondition label is present; check whether the trigger actually fired.",
+      "handoff": "",
+      "title": "Confirm the run started"
+    },
+    {
+      "actionId": "re-apply-the-trigger-label",
+      "authority": "human-only",
+      "command": "",
+      "description": "The bundled triggers fire only on their label event; re-apply it to re-kick.",
+      "handoff": "Remove and re-add the trigger label (implementation-approved for the implement trigger, agent-ready for the plan trigger) to fire the event again.",
+      "title": "Re-apply the trigger label"
+    }
+  ],
+  "awaiting-human-approval": [
+    {
+      "actionId": "record-approval-decision",
+      "authority": "human-only",
+      "command": "",
+      "description": "The factory stops here by design until a person approves or rejects the plan.",
+      "handoff": "Review the plan and record an approval or a rejection.",
+      "title": "Record the approval decision"
+    }
+  ],
+  "awaiting-human-merge": [
+    {
+      "actionId": "merge-as-human-authority",
+      "authority": "human-only",
+      "command": "",
+      "description": "Merge authority never leaves the human; the agent cannot complete this step.",
+      "handoff": "Review the change request and merge it, or ask for another repair cycle.",
+      "title": "Merge as the human authority"
+    }
+  ],
+  "awaiting-spec-review": [
+    {
+      "actionId": "release-or-reject-the-spec",
+      "authority": "human-only",
+      "command": "",
+      "description": "The spec stage holds the work until a human releases the draft.",
+      "handoff": "Review the drafted specification: add spec-approved to release it, or remove spec-drafted to reject it.",
+      "title": "Release or reject the drafted specification"
+    }
+  ],
+  "branch-behind": [
+    {
+      "actionId": "update-change-request-branch",
+      "authority": "agent",
+      "command": "",
+      "description": "Bring the base branch into the change request so checks run against the current base.",
+      "handoff": "",
+      "title": "Update the change request branch"
+    }
+  ],
+  "dependency-wait": [
+    {
+      "actionId": "inspect-work-graph",
+      "authority": "operator",
+      "command": "",
+      "description": "Confirm which upstream unit the blocked unit is actually waiting on.",
+      "handoff": "",
+      "title": "Inspect the dependency graph"
+    }
+  ],
+  "deterministic-ci-failed": [
+    {
+      "actionId": "reproduce-ci-failure",
+      "authority": "operator",
+      "command": "sdlcctl run-gates --config agentic-sdlc.toml --repository . --output gates-report.json",
+      "description": "Run the same deterministic gates the pipeline ran, before changing anything.",
+      "handoff": "",
+      "title": "Reproduce the failure locally"
+    },
+    {
+      "actionId": "route-to-bounded-repair",
+      "authority": "agent",
+      "command": "",
+      "description": "Hand the failure to a repair cycle with its declared cycle budget.",
+      "handoff": "",
+      "title": "Route to bounded repair"
+    }
+  ],
+  "dispatch-blocked": [
+    {
+      "actionId": "complete-dispatch-preconditions",
+      "authority": "human-only",
+      "command": "",
+      "description": "Dispatch is gated on declared labels and an approval; supply the missing one.",
+      "handoff": "Apply the approval label the mission requires, or record the approval event.",
+      "title": "Complete the dispatch preconditions"
+    },
+    {
+      "actionId": "re-run-dispatch",
+      "authority": "operator",
+      "command": "sdlcctl dispatch-mission --config agentic-sdlc.toml --mission-id <mission> --agents agents.json --work-ref <work-ref> --prompt prompt.md",
+      "description": "Once preconditions hold, re-dispatch the mission for this work unit.",
+      "handoff": "",
+      "title": "Re-run mission dispatch"
+    }
+  ],
+  "infrastructure-failure": [
+    {
+      "actionId": "classify-infrastructure-failure",
+      "authority": "operator",
+      "command": "sdlcctl classify-failure --log run.log --output classification.json",
+      "description": "Decide whether the failure is infrastructure or the change itself before retrying.",
+      "handoff": "",
+      "title": "Classify the failure"
+    },
+    {
+      "actionId": "decide-infrastructure-retry",
+      "authority": "operator",
+      "command": "sdlcctl decide-infra-retry --repository <owner/repo> --pull-request-number <pull-number> --run-id <run-id> --head-sha <sha> --current-head-sha <sha> --failure-class transient_infrastructure --state <retry-state-file> --output decision.json",
+      "description": "Apply the declared retry budget instead of retrying by hand.",
+      "handoff": "",
+      "title": "Decide the retry"
+    }
+  ],
+  "merge-conflict": [
+    {
+      "actionId": "refresh-change-request",
+      "authority": "agent",
+      "command": "",
+      "description": "Bring the base branch into the change request and resolve the conflict.",
+      "handoff": "",
+      "title": "Refresh the change request"
+    }
+  ],
+  "quota-exhausted": [
+    {
+      "actionId": "route-to-fallback-executor",
+      "authority": "operator",
+      "command": "sdlcctl route-executor --config agentic-sdlc.toml --mission-id <mission> --executors executors.json --repository <owner/repo> --task-class implementation --budget-usd 5",
+      "description": "Re-run routing so the work unit lands on an executor that still has quota.",
+      "handoff": "",
+      "title": "Route to a fallback executor"
+    },
+    {
+      "actionId": "wait-for-quota-reset",
+      "authority": "operator",
+      "command": "",
+      "description": "Quota exhaustion is recoverable; the unit resumes when the window rolls over.",
+      "handoff": "",
+      "title": "Wait for the quota window to reset"
+    }
+  ],
+  "review-gate-failed": [
+    {
+      "actionId": "read-review-verdict",
+      "authority": "operator",
+      "command": "",
+      "description": "The review gate records why it withheld approval; start from that reason.",
+      "handoff": "",
+      "title": "Read the independent verdict"
+    },
+    {
+      "actionId": "route-to-bounded-repair",
+      "authority": "agent",
+      "command": "",
+      "description": "Address the verdict's findings within the declared repair budget.",
+      "handoff": "",
+      "title": "Route to bounded repair"
+    }
+  ],
+  "runner-capacity": [
+    {
+      "actionId": "inspect-runner-pool",
+      "authority": "operator",
+      "command": "sdlcctl capacity-report --usage usage-ledger.json --window-start <start> --window-end <end> --output capacity.json",
+      "description": "Read current runner capacity and the queue depth that is waiting on it.",
+      "handoff": "",
+      "title": "Inspect the runner pool"
+    },
+    {
+      "actionId": "scale-runner-pool",
+      "authority": "human-only",
+      "command": "",
+      "description": "Raise the pool's minimum replicas so queued work units get a worker.",
+      "handoff": "Deployment capacity is owner-controlled: change the runner scale set and apply it.",
+      "title": "Scale the runner pool"
+    }
+  ],
+  "triage-needed": [
+    {
+      "actionId": "triage-the-work",
+      "authority": "human-only",
+      "command": "",
+      "description": "No lifecycle label owns this item; decide its stage and label it.",
+      "handoff": "Review the item and give it the lifecycle labels that admit it to a stage (spec review, implementation approval, dispatch).",
+      "title": "Triage the work"
+    }
+  ],
+  "unclassified": [
+    {
+      "actionId": "classify-incident",
+      "authority": "operator",
+      "command": "",
+      "description": "An unclassified incident has no declared remediation; classify it first.",
+      "handoff": "",
+      "title": "Classify the incident"
+    }
+  ]
+};
+  const declaredRemediations = (kind) => REMEDIATIONS[kind] || REMEDIATIONS.unclassified;
 
   function remediationNode(action) {
     const cls = action.authority === "human-only" ? "warn" : action.authority === "agent" ? "line" : "ok";
@@ -955,7 +1171,7 @@
     button.disabled = true;
     const out = el("div", { class: "small", style: "margin-top:7px; white-space:pre-wrap", text: "Thinking…" });
     target.after(out);
-    const declared = (incident.remediations || []).map((action) => `- ${action.title} (${action.authority}): ${action.description}${action.command ? " | command: " + action.command : ""}`).join("\n");
+    const declared = declaredRemediations(incident.kind).map((action) => `- ${action.title} (${action.authority}): ${action.description}${action.command ? " | command: " + action.command : ""}`).join("\n");
     // Summary and detail carry provider-controlled text (issue titles), so
     // they travel inside an explicit untrusted-data boundary with any
     // boundary markers stripped: a title cannot smuggle instructions into

@@ -595,6 +595,18 @@ def incidents_from_change_requests(
         if draft:
             continue
         number = _record_number(pull, "change request")
+        base = pull.get("base")
+        if isinstance(base, Mapping):
+            base_repo = base.get("repo")
+            full_name = base_repo.get("full_name") if isinstance(base_repo, Mapping) else None
+            if isinstance(full_name, str) and full_name.strip():
+                # A detail payload names its own target repository: a file
+                # fetched for another repository must not attribute its
+                # blockers to a same-numbered local change request.
+                _require(
+                    full_name.lower() == repository.lower(),
+                    f"change request {number} belongs to {full_name}, not repository {repository}",
+                )
         ref = f"{repository}!{number}"
         title = str(pull.get("title") or "")[:512]
         state = pull.get("mergeable_state")

@@ -67,11 +67,12 @@ MAX_INCIDENTS = 2000
 #: length budget covers GitHub's maxima (39-character owner, 100-character
 #: repository) plus an issue number and a rule suffix.
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/#!:-]{0,255}")
-#: A tracker reference that names a repository: bare OWNER/REPO, or
-#: OWNER/REPO followed by #/! and a number (optionally a :suffix, as incident
-#: ids carry). Arbitrary slash-bearing text (a CI URL) is NOT one.
+#: A tracker reference that names a repository: an identifier of one or more
+#: slash-separated segments (GitLab nests groups, example/group/assets),
+#: optionally followed by #/! and a number (and a :suffix, as incident ids
+#: carry). Arbitrary text with a scheme (a CI URL) is NOT one.
 _REPOSITORY_REFERENCE = re.compile(
-    r"(?P<name>[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+?)(?:[#!]\d+(?::.+)?)?"
+    r"(?P<name>[A-Za-z0-9][A-Za-z0-9-]*(?:/[A-Za-z0-9._-]+)+?)(?:[#!]\d+(?::.+)?)?"
 )
 _TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})")
 _SECRET_KEY = re.compile(
@@ -1467,9 +1468,27 @@ def build_control_center_snapshot(
                     # These rules report missing dispatch labels, not only the
                     # approval wait their kind shares: an approved unit still
                     # cannot fire without the label events, so only dispatch
-                    # proof retires them.
-                    proven_states = DISPATCH_PROVEN_STATES
-                    history_states = DISPATCH_PROVEN_STATES
+                    # proof retires them. Once approval IS proven, the hold is
+                    # re-stated as the dispatch-label gap it has become, so
+                    # the operator is not told to repeat a finished approval.
+                    seen = proven.states_seen
+                    if proven.state in DISPATCH_PROVEN_STATES or seen & DISPATCH_PROVEN_STATES:
+                        continue
+                    if FactoryState.APPROVED in seen:
+                        retained.append(
+                            replace(
+                                incident,
+                                kind="dispatch-blocked",
+                                summary=(
+                                    "Approval is proven by the ledger, but no dispatch label "
+                                    "follows it: apply the ready and implementation approval "
+                                    "labels so a trigger can fire"
+                                ),
+                            )
+                        )
+                        continue
+                    retained.append(incident)
+                    continue
                 else:
                     proven_states = _LEDGER_RETIREMENT[incident.kind]
                     history_states = proven_states
