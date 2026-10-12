@@ -67,6 +67,12 @@ MAX_INCIDENTS = 2000
 #: length budget covers GitHub's maxima (39-character owner, 100-character
 #: repository) plus an issue number and a rule suffix.
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/#!:-]{0,255}")
+#: A tracker reference that names a repository: bare OWNER/REPO, or
+#: OWNER/REPO followed by #/! and a number (optionally a :suffix, as incident
+#: ids carry). Arbitrary slash-bearing text (a CI URL) is NOT one.
+_REPOSITORY_REFERENCE = re.compile(
+    r"(?P<name>[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+?)(?:[#!]\d+(?::.+)?)?"
+)
 _TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})")
 _SECRET_KEY = re.compile(
     r"credential|secret|token|password|passphrase|api_?key|authorization|bearer|private_?key",
@@ -1388,8 +1394,16 @@ def build_control_center_snapshot(
                 )
             foreign: set[str] = set()
             for reference in references:
-                name = re.split(r"[#!]", reference, maxsplit=1)[0] if reference else ""
-                if name and "/" in name and name.lower() not in declared_repositories:
+                if not reference:
+                    continue
+                # Only repository-SHAPED references participate: evidenceRef
+                # accepts arbitrary text (a CI URL, a run id), which must not
+                # read as a foreign repository just because it has a slash.
+                match = _REPOSITORY_REFERENCE.fullmatch(reference)
+                if match is None:
+                    continue
+                name = match.group("name")
+                if name.lower() not in declared_repositories:
                     foreign.add(name)
             for name in sorted(foreign):
                 view_warnings.append(

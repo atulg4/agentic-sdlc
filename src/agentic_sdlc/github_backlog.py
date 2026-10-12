@@ -94,6 +94,10 @@ def canonical_repository(issues: Iterable[Mapping[str, Any]], declared: str) -> 
     """
 
     _require_repository(declared)
+    canonical = declared
+    found = False
+    # Every recognized URL is checked, not just the first: a foreign record
+    # hiding behind a valid one must still fail the export.
     for issue in issues:
         url = issue.get("repository_url")
         if not isinstance(url, str):
@@ -106,8 +110,10 @@ def canonical_repository(issues: Iterable[Mapping[str, Any]], declared: str) -> 
             name.lower() == declared.lower(),
             f"issue payloads belong to {name}, not repository {declared}",
         )
-        return name
-    return declared
+        if not found:
+            canonical = name
+            found = True
+    return canonical
 
 
 def _issue_state(issue: Mapping[str, Any]) -> str:
@@ -760,12 +766,7 @@ def parent_links(
     for group in groups:
         declared: int | None = None
         payload = group
-        if (
-            isinstance(group, tuple)
-            and len(group) == 2
-            and (group[1] is None or isinstance(group[1], int))
-            and not isinstance(group[1], Mapping)
-        ):
+        if isinstance(group, tuple) and len(group) == 2 and not isinstance(group[1], Mapping):
             # The explicit (payload, parent_number) pair; any other tuple is an
             # ordinary payload of child records. The declared parent passes
             # the same validation as every child number: True would alias
@@ -777,6 +778,7 @@ def parent_links(
                 f"declared parent number must be a positive integer: {declared!r}",
             )
         for entry in payload:
+            _require(isinstance(entry, Mapping), "every sub-issue record must be an object")
             # The shared validator, not a type check: bool is an int, so a
             # record with number true would alias issue #1.
             number = _record_number(entry, "sub-issue record")
