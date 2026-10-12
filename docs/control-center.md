@@ -27,8 +27,10 @@ incident document ┘
 | `projects[].health` | one word, derived only from the above |
 | `warnings` | data that did not fit the model, never silently dropped |
 
-`snapshotSha256` digests the content and excludes `generatedAt`, so two
-snapshots of an unchanged factory compare equal.
+`snapshotSha256` digests the content and excludes the run metadata —
+`generatedAt` and each incident's `observedAt` — so two snapshots of an
+unchanged factory compare equal even when the exporter stamped its incidents
+with the time it happened to run.
 
 ### Health is derived, never declared
 
@@ -104,16 +106,31 @@ inputs never mention is an error, not an empty page.
 adapter that turns GitHub payloads into the backlog and incident documents:
 
 ```bash
-gh api 'repos/OWNER/REPO/issues?state=all&per_page=100' > issues.json
-gh api 'repos/OWNER/REPO/pulls?state=open' > pulls.json
-gh api 'repos/OWNER/REPO/issues/109/sub_issues' > sub-109.json
+# paginate: one page caps issues at 100 and pulls at 30
+gh api --paginate 'repos/OWNER/REPO/issues?state=all&per_page=100' \
+  --jq '.[]' | jq -s '.' > issues.json
+
+# the pulls LIST response omits mergeable_state: fetch each pull's detail
+gh api --paginate 'repos/OWNER/REPO/pulls?state=open&per_page=100' --jq '.[].number' |
+  while read n; do gh api "repos/OWNER/REPO/pulls/$n"; done | jq -s '.' > pulls.json
+
+gh api --paginate 'repos/OWNER/REPO/issues/109/sub_issues?per_page=100' \
+  --jq '.[]' | jq -s '.' > sub-109.json
 
 sdlcctl github-backlog \
-  --issues issues.json --pulls pulls.json --sub-issues sub-109.json \
+  --issues issues.json --pulls pulls.json --sub-issues 109=sub-109.json \
   --failing 148=test \
   --project-id forge --repository OWNER/REPO \
   --backlog-output backlog.json --incidents-output incidents.json
 ```
+
+A change request without a mergeability verdict in its payload is never
+reported as "ready and waiting": unknown is not a state, so feed the command
+detail payloads, not the list response. `--sub-issues` prefers the
+`PARENT=path` form, which does not depend on each child carrying its own
+parent reference; a bare path still works when the payload carries
+`parent_issue_url`, and a child whose reference disagrees with the declared
+parent is rejected rather than silently relinked.
 
 Fetching stays outside the library: the operator's own client supplies the
 credential, and the library only ever sees already-fetched JSON.
@@ -127,9 +144,9 @@ Three published tables drive every inference, so none of it is a guess:
   `agent-auto-implement` triggers enforce. Each unmet row becomes an incident,
   which is how "approved, but nothing is running it" becomes visible.
 
-Parent links come from GitHub's `parent_issue_url` on each sub-issue, never
-from a title or a checklist. An epic is recognised from the title convention or
-from owning sub-issues.
+Parent links come from the declared `PARENT=path` pairing or from GitHub's
+`parent_issue_url` on each sub-issue — never from a title or a checklist. An
+epic is recognised from the title convention or from owning sub-issues.
 
 ## What the Control Center deliberately cannot do
 

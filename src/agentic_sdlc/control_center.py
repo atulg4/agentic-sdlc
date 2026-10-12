@@ -76,6 +76,26 @@ AWAITING_HUMAN_STATES = frozenset(
     {FactoryState.APPROVAL_PENDING, FactoryState.READY_FOR_HUMAN_MERGE}
 )
 
+#: States in which something is executing *right now*. Backlog-shaped states
+#: (intake through approved) and settled ones (merged, live) are deliberately
+#: excluded: ``live`` is not terminal — a rollback stays possible — but a live
+#: unit is not running work, and counting it would pin a project at "running"
+#: forever.
+EXECUTING_STATES = frozenset(
+    {
+        FactoryState.DISPATCHED,
+        FactoryState.IMPLEMENTING,
+        FactoryState.VERIFYING,
+        FactoryState.REVIEWING,
+        FactoryState.REPAIR_NEEDED,
+        FactoryState.REPAIRING,
+        FactoryState.RE_REVIEWING,
+        FactoryState.DEPLOYING,
+        FactoryState.DEPLOYMENT_VERIFYING,
+        FactoryState.ROLLING_BACK,
+    }
+)
+
 
 class ControlCenterError(ValueError):
     """Raised when a Control Center input is malformed or inconsistent."""
@@ -919,10 +939,18 @@ class ControlCenterSnapshot:
 
     @property
     def snapshot_sha256(self) -> str:
-        """Digest over the content, excluding when the snapshot was generated."""
+        """Digest over the content, excluding when it was generated or observed.
+
+        ``generatedAt`` and each incident's ``observedAt`` are run metadata: two
+        snapshots of an unchanged factory must compare equal even when the
+        exporter stamped its incidents with the time it happened to run.
+        """
 
         payload = self.as_dict()
         payload.pop("generatedAt", None)
+        for project in payload.get("projects", ()):
+            for incident in project.get("incidents", ()):
+                incident.pop("observedAt", None)
         return _digest(payload)
 
     def as_document(self) -> dict[str, Any]:
@@ -934,20 +962,62 @@ class ControlCenterSnapshot:
 
 
 def _resolve_state(
-    item: BacklogItem, statuses: Mapping[str, WorkUnitStatus]
+    item: BacklogItem,
+    statuses: Mapping[str, WorkUnitStatus],
+    by_issue_ref: Mapping[str, WorkUnitStatus],
 ) -> tuple[str, str, WorkUnitStatus | None]:
-    """Resolve a backlog item's state, naming the basis and never inventing one."""
+    """Resolve a backlog item's state, naming the basis and never inventing one.
+
+    A declared work-unit key wins; an unambiguous issue reference joins next,
+    because tracker-exported backlogs carry ``issueRef`` while the ledger's
+    projections carry the same reference. Only then does a source-declared
+    state apply, and with no evidence at all the state is *unknown*.
+    """
 
     if item.work_unit_id and item.work_unit_id in statuses:
         status = statuses[item.work_unit_id]
+        return status.state.value, STATE_BASIS_LEDGER, status
+    if item.issue_ref and item.issue_ref in by_issue_ref:
+        status = by_issue_ref[item.issue_ref]
         return status.state.value, STATE_BASIS_LEDGER, status
     if item.declared_state:
         return item.declared_state, STATE_BASIS_DECLARED, None
     return "unknown", STATE_BASIS_UNKNOWN, None
 
 
+def _index_by_issue_ref(
+    statuses: Mapping[str, WorkUnitStatus],
+) -> tuple[dict[str, WorkUnitStatus], tuple[str, ...]]:
+    """Index projections by issue reference, dropping ambiguous references.
+
+    Two work units legitimately share an issue when one supersedes another;
+    joining either would guess, so the reference is excluded with a warning.
+    """
+
+    index: dict[str, WorkUnitStatus] = {}
+    ambiguous: set[str] = set()
+    for key in sorted(statuses):
+        status = statuses[key]
+        if not status.issue_ref:
+            continue
+        if status.issue_ref in index:
+            ambiguous.add(status.issue_ref)
+            continue
+        index[status.issue_ref] = status
+    warnings = tuple(
+        f"issue reference {reference} names more than one work unit; "
+        "its backlog items keep their declared state"
+        for reference in sorted(ambiguous)
+    )
+    for reference in ambiguous:
+        index.pop(reference, None)
+    return index, warnings
+
+
 def _build_backlog_tree(
-    items: Sequence[BacklogItem], statuses: Mapping[str, WorkUnitStatus]
+    items: Sequence[BacklogItem],
+    statuses: Mapping[str, WorkUnitStatus],
+    by_issue_ref: Mapping[str, WorkUnitStatus],
 ) -> tuple[tuple[BacklogNode, ...], tuple[str, ...]]:
     """Build the epic/story/task forest, rooting any item whose parent is absent."""
 
@@ -969,7 +1039,7 @@ def _build_backlog_tree(
         roots.append(item)
 
     def node_for(item: BacklogItem) -> BacklogNode:
-        state, basis, status = _resolve_state(item, statuses)
+        state, basis, status = _resolve_state(item, statuses, by_issue_ref)
         return BacklogNode(
             item=item,
             state=state,
@@ -1058,8 +1128,9 @@ def build_control_center_snapshot(
         statuses = by_project_units.get(project_id, {})
         items = by_project_backlog.get(project_id, [])
         project_incidents = tuple(by_project_incidents.get(project_id, ()))
-        tree, tree_warnings = _build_backlog_tree(items, statuses)
-        view_warnings = list(tree_warnings)
+        by_issue_ref, reference_warnings = _index_by_issue_ref(statuses)
+        tree, tree_warnings = _build_backlog_tree(items, statuses, by_issue_ref)
+        view_warnings = list(reference_warnings) + list(tree_warnings)
 
         if not registered:
             view_warnings.append(
@@ -1091,7 +1162,9 @@ def build_control_center_snapshot(
 
         ordered = tuple(statuses[key] for key in sorted(statuses))
         active = tuple(
-            status for status in ordered if not status.terminal and not status.needs_attention
+            status
+            for status in ordered
+            if status.state in EXECUTING_STATES and not status.needs_attention
         )
         attention = tuple(status for status in ordered if status.needs_attention)
 

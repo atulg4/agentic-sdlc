@@ -277,6 +277,11 @@
     else document.documentElement.removeAttribute("data-theme");
   }
   try { const saved = localStorage.getItem(themeKey); if (saved) applyTheme(saved); } catch {}
+  document.getElementById("refresh-btn").addEventListener("click", () => {
+    state.tab = "snapshot";
+    render();
+    window.scrollTo({ top: 0 });
+  });
   document.getElementById("theme-btn").addEventListener("click", () => {
     const now = document.documentElement.getAttribute("data-theme");
     const next = now === "dark" ? "light" : "dark";
@@ -285,7 +290,16 @@
   });
 
   /* ---------- store ---------- */
-  const docId = (value) => String(value).replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 120) || "item";
+  function docId(value) {
+    const full = String(value);
+    let hash = 0x811c9dc5;
+    for (let index = 0; index < full.length; index += 1) {
+      hash ^= full.charCodeAt(index);
+      hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    const readable = full.replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 100) || "item";
+    return readable + "." + hash.toString(36);
+  }
 
   function tryUse(name) {
     try {
@@ -688,14 +702,30 @@
       el("div", { style: "margin-top:7px; font-weight:560", text: txt(incident.summary) }),
       incident.detail ? el("div", { class: "small muted", style: "margin-top:3px", text: incident.detail }) : null,
       el("div", { class: "row tiny muted", style: "margin-top:6px" },
-        incident.backlogItemId ? el("span", { class: "mono", text: incident.backlogItemId }) : null,
         incident.workUnitId ? el("span", { class: "mono", text: incident.workUnitId }) : null,
+        evidenceNode(incident, project),
         incident.observedAt ? el("span", { text: "observed " + incident.observedAt }) : null,
       ),
     );
     for (const action of incident.remediations || []) card.append(remediationNode(action));
     card.append(noteNode(incident, note));
     return card;
+  }
+
+  function evidenceNode(incident, project) {
+    const reference = incident.evidenceRef || incident.backlogItemId;
+    if (!reference) return null;
+    const match = /^([A-Za-z0-9._-]+\/[A-Za-z0-9._-]+)([#!])(\d+)$/.exec(reference);
+    const hosted = match && (project.repositories || []).includes("github:" + match[1]);
+    if (hosted) {
+      const path = match[2] === "!" ? "pull" : "issues";
+      return el("a", {
+        class: "mono", target: "_blank", rel: "noreferrer noopener",
+        href: `https://github.com/${match[1]}/${path}/${match[3]}`,
+        text: reference,
+      });
+    }
+    return el("span", { class: "mono", text: reference });
   }
 
   function remediationNode(action) {
@@ -871,6 +901,10 @@
     if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(projectId)) return "A project ID must start with a letter or digit and hold only lowercase letters, digits, dot, dash or underscore.";
     if (!displayName) return "A display name is required.";
     if (!/^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)+$/.test(repository)) return "A repository looks like owner/name.";
+    const group = fields.group.value.trim();
+    if (group && !/^[a-z0-9][a-z0-9._-]{0,63}$/.test(group)) {
+      return "A group uses only lowercase letters, digits, dot, dash or underscore — the registry will reject anything else.";
+    }
     const entry = {
       projectId,
       displayName,
@@ -878,7 +912,6 @@
       repositories: [{ provider: fields.provider.value, identifier: repository, role: "primary" }],
       capabilities: ["planning", "implementation", "independent-review", "protected-merge"],
     };
-    const group = fields.group.value.trim();
     if (group) entry.group = group;
     return entry;
   }
@@ -948,10 +981,16 @@
   }
 
   const SNAPSHOT_RECIPE = [
-    "gh api 'repos/OWNER/REPO/issues?state=all&per_page=100' > issues.json",
-    "gh api 'repos/OWNER/REPO/pulls?state=open' > pulls.json",
+    "gh api --paginate 'repos/OWNER/REPO/issues?state=all&per_page=100' \\",
+    "  --jq '.[]' | jq -s '.' > issues.json",
+    "# the pulls LIST omits mergeable_state: fetch each pull's detail",
+    "gh api --paginate 'repos/OWNER/REPO/pulls?state=open&per_page=100' --jq '.[].number' |",
+    "  while read n; do gh api \"repos/OWNER/REPO/pulls/$n\"; done | jq -s '.' > pulls.json",
+    "gh api --paginate 'repos/OWNER/REPO/issues/109/sub_issues?per_page=100' \\",
+    "  --jq '.[]' | jq -s '.' > sub-109.json",
     "",
     "sdlcctl github-backlog --issues issues.json --pulls pulls.json \\",
+    "  --sub-issues 109=sub-109.json \\",
     "  --project-id PROJECT --repository OWNER/REPO \\",
     "  --backlog-output backlog.json --incidents-output incidents.json",
     "",

@@ -2047,7 +2047,7 @@
     }
   ],
   "schemaVersion": 1,
-  "snapshotSha256": "336b09b58a5a04e4a640169f5d559657469326a703fe64cba3cf9f40788043f1",
+  "snapshotSha256": "0e73cf794b802e3f1cb6ad49b7e091f51950653044030a94b7ba9605b4a0e244",
   "sources": [
     "registry:examples/control-center/project-registry.json",
     "backlog:examples/control-center/backlog.json",
