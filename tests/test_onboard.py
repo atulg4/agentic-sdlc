@@ -2344,6 +2344,14 @@ def test_doctor_rejects_a_ci_gate_whose_failure_is_ignored(tmp_path, mutate):
         ("command -v set -o pipefail; pytest | tee out", None, False),
         ("builtin set -o pipefail; pytest | tee out", None, True),
         ("command set -euo pipefail; pytest | tee out", None, True),
+        # A `{ ...; }` group piped or backgrounded as a whole runs in a child (Codex 4250684144).
+        ("set +o pipefail; { set -o pipefail; } | cat; pytest | tee out", "bash", False),
+        ("set +o pipefail; { set -o pipefail; } & pytest | tee out", "bash", False),
+        ("{ set -o pipefail; }; pytest | tee out", None, False),
+        # Heredoc bodies and multi-line strings are text, not commands.
+        ("cat <<EOF\nset -o pipefail\nEOF\npytest | tee out", None, False),
+        ("echo 'a\nset -o pipefail\nb'\npytest | tee out", None, False),
+        ("cat <<EOF\nhi\nEOF\npytest | tee out", "bash", True),
     ],
 )
 def test_shell_parse_enforces_a_piped_command_only_with_pipefail(script, shell, enforced):

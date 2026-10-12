@@ -6729,12 +6729,16 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
     previous = ";"
     subshell = 0  # open `(` ... `)`: a command inside runs in a child shell
     started_in_subshell = False
+    # A heredoc body or a quoted string spanning lines is text the line-by-line parse would read
+    # as commands: from the first one on, no `set` can be trusted to turn an option ON.
+    opaque = False
     for line in script.replace("\\\n", " ").splitlines():
         lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
         lexer.whitespace_split = True
         try:
             tokens = list(lexer)
         except ValueError:  # unbalanced quotes: no command we can vouch for
+            opaque = True
             continue
         if not tokens:
             continue
@@ -6750,6 +6754,8 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
             if token is not None and token not in _SHELL_SEPARATORS:
                 if not argv:
                     started_in_subshell = subshell > 0
+                if token.startswith("<<"):
+                    opaque = True
                 argv.append(token)
                 subshell = _subshell_depth(subshell, token)  # shlex merges `)` into `);`
                 continue
@@ -6801,10 +6807,14 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                     arguments, plain = invocation
                     # Turning an option ON counts only when the parent shell surely runs this
                     # `set`: not piped, backgrounded or in a subshell (each runs in a child),
-                    # not conditional, not a wrapper with options (Codex 4250527925/4250527932).
-                    # Turning one OFF counts wherever it is: an unproven OFF fails closed.
+                    # not in a `{ ...; }` group (piped or backgrounded as a whole, it runs in a
+                    # child too: Codex 4250684144), not conditional, not a wrapper with options
+                    # (Codex 4250527925/4250527932), and not after a heredoc or a multi-line
+                    # string. Turning one OFF counts wherever it is: an unproven OFF fails closed.
                     in_parent = (
                         plain
+                        and not opaque
+                        and not braces
                         and not condition
                         and not nested
                         and not in_function
