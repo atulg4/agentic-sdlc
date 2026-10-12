@@ -79,6 +79,15 @@ AWAITING_HUMAN_STATES = frozenset(
     {FactoryState.APPROVAL_PENDING, FactoryState.READY_FOR_HUMAN_MERGE}
 )
 
+#: The adapter rule id for the plan-ordering advisory. The read model retires
+#: that advisory on earlier evidence than the implementation one, so the rule
+#: name is shared here rather than guessed from text.
+PLAN_EVIDENCE_RULE = "plan-ready-awaiting-dispatch-evidence"
+
+#: States that precede any planning evidence: a ledger projection past these
+#: proves a plan ran, which retires the plan-ordering advisory.
+PRE_PLANNING_STATES = frozenset({FactoryState.INTAKE, FactoryState.TRIAGED, FactoryState.SPECIFIED})
+
 #: States that prove dispatch happened: everything past the approval gates.
 #: A label-only "confirm a run started" advisory is retired once a joined
 #: ledger projection shows one of these.
@@ -1200,11 +1209,16 @@ def build_control_center_snapshot(
                 incident.kind == "dispatch-blocked"
                 and incident.severity is IncidentSeverity.ADVISORY
                 and proven is not None
-                and proven.state not in PRE_DISPATCH_STATES
             ):
-                # The ledger already proves dispatch for this item; the
-                # label-only "confirm a run started" advisory is moot.
-                continue
+                # The plan advisory is moot once a plan ran (PLANNED or
+                # later); the implementation advisory needs dispatch itself.
+                threshold = (
+                    PRE_PLANNING_STATES
+                    if incident.incident_id.endswith(":" + PLAN_EVIDENCE_RULE)
+                    else PRE_DISPATCH_STATES
+                )
+                if proven.state not in threshold:
+                    continue
             retained.append(incident)
         project_incidents = tuple(retained)
         for incident in project_incidents:
