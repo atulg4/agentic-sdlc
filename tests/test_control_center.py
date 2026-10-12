@@ -1515,3 +1515,103 @@ def test_a_malformed_observed_at_fails_the_export_not_the_next_command(tmp_path)
         == 2
     )
     assert not incidents.exists()
+
+
+def test_a_dispatched_unit_is_queued_not_running():
+    ledger = _ledger(*_chain(TO_PLANNED + ("approved", "dispatched")))
+    view = build_control_center_snapshot(
+        generated_at=NOW, registry=REGISTRY, projections=ledger.projections()
+    ).get("forge")
+    assert view.active == ()
+    assert view.health == "idle"
+
+
+def test_an_untriaged_issue_gets_a_triage_remediation():
+    incidents = incidents_from_issues(
+        [_issue(1, "bare")], project_id="forge", repository="acme/forge", observed_at=NOW
+    )
+    loaded = load_incident_document(_incidents(*incidents))
+    assert loaded[0].kind == "triage-needed"
+    actions = loaded[0].as_dict()["remediations"]
+    assert actions[0]["actionId"] == "triage-the-work"
+    assert actions[0]["authority"] == "human-only"
+
+
+def test_closed_change_requests_raise_no_incident():
+    incidents = incidents_from_change_requests(
+        [
+            {"number": 1, "title": "merged", "state": "closed", "mergeable_state": "dirty"},
+            {"number": 2, "title": "open", "state": "open", "mergeable_state": "clean"},
+        ],
+        project_id="forge",
+        repository="acme/forge",
+        observed_at=NOW,
+        failing={1: "test"},
+    )
+    assert [item["incidentId"] for item in incidents] == ["acme/forge!2:awaiting-merge"]
+
+
+def test_a_cross_document_parent_cycle_is_rejected_at_the_snapshot():
+    first = load_backlog_document(_document(_backlog(itemId="a", parentId="b")))
+    second = load_backlog_document(_document(_backlog(itemId="b", parentId="a", title="Other")))
+    with pytest.raises(ControlCenterError, match="parent cycle"):
+        build_control_center_snapshot(generated_at=NOW, registry=REGISTRY, backlog=first + second)
+
+
+def test_a_non_array_sub_issue_payload_is_a_controlled_error(tmp_path):
+    from agentic_sdlc.cli import main as cli_main
+
+    issues = tmp_path / "issues.json"
+    issues.write_text(json.dumps([]), encoding="utf-8")
+    bad = tmp_path / "sub.json"
+    bad.write_text(json.dumps({"number": 2}), encoding="utf-8")
+    assert (
+        cli_main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--sub-issues",
+                f"1={bad}",
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+            ]
+        )
+        == 2
+    )
+
+
+def test_a_failed_export_writes_neither_output(tmp_path):
+    from agentic_sdlc.cli import main as cli_main
+
+    issues = tmp_path / "issues.json"
+    issues.write_text(
+        json.dumps([{"number": 1, "title": "bare", "state": "open", "labels": []}]),
+        encoding="utf-8",
+    )
+    backlog = tmp_path / "backlog.json"
+    incidents = tmp_path / "incidents.json"
+    assert (
+        cli_main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--observed-at",
+                "not-a-time",
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+                "--backlog-output",
+                str(backlog),
+                "--incidents-output",
+                str(incidents),
+            ]
+        )
+        == 2
+    )
+    assert not backlog.exists()
+    assert not incidents.exists()

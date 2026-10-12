@@ -178,7 +178,7 @@ DISPATCH_RULES: tuple[DispatchRule, ...] = (
         missing=frozenset(
             {"human-review-required", "implementation-approved", "agent-ready", "spec-drafted"}
         ),
-        kind="awaiting-human-approval",
+        kind="triage-needed",
         severity="advisory",
         summary="Not triaged: no lifecycle label, so no stage owns this item",
     ),
@@ -347,6 +347,11 @@ def incidents_from_change_requests(
     checks = dict(failing or {})
     incidents: list[dict[str, Any]] = []
     for pull in pulls:
+        state_field = pull.get("state")
+        if state_field is not None and state_field != "open":
+            # A merged or closed change request is not an open problem,
+            # whatever its final mergeability read.
+            continue
         if pull.get("draft"):
             continue
         number = int(pull["number"])
