@@ -2366,6 +2366,17 @@ def test_doctor_rejects_a_ci_gate_whose_failure_is_ignored(tmp_path, mutate):
         ("set +e +o pipefail; set -z -e -o pipefail; pytest | tee out", None, False),
         ("set +o pipefail; set -o bogus -o pipefail; pytest | tee out", "bash", False),
         ("set -x -o pipefail; pytest | tee out", None, True),
+        # `trap` behind a redirection; `enable` disabling a wrapper (Codex 4251826068/-84).
+        (">/tmp/x trap 'set +o pipefail' DEBUG; pytest | tee out", "bash", False),
+        (
+            "set +e +o pipefail; enable -n command; command set -e -o pipefail; pytest | true",
+            "bash",
+            False,
+        ),
+        # `!` / `if` make the whole pipeline the condition (Codex 4251826079).
+        ("! tee /dev/null | pytest", "bash", False),
+        ("! pytest | tee /dev/null", "bash", False),
+        ("if true | pytest; then echo; fi", "bash", False),
         ("set -o pipefail; echo ok; pytest | tee out", None, True),
         # `o` anywhere in a cluster takes the option name (Codex 4251046345).
         ("set +ou pipefail; pytest | tee out", "bash", False),

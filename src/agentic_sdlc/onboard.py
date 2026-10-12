@@ -6619,9 +6619,11 @@ _PIPEFAIL_SHELLS = {"bash"}
 _SHELL_EXPANSION_CHARS = set("$`{}*?[]")
 
 #: Builtins that change shell options themselves, or run a handler string that may.
-_SHELL_OPTION_COMMANDS = {"set", "shopt", "trap"}
+_SHELL_OPTION_COMMANDS = {"set", "shopt", "trap", "enable"}
 #: Whole words that name an option-changing builtin or one of the tracked options.
-_SHELL_OPTION_WORDS = {"set", "shopt", "pipefail", "errexit"}
+#: `trap` behind a redirection (Codex 4251826068); `enable` can disable the `command`/`builtin`
+#: wrappers a later `set` relies on (Codex 4251826084).
+_SHELL_OPTION_WORDS = {"set", "shopt", "trap", "enable", "pipefail", "errexit"}
 
 
 def _may_change_shell_options(argv: list[str]) -> bool:
@@ -6785,6 +6787,9 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
     # A heredoc body or a quoted string spanning lines is text the line-by-line parse would read
     # as commands: from the first one on, no `set` can be trusted to turn an option ON.
     opaque = False
+    # After any `enable` the `builtin`/`command` wrappers may be disabled (Codex 4251826084): a
+    # wrapped `set` is no longer proven to run.
+    wrappers_untrusted = False
     for line in script.replace("\\\n", " ").splitlines():
         lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
         lexer.whitespace_split = True
@@ -6867,12 +6872,16 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                 invocation = _set_invocation(tuple(argv))
                 if invocation is not None and not invocation[1]:
                     invocation = None  # `command -v set ...`: not a call we can read
+                if invocation is not None and wrappers_untrusted and argv[0] in _BUILTIN_WRAPPERS:
+                    invocation = None
                 if invocation is not None and any(
                     set(word) & _SHELL_EXPANSION_CHARS for word in invocation[0]
                 ):
                     # `set -o pipefail $x`: $x may expand to `+o pipefail`; so may a brace or a
                     # pathname expansion, `+o {pipefail,pipefail}` (Codex 4251046343).
                     invocation = None
+                if "enable" in argv:
+                    wrappers_untrusted = True
                 if invocation is None and _may_change_shell_options(argv):
                     # Anything else that could touch errexit or pipefail -- a redirected or
                     # timed `set`, `shopt`, a `trap` string, a command run through a variable
@@ -6911,6 +6920,7 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                 records.append(
                     {
                         "argv": tuple(argv),
+                        "condition": condition,
                         "reached": not terminated
                         and not condition
                         and not nested
@@ -6945,6 +6955,15 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
         last -= 1
     # `a | b &` backgrounds the WHOLE pipeline and reports 0 for it: every member, not only the
     # last, is unenforced (Codex 4251046354).
+    # `! a | b` and `if a | b` make the WHOLE pipeline the condition, not only its first member
+    # (Codex 4251826079).
+    in_condition = False
+    for r in records:
+        if r["previous"] in {"|", "|&"}:
+            if in_condition:
+                r["reached"] = False
+        else:
+            in_condition = r["condition"]
     background = False
     for r in reversed(records):
         if r["following"] == "&":
