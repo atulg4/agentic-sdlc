@@ -596,6 +596,8 @@ def _github_backlog(args: argparse.Namespace) -> int:
             observed_at=observed_at,
         )
     ]
+    if args.failing and not args.pulls:
+        raise ControlCenterError("--failing names change-request checks, so it requires --pulls")
     if args.pulls:
         pulls = _json_file(args.pulls)
         if not isinstance(pulls, list):

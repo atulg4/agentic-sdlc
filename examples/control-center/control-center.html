@@ -412,6 +412,9 @@
       while (stack.length) {
         const node = stack.pop();
         if (!isObj(node) || typeof node.title !== "string") return `${where} has a malformed backlog node.`;
+        for (const key of ["itemId", "kind", "state", "stateBasis", "url", "issueRef"]) {
+          if (node[key] !== undefined && typeof node[key] !== "string") return `${where} backlog node field ${key} must be a string.`;
+        }
         if (node.children !== undefined && !Array.isArray(node.children)) return `${where} backlog node ${node.itemId || ""} children must be an array.`;
         visited += 1;
         if (visited > 10000) return `${where} backlog is too large or cyclic to render.`;
