@@ -425,6 +425,10 @@
     }
     if (value.totals !== undefined && !isObj(value.totals)) return "totals must be an object.";
     if (value.warnings !== undefined && !Array.isArray(value.warnings)) return "warnings must be an array.";
+    if (value.sources !== undefined && !Array.isArray(value.sources)) return "sources must be an array.";
+    for (const key of ["generatedAt", "snapshotSha256"]) {
+      if (value[key] !== undefined && typeof value[key] !== "string") return `${key} must be a string.`;
+    }
     return "";
   }
 

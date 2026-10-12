@@ -100,7 +100,7 @@ DISPATCH_RULES: tuple[DispatchRule, ...] = (
         rule_id="spec-awaiting-human-review",
         required=frozenset({"spec-drafted"}),
         missing=frozenset({"spec-approved"}),
-        kind="awaiting-human-approval",
+        kind="awaiting-spec-review",
         severity="degraded",
         summary=(
             "Specification draft held for human spec review: planning and "
