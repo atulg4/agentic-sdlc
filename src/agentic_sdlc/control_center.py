@@ -44,6 +44,7 @@ from .event_ledger import (
 )
 from .project_registry import (
     EMPTY_PROJECT_REGISTRY,
+    SCM_PROVIDERS,
     ProjectRegistry,
     read_optional_project_registry,
     read_project_registry,
@@ -630,6 +631,9 @@ class BacklogItem:
     labels: tuple[str, ...] = ()
     url: str = ""
     updated_at: str = ""
+    #: The SCM provider the item's DOCUMENT declared as its source; carried
+    #: for provider-qualified ownership checks, never serialized back out.
+    source_provider: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -683,6 +687,20 @@ def _load_backlog_item(raw: Any, index: int) -> BacklogItem:
     )
 
 
+def _source_provider(entry: Mapping[str, Any]) -> str:
+    """The SCM provider a document's declared source names, or "".
+
+    Adapter sources lead with the provider ("github-issues", "github"); an
+    absent or unrecognized source yields "" so ownership checks stay
+    name-only for that document's records.
+    """
+    source = entry.get("source")
+    if not isinstance(source, str):
+        return ""
+    provider = source.split("-", 1)[0].strip().lower()
+    return provider if provider in SCM_PROVIDERS else ""
+
+
 def load_backlog_document(document: Any) -> tuple[BacklogItem, ...]:
     """Load a backlog document, failing closed on anything inconsistent."""
 
@@ -706,6 +724,9 @@ def load_backlog_document(document: Any) -> tuple[BacklogItem, ...]:
         f"backlog document holds more than {MAX_BACKLOG_ITEMS} items",
     )
     items = tuple(_load_backlog_item(raw, index) for index, raw in enumerate(raw_items))
+    provider = _source_provider(entry)
+    if provider:
+        items = tuple(replace(item, source_provider=provider) for item in items)
     by_id: dict[str, BacklogItem] = {}
     for item in items:
         _require(item.item_id not in by_id, f"duplicate backlog itemId: {item.item_id}")
@@ -799,6 +820,9 @@ class Incident:
     backlog_item_id: str = ""
     observed_at: str = ""
     evidence_ref: str = ""
+    #: The SCM provider the incident's DOCUMENT declared as its source;
+    #: carried for provider-qualified ownership checks, never serialized.
+    source_provider: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -867,6 +891,9 @@ def load_incident_document(document: Any) -> tuple[Incident, ...]:
         f"incident document holds more than {MAX_INCIDENTS} incidents",
     )
     incidents = tuple(_load_incident(raw, index) for index, raw in enumerate(raw_items))
+    provider = _source_provider(entry)
+    if provider:
+        incidents = tuple(replace(item, source_provider=provider) for item in incidents)
     seen: set[str] = set()
     for incident in incidents:
         _require(
@@ -1390,41 +1417,70 @@ def build_control_center_snapshot(
             # Registered data must belong to the registered repositories: a
             # mistyped --project-id would otherwise file another project's
             # issue tree and incidents under this profile without a trace.
-            declared_repositories = {
-                repository.identifier.lower()
-                for repository in registry.get(project_id).repositories
-            }
+            # Ownership is PROVIDER-QUALIFIED: gitlab:acme/forge does not own
+            # GitHub-adapter data about acme/forge, so a reference matches
+            # only a declaration whose provider agrees (or any declaration,
+            # for data whose provider is unknown).
+            declared_providers: dict[str, set[str]] = {}
+            for repository in registry.get(project_id).repositories:
+                declared_providers.setdefault(repository.identifier.lower(), set()).add(
+                    repository.provider
+                )
+
+            def owned(
+                name: str, provider: str, declared: Mapping[str, set[str]] = declared_providers
+            ) -> bool:
+                providers = declared.get(name.lower())
+                if providers is None:
+                    return False
+                return not provider or provider in providers
+
             # Each field participates under ITS OWN contract: free-form
             # references ("build/123", a CI URL) count only when they carry
             # the full repo#number shape, while a status's repository field
-            # is a bare identifier by contract.
-            references: list[str] = []
+            # is a bare identifier by contract. Ledger statuses carry no
+            # adapter provider, so they stay name-only.
+            references: list[tuple[str, str]] = []
             for item in items:
-                references.extend((item.item_id, item.issue_ref))
+                references.extend(
+                    (reference, item.source_provider)
+                    for reference in (item.item_id, item.issue_ref)
+                )
             for status in statuses.values():
-                references.extend((status.issue_ref, status.change_request_ref))
+                references.extend(
+                    (reference, "") for reference in (status.issue_ref, status.change_request_ref)
+                )
             for incident in project_incidents:
                 references.extend(
-                    (incident.incident_id, incident.evidence_ref, incident.backlog_item_id)
+                    (reference, incident.source_provider)
+                    for reference in (
+                        incident.incident_id,
+                        incident.evidence_ref,
+                        incident.backlog_item_id,
+                    )
                 )
-            foreign: set[str] = set()
-            for reference in references:
+            foreign: set[tuple[str, str]] = set()
+            for reference, provider in references:
                 match = _REPOSITORY_REFERENCE.fullmatch(reference) if reference else None
-                if match is not None and match.group("name").lower() not in declared_repositories:
-                    foreign.add(match.group("name"))
+                if match is not None and not owned(match.group("name"), provider):
+                    foreign.add((match.group("name"), provider))
             for status in statuses.values():
                 name = status.repository
-                if (
-                    name
-                    and _REPOSITORY_IDENTIFIER.fullmatch(name)
-                    and name.lower() not in declared_repositories
-                ):
-                    foreign.add(name)
-            for name in sorted(foreign):
-                view_warnings.append(
-                    f"project {project_id} data references repository {name}, "
-                    "which its registry profile does not declare"
-                )
+                if name and _REPOSITORY_IDENTIFIER.fullmatch(name) and not owned(name, ""):
+                    foreign.add((name, ""))
+            for name, provider in sorted(foreign):
+                declared_for = declared_providers.get(name.lower())
+                if provider and declared_for:
+                    view_warnings.append(
+                        f"project {project_id} {provider} data references repository "
+                        f"{name}, which its registry profile declares only for "
+                        + ", ".join(sorted(declared_for))
+                    )
+                else:
+                    view_warnings.append(
+                        f"project {project_id} data references repository {name}, "
+                        "which its registry profile does not declare"
+                    )
 
         known_units = frozenset(statuses)
         known_items = frozenset(item.item_id for item in items)
@@ -1494,23 +1550,19 @@ def build_control_center_snapshot(
                     if proven.state in DISPATCH_PROVEN_STATES or seen & DISPATCH_PROVEN_STATES:
                         continue
                     if FactoryState.APPROVED in seen:
-                        # Rule-specific label guidance: the released-spec rule
-                        # matched with ALL THREE dispatch labels absent, while
-                        # spec-without-approval still carries the review label.
-                        if incident.incident_id.endswith(":" + RELEASED_SPEC_RULE):
-                            missing_labels = (
-                                "apply the ready, human-review and implementation approval labels"
-                            )
-                        else:
-                            missing_labels = "apply the ready and implementation approval labels"
+                        # The hold's own summary already names the project's
+                        # CONFIGURED labels (a policy may rename them), so the
+                        # replacement quotes it rather than substituting
+                        # default names an operator may not have.
                         retained.append(
                             replace(
                                 incident,
                                 kind="dispatch-blocked",
                                 severity=IncidentSeverity.BLOCKER,
                                 summary=(
-                                    "Approval is proven by the ledger, but no dispatch label "
-                                    f"follows it: {missing_labels} so a trigger can fire"
+                                    "Approval is proven by the ledger, but no dispatch "
+                                    f"label follows it. The hold said: {incident.summary} "
+                                    "- apply the label(s) it names so a trigger can fire"
                                 ),
                             )
                         )

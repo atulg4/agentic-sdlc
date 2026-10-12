@@ -1229,7 +1229,8 @@ def test_a_released_spec_waits_on_implementation_approval():
     )
     assert len(incidents) == 1
     assert incidents[0]["summary"] == (
-        "Specification drafted and waiting on a human implementation approval"
+        "Specification drafted and waiting on a human implementation "
+        "approval: dispatch needs implementation-approved and agent-ready"
     )
 
 
@@ -2485,7 +2486,7 @@ def test_a_cross_repository_sub_issue_is_rejected():
             "parent_issue_url": "https://api.github.com/repos/acme/forge/issues/1",
         }
     ]
-    with pytest.raises(ControlCenterError, match="another repository"):
+    with pytest.raises(ControlCenterError, match="belongs to other/repo"):
         parent_links(foreign_repo, repository="acme/forge")
     foreign_parent = [
         {
@@ -3438,6 +3439,14 @@ def test_proven_approval_restates_the_spec_hold_as_dispatch_blocked():
         kind="awaiting-human-approval",
         severity="degraded",
         backlogItemId="acme/forge#7",
+        # The adapter's hold names the project's CONFIGURED labels; here the
+        # policy renamed the ready label, so the replacement must keep that
+        # literal spelling rather than substitute default conventions.
+        summary=(
+            "Specification released, but no dispatch label follows it: the work "
+            "waits on implementation-approved with claude-ready and "
+            "human-review-required"
+        ),
     )
     approved = _ledger(
         *_chain(
@@ -3460,9 +3469,10 @@ def test_proven_approval_restates_the_spec_hold_as_dispatch_blocked():
     # severity rather than inherit the hold's advisory one.
     assert kept[0].severity.value == "blocker"
     assert "Approval is proven" in kept[0].summary
-    # The released-spec rule matched with ALL THREE labels absent, so the
-    # guidance must name the review label too.
-    assert "human-review" in kept[0].summary
+    # The hold is quoted verbatim, so every configured label name survives,
+    # including the renamed ready label an operator actually has to apply.
+    assert "claude-ready" in kept[0].summary
+    assert "human-review-required" in kept[0].summary
     document_incident = snapshot.get("forge").as_dict()["incidents"][0]
     assert any(
         action["actionId"] == "re-run-dispatch" for action in document_incident["remediations"]
@@ -3936,4 +3946,113 @@ def test_a_zero_sub_issue_parent_is_a_controlled_error(tmp_path):
             ]
         )
         == 2
+    )
+
+
+def test_a_pinned_sub_issue_listing_requires_repository_identity():
+    # A partial foreign payload must not be PRESUMED local: with the export
+    # pinned to a repository, every record proves where it belongs.
+    with pytest.raises(ControlCenterError, match="repository_url is required"):
+        parent_links(([{"number": 7}], 1), repository="acme/forge")
+    with pytest.raises(ControlCenterError, match="not a recognized repository URL"):
+        parent_links(([{"number": 7, "repository_url": "nope"}], 1), repository="acme/forge")
+    links = parent_links(
+        ([{"number": 7, "repository_url": "https://api.github.com/repos/acme/forge"}], 1),
+        repository="acme/forge",
+    )
+    assert links == {7: 1}
+    # An unpinned listing keeps today's lenient contract.
+    assert parent_links(([{"number": 7}], 1)) == {7: 1}
+
+
+def test_a_malformed_sub_issue_total_is_a_controlled_error():
+    for bad in ("0", True, -1, 1.5):
+        issue = _issue(1, "weird")
+        issue["sub_issues_summary"] = {"total": bad}
+        with pytest.raises(ControlCenterError, match="sub_issues_summary.total"):
+            _export(issue)
+    issue = _issue(1, "weird")
+    issue["sub_issues_summary"] = "two"
+    with pytest.raises(ControlCenterError, match="sub_issues_summary must be an object"):
+        _export(issue)
+    zero = _issue(1, "childless")
+    zero["sub_issues_summary"] = {"total": 0, "completed": 0}
+    assert _export(zero)["items"][0]["kind"] == "task"
+
+
+def test_spec_holds_name_the_configured_labels():
+    from agentic_sdlc.control_center import RELEASED_SPEC_RULE, SPEC_WITHOUT_APPROVAL_RULE
+    from agentic_sdlc.github_backlog import dispatch_rules
+
+    labels = LifecycleLabels(
+        ready="claude-ready", human_review="needs-human", implementation="go-implement"
+    )
+    rules = {rule.rule_id: rule for rule in dispatch_rules(labels)}
+    released = rules[RELEASED_SPEC_RULE].summary
+    assert "go-implement" in released
+    assert "claude-ready" in released
+    assert "needs-human" in released
+    drafted = rules[SPEC_WITHOUT_APPROVAL_RULE].summary
+    assert "go-implement" in drafted
+    assert "claude-ready" in drafted
+
+
+def test_ownership_checks_are_provider_qualified():
+    gitlab_registry = load_project_registry(
+        {
+            "schemaVersion": 1,
+            "projects": [
+                {
+                    "projectId": "forge",
+                    "displayName": "Forge",
+                    "group": "platform",
+                    "defaultBranch": "main",
+                    "repositories": [
+                        {"provider": "gitlab", "identifier": "acme/forge", "role": "primary"}
+                    ],
+                    "environments": [{"name": "production", "kind": "production"}],
+                    "capabilities": ["planning"],
+                }
+            ],
+        }
+    )
+    github_document = dict(_document(_backlog()), source="github-issues")
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=gitlab_registry,
+        backlog=load_backlog_document(github_document),
+    )
+    assert any(
+        "github data references repository acme/forge" in warning
+        and "declares only for gitlab" in warning
+        for warning in snapshot.get("forge").warnings
+    )
+    # Incident documents carry the same qualification.
+    github_incidents = dict(_incidents(_incident(backlogItemId="acme/forge#1")), source="github")
+    incident_view = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=gitlab_registry,
+        incidents=load_incident_document(github_incidents),
+    )
+    assert any(
+        "github data references repository acme/forge" in warning
+        for warning in incident_view.get("forge").warnings
+    )
+    # The same identifier declared FOR github is owned.
+    owned = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        backlog=load_backlog_document(github_document),
+    )
+    assert not any(
+        "references repository acme/forge" in warning for warning in owned.get("forge").warnings
+    )
+    # A document with no recognizable source stays name-only.
+    unqualified = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=gitlab_registry,
+        backlog=load_backlog_document(_document(_backlog())),
+    )
+    assert not any(
+        "references repository" in warning for warning in unqualified.get("forge").warnings
     )
