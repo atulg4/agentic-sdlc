@@ -2135,6 +2135,55 @@ def test_the_cli_reads_configured_labels_from_the_policy(tmp_path):
     ]
 
 
+def test_the_config_must_belong_to_the_exported_repository(tmp_path):
+    # Another repository's labels (or a non-GitHub policy) would silently
+    # misread every issue, so the policy is bound to this export.
+    from agentic_sdlc.cli import main as cli_main
+
+    issues = tmp_path / "issues.json"
+    issues.write_text(json.dumps([]), encoding="utf-8")
+
+    def run(config) -> int:
+        return cli_main(
+            [
+                "github-backlog",
+                "--config",
+                str(config),
+                "--issues",
+                str(issues),
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+                "--backlog-output",
+                str(tmp_path / "backlog.json"),
+            ]
+        )
+
+    def write_config(path, *, project: str, provider: str):
+        path.write_text(
+            "\n".join(
+                (
+                    "version = 1",
+                    "[project]",
+                    f'id = "{project}"',
+                    f'provider = "{provider}"',
+                    'default_branch = "main"',
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return path
+
+    foreign = write_config(tmp_path / "foreign.toml", project="other/repo", provider="github")
+    assert run(foreign) == 2
+    gitlab = write_config(tmp_path / "gitlab.toml", project="acme/forge", provider="gitlab")
+    assert run(gitlab) == 2
+    matching = write_config(tmp_path / "match.toml", project="ACME/forge", provider="github")
+    assert run(matching) == 0
+
+
 def test_staged_replacement_preserves_destination_mode(tmp_path):
     import stat
 
