@@ -1409,6 +1409,7 @@ def test_control_center_joins_registry_backlog_and_incidents(tmp_path):
                         {"name": "human-review-required"},
                     ],
                     "html_url": "https://github.com/acme/forge/issues/1",
+                    "repository_url": "https://api.github.com/repos/acme/forge",
                 }
             ]
         ),

@@ -624,6 +624,7 @@ def _issue(number, title, labels=(), state="open", reason=None, subtotal=0):
         "state": state,
         "state_reason": reason,
         "labels": [{"name": name} for name in labels],
+        "repository_url": "https://api.github.com/repos/acme/forge",
         "html_url": f"https://github.com/acme/forge/issues/{number}",
         "updated_at": NOW,
         "sub_issues_summary": {"total": subtotal, "completed": 0},
@@ -1235,8 +1236,12 @@ def test_a_released_spec_waits_on_implementation_approval():
 def test_full_length_github_names_fit_generated_identifiers():
     owner = "o" * 39
     repository = f"{owner}/{'r' * 100}"
+    long_issue = dict(
+        _issue(123456, "long names"),
+        repository_url=f"https://api.github.com/repos/{repository}",
+    )
     document = backlog_document_from_issues(
-        [_issue(123456, "long names")],
+        [long_issue],
         project_id="forge",
         repository=repository,
     )
@@ -1246,7 +1251,7 @@ def test_full_length_github_names_fit_generated_identifiers():
     )
     assert items[0].item_id == f"{repository}#123456"
     incidents = incidents_from_issues(
-        [_issue(123456, "long names")],
+        [long_issue],
         project_id="forge",
         repository=repository,
         observed_at=NOW,
@@ -1675,6 +1680,7 @@ def test_a_malformed_observed_at_fails_the_export_not_the_next_command(tmp_path)
                     "title": "bare",
                     "state": "open",
                     "labels": [],
+                    "repository_url": "https://api.github.com/repos/acme/forge",
                 }
             ]
         ),
@@ -1787,7 +1793,17 @@ def test_a_failed_export_writes_neither_output(tmp_path):
 
     issues = tmp_path / "issues.json"
     issues.write_text(
-        json.dumps([{"number": 1, "title": "bare", "state": "open", "labels": []}]),
+        json.dumps(
+            [
+                {
+                    "number": 1,
+                    "title": "bare",
+                    "state": "open",
+                    "labels": [],
+                    "repository_url": "https://api.github.com/repos/acme/forge",
+                }
+            ]
+        ),
         encoding="utf-8",
     )
     backlog = tmp_path / "backlog.json"
@@ -1996,7 +2012,15 @@ def test_malformed_labels_are_a_controlled_error():
     for bad in (1, 0, False, "", "x", {}):
         with pytest.raises(ControlCenterError, match="labels must be an array"):
             backlog_document_from_issues(
-                [{"number": 1, "title": "bad labels", "state": "open", "labels": bad}],
+                [
+                    {
+                        "number": 1,
+                        "title": "bad labels",
+                        "state": "open",
+                        "labels": bad,
+                        "repository_url": "https://api.github.com/repos/acme/forge",
+                    }
+                ],
                 project_id="forge",
                 repository="acme/forge",
             )
@@ -2005,8 +2029,19 @@ def test_malformed_labels_are_a_controlled_error():
 def test_a_null_or_absent_labels_field_defaults_to_no_labels():
     document = backlog_document_from_issues(
         [
-            {"number": 1, "title": "null labels", "state": "open", "labels": None},
-            {"number": 2, "title": "no labels", "state": "open"},
+            {
+                "number": 1,
+                "title": "null labels",
+                "state": "open",
+                "labels": None,
+                "repository_url": "https://api.github.com/repos/acme/forge",
+            },
+            {
+                "number": 2,
+                "title": "no labels",
+                "state": "open",
+                "repository_url": "https://api.github.com/repos/acme/forge",
+            },
         ],
         project_id="forge",
         repository="acme/forge",
@@ -2083,7 +2118,13 @@ def test_a_malformed_record_number_is_a_controlled_error():
     # True or "1" and attach the record's items and incidents to a DIFFERENT
     # real issue when called without the CLI's own boundary check.
     for bad in (1.9, True, "1", 0, -3, None):
-        record = {"number": bad, "title": "odd", "state": "open", "labels": []}
+        record = {
+            "number": bad,
+            "title": "odd",
+            "state": "open",
+            "labels": [],
+            "repository_url": "https://api.github.com/repos/acme/forge",
+        }
         with pytest.raises(ControlCenterError, match="number must be a positive integer"):
             backlog_document_from_issues([record], project_id="forge", repository="acme/forge")
         with pytest.raises(ControlCenterError, match="number must be a positive integer"):
@@ -2299,8 +2340,19 @@ def test_an_absent_issue_or_pull_state_is_a_controlled_error():
     # Without an explicit state the adapter has no evidence the record is
     # open, so it fails closed instead of fabricating current work.
     for record in (
-        {"number": 1, "title": "no state", "labels": []},
-        {"number": 1, "title": "null state", "labels": [], "state": None},
+        {
+            "number": 1,
+            "title": "no state",
+            "labels": [],
+            "repository_url": "https://api.github.com/repos/acme/forge",
+        },
+        {
+            "number": 1,
+            "title": "null state",
+            "labels": [],
+            "state": None,
+            "repository_url": "https://api.github.com/repos/acme/forge",
+        },
     ):
         with pytest.raises(ControlCenterError, match="state must be"):
             incidents_from_issues(
@@ -2539,6 +2591,7 @@ def test_the_cli_reads_configured_labels_from_the_policy(tmp_path):
                     "title": "renamed ready",
                     "state": "open",
                     "labels": ["claude-ready", "human-review-required"],
+                    "repository_url": "https://api.github.com/repos/acme/forge",
                 }
             ]
         ),
@@ -2619,14 +2672,24 @@ def test_the_config_must_belong_to_the_exported_repository(tmp_path):
     assert run(gitlab) == 2
     matching = write_config(tmp_path / "match.toml", project="ACME/forge", provider="github")
     issues.write_text(
-        json.dumps([{"number": 1, "title": "spelled", "state": "open", "labels": []}]),
+        json.dumps(
+            [
+                {
+                    "number": 1,
+                    "title": "spelled",
+                    "state": "open",
+                    "labels": [],
+                    "repository_url": "https://api.github.com/repos/acme/forge",
+                }
+            ]
+        ),
         encoding="utf-8",
     )
     assert run(matching) == 0
     # The policy's spelling is canonical: a case-differing --repository must
     # not leak into references, or ledger joins by exact string would miss.
     written = json.loads((tmp_path / "backlog.json").read_text(encoding="utf-8"))
-    assert written["items"][0]["itemId"] == "ACME/forge#1"
+    assert written["items"][0]["itemId"] == "acme/forge#1"
 
 
 def test_staged_replacement_preserves_destination_mode(tmp_path):
@@ -3300,8 +3363,31 @@ def test_a_foreign_payload_behind_a_valid_record_is_still_rejected():
         {"number": 1, "repository_url": "https://api.github.com/repos/acme/forge"},
         {"number": 2, "repository_url": "https://api.github.com/repos/other/repo"},
     ]
-    with pytest.raises(ControlCenterError, match="belong to other/repo"):
+    with pytest.raises(ControlCenterError, match="belongs to other/repo"):
         canonical_repository(records, "acme/forge")
+
+
+def test_an_issue_without_its_repository_identity_is_rejected():
+    # Both builders require every issue to prove which repository it belongs
+    # to: absent, unrecognizable, and foreign repository_url are all errors.
+    absent = _issue(1, "no identity")
+    del absent["repository_url"]
+    unrecognized = _issue(1, "bad identity")
+    unrecognized["repository_url"] = "not-a-repository-url"
+    foreign = _issue(1, "foreign identity")
+    foreign["repository_url"] = "https://api.github.com/repos/other/repo"
+    cases = [
+        (absent, "repository_url is required"),
+        (unrecognized, "not a recognized repository URL"),
+        (foreign, "belongs to other/repo"),
+    ]
+    for issue, message in cases:
+        with pytest.raises(ControlCenterError, match=message):
+            _export(issue)
+        with pytest.raises(ControlCenterError, match=message):
+            incidents_from_issues(
+                [issue], project_id="forge", repository="acme/forge", observed_at=NOW
+            )
 
 
 def test_nested_repository_references_participate_in_ownership_checks():
@@ -3370,6 +3456,9 @@ def test_proven_approval_restates_the_spec_hold_as_dispatch_blocked():
     )
     kept = snapshot.get("forge").incidents
     assert [item.kind for item in kept] == ["dispatch-blocked"]
+    # The replacement blocks dispatch, so it must carry the blocker
+    # severity rather than inherit the hold's advisory one.
+    assert kept[0].severity.value == "blocker"
     assert "Approval is proven" in kept[0].summary
     # The released-spec rule matched with ALL THREE labels absent, so the
     # guidance must name the review label too.
@@ -3550,14 +3639,30 @@ def test_a_malformed_issue_state_is_a_controlled_error():
     for bad in (False, 1, "merged", ""):
         with pytest.raises(ControlCenterError, match="state must be"):
             incidents_from_issues(
-                [{"number": 1, "title": "odd", "state": bad, "labels": []}],
+                [
+                    {
+                        "number": 1,
+                        "title": "odd",
+                        "state": bad,
+                        "labels": [],
+                        "repository_url": "https://api.github.com/repos/acme/forge",
+                    }
+                ],
                 project_id="forge",
                 repository="acme/forge",
                 observed_at=NOW,
             )
         with pytest.raises(ControlCenterError, match="state must be"):
             backlog_document_from_issues(
-                [{"number": 1, "title": "odd", "state": bad, "labels": []}],
+                [
+                    {
+                        "number": 1,
+                        "title": "odd",
+                        "state": bad,
+                        "labels": [],
+                        "repository_url": "https://api.github.com/repos/acme/forge",
+                    }
+                ],
                 project_id="forge",
                 repository="acme/forge",
             )
@@ -3677,7 +3782,15 @@ def test_a_fresh_spec_hold_survives_planning_evidence():
 def test_a_malformed_label_entry_is_a_controlled_error():
     with pytest.raises(ControlCenterError, match="string name"):
         backlog_document_from_issues(
-            [{"number": 1, "title": "bad entry", "state": "open", "labels": [{}]}],
+            [
+                {
+                    "number": 1,
+                    "title": "bad entry",
+                    "state": "open",
+                    "labels": [{}],
+                    "repository_url": "https://api.github.com/repos/acme/forge",
+                }
+            ],
             project_id="forge",
             repository="acme/forge",
         )
