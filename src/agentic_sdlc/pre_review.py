@@ -19,9 +19,6 @@ import yaml
 from .git_diff import collect_git_diff
 
 _FULL_SHA = re.compile(r"[0-9a-f]{40}")
-_ENV_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
-_SHELL_BUILTINS = frozenset({".", "cd", "export", "set", "source", "ulimit"})
-_SHELL_PUNCTUATION = frozenset({"&", "&&", "|", "||", ";", ">", ">>", "<", "<<"})
 _DEFAULT_FORBIDDEN_ADDITIONS = (
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
@@ -52,13 +49,6 @@ def _load_config(path: str | Path) -> dict[str, Any]:
     return document
 
 
-def _shell_tokens(command: str) -> list[str]:
-    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
-    lexer.whitespace_split = True
-    lexer.commenters = ""
-    return list(lexer)
-
-
 def _gate_command_findings(config_path: str | Path) -> list[PreReviewFinding]:
     document = _load_config(config_path)
     commands = document.get("commands", {})
@@ -81,9 +71,18 @@ def _gate_command_findings(config_path: str | Path) -> list[PreReviewFinding]:
                 )
             )
             continue
+        if "\n" in command or "\r" in command:
+            findings.append(
+                PreReviewFinding(
+                    "gate-command-multiline",
+                    str(config_path),
+                    f"verification gate {name!r} spans several lines; a gate is one shell "
+                    "command line (join commands with `&&`)",
+                )
+            )
+            continue
         try:
             arguments = shlex.split(command, posix=True)
-            tokens = _shell_tokens(command)
         except ValueError as exc:
             findings.append(
                 PreReviewFinding(
@@ -101,36 +100,8 @@ def _gate_command_findings(config_path: str | Path) -> list[PreReviewFinding]:
                     f"verification gate {name!r} is empty",
                 )
             )
-            continue
-        if _ENV_ASSIGNMENT.fullmatch(arguments[0]):
-            findings.append(
-                PreReviewFinding(
-                    "gate-command-env-prefix",
-                    str(config_path),
-                    f"verification gate {name!r} starts with an environment assignment; "
-                    "use a checked-in wrapper instead",
-                )
-            )
-        if arguments[0] in _SHELL_BUILTINS:
-            findings.append(
-                PreReviewFinding(
-                    "gate-command-shell-builtin",
-                    str(config_path),
-                    f"verification gate {name!r} requires shell builtin {arguments[0]!r}; "
-                    "use a checked-in wrapper instead",
-                )
-            )
-        punctuation = sorted(token for token in tokens if token in _SHELL_PUNCTUATION)
-        if punctuation or "$(" in command or "`" in command:
-            detail = ", ".join(punctuation) if punctuation else "command substitution"
-            findings.append(
-                PreReviewFinding(
-                    "gate-command-shell-syntax",
-                    str(config_path),
-                    f"verification gate {name!r} requires unsupported shell syntax ({detail}); "
-                    "Forge executes gates with shell=False, so use a checked-in wrapper",
-                )
-            )
+        # Shell syntax (`&&`, `cd`, `VAR=x cmd`) is no finding (Codex 4243193109): `run-gates`
+        # runs each gate as one `bash -e -o pipefail -c` line (ci.yml's shell, plus pipefail).
     return findings
 
 

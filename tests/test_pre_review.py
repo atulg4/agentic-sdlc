@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
+
+import pytest
 
 from agentic_sdlc.pre_review import run_pre_review
 
@@ -47,35 +50,39 @@ def test_clean_non_workflow_change_passes(tmp_path: Path) -> None:
     assert report["findings"] == []
 
 
-def test_gate_command_environment_prefix_fails_before_review(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "command",
+    [
+        "DATABASE_URL=sqlite:///test.db pytest -q",
+        "python -m pytest -q && python -m ruff check .",
+        "cd frontend && npm test",
+    ],
+)
+def test_gate_command_shell_syntax_is_no_finding(tmp_path: Path, command: str) -> None:
+    """Codex 4243193109: `run-gates` runs a gate as one `bash -e -c` line, exactly as the
+    generated ci.yml does, so the `&&` onboard recommends (and `cd`, `VAR=x cmd`) is supported."""
     base = _init(tmp_path)
     (tmp_path / "agentic-sdlc.toml").write_text(
-        "[commands]\n"
-        'test = "DATABASE_URL=sqlite:///test.db pytest -q"\n\n'
-        "[verification]\n"
-        'gates = ["test"]\n',
+        f'[commands]\ntest = {json.dumps(command)}\n\n[verification]\ngates = ["test"]\n',
+        encoding="utf-8",
+    )
+
+    report = run_pre_review(tmp_path / "agentic-sdlc.toml", tmp_path, base)
+
+    assert not {code for code in _codes(report) if code.startswith("gate-command")}
+
+
+def test_gate_command_spanning_lines_fails_before_review(tmp_path: Path) -> None:
+    base = _init(tmp_path)
+    (tmp_path / "agentic-sdlc.toml").write_text(
+        '[commands]\ntest = "true\\npytest"\n\n[verification]\ngates = ["test"]\n',
         encoding="utf-8",
     )
 
     report = run_pre_review(tmp_path / "agentic-sdlc.toml", tmp_path, base)
 
     assert report["passed"] is False
-    assert "gate-command-env-prefix" in _codes(report)
-
-
-def test_gate_command_shell_metacharacters_fail_before_review(tmp_path: Path) -> None:
-    base = _init(tmp_path)
-    (tmp_path / "agentic-sdlc.toml").write_text(
-        "[commands]\n"
-        'test = "python -m pytest -q && python -m ruff check ."\n\n'
-        "[verification]\n"
-        'gates = ["test"]\n',
-        encoding="utf-8",
-    )
-
-    report = run_pre_review(tmp_path / "agentic-sdlc.toml", tmp_path, base)
-
-    assert "gate-command-shell-syntax" in _codes(report)
+    assert "gate-command-multiline" in _codes(report)
 
 
 def test_mutable_external_workflow_reference_fails(tmp_path: Path) -> None:

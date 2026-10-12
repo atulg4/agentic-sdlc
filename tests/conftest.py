@@ -1,8 +1,41 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
+
+_REAL_ACCESS = os.access
+
+
+@pytest.fixture(autouse=True)
+def _system_dirs_read_only(monkeypatch, tmp_path_factory):
+    """Model an ordinary user whose system directories are not writable, wherever the suite runs.
+
+    The commit guard needs the lease when a directory PATH searches before a program git runs is
+    writable (Codex 4240952107). Run as root -- or on a CI runner whose tool-cache `bin` precedes
+    /usr/bin -- every PATH entry is writable and every read-only git command would be guarded.
+    Writability is therefore real only under pytest's own temporary directories, where tests
+    build the writable entries they mean; everything else answers "not writable"."""
+    base = os.path.realpath(tmp_path_factory.getbasetemp())
+
+    def access(path, mode, *args, **kwargs):
+        if mode & os.W_OK and not isinstance(path, int):
+            real = os.path.realpath(os.fspath(path))
+            if real != base and not real.startswith(base + os.sep):
+                return False
+        return _REAL_ACCESS(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "access", access)
+
+
+@pytest.fixture(autouse=True)
+def _no_policy_trust_mode(monkeypatch):
+    """Each test starts with no policy trust mode recorded (`use_trust_mode` is process state)."""
+    from agentic_sdlc import trusted_exec
+
+    monkeypatch.setattr(trusted_exec, "_POLICY_MODE", None)
+    monkeypatch.setattr(trusted_exec, "_GATE", False)
 
 
 @pytest.fixture

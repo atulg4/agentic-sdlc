@@ -287,7 +287,7 @@ jobs:
           printf 'selected_auth_mode=%s\n' "$(jq -r '.authMode // ""' .agentic-input/selected-executor.json)" >> "$GITHUB_OUTPUT"
       - name: Store validated spec request
         if: steps.check.outputs.needs_draft == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: agent-spec-input-${{ github.run_id }}
           path: |
@@ -300,7 +300,7 @@ jobs:
           retention-days: 3
       - name: Store pinned policy engine for the credential-free merge
         if: steps.check.outputs.needs_draft == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: spec-policy-engine-${{ github.run_id }}
           path: .agentic-platform/src/agentic_sdlc/
@@ -324,7 +324,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Restore validated spec request
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: agent-spec-input-${{ github.run_id }}
           path: .agentic-input
@@ -341,7 +341,7 @@ jobs:
             .agentic-input/selected-executor.json
       - name: Draft missing sections with Codex in a read-only sandbox
         if: needs.prepare.outputs.selected_provider == 'codex'
-        uses: openai/codex-action@86365089eb2b84e0a8fb0717b304f8bdcb13b20e # v1
+        uses: openai/codex-action@bdf19a4a223ec2549a3e2274a0cf61556bc07675 # v1
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           prompt-file: .agentic-input/prompt.md
@@ -352,11 +352,28 @@ jobs:
       - name: Install bubblewrap (Claude Code subprocess isolation)
         if: needs.prepare.outputs.selected_provider == 'anthropic'
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q bubblewrap
+          set -euo pipefail
+          # bubblewrap is baked into the self-hosted runner images; skip apt (and its
+          # lock contention with sibling runners / unattended-upgrades) when present,
+          # and wait for the lock when an install is genuinely needed.
+          if command -v bwrap >/dev/null; then
+            echo "bubblewrap already installed; skipping apt"
+          else
+            # DPkg::Lock::Timeout covers the dpkg locks only; `update` takes the
+            # apt lists lock once and exits 100 if another process holds it.
+            # Retry it for the same ~5 minutes the dpkg timeout allows.
+            for attempt in 1 2 3 4 5 6 7 8 9 10; do
+              sudo apt-get -o DPkg::Lock::Timeout=300 update -q && break
+              if [ "$attempt" = 10 ]; then exit 1; fi
+              echo "apt-get update failed (attempt $attempt); retrying in 30s"
+              sleep 30
+            done
+            sudo apt-get -o DPkg::Lock::Timeout=300 install -y -q bubblewrap
+          fi
+          command -v bwrap >/dev/null
       - name: Draft missing sections with Claude Code using Max/Pro OAuth
         if: needs.prepare.outputs.selected_provider == 'anthropic' && needs.prepare.outputs.selected_auth_mode == 'oauth'
-        uses: anthropics/claude-code-action@8cf3482550831fb35a4fc3fbf7ca139cf8028b4c # v1
+        uses: anthropics/claude-code-action@6fed3ca145920b639991cb756090506e1bcaf515 # v1
         env:
           CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
         with:
@@ -373,7 +390,7 @@ jobs:
             --allowedTools "Read,Write,Glob,Grep"
       - name: Draft missing sections with Claude Code using direct API billing
         if: needs.prepare.outputs.selected_provider == 'anthropic' && needs.prepare.outputs.selected_auth_mode == 'api-key'
-        uses: anthropics/claude-code-action@8cf3482550831fb35a4fc3fbf7ca139cf8028b4c # v1
+        uses: anthropics/claude-code-action@6fed3ca145920b639991cb756090506e1bcaf515 # v1
         env:
           CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
         with:
@@ -414,7 +431,7 @@ jobs:
           set -euo pipefail
           test -s .agentic-input/spec-draft.md
       - name: Store draft
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: agent-spec-draft-${{ github.run_id }}
           path: .agentic-input/spec-draft.md
@@ -431,12 +448,12 @@ jobs:
       issues: write
     steps:
       - name: Restore pinned policy engine
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: spec-policy-engine-${{ github.run_id }}
           path: ${{ runner.temp }}/engine/agentic_sdlc
       - name: Restore draft only
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: agent-spec-draft-${{ github.run_id }}
           path: ${{ runner.temp }}/agent-spec
