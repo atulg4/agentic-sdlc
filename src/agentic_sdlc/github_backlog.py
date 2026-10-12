@@ -683,7 +683,10 @@ def incidents_from_change_requests(
             full_name.lower() == repository.lower(),
             f"change request {number} belongs to {full_name}, not repository {repository}",
         )
-        ref = f"{repository}!{number}"
+        # The provider's own spelling, validated above: ledger events carry
+        # it, and the read model joins change-request references by exact
+        # string equality, so the caller's casing must never leak into refs.
+        ref = f"{full_name.strip()}!{number}"
         title = str(pull.get("title") or "")[:512]
         state = pull.get("mergeable_state")
         _require(
@@ -872,6 +875,15 @@ def parent_links(
             referenced: int | None = None
             url = entry.get("parent_issue_url")
             if isinstance(url, str):
+                # Only the recognized API shape may contribute a parent
+                # number: a web URL like https://github.com/other/repo/
+                # issues/1 would otherwise bypass the repository check while
+                # its trailing number reparents the child to local issue #1.
+                _require(
+                    _PARENT_REPOSITORY.search(url) is not None,
+                    f"sub-issue record {number}: parent_issue_url is not a "
+                    f"recognized GitHub issue URL: {url}",
+                )
                 match = _PARENT_URL.search(url)
                 if match is not None and int(match.group(1)) > 0:
                     referenced = int(match.group(1))

@@ -415,7 +415,12 @@
     }
     const registered = project.registered === true;
     const serialized = project.counts || {};
-    const workUnits = Number.isInteger(serialized.workUnits) && serialized.workUnits >= 0 ? serialized.workUnits : 0;
+    // The serialized workUnits scalar is never trusted: the sum of the
+    // VALIDATED byState object is the document's unit count, so the scalar
+    // cannot disagree with the state breakdown the page displays.
+    const byState = serialized.byState && typeof serialized.byState === "object" && !Array.isArray(serialized.byState) ? serialized.byState : {};
+    let workUnits = 0;
+    for (const key of Object.keys(byState)) workUnits += byState[key];
     project.health =
       !registered ? "unregistered" :
       blockers ? "blocked" :
@@ -538,6 +543,20 @@
         if (problem) return problem;
       }
       if (project.counts !== undefined && !isObj(project.counts)) return `${where}.counts must be an object.`;
+      if (project.counts && project.counts.byState !== undefined) {
+        // byState is the only complete unit representation the document
+        // carries, and deriveProjectFacts sums it for the work-unit count,
+        // so its shape is pinned here.
+        if (!isObj(project.counts.byState)) return `${where}.counts.byState must be an object.`;
+        const states = Object.keys(project.counts.byState);
+        if (states.length > 64) return `${where}.counts.byState holds more than 64 states.`;
+        for (const key of states) {
+          const count = project.counts.byState[key];
+          if (!Number.isInteger(count) || count < 0 || count > 1000000) {
+            return `${where}.counts.byState.${key} must be a non-negative integer.`;
+          }
+        }
+      }
       for (const list of [project.active || [], project.attention || []]) {
         for (const unit of list) {
           if (!isObj(unit)) return `${where} has a work unit that is not an object.`;
@@ -585,7 +604,7 @@
       }
     }
     if (value.totals !== undefined && !isObj(value.totals)) return "totals must be an object.";
-    const topLevel = arrayField(value, "warnings", "snapshot", 5000) || arrayField(value, "sources", "snapshot", 100);
+    const topLevel = arrayField(value, "warnings", "snapshot", 5000) || arrayField(value, "sources", "snapshot", 1200);
     if (topLevel) return topLevel;
     if (value.generatedAt !== undefined && typeof value.generatedAt !== "string") return "generatedAt must be a string.";
     if (!/^[0-9a-f]{64}$/.test(value.snapshotSha256 || "")) return "The snapshot must carry its 64-character snapshotSha256 digest.";
@@ -1361,6 +1380,11 @@
       }
     } else if (!/^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)+$/.test(repository)) {
       return "A repository looks like group/name (nested groups are allowed).";
+    }
+    // The registry's shared length contract (MAX_REPOSITORY_LENGTH): a draft
+    // this form calls commit-ready must pass load_project_registry later.
+    if (repository.length > 255) {
+      return "A repository identifier is at most 255 characters - the registry rejects longer ones.";
     }
     const group = fields.group.value.trim();
     if (group && !/^[a-z0-9][a-z0-9._-]{0,63}$/.test(group)) {
