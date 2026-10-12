@@ -2063,3 +2063,66 @@ def test_combined_per_project_incidents_respect_the_budget():
         build_control_center_snapshot(
             generated_at=NOW, registry=REGISTRY, incidents=half_one + half_two
         )
+
+
+def test_an_unstable_state_is_not_double_counted_with_its_failing_check():
+    incidents = incidents_from_change_requests(
+        [{"number": 7, "title": "red", "mergeable_state": "unstable"}],
+        project_id="forge",
+        repository="acme/forge",
+        observed_at=NOW,
+        failing={7: "test"},
+    )
+    assert [item["kind"] for item in incidents] == ["deterministic-ci-failed"]
+
+
+def test_repeated_failing_flags_aggregate_check_names(tmp_path):
+    from agentic_sdlc.cli import _failing_checks
+
+    assert _failing_checks(["7=test", "7=lint"]) == {7: "test, lint"}
+
+
+def test_a_boolean_record_number_is_a_controlled_error(tmp_path):
+    from agentic_sdlc.cli import main as cli_main
+
+    issues = tmp_path / "issues.json"
+    issues.write_text(json.dumps([{"number": True, "title": "bool"}]), encoding="utf-8")
+    assert (
+        cli_main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+            ]
+        )
+        == 2
+    )
+
+
+def test_a_triage_incident_survives_approval_without_labels():
+    stale = _incident(
+        incidentId="acme/forge#7:untriaged",
+        kind="triage-needed",
+        severity="advisory",
+        backlogItemId="acme/forge#7",
+    )
+    approved = _ledger(
+        *_chain(
+            TO_PLANNED + ("approved",),
+            workUnit={"projectId": "forge", "workUnitId": "wu-1", "issueRef": "acme/forge#7"},
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=approved.projections(),
+        backlog=load_backlog_document(
+            _document(_backlog(itemId="acme/forge#7", issueRef="acme/forge#7"))
+        ),
+        incidents=load_incident_document(_incidents(stale)),
+    )
+    assert len(snapshot.get("forge").incidents) == 1

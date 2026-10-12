@@ -375,6 +375,47 @@
     return "";
   }
 
+  function canonicalJson(value) {
+    // Mirror Python's json.dumps(sort_keys=True, separators=(",", ":"),
+    // ensure_ascii=True) so the digest computes identically on both sides.
+    const encode = (entry) => {
+      if (entry === null || typeof entry === "number" || typeof entry === "boolean") {
+        return JSON.stringify(entry);
+      }
+      if (typeof entry === "string") {
+        return JSON.stringify(entry).replace(/[\u0080-\uffff]/g,
+          (ch) => "\\u" + ch.charCodeAt(0).toString(16).padStart(4, "0"));
+      }
+      if (Array.isArray(entry)) return "[" + entry.map(encode).join(",") + "]";
+      return "{" + Object.keys(entry).sort().map(
+        (key) => encode(key) + ":" + encode(entry[key])).join(",") + "}";
+    };
+    return encode(value);
+  }
+
+  async function digestMismatch(value) {
+    // The producer digests the content minus the run metadata; a snapshot
+    // carrying a digest that does not match was edited or truncated.
+    if (typeof value.snapshotSha256 !== "string" || !crypto?.subtle) return "";
+    const clone = JSON.parse(JSON.stringify(value));
+    delete clone.snapshotSha256;
+    delete clone.generatedAt;
+    for (const project of clone.projects || []) {
+      for (const incident of project.incidents || []) delete incident.observedAt;
+    }
+    try {
+      const bytes = await crypto.subtle.digest(
+        "SHA-256", new TextEncoder().encode(canonicalJson(clone)));
+      const digest = [...new Uint8Array(bytes)]
+        .map((byte) => byte.toString(16).padStart(2, "0")).join("");
+      return digest === value.snapshotSha256
+        ? ""
+        : "The snapshot's content does not match its snapshotSha256 digest; it was edited or truncated.";
+    } catch {
+      return "";
+    }
+  }
+
   function validateSnapshot(value) {
     // Deep structural validation: a malformed document saved to the shared
     // store would crash every viewer, so every shape a renderer touches is
@@ -385,6 +426,7 @@
     if (!Array.isArray(value.projects)) return "The snapshot has no projects array.";
     const seenProjects = new Set();
     const seenIncidents = new Set();
+    const seenItems = new Set();
     const arrayField = (owner, key, where) =>
       owner[key] === undefined || Array.isArray(owner[key]) ? "" : `${where}.${key} must be an array.`;
     for (const project of value.projects) {
@@ -420,6 +462,9 @@
         const [node, depth] = stack.pop();
         if (depth > 32) return `${where} backlog nests deeper than 32 levels.`;
         if (!isObj(node) || typeof node.title !== "string") return `${where} has a malformed backlog node.`;
+        if (typeof node.itemId !== "string" || !node.itemId) return `${where} has a backlog node without a string itemId.`;
+        if (seenItems.has(node.itemId)) return `Duplicate backlog itemId: ${node.itemId}.`;
+        seenItems.add(node.itemId);
         for (const key of ["itemId", "kind", "state", "stateBasis", "url", "issueRef"]) {
           if (node[key] !== undefined && typeof node[key] !== "string") return `${where} backlog node field ${key} must be a string.`;
         }
@@ -1009,7 +1054,7 @@
           let parsed;
           try { parsed = JSON.parse(area.value); }
           catch (error) { result.append(el("div", { class: "banner bad", text: "That is not valid JSON: " + describe(error) })); return; }
-          const problem = validateSnapshot(parsed);
+          const problem = validateSnapshot(parsed) || await digestMismatch(parsed);
           if (problem) { result.append(el("div", { class: "banner bad", text: problem })); return; }
           const button = event.currentTarget;
           button.disabled = true;
