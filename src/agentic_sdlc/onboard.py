@@ -6675,11 +6675,27 @@ def _set_invocation(argv: tuple[str, ...]) -> tuple[list[str], bool] | None:
     return words[1:], plain
 
 
-def _set_options(arguments: list[str]) -> dict[str, bool]:
+#: The single-letter flags bash's `set` accepts (`help set`); any other aborts the call.
+_SET_FLAGS = set("abefhkmnoptuvxBCEHPT")
+#: The `-o` option names bash's `set` accepts; any other aborts the call.
+_SET_OPTION_NAMES = {
+    "allexport", "braceexpand", "emacs", "errexit", "errtrace", "functrace", "hashall",
+    "histexpand", "history", "ignoreeof", "interactive-comments", "keyword", "monitor",
+    "noclobber", "noexec", "noglob", "nolog", "notify", "nounset", "onecmd", "physical",
+    "pipefail", "posix", "privileged", "verbose", "vi", "xtrace",
+}  # fmt: skip
+
+
+def _set_options(arguments: list[str]) -> tuple[dict[str, bool], bool]:
     """The `errexit`/`pipefail` changes a `set` call's arguments make, parsed as bash does: options
     (`-e`, `+e`, `-o NAME`, `+o NAME`, clustered as in `-euo pipefail`) until `--`, `-` or the first
-    operand; everything after that is positional parameters (Codex 4250527928)."""
+    operand; everything after that is positional parameters (Codex 4250527928).
+
+    Also whether the call surely runs and applies them: False when it carries a redirection (a
+    failing one skips the builtin: Codex 4251593338) or an invalid flag or option name (bash
+    stops there: Codex 4251593332). An untrusted call may only turn options OFF."""
     changes: dict[str, bool] = {}
+    trusted = not any("<" in word or ">" in word for word in arguments)
     index = 0
     while index < len(arguments):
         word = arguments[index]
@@ -6687,16 +6703,20 @@ def _set_options(arguments: list[str]) -> dict[str, bool]:
             break
         on = word[0] == "-"
         flags = word[1:]
+        if set(flags) - _SET_FLAGS:
+            trusted = False
         if "e" in flags:
             changes["errexit"] = on
         if "o" in flags and index + 1 < len(arguments):
             # Wherever `o` sits in the cluster (`+ou pipefail`), it takes the next word as its
             # option name (Codex 4251046345).
             index += 1
+            if arguments[index] not in _SET_OPTION_NAMES:
+                trusted = False
             if arguments[index] in {"errexit", "pipefail"}:
                 changes[arguments[index]] = on
         index += 1
-    return changes
+    return changes, trusted
 
 
 def _job_key_set(node: dict, key: str) -> bool:
@@ -6880,8 +6900,9 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                         and previous not in {"|", "|&", "&&", "||"}
                         and following not in {"|", "|&", "&", "||"}
                     )
-                    for option, on in _set_options(arguments).items():
-                        if on and not in_parent:
+                    changes, trusted = _set_options(arguments)
+                    for option, on in changes.items():
+                        if on and not (in_parent and trusted):
                             continue
                         if option == "errexit":
                             errexit = on
