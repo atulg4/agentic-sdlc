@@ -13533,3 +13533,32 @@ def test_safe_json_not_found_only_on_a_404_answer(failure):
         _raising(GhCommandError("gh: Not Found (HTTP 404)", http_status=404)), args
     )
     assert isinstance(genuine, Unreadable) and genuine.not_found
+
+
+def test_hook_python_is_strict_in_an_agent_context(monkeypatch, tmp_path) -> None:
+    # Codex 4244145211: --trust-mode local / a local policy must not let an agent context pin a
+    # user-writable interpreter; the effective mode there is strict.
+    from agentic_sdlc import onboard
+
+    fake = tmp_path / "python3"
+    fake.write_text("#!/bin/sh\n", encoding="utf-8")
+    fake.chmod(0o755)
+    seen: list[str] = []
+    monkeypatch.setattr(onboard, "_hook_python_probe_problem", lambda path: "")
+    import agentic_sdlc.trusted_exec as te
+
+    monkeypatch.setattr(te, "local_candidate_reason", lambda path: seen.append("local") or "")
+    monkeypatch.setattr(te, "candidate_reason", lambda path: seen.append("strict") or "untrusted")
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_REMOTE", raising=False)
+    assert onboard.hook_python_problem(str(fake), onboard.LOCAL) == ""
+    assert seen == ["local"]
+    seen.clear()
+    monkeypatch.setenv("CLAUDE_CODE_REMOTE", "true")
+    assert "only root" in onboard.hook_python_problem(str(fake), onboard.LOCAL)
+    assert seen == ["strict"]
+    seen.clear()
+    monkeypatch.delenv("CLAUDE_CODE_REMOTE")
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    assert "only root" in onboard.hook_python_problem(str(fake), onboard.LOCAL)
+    assert seen == ["strict"]

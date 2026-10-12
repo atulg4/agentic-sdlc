@@ -6931,6 +6931,10 @@ def hook_python_problem(path: str, mode: str = STRICT) -> str:
     (`_hook_python_probe_problem`, Codex 4242925452) -- in both modes."""
     if not _HOOK_PYTHON_PATH.fullmatch(path or ""):
         return f"{path!r} is not an absolute path made of [A-Za-z0-9._+/-]"
+    # Codex 4244145211: in an agent context the effective mode is strict whatever the policy or
+    # --trust-mode asked for, exactly as `trust_mode()` decides for git and gh.
+    if agent_context():
+        mode = STRICT
     if mode == LOCAL:
         from .trusted_exec import local_candidate_reason
 
