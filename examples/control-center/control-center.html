@@ -333,11 +333,24 @@
     }
     if (!state.db) { render(); return; }
     try {
-      const snap = await state.db.doc("snapshots/current").get();
-      if (snap?.exists) {
-        const body = snap.data() || {};
-        adoptSnapshot(body.document, body.loadedAt, body.loadedBy);
-      }
+      // A live subscription, not a one-shot get: a snapshot replaced by
+      // another operator must reach every open view. Each delivery passes
+      // the same structural AND digest verification as a pasted document,
+      // because the store itself is writable by other viewers.
+      let deliveries = 0;
+      state.db.doc("snapshots/current").onSnapshot(
+        async (snap) => {
+          if (!snap?.exists) return;
+          const delivery = ++deliveries;
+          const body = snap.data() || {};
+          const problem = validateSnapshot(body.document) || await digestMismatch(body.document);
+          if (delivery !== deliveries) return; // a newer delivery superseded this one
+          if (problem) { state.error = problem; render(); return; }
+          adoptSnapshot(body.document, body.loadedAt, body.loadedBy);
+          render();
+        },
+        () => { /* a dropped subscription leaves the last view in place */ },
+      );
     } catch (error) { state.error = describe(error); }
     subscribe("notes", (docs) => {
       state.notes = new Map();
