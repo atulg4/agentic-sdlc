@@ -10,7 +10,10 @@ only the environment: an allowlist, never the runner's credentials or control fi
 
 The interpreter must be CI's too (Codex 4243659485): before any gate runs, the `python3` on the
 gate environment's PATH is asked its version, and a major.minor other than the policy's
-`[ci] python_version` (what ci.yml's setup-python installs) fails closed. Unset: a warning.
+`[ci] python_version` (what ci.yml's setup-python installs) is reported as a warning, as is an
+unset version or a missing python3. A warning, not a failure: the platform's reusable-implement
+`verify` job installs no Python yet, so failing closed would fail every verification whose
+policy pins a version other than the runner's preinstalled one. A malformed version still fails.
 """
 
 from __future__ import annotations
@@ -134,27 +137,28 @@ def gate_python_version(environment: dict[str, str], root: Path) -> tuple[str, s
 def check_gate_python(
     python_version: str | None, environment: dict[str, str], root: Path
 ) -> str | None:
-    """Fail closed (GateError) when the `python3` the gates will run is not the policy's
+    """A warning (never a failure) when the `python3` the gates will run is not the policy's
     `[ci] python_version` (major.minor) -- the interpreter the repository's own ci.yml installs
-    with setup-python (Codex 4243659485): gates verified under another Python prove nothing about
-    what CI runs. Returns a warning, instead, when the policy sets no version."""
-    if python_version is None:
-        try:
-            found, version = gate_python_version(environment, root)
-        except GateError as error:
+    with setup-python (Codex 4243659485) -- or when it cannot be read, or the policy sets no
+    version. None when they match."""
+    try:
+        found, version = gate_python_version(environment, root)
+    except GateError as error:
+        if python_version is None:
             return f"[ci] python_version is not set ({error})"
+        return f"cannot confirm the gates run under Python {python_version}: {error}"
+    if python_version is None:
         return (
             f"[ci] python_version is not set; the gates run under {found} (Python {version}), "
             "which nothing checks against the interpreter CI installs"
         )
-    found, version = gate_python_version(environment, root)
     wanted = python_version.split(".")[:2]
     if version.split(".")[:2] != wanted:
-        raise GateError(
-            f"the verification gates would run under {found} (Python {version}), but the "
-            f"policy's [ci] python_version is {python_version}: install Python "
-            f"{'.'.join(wanted)} (actions/setup-python) before run-gates, or change "
-            "[ci] python_version"
+        return (
+            f"the verification gates run under {found} (Python {version}), but the "
+            f"policy's [ci] python_version is {python_version}: results may differ from CI; "
+            f"install Python {'.'.join(wanted)} (actions/setup-python) before run-gates, or "
+            "change [ci] python_version"
         )
     return None
 
