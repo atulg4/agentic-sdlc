@@ -3028,6 +3028,127 @@ def test_a_lifecycle_restart_voids_crossed_gate_history():
     ]
 
 
+def test_planning_history_retires_the_plan_advisory_after_a_block():
+    from agentic_sdlc.control_center import PLAN_EVIDENCE_RULE
+
+    # planned -> approval-pending -> blocked: planning provably ran, so the
+    # advisory telling the operator to confirm the plan run is stale even
+    # though the unit now sits in a pre-plan-reachable state.
+    advisory = _incident(
+        incidentId=f"acme/forge#7:{PLAN_EVIDENCE_RULE}",
+        kind="awaiting-dispatch-evidence",
+        severity="advisory",
+        backlogItemId="acme/forge#7",
+    )
+    ledger = _ledger(
+        *_chain(
+            TO_PLANNED + ("approval-pending", "blocked"),
+            workUnit={"projectId": "forge", "workUnitId": "wu-1", "issueRef": "acme/forge#7"},
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        backlog=load_backlog_document(
+            _document(_backlog(itemId="acme/forge#7", issueRef="acme/forge#7"))
+        ),
+        incidents=load_incident_document(_incidents(advisory)),
+    )
+    assert snapshot.get("forge").incidents == ()
+
+
+def test_incident_only_foreign_references_warn():
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        incidents=load_incident_document(
+            _incidents(
+                _incident(
+                    incidentId="acme/other!7:merge-conflict",
+                    projectId="forge",
+                    kind="merge-conflict",
+                    severity="blocker",
+                    evidenceRef="acme/other!7",
+                )
+            )
+        ),
+    )
+    assert any(
+        "references repository acme/other" in warning for warning in snapshot.get("forge").warnings
+    )
+
+
+def test_the_payload_spelling_canonicalizes_the_repository(tmp_path):
+    from agentic_sdlc.cli import main as cli_main
+
+    issues = tmp_path / "issues.json"
+    issues.write_text(
+        json.dumps(
+            [
+                {
+                    "number": 1,
+                    "title": "cased",
+                    "state": "open",
+                    "labels": [],
+                    "repository_url": "https://api.github.com/repos/Acme/Forge",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    backlog_out = tmp_path / "backlog.json"
+    assert (
+        cli_main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+                "--backlog-output",
+                str(backlog_out),
+            ]
+        )
+        == 0
+    )
+    written = json.loads(backlog_out.read_text(encoding="utf-8"))
+    assert written["items"][0]["itemId"] == "Acme/Forge#1"
+    foreign = tmp_path / "foreign.json"
+    foreign.write_text(
+        json.dumps(
+            [
+                {
+                    "number": 1,
+                    "title": "foreign",
+                    "state": "open",
+                    "labels": [],
+                    "repository_url": "https://api.github.com/repos/other/repo",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        cli_main(
+            [
+                "github-backlog",
+                "--issues",
+                str(foreign),
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+                "--backlog-output",
+                str(tmp_path / "out.json"),
+            ]
+        )
+        == 2
+    )
+
+
 def test_proven_approval_replaces_the_plan_advisory_guidance():
     from agentic_sdlc.control_center import PLAN_EVIDENCE_RULE
 

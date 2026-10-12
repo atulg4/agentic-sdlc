@@ -83,6 +83,33 @@ def _record_number(record: Mapping[str, Any], label: str) -> int:
     return number
 
 
+def canonical_repository(issues: Iterable[Mapping[str, Any]], declared: str) -> str:
+    """The provider's own spelling of ``declared``, taken from the payloads.
+
+    The read model joins references by exact string equality, so the export
+    must emit the spelling the ledger records carry. GitHub payloads state it
+    in ``repository_url``: when present, that spelling wins over the caller's
+    casing, and a payload from a DIFFERENT repository is a controlled error.
+    Payloads without the field keep the declared spelling.
+    """
+
+    _require_repository(declared)
+    for issue in issues:
+        url = issue.get("repository_url")
+        if not isinstance(url, str):
+            continue
+        match = _REPOSITORY_URL.search(url)
+        if match is None:
+            continue
+        name = match.group(1)
+        _require(
+            name.lower() == declared.lower(),
+            f"issue payloads belong to {name}, not repository {declared}",
+        )
+        return name
+    return declared
+
+
 def _issue_state(issue: Mapping[str, Any]) -> str:
     """The issue's explicit state, or a controlled error: a record without
     "open" or "closed" must never silently classify as open."""
