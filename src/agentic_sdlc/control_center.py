@@ -1331,10 +1331,11 @@ def build_control_center_snapshot(
         retained: list[Incident] = []
         for incident in project_incidents:
             # A named work unit is direct ledger evidence; the backlog-item
-            # join is the fallback for incidents that only name the item
-            # (e.g. when no backlog document was supplied at all).
-            proven = statuses.get(incident.work_unit_id) if incident.work_unit_id else None
-            if proven is None:
+            # join applies ONLY when no unit is named, so an incident naming
+            # an unknown unit is never retired on some other unit's proof.
+            if incident.work_unit_id:
+                proven = statuses.get(incident.work_unit_id)
+            else:
                 proven = item_status.get(incident.backlog_item_id)
             if incident.kind in _LEDGER_RETIREMENT and proven is not None:
                 # Label-derived incidents are outranked by durable ledger

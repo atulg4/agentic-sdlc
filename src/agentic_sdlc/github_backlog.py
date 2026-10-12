@@ -46,6 +46,8 @@ def _require(condition: bool, message: str) -> None:
 
 
 _PARENT_URL = re.compile(r"/issues/(\d+)/?$")
+_PARENT_REPOSITORY = re.compile(r"/repos/([^/\s]+/[^/\s]+)/issues/\d+/?$")
+_REPOSITORY_URL = re.compile(r"/repos/([^/\s]+/[^/\s]+)/?$")
 
 #: The OWNER/REPO shape every GitHub repository identifier must carry; a bare
 #: or slashless value would generate references no registry entry or ledger
@@ -622,6 +624,7 @@ def incident_document(
 
 def parent_links(
     *groups: Iterable[Mapping[str, Any]] | tuple[Iterable[Mapping[str, Any]], int | None],
+    repository: str | None = None,
 ) -> dict[int, int]:
     """Map child issue number to parent issue number, from sub-issue payloads.
 
@@ -632,9 +635,34 @@ def parent_links(
     field the API documentation does not promise, and a child whose own
     reference disagrees with the declared parent is rejected rather than
     silently relinked.
+
+    ``repository`` pins the export's repository: GitHub supports sub-issues
+    from OTHER repositories, and such a child's bare number could collide with
+    an unrelated local issue, so with the repository given every record whose
+    ``repository_url`` or ``parent_issue_url`` names a different repository is
+    rejected rather than silently treated as local.
     """
 
     links: dict[int, int] = {}
+
+    def require_local(entry: Mapping[str, Any], number: int) -> None:
+        if repository is None:
+            return
+        for key, pattern in (
+            ("repository_url", _REPOSITORY_URL),
+            ("parent_issue_url", _PARENT_REPOSITORY),
+        ):
+            url = entry.get(key)
+            if not isinstance(url, str):
+                continue
+            match = pattern.search(url)
+            if match is not None and match.group(1).lower() != repository.lower():
+                _require(
+                    False,
+                    f"sub-issue record {number} belongs to another repository "
+                    f"({match.group(1)}); cross-repository sub-issues are not "
+                    "supported by this export",
+                )
 
     def link(child: int, parent: int) -> None:
         _require(child != parent, f"issue {child} is listed as its own parent")
@@ -661,6 +689,7 @@ def parent_links(
             number = entry.get("number")
             if not isinstance(number, int):
                 continue
+            require_local(entry, number)
             referenced: int | None = None
             url = entry.get("parent_issue_url")
             if isinstance(url, str):
