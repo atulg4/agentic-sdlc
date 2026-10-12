@@ -2380,6 +2380,16 @@ def test_doctor_rejects_a_ci_gate_whose_failure_is_ignored(tmp_path, mutate):
         # shlex drops quoting: a quoted `)` must not end a subshell early (Codex 4251246570).
         ("set +o pipefail; ( echo ')' ; set -o pipefail ) ; pytest | tee out", "bash", False),
         ("( true ); set -o pipefail; pytest | tee out", None, False),
+        # A trap handler or a wrapped command built from an expansion (Codex 4251422330/-08).
+        ("x='set +o pipefail'; trap \"$x\" DEBUG; pytest | tee out", "bash", False),
+        ("x='set +o pipefail'; command $x; pytest | tee out", "bash", False),
+        # shlex drops quoting: a quoted `"fi"` must not close the `if` (Codex 4251422334).
+        (
+            'set +o pipefail; if false; then "fi"; set -o pipefail; fi; pytest | tee out',
+            "bash",
+            False,
+        ),
+        ('echo "hi"\nset -o pipefail\npytest | tee out', None, False),
     ],
 )
 def test_shell_parse_enforces_a_piped_command_only_with_pipefail(script, shell, enforced):
@@ -2434,6 +2444,14 @@ def test_doctor_enforces_a_piped_gate_only_where_ci_has_pipefail(tmp_path, defau
     report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
     gate = "ci.yml runs the policy gates as 'test'"
     assert (gate in _failed(report)) is rejected
+
+
+def test_doctor_accepts_a_piped_gate_naming_an_option_in_a_path(tmp_path):
+    # Codex 4251422319: a word that merely CONTAINS `pipefail` changes no shell option.
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(test_command="pytest tests/test_pipefail.py | tee out.txt"))
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    assert "ci.yml runs the policy gates as 'test'" not in _failed(report)
 
 
 def test_doctor_requires_the_managed_files_on_the_remote_default_branch(tmp_path):

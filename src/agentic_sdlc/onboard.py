@@ -6618,20 +6618,30 @@ _PIPEFAIL_SHELLS = {"bash"}
 #: substitution, brace expansion and pathname globs.
 _SHELL_EXPANSION_CHARS = set("$`{}*?[]")
 
-#: Words that name, or spell the arguments of, the builtins that change shell options.
-_SHELL_OPTION_WORDS = {"set", "shopt"}
+#: Builtins that change shell options themselves, or run a handler string that may.
+_SHELL_OPTION_COMMANDS = {"set", "shopt", "trap"}
+#: Whole words that name an option-changing builtin or one of the tracked options.
+_SHELL_OPTION_WORDS = {"set", "shopt", "pipefail", "errexit"}
 
 
 def _may_change_shell_options(argv: list[str]) -> bool:
     """Whether a command that `_set_invocation` cannot read may still change errexit or
-    pipefail: it names `set`/`shopt` anywhere, mentions either option, or runs a command named
-    by an expansion (`$cmd +o pipefail`)."""
-    return bool(argv) and (
-        # `s$x +o pipe$y` is `set +o pipefail` once expanded (Codex 4251246556).
-        bool(set(argv[0]) & _SHELL_EXPANSION_CHARS)
-        or any(
-            word in _SHELL_OPTION_WORDS or "pipefail" in word or "errexit" in word for word in argv
-        )
+    pipefail. Judged on the command after its `builtin`/`command` wrappers: it is `set`, `shopt`
+    or `trap` (a trap handler runs in the parent: Codex 4251422330), its name is an expansion
+    (`s$x`, `command $x`: Codex 4251246556/4251422308), or a whole word of it is `set`,
+    `shopt`, `pipefail` or `errexit` (a redirected or timed `set`). A word merely CONTAINING an
+    option name -- `pytest tests/test_pipefail.py` -- changes nothing (Codex 4251422319)."""
+    words = list(argv)
+    while words and words[0] in _BUILTIN_WRAPPERS:
+        words.pop(0)
+        while words and words[0].startswith("-"):
+            words.pop(0)
+    if not words:
+        return False
+    return bool(
+        set(words[0]) & _SHELL_EXPANSION_CHARS
+        or words[0] in _SHELL_OPTION_COMMANDS
+        or any(word in _SHELL_OPTION_WORDS for word in argv)
     )
 
 
@@ -6763,6 +6773,10 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
         except ValueError:  # unbalanced quotes: no command we can vouch for
             opaque = True
             continue
+        if "'" in line or '"' in line:
+            # shlex drops quoting, so a quoted `"fi"` would read as the `if` closer: from the
+            # first quoted line on, no `set` is trusted to turn an option ON (Codex 4251422334).
+            opaque = True
         if not tokens:
             continue
         argv: list[str] = []
