@@ -1139,7 +1139,10 @@ def _github_backlog(args: argparse.Namespace) -> int:
             implementation=policy.implementation_label,
         )
     issues = _record_array(_json_file(args.issues), "--issues", require_number=True)
-    links = parent_links(*(_sub_issue_group(entry) for entry in args.sub_issues))
+    links = parent_links(
+        *(_sub_issue_group(entry) for entry in args.sub_issues),
+        repository=args.repository,
+    )
     backlog = backlog_document_from_issues(
         issues,
         project_id=args.project_id,
@@ -1189,7 +1192,7 @@ def _github_backlog(args: argparse.Namespace) -> int:
         else entry
         for entry in args.sub_issues
     ]
-    input_paths = [args.issues, args.pulls, *sub_issue_paths]
+    input_paths = [args.config, args.issues, args.pulls, *sub_issue_paths]
     for output in (args.backlog_output, args.incidents_output):
         if not output:
             continue

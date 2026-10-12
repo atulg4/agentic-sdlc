@@ -1897,6 +1897,110 @@ def test_adapter_outputs_must_not_overwrite_inputs(tmp_path):
     assert json.loads(issues.read_text(encoding="utf-8")) == []
 
 
+def test_the_config_cannot_be_overwritten_by_an_output(tmp_path):
+    from agentic_sdlc.cli import main as cli_main
+
+    config = tmp_path / "agentic-sdlc.toml"
+    config.write_text(
+        "\n".join(
+            (
+                "version = 1",
+                "[project]",
+                'id = "acme/forge"',
+                'provider = "github"',
+                'default_branch = "main"',
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    original = config.read_text(encoding="utf-8")
+    issues = tmp_path / "issues.json"
+    issues.write_text(json.dumps([]), encoding="utf-8")
+    assert (
+        cli_main(
+            [
+                "github-backlog",
+                "--config",
+                str(config),
+                "--issues",
+                str(issues),
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+                "--backlog-output",
+                str(config),
+            ]
+        )
+        == 2
+    )
+    assert config.read_text(encoding="utf-8") == original
+
+
+def test_an_unknown_work_unit_never_retires_on_another_units_proof():
+    # The incident names wu-missing; the backlog item it also names resolved
+    # to wu-1, which provably dispatched. That other unit's proof must not
+    # retire this incident, and the unknown-unit warning must still appear.
+    stale = _incident(
+        incidentId="acme/forge#7:blocked",
+        kind="dispatch-blocked",
+        severity="blocker",
+        workUnitId="wu-missing",
+        backlogItemId="acme/forge#7",
+    )
+    ledger = _ledger(
+        *_chain(
+            TO_IMPLEMENTING,
+            workUnit={"projectId": "forge", "workUnitId": "wu-1", "issueRef": "acme/forge#7"},
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        backlog=load_backlog_document(
+            _document(_backlog(itemId="acme/forge#7", workUnitId="wu-1"))
+        ),
+        incidents=load_incident_document(_incidents(stale)),
+    )
+    view = snapshot.get("forge")
+    assert [item.incident_id for item in view.incidents] == ["acme/forge#7:blocked"]
+    assert any("unknown work unit" in warning for warning in view.warnings)
+
+
+def test_a_cross_repository_sub_issue_is_rejected():
+    foreign_repo = [
+        {
+            "number": 7,
+            "repository_url": "https://api.github.com/repos/other/repo",
+            "parent_issue_url": "https://api.github.com/repos/acme/forge/issues/1",
+        }
+    ]
+    with pytest.raises(ControlCenterError, match="another repository"):
+        parent_links(foreign_repo, repository="acme/forge")
+    foreign_parent = [
+        {
+            "number": 7,
+            "repository_url": "https://api.github.com/repos/acme/forge",
+            "parent_issue_url": "https://api.github.com/repos/other/repo/issues/1",
+        }
+    ]
+    with pytest.raises(ControlCenterError, match="another repository"):
+        parent_links((foreign_parent, 1), repository="acme/forge")
+    local = [
+        {
+            "number": 7,
+            "repository_url": "https://api.github.com/repos/acme/forge",
+            "parent_issue_url": "https://api.github.com/repos/acme/forge/issues/1",
+        }
+    ]
+    assert parent_links(local, repository="acme/forge") == {7: 1}
+    # Without the repository pin, behavior is unchanged for callers that
+    # already resolved locality themselves.
+    assert parent_links(foreign_repo) == {7: 1}
+
+
 def test_a_malformed_repository_is_a_controlled_error():
     for bad in ("typo", "owner/", "/repo", "owner repo", "owner/repo/extra", ""):
         with pytest.raises(ControlCenterError, match="OWNER/REPO"):
