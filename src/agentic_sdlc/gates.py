@@ -1,10 +1,11 @@
 """Run trusted project verification commands with the shell semantics of the generated CI.
 
-Each gate is ONE shell command line, run exactly as the generated `ci.yml` runs it: a GitHub
-Actions `run:` step with no `shell:` key on Linux is `bash -e {0}` (`sh -e {0}` when no bash is
-found), so `run-gates` runs `bash -e -o pipefail -c <command>` (or `sh -e -c`), in its own process,
-from the repository root. pipefail is the one place it is stricter than that CI step (Codex
-4246344191): `pytest | tee out` must not pass the gate a patch is attested on while pytest fails.
+Each gate is ONE shell command line, run exactly as the generated `ci.yml` runs it: its
+`defaults.run.shell: bash` makes every step `bash --noprofile --norc -eo pipefail {0}` (#153;
+with no `shell:` GitHub would run `bash -e {0}`, where `pytest | tee out` passes when pytest
+fails), so `run-gates` runs `bash -e -o pipefail -c <command>` (`sh -e -c` when no bash is
+found), in its own process, from the repository root (Codex 4246344191: a piped gate must not
+pass the gate a patch is attested on while pytest fails).
 `cd sub && make test`, `VAR=x pytest` and `true && false` (which fails) mean
 here what they mean in CI (Codex 4243193109: tokenizing the line and executing the first word
 let `true && false` pass and turned `VAR=x cmd` into a missing program). What differs from CI is
@@ -210,15 +211,15 @@ _SHELL_CANDIDATES = ("/bin/bash", "/usr/bin/bash", "/bin/sh", "/usr/bin/sh")
 
 def _shell_argv(shell: str) -> list[str]:
     # Codex 4246344191: without pipefail `pytest | tee x` passes when pytest fails, and the patch
-    # would be attested on it. Stricter than CI's unspecified shell (`bash -e`), never looser.
+    # would be attested on it. The generated ci.yml's `shell: bash` has pipefail too (#153).
     if Path(shell).name == "bash":
         return [shell, "-e", "-o", "pipefail", "-c"]
     return [shell, "-e", "-c"]
 
 
 def gate_shell() -> list[str]:
-    """The argv prefix the gates run under: the generated CI's default `run:` shell on Linux
-    (`bash -e`, else `sh -e`) plus pipefail under bash, ending in `-c`; the gate's command line
+    """The argv prefix the gates run under: the generated CI's `run:` shell (`shell: bash`, i.e.
+    `bash -eo pipefail`; `sh -e` when no bash is found), ending in `-c`; the gate's command line
     follows it as ONE argument."""
     for candidate in _SHELL_CANDIDATES:
         if Path(candidate).is_file():

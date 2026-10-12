@@ -6606,9 +6606,28 @@ _SHELL_TERMINATORS = {"exit", "exec", "return"}
 _SHELL_DECLARERS = {"export", "declare", "typeset", "readonly", "local"}
 _ASSIGNMENT_WORD = re.compile(r"^([A-Za-z_]\w*)=")
 _NAME_WORD = re.compile(r"^[A-Za-z_]\w*$")
-#: Shells whose run steps abort on a failing command: GitHub runs an unspecified or `bash` shell
-#: as `bash -eo pipefail`, and `sh` as `sh -e` (no pipefail).
+#: Shells whose run steps abort on a failing command. On Linux and macOS GitHub runs an
+#: unspecified shell as `bash -e {0}`, `shell: bash` as `bash --noprofile --norc -eo pipefail
+#: {0}` and `shell: sh` as `sh -e {0}`: only an explicit `bash` has pipefail (#153).
 _ERREXIT_SHELLS = {None, "bash", "sh"}
+#: The one shell GitHub starts with pipefail; any other starts without it.
+_PIPEFAIL_SHELLS = {"bash"}
+
+
+def _set_pipefail(arguments: list[str]) -> bool | None:
+    """What a `set` command does to pipefail: True for `set -o pipefail` (also clustered, as in
+    `set -euo pipefail`), False for `set +o pipefail`, None when it does not name it."""
+    result = None
+    for index, word in enumerate(arguments[:-1]):
+        if (
+            len(word) > 1
+            and word[0] in "-+"
+            and word[-1] == "o"
+            and word[1:].isalpha()
+            and arguments[index + 1] == "pipefail"
+        ):
+            result = word[0] == "-"
+    return result
 
 
 def _job_key_set(node: dict, key: str) -> bool:
@@ -6646,11 +6665,14 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
     """The simple commands a `run:` script executes, each with whether its failure fails the
     step, plus what the script sets up for later commands (`ShellScript`).
 
-    With errexit (GitHub's default `bash -eo pipefail`, or `sh -e`) a command is enforced unless it
-    is a condition (`if`/`while`/`until`/`!`) or inside a conditional/loop body, backgrounded with
-    `&`, part of an `&&`/`||` list other than its last member (errexit ignores those), after `||`
-    (it may never run), piped onward without pipefail, or after `set +e`. Whatever the shell, the
-    script's LAST and-or list is the step's exit status: its `&&` members are enforced too.
+    With errexit (GitHub's default `bash -e`, `shell: bash`'s `bash -eo pipefail`, or `sh -e`) a
+    command is enforced unless it is a condition (`if`/`while`/`until`/`!`) or inside a
+    conditional/loop body, backgrounded with `&`, part of an `&&`/`||` list other than its last
+    member (errexit ignores those), after `||` (it may never run), piped onward without pipefail,
+    or after `set +e`. Pipefail is on only under an explicit `shell: bash` or after the script's
+    own `set -o pipefail` (#153): with no `shell:` key, `pytest | tee out` exits with tee's status.
+    Whatever the shell, the script's LAST and-or list is the step's exit status: its `&&` members
+    are enforced too.
 
     Commands inside a shell function body (`name() { ... }`, `function name { ... }`) are NEVER
     enforced: defining a function runs nothing, and whether a later call reaches the body (and
@@ -6659,6 +6681,7 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
     """
     shell_name = None if shell is None else str(shell).strip()
     errexit = shell_name in _ERREXIT_SHELLS
+    pipefail = shell_name in _PIPEFAIL_SHELLS
     out = ShellScript(
         [], set(), set(), set(), [], False, "GITHUB_ENV" in script, "GITHUB_PATH" in script
     )
@@ -6738,6 +6761,10 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                     a.startswith("-") and "e" in a.lstrip("-") for a in argv[1:]
                 ):
                     errexit = True
+                if argv[0] == "set":
+                    turned = _set_pipefail(list(argv[1:]))
+                    if turned is not None:
+                        pipefail = turned
                 records.append(
                     {
                         "argv": tuple(argv),
@@ -6749,9 +6776,7 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                         "previous": previous,
                         "following": following,
                         "errexit": errexit,
-                        "piped": following in {"|", "|&"}
-                        and shell_name != "bash"
-                        and shell_name is not None,
+                        "piped": following in {"|", "|&"} and not pipefail,
                     }
                 )
                 program = (

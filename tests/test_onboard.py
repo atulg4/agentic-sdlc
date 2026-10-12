@@ -2314,6 +2314,56 @@ def test_doctor_rejects_a_ci_gate_whose_failure_is_ignored(tmp_path, mutate):
     assert "ci.yml runs the policy gates as 'test'" in _failed(report)
 
 
+# #153: GitHub runs a step with no `shell:` key as `bash -e {0}` -- no pipefail. Only an explicit
+# `shell: bash` (`bash --noprofile --norc -eo pipefail {0}`) or the script's own `set -o pipefail`
+# makes a failure before a pipe fail the step.
+@pytest.mark.parametrize(
+    ("script", "shell", "enforced"),
+    [
+        ("pytest | tee out", None, False),
+        ("pytest |& tee out", None, False),
+        ("pytest | tee out", "sh", False),
+        ("pytest | tee out", "bash", True),
+        ("set -o pipefail\npytest | tee out", None, True),
+        ("set -euo pipefail\npytest | tee out", None, True),
+        ("set -eo pipefail; pytest | tee out", "sh", True),
+        ("set +o pipefail\npytest | tee out", "bash", False),
+        ("set -o pipefail\nset +o pipefail\npytest | tee out", None, False),
+        ("set -o errexit\npytest | tee out", None, False),
+        ("pytest", None, True),
+    ],
+)
+def test_shell_parse_enforces_a_piped_command_only_with_pipefail(script, shell, enforced):
+    from agentic_sdlc.onboard import _shell_parse
+
+    commands = dict(_shell_parse(script, shell).commands)
+    assert commands[("pytest",)] is enforced, commands
+
+
+@pytest.mark.parametrize(
+    ("defaults", "rejected"),
+    [
+        ({"run": {"shell": "bash"}}, False),  # what onboard generates: `bash -eo pipefail`
+        (None, True),  # a ci.yml from before #153: GitHub's default `bash -e`, no pipefail
+        ({"run": {"shell": "sh"}}, True),
+    ],
+)
+def test_doctor_enforces_a_piped_gate_only_where_ci_has_pipefail(tmp_path, defaults, rejected):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(test_command="pytest tests -q | tee test-output.txt"))
+    ci = repo / ".github/workflows/ci.yml"
+    doc = yaml.safe_load(ci.read_text())
+    assert doc["defaults"] == {"run": {"shell": "bash"}}
+    if defaults is None:
+        del doc["defaults"]
+    else:
+        doc["defaults"] = defaults
+    ci.write_text(yaml.safe_dump(doc, sort_keys=False))
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    gate = "ci.yml runs the policy gates as 'test'"
+    assert (gate in _failed(report)) is rejected
+
+
 def test_doctor_requires_the_managed_files_on_the_remote_default_branch(tmp_path):
     repo = _repo(tmp_path)
     write_onboarding(repo, spec())
