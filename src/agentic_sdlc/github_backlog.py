@@ -83,33 +83,50 @@ def _record_number(record: Mapping[str, Any], label: str) -> int:
     return number
 
 
+def _issue_repository(issue: Mapping[str, Any], repository: str) -> str:
+    """The record's own repository spelling, REQUIRED to match ``repository``.
+
+    Every GitHub issue payload carries ``repository_url``; without it the
+    adapter has no evidence the record belongs to this repository at all, and
+    a record naming another repository must not attach a same-numbered local
+    issue, its hierarchy, or its incidents to this project.
+    """
+
+    url = issue.get("repository_url")
+    number = issue.get("number")
+    _require(
+        isinstance(url, str) and bool(url.strip()),
+        f"issue {number!r}: repository_url is required",
+    )
+    assert isinstance(url, str)
+    match = _REPOSITORY_URL.search(url)
+    _require(
+        match is not None,
+        f"issue {number!r}: repository_url is not a recognized repository URL: {url}",
+    )
+    assert match is not None
+    name = match.group(1)
+    _require(
+        name.lower() == repository.lower(),
+        f"issue {number!r} belongs to {name}, not repository {repository}",
+    )
+    return name
+
+
 def canonical_repository(issues: Iterable[Mapping[str, Any]], declared: str) -> str:
     """The provider's own spelling of ``declared``, taken from the payloads.
 
     The read model joins references by exact string equality, so the export
-    must emit the spelling the ledger records carry. GitHub payloads state it
-    in ``repository_url``: when present, that spelling wins over the caller's
-    casing, and a payload from a DIFFERENT repository is a controlled error.
-    Payloads without the field keep the declared spelling.
+    must emit the spelling the ledger records carry. Every record must carry
+    a recognized ``repository_url`` matching ``declared`` (the builders
+    enforce the same rule); the first record's spelling is canonical.
     """
 
     _require_repository(declared)
     canonical = declared
     found = False
-    # Every recognized URL is checked, not just the first: a foreign record
-    # hiding behind a valid one must still fail the export.
     for issue in issues:
-        url = issue.get("repository_url")
-        if not isinstance(url, str):
-            continue
-        match = _REPOSITORY_URL.search(url)
-        if match is None:
-            continue
-        name = match.group(1)
-        _require(
-            name.lower() == declared.lower(),
-            f"issue payloads belong to {name}, not repository {declared}",
-        )
+        name = _issue_repository(issue, declared)
         if not found:
             canonical = name
             found = True
@@ -464,6 +481,9 @@ def backlog_document_from_issues(
                 isinstance(value, int) and not isinstance(value, bool) and value > 0,
                 f"parents map {role} must be a positive integer: {value!r}",
             )
+    issues = list(issues)
+    for issue in issues:
+        _issue_repository(issue, repository)
     rows = [issue for issue in issues if "pull_request" not in issue]
     numbers = {_record_number(issue, "issue") for issue in rows}
     parent_of_children = {parent for parent in links.values() if parent in numbers}
@@ -522,6 +542,7 @@ def incidents_from_issues(
     rules = dispatch_rules(labels or DEFAULT_LABELS)
     incidents: list[dict[str, Any]] = []
     for issue in issues:
+        _issue_repository(issue, repository)
         if "pull_request" in issue or _issue_state(issue) == "closed":
             continue
         number = _record_number(issue, "issue")

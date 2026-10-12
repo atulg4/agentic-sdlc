@@ -422,7 +422,11 @@ REMEDIATION_CATALOGUE: Mapping[str, tuple[RemediationAction, ...]] = {
             "Complete the dispatch preconditions",
             "Dispatch is gated on declared labels and an approval; supply the missing one.",
             _HUMAN,
-            handoff="Apply the approval label the mission requires, or record the approval event.",
+            handoff=(
+                "Apply the label(s) the incident names as missing - the ready label, the "
+                "human-review label, or the implementation approval - or record the approval "
+                "event; approval alone does not restore a missing trigger label."
+            ),
         ),
         _action(
             "re-run-dispatch",
@@ -543,8 +547,10 @@ REMEDIATION_CATALOGUE: Mapping[str, tuple[RemediationAction, ...]] = {
             "The bundled triggers fire only on their label event; re-apply it to re-kick.",
             _HUMAN,
             handoff=(
-                "Remove and re-add the trigger label (implementation-approved for the "
-                "implement trigger, agent-ready for the plan trigger) to fire the event again."
+                "Remove and re-add the trigger label the incident's summary names "
+                "(implementation-approved for the implement trigger and agent-ready for the "
+                "plan trigger by default; a project policy may rename them) to fire the "
+                "event again."
             ),
         ),
     ),
@@ -1501,6 +1507,7 @@ def build_control_center_snapshot(
                             replace(
                                 incident,
                                 kind="dispatch-blocked",
+                                severity=IncidentSeverity.BLOCKER,
                                 summary=(
                                     "Approval is proven by the ledger, but no dispatch label "
                                     f"follows it: {missing_labels} so a trigger can fire"
