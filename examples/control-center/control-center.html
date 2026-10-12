@@ -542,19 +542,18 @@
         const problem = arrayField(project, key, where, BUDGETS[key]);
         if (problem) return problem;
       }
-      if (project.counts !== undefined && !isObj(project.counts)) return `${where}.counts must be an object.`;
-      if (project.counts && project.counts.byState !== undefined) {
-        // byState is the only complete unit representation the document
-        // carries, and deriveProjectFacts sums it for the work-unit count,
-        // so its shape is pinned here.
-        if (!isObj(project.counts.byState)) return `${where}.counts.byState must be an object.`;
-        const states = Object.keys(project.counts.byState);
-        if (states.length > 64) return `${where}.counts.byState holds more than 64 states.`;
-        for (const key of states) {
-          const count = project.counts.byState[key];
-          if (!Number.isInteger(count) || count < 0 || count > 1000000) {
-            return `${where}.counts.byState.${key} must be a non-negative integer.`;
-          }
+      // byState is the only complete unit representation the document
+      // carries, and deriveProjectFacts sums it for the work-unit count, so
+      // it is REQUIRED (the producer always serializes it) and its shape is
+      // pinned: deleting it must not read as an empty ledger.
+      if (!isObj(project.counts)) return `${where}.counts must be an object.`;
+      if (!isObj(project.counts.byState)) return `${where}.counts.byState must be an object.`;
+      const states = Object.keys(project.counts.byState);
+      if (states.length > 64) return `${where}.counts.byState holds more than 64 states.`;
+      for (const key of states) {
+        const count = project.counts.byState[key];
+        if (!Number.isInteger(count) || count < 0 || count > 1000000) {
+          return `${where}.counts.byState.${key} must be a non-negative integer.`;
         }
       }
       for (const list of [project.active || [], project.attention || []]) {
