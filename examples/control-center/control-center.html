@@ -396,7 +396,9 @@
   async function digestMismatch(value) {
     // The producer digests the content minus the run metadata; a snapshot
     // carrying a digest that does not match was edited or truncated.
-    if (typeof value.snapshotSha256 !== "string" || !crypto?.subtle) return "";
+    if (!crypto?.subtle) {
+      return "This view cannot verify the snapshot's digest, so it will not adopt it.";
+    }
     const clone = JSON.parse(JSON.stringify(value));
     delete clone.snapshotSha256;
     delete clone.generatedAt;
@@ -478,9 +480,8 @@
     if (value.totals !== undefined && !isObj(value.totals)) return "totals must be an object.";
     if (value.warnings !== undefined && !Array.isArray(value.warnings)) return "warnings must be an array.";
     if (value.sources !== undefined && !Array.isArray(value.sources)) return "sources must be an array.";
-    for (const key of ["generatedAt", "snapshotSha256"]) {
-      if (value[key] !== undefined && typeof value[key] !== "string") return `${key} must be a string.`;
-    }
+    if (value.generatedAt !== undefined && typeof value.generatedAt !== "string") return "generatedAt must be a string.";
+    if (!/^[0-9a-f]{64}$/.test(value.snapshotSha256 || "")) return "The snapshot must carry its 64-character snapshotSha256 digest.";
     return "";
   }
 
@@ -1115,6 +1116,7 @@
     "  --backlog-output backlog.json --incidents-output incidents.json",
     "",
     "sdlcctl control-center --registry project-registry.json \\",
+    "  --ledger event-ledger.json \\",
     "  --backlog backlog.json --incidents incidents.json --output snapshot.json",
   ].join("\n");
 

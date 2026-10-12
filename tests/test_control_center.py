@@ -1130,8 +1130,12 @@ def test_every_declared_remediation_command_parses_against_the_cli():
         if action.command
     ]
     assert commands
+    import re
+
     for command in commands:
-        argv = shlex.split(command)
+        # Angle-bracket placeholders stand in for operator-supplied values;
+        # substitute a value every argument type accepts before parsing.
+        argv = [re.sub(r"<[^>]+>", "1", token) for token in shlex.split(command)]
         assert argv[0] == "sdlcctl"
         try:
             parser.parse_args(argv[1:])
@@ -2126,3 +2130,46 @@ def test_a_triage_incident_survives_approval_without_labels():
         incidents=load_incident_document(_incidents(stale)),
     )
     assert len(snapshot.get("forge").incidents) == 1
+
+
+def test_an_over_budget_failing_check_aggregate_is_rejected():
+    with pytest.raises(ControlCenterError, match="too many failing check names"):
+        incidents_from_change_requests(
+            [{"number": 7, "title": "red", "mergeable_state": "blocked"}],
+            project_id="forge",
+            repository="acme/forge",
+            observed_at=NOW,
+            failing={7: ", ".join(f"check-{index:03d}" for index in range(60))},
+        )
+
+
+def test_a_boolean_or_float_schema_version_is_rejected():
+    with pytest.raises(ControlCenterError, match="unsupported backlog schemaVersion"):
+        load_backlog_document({"schemaVersion": True, "items": []})
+    with pytest.raises(ControlCenterError, match="unsupported incident schemaVersion"):
+        load_incident_document({"schemaVersion": 1.0, "incidents": []})
+
+
+def test_a_zero_sub_issue_parent_is_a_controlled_error(tmp_path):
+    from agentic_sdlc.cli import main as cli_main
+
+    issues = tmp_path / "issues.json"
+    issues.write_text(json.dumps([]), encoding="utf-8")
+    children = tmp_path / "sub.json"
+    children.write_text(json.dumps([{"number": 2}]), encoding="utf-8")
+    assert (
+        cli_main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--sub-issues",
+                f"0={children}",
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+            ]
+        )
+        == 2
+    )
