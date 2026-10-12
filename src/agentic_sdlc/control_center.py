@@ -114,13 +114,13 @@ PLAN_PROVEN_STATES = DISPATCH_PROVEN_STATES | frozenset(
 )
 
 #: States in which something is executing *right now*. Backlog-shaped states
-#: (intake through approved) and settled ones (merged, live) are deliberately
+#: (intake through approved), queued ones (dispatched — a worker has not
+#: started) and settled ones (merged, live) are deliberately
 #: excluded: ``live`` is not terminal — a rollback stays possible — but a live
 #: unit is not running work, and counting it would pin a project at "running"
 #: forever.
 EXECUTING_STATES = frozenset(
     {
-        FactoryState.DISPATCHED,
         FactoryState.IMPLEMENTING,
         FactoryState.VERIFYING,
         FactoryState.REVIEWING,
@@ -453,6 +453,18 @@ REMEDIATION_CATALOGUE: Mapping[str, tuple[RemediationAction, ...]] = {
                 "--pull-request-number 123 --run-id 456 --head-sha <sha> "
                 "--current-head-sha <sha> --failure-class transient_infrastructure "
                 "--output decision.json"
+            ),
+        ),
+    ),
+    "triage-needed": (
+        _action(
+            "triage-the-work",
+            "Triage the work",
+            "No lifecycle label owns this item; decide its stage and label it.",
+            _HUMAN,
+            handoff=(
+                "Review the item and give it the lifecycle labels that admit it to a "
+                "stage (spec review, implementation approval, dispatch)."
             ),
         ),
     ),
@@ -1166,6 +1178,11 @@ def build_control_center_snapshot(
         _require(item.item_id not in seen_items, f"duplicate backlog itemId: {item.item_id}")
         seen_items.add(item.item_id)
         by_project_backlog.setdefault(item.project_id, []).append(item)
+    for project_items in by_project_backlog.values():
+        # Documents are validated one by one, so a parent cycle or an
+        # over-deep chain can appear only once they are combined: reject it
+        # here, before any tree construction could loop or lose both items.
+        _detect_backlog_cycles({item.item_id: item for item in project_items})
 
     by_project_incidents: dict[str, list[Incident]] = {}
     seen_incidents: set[str] = set()

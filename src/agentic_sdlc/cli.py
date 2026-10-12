@@ -574,8 +574,14 @@ def _sub_issue_group(entry: str) -> tuple[Any, int | None]:
     a bare path relies on each child's own parent reference."""
     number, separator, path = entry.partition("=")
     if separator and number.strip().isdigit():
-        return _json_file(path), int(number)
-    return _json_file(entry), None
+        payload, parent = _json_file(path), int(number)
+    else:
+        payload, parent = _json_file(entry), None
+    if not isinstance(payload, list):
+        raise ControlCenterError(
+            f"--sub-issues must hold a JSON array of sub-issue payloads: {entry}"
+        )
+    return payload, parent
 
 
 def _github_backlog(args: argparse.Namespace) -> int:
@@ -625,14 +631,15 @@ def _github_backlog(args: argparse.Namespace) -> int:
                 failing=failing,
             )
         )
-    # Round-trip the generated documents through their own loaders, so a bad
-    # input (e.g. a malformed --observed-at) fails the export here instead of
-    # the next command.
+    # Round-trip every generated document through its own loader BEFORE
+    # writing any of them, so a bad input (e.g. a malformed --observed-at)
+    # fails the export without leaving a mismatched pair on disk.
     load_backlog_document(backlog)
-    _write(backlog, args.backlog_output)
-    if args.incidents_output:
-        incidents_document = incident_document(*groups)
+    incidents_document = incident_document(*groups) if args.incidents_output else None
+    if incidents_document is not None:
         load_incident_document(incidents_document)
+    _write(backlog, args.backlog_output)
+    if incidents_document is not None:
         _write(incidents_document, args.incidents_output)
     return 0
 
