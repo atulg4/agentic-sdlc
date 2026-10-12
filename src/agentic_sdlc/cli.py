@@ -1143,6 +1143,10 @@ def _github_backlog(args: argparse.Namespace) -> int:
             raise ControlCenterError(
                 f"--config belongs to {policy.project_id}, not --repository {args.repository}"
             )
+        # The policy's spelling is canonical: the read model joins issue
+        # references by exact string equality, so the export must emit the
+        # same spelling the ledger records carry.
+        args.repository = policy.project_id
         labels = LifecycleLabels(
             ready=policy.ready_label,
             human_review=policy.human_review_label,
