@@ -2395,6 +2395,11 @@ def test_doctor_rejects_a_ci_gate_whose_failure_is_ignored(tmp_path, mutate):
         ("2>/dev/null set +e +o pipefail; pytest | tee out", "bash", False),
         ("command -p set +o pipefail; pytest | tee out", "bash", False),
         ("echo set; echo trap; echo enable; pytest | tee out", "bash", True),
+        # `set -- -n` assigns positional parameters (Codex 4252615565).
+        ("set -- -n; pytest", "bash", True),
+        # Only `shopt -o` reaches errexit/pipefail (Codex 4252615579).
+        ("shopt -s nullglob; pytest | tee out", "bash", True),
+        ("shopt -uo pipefail; pytest | tee out", "bash", False),
         ("set -o pipefail; echo ok; pytest | tee out", None, True),
         # `o` anywhere in a cluster takes the option name (Codex 4251046345).
         ("set +ou pipefail; pytest | tee out", "bash", False),

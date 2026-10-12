@@ -6651,6 +6651,13 @@ def _may_change_shell_options(argv: list[str]) -> bool:
     words = _effective_command(argv)
     if not words:
         return False
+    if words[0] == "shopt":
+        # Only `shopt -o` reaches the `set -o` options (`help shopt`); `shopt -s nullglob`
+        # changes neither errexit nor pipefail (Codex 4252615579).
+        return any(
+            set(word) & _SHELL_EXPANSION_CHARS or (word.startswith("-") and "o" in word[1:])
+            for word in words[1:]
+        )
     return bool(set(words[0]) & _SHELL_EXPANSION_CHARS or words[0] in _SHELL_OPTION_COMMANDS)
 
 
@@ -6700,11 +6707,18 @@ def _set_enables_noexec(arguments: list[str]) -> bool:
     command without running it. Judged on any option-looking word, so an unreadable call fails
     closed."""
     for index, word in enumerate(arguments):
-        if len(word) > 1 and word[0] == "-" and word[1:].isalpha():
-            if "n" in word[1:]:
-                return True
-            if "o" in word[1:] and index + 1 < len(arguments) and arguments[index + 1] == "noexec":
-                return True
+        if word in {"--", "-"} or len(word) < 2 or word[0] not in "-+":
+            # `set -- -n` assigns positional parameters (Codex 4252615565).
+            return False
+        if word[0] == "-" and "n" in word[1:]:
+            return True
+        if (
+            word[0] == "-"
+            and "o" in word[1:]
+            and index + 1 < len(arguments)
+            and arguments[index + 1] == "noexec"
+        ):
+            return True
     return False
 
 
