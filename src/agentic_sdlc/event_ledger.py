@@ -64,12 +64,6 @@ __all__ = [
 LEDGER_SCHEMA_VERSION = 1
 EVENT_SCHEMA_VERSION = 1
 
-#: The work-unit identifier contract every consumer shares: any non-empty
-#: string of at most this many characters. The Control Center's snapshot
-#: loaders apply the same bound, so an id the ledger accepts always stays
-#: addressable from backlog items and incidents.
-MAX_WORK_UNIT_ID_LENGTH = 512
-
 #: Version 0 is the pre-ledger orchestration vocabulary (``unitId``/``eventKey``
 #: without an explicit ``schemaVersion``). It is accepted and upgraded on read.
 SUPPORTED_EVENT_SCHEMA_VERSIONS = (0, 1)
@@ -489,14 +483,9 @@ def _load_work_unit(raw: Any) -> WorkUnitRef:
     label = "lifecycle event workUnit"
     entry = _mapping(raw, label)
     _known_keys(entry, _WORK_UNIT_KEYS, label)
-    work_unit_id = _text(entry, "workUnitId", label, required=True)
-    _require(
-        len(work_unit_id) <= MAX_WORK_UNIT_ID_LENGTH,
-        f"{label}: workUnitId must be at most {MAX_WORK_UNIT_ID_LENGTH} characters",
-    )
     return WorkUnitRef(
         project_id=_text(entry, "projectId", label, required=True),
-        work_unit_id=work_unit_id,
+        work_unit_id=_text(entry, "workUnitId", label, required=True),
         repository=_text(entry, "repository", label),
         issue_ref=_text(entry, "issueRef", label),
         change_request_ref=_text(entry, "changeRequestRef", label),

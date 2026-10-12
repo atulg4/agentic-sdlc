@@ -38,7 +38,6 @@ from pathlib import Path
 from typing import Any
 
 from .event_ledger import (
-    MAX_WORK_UNIT_ID_LENGTH,
     FactoryState,
     LifecycleStage,
     WorkUnitProjection,
@@ -59,10 +58,6 @@ STATE_BASIS_DECLARED = "state declared by the backlog source"
 STATE_BASIS_UNKNOWN = "state unknown: no ledger events and no declared state"
 
 MAX_TEXT_LENGTH = 512
-# The snapshot loaders validate workUnitId with _text (bounded by
-# MAX_TEXT_LENGTH), which must stay the ledger's own identifier contract: an
-# id the ledger accepts must remain addressable from backlog and incidents.
-assert MAX_TEXT_LENGTH == MAX_WORK_UNIT_ID_LENGTH
 MAX_BACKLOG_ITEMS = 5000
 MAX_BACKLOG_DEPTH = 32
 MAX_INCIDENTS = 2000
@@ -234,6 +229,19 @@ def _text(entry: Mapping[str, Any], key: str, label: str, *, required: bool = Fa
         f"{label}.{key} must be at most {MAX_TEXT_LENGTH} characters",
     )
     return value
+
+
+def _unit_text(entry: Mapping[str, Any], key: str, label: str) -> str:
+    """A work-unit id under the LEDGER's identifier contract: any string, with
+    no character-set restriction and NO length cap, because existing
+    version-1 ledgers already hold unbounded ids and every unit the ledger
+    accepted must stay addressable from backlog items and incidents."""
+
+    raw = entry.get(key, "")
+    if raw is None:
+        raw = ""
+    _require(isinstance(raw, str), f"{label}.{key} must be a string")
+    return raw.strip()
 
 
 def _identifier(entry: Mapping[str, Any], key: str, label: str, *, required: bool = True) -> str:
@@ -644,10 +652,7 @@ def _load_backlog_item(raw: Any, index: int) -> BacklogItem:
         title=_text(entry, "title", label, required=True),
         project_id=_identifier(entry, "projectId", label),
         parent_id=_identifier(entry, "parentId", label, required=False),
-        # Work-unit ids follow the LEDGER's identifier contract (any bounded
-        # non-empty string), not the tracker-reference character set: a unit
-        # the ledger accepted must stay addressable from here.
-        work_unit_id=_text(entry, "workUnitId", label),
+        work_unit_id=_unit_text(entry, "workUnitId", label),
         issue_ref=_identifier(entry, "issueRef", label, required=False),
         declared_state=declared,
         labels=_string_tuple(entry.get("labels"), f"{label}.labels"),
@@ -810,8 +815,7 @@ def _load_incident(raw: Any, index: int) -> Incident:
         severity=IncidentSeverity(severity),
         summary=_text(entry, "summary", label, required=True),
         detail=_text(entry, "detail", label),
-        # Same ledger-aligned contract as the backlog item's workUnitId.
-        work_unit_id=_text(entry, "workUnitId", label),
+        work_unit_id=_unit_text(entry, "workUnitId", label),
         backlog_item_id=_identifier(entry, "backlogItemId", label, required=False),
         observed_at=_timestamp(entry, "observedAt", label),
         evidence_ref=_text(entry, "evidenceRef", label),
