@@ -75,6 +75,17 @@ class DispatchRule:
 #: item is sitting still, which is precisely what an operator needs told.
 DISPATCH_RULES: tuple[DispatchRule, ...] = (
     DispatchRule(
+        rule_id="approved-without-dispatch-labels",
+        required=frozenset({"implementation-approved"}),
+        missing=frozenset({"agent-ready", "human-review-required"}),
+        kind="dispatch-blocked",
+        severity="blocker",
+        summary=(
+            "Approved for implementation but carrying neither agent-ready nor "
+            "human-review-required, so no trigger fires"
+        ),
+    ),
+    DispatchRule(
         rule_id="approved-without-agent-ready",
         required=frozenset({"implementation-approved", "human-review-required"}),
         missing=frozenset({"agent-ready"}),
@@ -247,17 +258,25 @@ def incidents_from_change_requests(
     """Report what is holding each open change request.
 
     ``failing`` maps a change-request number to a failing check's name, which
-    the caller reads from whichever checks API it already has. A conflicted
-    change request is reported from GitHub's own ``mergeable_state``.
+    the caller reads from whichever checks API it already has. Mergeability
+    comes from the change request's own detail payload (GitHub's *list*
+    endpoint omits ``mergeable_state``, so the caller fetches each one — the
+    documented recipe does). Drafts are skipped before any classification: a
+    work in progress is not a blocker. A payload with no mergeability verdict
+    is never reported as ready — unknown is not "waiting on the merge
+    authority".
     """
 
     checks = dict(failing or {})
     incidents: list[dict[str, Any]] = []
     for pull in pulls:
+        if pull.get("draft"):
+            continue
         number = int(pull["number"])
         ref = f"{repository}!{number}"
         title = str(pull.get("title") or "")[:512]
-        if pull.get("mergeable_state") == "dirty":
+        state = pull.get("mergeable_state")
+        if state == "dirty":
             incidents.append(
                 {
                     "incidentId": f"{ref}:merge-conflict",
@@ -285,7 +304,7 @@ def incidents_from_change_requests(
                 }
             )
             continue
-        if pull.get("draft"):
+        if not isinstance(state, str) or not state:
             continue
         incidents.append(
             {
@@ -323,31 +342,54 @@ def incident_document(
     }
 
 
-def parent_links(*payloads: Iterable[Mapping[str, Any]]) -> dict[int, int]:
+def parent_links(
+    *groups: Iterable[Mapping[str, Any]] | tuple[Iterable[Mapping[str, Any]], int | None],
+) -> dict[int, int]:
     """Map child issue number to parent issue number, from sub-issue payloads.
 
-    GitHub's sub-issue listing carries ``parent_issue_url`` on each child, so a
-    parent link never has to be inferred from a title or a checklist.
+    Each group is either a payload (children carrying their own
+    ``parent_issue_url``, which GitHub's sub-issue listing returns today) or a
+    ``(payload, parent_number)`` pair naming the parent the listing was fetched
+    for. Pass the explicit pair where you can: it does not depend on a response
+    field the API documentation does not promise, and a child whose own
+    reference disagrees with the declared parent is rejected rather than
+    silently relinked.
     """
 
     links: dict[int, int] = {}
-    for payload in payloads:
+
+    def link(child: int, parent: int) -> None:
+        if child == parent:
+            return
+        existing = links.get(child)
+        _require(
+            existing is None or existing == parent,
+            f"issue {child} is claimed by two parents: {existing} and {parent}",
+        )
+        links[child] = parent
+
+    for group in groups:
+        declared: int | None = None
+        payload = group
+        if isinstance(group, tuple):
+            payload, declared = group
         for entry in payload:
-            url = entry.get("parent_issue_url")
             number = entry.get("number")
-            if not isinstance(url, str) or not isinstance(number, int):
+            if not isinstance(number, int):
                 continue
-            match = _PARENT_URL.search(url)
-            if match is None:
-                continue
-            parent = int(match.group(1))
-            child = int(number)
-            if child == parent:
-                continue
-            existing = links.get(child)
-            _require(
-                existing is None or existing == parent,
-                f"issue {child} is claimed by two parents: {existing} and {parent}",
-            )
-            links[child] = parent
+            referenced: int | None = None
+            url = entry.get("parent_issue_url")
+            if isinstance(url, str):
+                match = _PARENT_URL.search(url)
+                if match is not None:
+                    referenced = int(match.group(1))
+            if declared is not None and referenced is not None:
+                _require(
+                    referenced == declared,
+                    f"issue {number} references parent {referenced}, "
+                    f"but the listing was declared for {declared}",
+                )
+            parent = declared if declared is not None else referenced
+            if parent is not None:
+                link(int(number), parent)
     return links

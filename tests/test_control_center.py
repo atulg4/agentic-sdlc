@@ -10,6 +10,7 @@ from agentic_sdlc.control_center import (
     AWAITING_HUMAN_STATES,
     BACKLOG_SCHEMA_VERSION,
     CONTROL_CENTER_SCHEMA_VERSION,
+    EXECUTING_STATES,
     INCIDENT_KINDS,
     INCIDENT_SCHEMA_VERSION,
     REMEDIATION_CATALOGUE,
@@ -132,6 +133,7 @@ _STAGE_FOR = {
     "ready-for-human-merge": "independent-review",
     "blocked": "blocked",
     "merged": "merge",
+    "live": "live",
 }
 
 
@@ -822,3 +824,192 @@ def test_the_adapter_requires_a_project_and_a_repository():
         backlog_document_from_issues([], project_id="", repository="acme/forge")
     with pytest.raises(ControlCenterError, match="repository is required"):
         backlog_document_from_issues([], project_id="forge", repository="")
+
+
+# --- the Codex review round: regressions pinned by test -------------------
+
+
+def test_an_item_with_only_an_issue_reference_joins_the_ledger_state():
+    ledger = _ledger(
+        *_chain(
+            TO_IMPLEMENTING,
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "issueRef": "acme/forge#7",
+            },
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        backlog=load_backlog_document(
+            _document(_backlog(issueRef="acme/forge#7", declaredState="approved"))
+        ),
+    )
+    node = snapshot.get("forge").backlog[0]
+    assert node.state == FactoryState.IMPLEMENTING.value
+    assert node.state_basis == STATE_BASIS_LEDGER
+    assert node.status is not None
+
+
+def test_an_ambiguous_issue_reference_is_never_joined_and_is_warned_about():
+    ledger = _ledger(
+        *_chain(
+            ("intake",),
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "issueRef": "acme/forge#7",
+            },
+        ),
+        *_chain(
+            ("intake",),
+            work_unit="wu-2",
+            prefix="b",
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-2",
+                "issueRef": "acme/forge#7",
+            },
+        ),
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        backlog=load_backlog_document(
+            _document(_backlog(issueRef="acme/forge#7", declaredState="approved"))
+        ),
+    )
+    view = snapshot.get("forge")
+    node = view.backlog[0]
+    assert (node.state, node.state_basis) == ("approved", STATE_BASIS_DECLARED)
+    assert any("more than one work unit" in warning for warning in view.warnings)
+
+
+def test_a_live_unit_is_settled_not_running():
+    ledger = _ledger(
+        *_chain(
+            TO_IMPLEMENTING + ("verifying", "reviewing", "ready-for-human-merge", "merged", "live"),
+        )
+    )
+    view = build_control_center_snapshot(
+        generated_at=NOW, registry=REGISTRY, projections=ledger.projections()
+    ).get("forge")
+    assert view.active == ()
+    assert view.attention == ()
+    assert view.health == "idle"
+
+
+def test_a_planned_unit_is_backlog_not_running():
+    ledger = _ledger(*_chain(TO_PLANNED))
+    view = build_control_center_snapshot(
+        generated_at=NOW, registry=REGISTRY, projections=ledger.projections()
+    ).get("forge")
+    assert view.active == ()
+    assert view.health == "idle"
+
+
+def test_executing_states_exclude_backlog_and_settled_states():
+    settled = {
+        FactoryState.INTAKE,
+        FactoryState.PLANNED,
+        FactoryState.APPROVED,
+        FactoryState.MERGED,
+        FactoryState.LIVE,
+    }
+    assert not (EXECUTING_STATES & settled)
+
+
+def test_the_digest_ignores_when_incidents_were_observed():
+    def snapshot_at(observed):
+        return build_control_center_snapshot(
+            generated_at=NOW,
+            registry=REGISTRY,
+            incidents=load_incident_document(_incidents(_incident(observedAt=observed))),
+        )
+
+    first = snapshot_at("2026-10-11T10:00:00Z")
+    later = snapshot_at("2026-10-12T10:00:00Z")
+    assert first.snapshot_sha256 == later.snapshot_sha256
+    changed = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        incidents=load_incident_document(_incidents(_incident(summary="A different problem"))),
+    )
+    assert changed.snapshot_sha256 != first.snapshot_sha256
+
+
+def test_an_approval_with_neither_dispatch_label_is_a_blocker():
+    incidents = incidents_from_issues(
+        [_issue(1, "approved but unlabelled", ["implementation-approved"])],
+        project_id="forge",
+        repository="acme/forge",
+        observed_at=NOW,
+    )
+    assert len(incidents) == 1
+    assert incidents[0]["kind"] == "dispatch-blocked"
+    assert incidents[0]["severity"] == "blocker"
+    assert "neither" in incidents[0]["summary"]
+
+
+def test_a_draft_change_request_is_never_a_blocker():
+    incidents = incidents_from_change_requests(
+        [
+            {"number": 1, "title": "wip", "draft": True, "mergeable_state": "dirty"},
+            {"number": 2, "title": "wip red", "draft": True, "mergeable_state": "blocked"},
+        ],
+        project_id="forge",
+        repository="acme/forge",
+        observed_at=NOW,
+        failing={2: "test"},
+    )
+    assert incidents == []
+
+
+def test_a_change_request_without_a_mergeability_verdict_is_not_ready():
+    incidents = incidents_from_change_requests(
+        [{"number": 1, "title": "list payload only"}],
+        project_id="forge",
+        repository="acme/forge",
+        observed_at=NOW,
+    )
+    assert incidents == []
+
+
+def test_a_failing_check_is_reported_even_without_a_mergeability_verdict():
+    incidents = incidents_from_change_requests(
+        [{"number": 1, "title": "red"}],
+        project_id="forge",
+        repository="acme/forge",
+        observed_at=NOW,
+        failing={1: "test"},
+    )
+    assert [item["kind"] for item in incidents] == ["deterministic-ci-failed"]
+
+
+def test_a_declared_sub_issue_parent_needs_no_response_field():
+    links = parent_links(([{"number": 2}, {"number": 3}], 1))
+    assert links == {2: 1, 3: 1}
+
+
+def test_a_child_contradicting_the_declared_parent_is_rejected():
+    with pytest.raises(ControlCenterError, match="declared for"):
+        parent_links(
+            (
+                [{"number": 2, "parent_issue_url": ".../repos/acme/forge/issues/9"}],
+                1,
+            )
+        )
+
+
+def test_a_declared_parent_agreeing_with_the_reference_links_once():
+    links = parent_links(
+        (
+            [{"number": 2, "parent_issue_url": "https://api.github.com/repos/a/b/issues/1"}],
+            1,
+        )
+    )
+    assert links == {2: 1}

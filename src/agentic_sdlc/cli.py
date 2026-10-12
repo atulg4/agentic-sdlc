@@ -531,9 +531,9 @@ def _control_center(args: argparse.Namespace) -> int:
     if args.registry:
         sources.append(f"registry:{args.registry}")
     if args.ledger:
-        ledger = EventLedger.from_dict(
-            json.loads(Path(args.ledger).read_text(encoding="utf-8")), registry=registry
-        )
+        # Load permissively: the snapshot builder itself surfaces projects the
+        # registry does not declare, flagged unregistered rather than rejected.
+        ledger = EventLedger.from_dict(json.loads(Path(args.ledger).read_text(encoding="utf-8")))
         projections = ledger.projections()
         sources.append(f"ledger:{args.ledger}")
     if args.backlog:
@@ -569,11 +569,20 @@ def _failing_checks(values: list[str]) -> dict[int, str]:
     return failing
 
 
+def _sub_issue_group(entry: str) -> tuple[Any, int | None]:
+    """Parse a --sub-issues value: ``PARENT=path`` names the parent explicitly,
+    a bare path relies on each child's own parent reference."""
+    number, separator, path = entry.partition("=")
+    if separator and number.strip().isdigit():
+        return _json_file(path), int(number)
+    return _json_file(entry), None
+
+
 def _github_backlog(args: argparse.Namespace) -> int:
     issues = _json_file(args.issues)
     if not isinstance(issues, list):
         raise ControlCenterError("--issues must hold a JSON array of issue payloads")
-    links = parent_links(*(_json_file(path) for path in args.sub_issues))
+    links = parent_links(*(_sub_issue_group(entry) for entry in args.sub_issues))
     backlog = backlog_document_from_issues(
         issues,
         project_id=args.project_id,
