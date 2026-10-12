@@ -27,7 +27,7 @@ sdlcctl = "agentic_sdlc.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-agentic_sdlc = ["templates/*.md", "templates/github/*.yml", "templates/gitlab/*.yml", "schemas/*.json"]
+agentic_sdlc = ["templates/*.md", "templates/github/*.yml", "templates/github/forge/*.yml", "templates/gitlab/*.yml", "templates/hooks/*.py", "schemas/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

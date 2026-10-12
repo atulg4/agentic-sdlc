@@ -13,9 +13,48 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from .git_diff import SAFE_PATH
+from .trusted_git import UntrustedGitError, trusted_git
+
+#: Every local git call is bounded (Codex 4240421134): a stalled git fails the run, never hangs it.
+GIT_TIMEOUT_SECONDS = 300
+
 
 class AdapterError(RuntimeError):
     """Raised when a provider cannot produce an applicable patch."""
+
+
+def _git_env() -> dict[str, str]:
+    """The whole environment of this adapter's git calls, BUILT from an allowlist (Codex
+    4243659475): the routed run holds provider API keys and a GitHub token, and an inherited
+    environment would hand them, the dynamic loader's variables (`LD_PRELOAD`, `DYLD_*`) and
+    `GIT_*` redirections to git and every helper it starts. A fixed system PATH, the C locale,
+    no system or global configuration, never a prompt."""
+    return {
+        "PATH": SAFE_PATH,
+        "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+
+
+def _run_git(arguments: Sequence[str], *, check: bool) -> subprocess.CompletedProcess[str]:
+    """`git ARGUMENTS` in the current directory: never a bare `git` from PATH (a planted one
+    could fake the applicability check), but `trusted_git()`'s under the trust mode in force,
+    in `_git_env()`. No trusted git: AdapterError (fail closed)."""
+    try:
+        program = trusted_git()
+    except UntrustedGitError as exc:
+        raise AdapterError(str(exc)) from exc
+    return subprocess.run(
+        [program, *arguments],
+        capture_output=True,
+        text=True,
+        check=check,
+        timeout=GIT_TIMEOUT_SECONDS,
+        env=_git_env(),
+    )
 
 
 class ProviderExhaustedError(AdapterError):
@@ -141,12 +180,7 @@ def _safe_text_path(path: str) -> bool:
 
 
 def _tracked_files() -> list[str]:
-    result = subprocess.run(
-        ["git", "ls-files"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    result = _run_git(["ls-files"], check=True)
     return [line for line in result.stdout.splitlines() if _safe_text_path(line)]
 
 
@@ -492,11 +526,7 @@ def generate_and_apply_patch(
 
     def _check_applies(patch: str) -> None:
         output_patch.write_text(patch, encoding="utf-8")
-        result = subprocess.run(
-            ["git", "apply", "--check", str(output_patch)],
-            capture_output=True,
-            text=True,
-        )
+        result = _run_git(["apply", "--check", str(output_patch)], check=False)
         if result.returncode != 0:
             raise AdapterError(
                 "patch does not apply to the checkout: " + _excerpt(result.stderr.strip())
@@ -522,7 +552,7 @@ def generate_and_apply_patch(
             print(f"Routing fallback: {label} {error.status}", file=sys.stderr)
             continue
         output_patch.write_text(patch, encoding="utf-8")
-        subprocess.run(["git", "apply", str(output_patch)], check=True)
+        _run_git(["apply", str(output_patch)], check=True)
         message = f"Generated patch with routed OpenAI-compatible provider {attempt.provider}.\n"
         if fallbacks:
             message += "Routing fallback: " + "; ".join(fallbacks) + "\n"
@@ -552,7 +582,12 @@ def main(argv: list[str] | None = None) -> int:
             output_message=Path(message_output),
             candidates=candidates,
         )
-    except (AdapterError, OSError, subprocess.CalledProcessError) as error:
+    except (
+        AdapterError,
+        OSError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 2
     return 0
