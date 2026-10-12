@@ -4536,3 +4536,13 @@ def test_the_snapshot_enforces_per_project_collection_budgets():
         build_control_center_snapshot(
             generated_at=NOW, registry=REGISTRY, projections=crowded_ledger.projections()
         )
+
+
+def test_the_console_caps_the_summed_state_counts():
+    from pathlib import Path
+
+    html = Path("examples/control-center/control-center.html").read_text(encoding="utf-8")
+    assert "counts.byState sums past the 5000-unit budget" in html
+    # Per-state values are shape-checked, and the SUM is held to the same
+    # shared budget the producer enforces per project.
+    assert "stateTotal += count;" in html

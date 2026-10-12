@@ -550,12 +550,17 @@
       if (!isObj(project.counts.byState)) return `${where}.counts.byState must be an object.`;
       const states = Object.keys(project.counts.byState);
       if (states.length > 64) return `${where}.counts.byState holds more than 64 states.`;
+      let stateTotal = 0;
       for (const key of states) {
         const count = project.counts.byState[key];
-        if (!Number.isInteger(count) || count < 0 || count > 1000000) {
+        if (!Number.isInteger(count) || count < 0) {
           return `${where}.counts.byState.${key} must be a non-negative integer.`;
         }
+        stateTotal += count;
       }
+      // The producer's shared per-project budget: it rejects more than 5000
+      // work units, so a byState summing past that is never producer output.
+      if (stateTotal > 5000) return `${where}.counts.byState sums past the 5000-unit budget.`;
       for (const list of [project.active || [], project.attention || []]) {
         for (const unit of list) {
           if (!isObj(unit)) return `${where} has a work unit that is not an object.`;
