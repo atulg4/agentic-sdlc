@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from agentic_sdlc.gates import GateError, run_gates, write_report
+from agentic_sdlc.gates import GateError, gate_shell, run_gates, write_report
 
 
 def _write_config(path: Path, first: str, second: str) -> None:
@@ -125,6 +125,28 @@ def test_a_compound_gate_fails_when_any_part_fails(tmp_path: Path) -> None:
     assert _single(tmp_path, "true && true")["passed"] is True
 
 
+def test_a_piped_gate_fails_when_an_earlier_command_fails_under_bash(tmp_path: Path) -> None:
+    # Codex 4246344191: a piped gate must not hide a failing test from the attestation.
+    if Path(gate_shell()[0]).name != "bash":
+        pytest.skip("pipefail is a bash option; CI's sh default has none")
+    assert _single(tmp_path, "false | cat")["passed"] is False
+    assert _single(tmp_path, "true | cat")["passed"] is True
+
+
+def test_the_gate_shell_matches_githubs_default_for_each_shell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import agentic_sdlc.gates as gates
+
+    bash, sh = tmp_path / "bash", tmp_path / "sh"
+    bash.write_text("", encoding="utf-8")
+    sh.write_text("", encoding="utf-8")
+    monkeypatch.setattr(gates, "_SHELL_CANDIDATES", (str(bash),))
+    assert gate_shell() == [str(bash), "-e", "-o", "pipefail", "-c"]
+    monkeypatch.setattr(gates, "_SHELL_CANDIDATES", (str(sh),))
+    assert gate_shell() == [str(sh), "-e", "-c"]
+
+
 def test_a_gate_can_change_directory_first(tmp_path: Path) -> None:
     sub = tmp_path / "sub"
     sub.mkdir()
@@ -143,8 +165,11 @@ def test_a_gate_can_set_a_variable_for_its_command(tmp_path: Path) -> None:
 def test_a_gate_runs_as_one_shell_line(tmp_path: Path) -> None:
     report = _single(tmp_path, "true")
     command = report["gates"][0]["command"]
-    assert command[1:] == ["-e", "-c", "true"]
-    assert Path(command[0]).name in {"bash", "sh"}
+    if Path(command[0]).name == "bash":
+        assert command[1:] == ["-e", "-o", "pipefail", "-c", "true"]
+    else:
+        assert Path(command[0]).name == "sh"
+        assert command[1:] == ["-e", "-c", "true"]
     with pytest.raises(GateError, match="single line"):
         _single(tmp_path, "true\nfalse")
 

@@ -2,8 +2,10 @@
 
 Each gate is ONE shell command line, run exactly as the generated `ci.yml` runs it: a GitHub
 Actions `run:` step with no `shell:` key on Linux is `bash -e {0}` (`sh -e {0}` when no bash is
-found), so `run-gates` runs `bash -e -c <command>` (or `sh -e -c`), in its own process, from the
-repository root. `cd sub && make test`, `VAR=x pytest` and `true && false` (which fails) mean
+found), so `run-gates` runs `bash -e -o pipefail -c <command>` (or `sh -e -c`), in its own process,
+from the repository root. pipefail is the one place it is stricter than that CI step (Codex
+4246344191): `pytest | tee out` must not pass the gate a patch is attested on while pytest fails.
+`cd sub && make test`, `VAR=x pytest` and `true && false` (which fails) mean
 here what they mean in CI (Codex 4243193109: tokenizing the line and executing the first word
 let `true && false` pass and turned `VAR=x cmd` into a missing program). What differs from CI is
 only the environment: an allowlist, never the runner's credentials or control files.
@@ -206,16 +208,25 @@ def _environment(verification: dict[str, Any]) -> dict[str, str]:
 _SHELL_CANDIDATES = ("/bin/bash", "/usr/bin/bash", "/bin/sh", "/usr/bin/sh")
 
 
+def _shell_argv(shell: str) -> list[str]:
+    # Codex 4246344191: without pipefail `pytest | tee x` passes when pytest fails, and the patch
+    # would be attested on it. Stricter than CI's unspecified shell (`bash -e`), never looser.
+    if Path(shell).name == "bash":
+        return [shell, "-e", "-o", "pipefail", "-c"]
+    return [shell, "-e", "-c"]
+
+
 def gate_shell() -> list[str]:
-    """The argv prefix the generated CI's default `run:` shell uses on Linux (`bash -e`, else
-    `sh -e`), ending in `-c`; the gate's command line follows it as ONE argument."""
+    """The argv prefix the gates run under: the generated CI's default `run:` shell on Linux
+    (`bash -e`, else `sh -e`) plus pipefail under bash, ending in `-c`; the gate's command line
+    follows it as ONE argument."""
     for candidate in _SHELL_CANDIDATES:
         if Path(candidate).is_file():
-            return [candidate, "-e", "-c"]
+            return _shell_argv(candidate)
     for name in ("bash", "sh"):
         found = shutil.which(name, path="/usr/bin:/bin")
         if found:
-            return [found, "-e", "-c"]
+            return _shell_argv(found)
     raise GateError("no POSIX shell (bash or sh) to run the verification gates with")
 
 
