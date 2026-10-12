@@ -66,6 +66,26 @@ MAX_INCIDENTS = 2000
 #: snapshot either fits every declared and observed project in it or fails
 #: with a reason, so the producer and the viewer agree on what is renderable.
 MAX_PROJECTS = 500
+#: The sources list budget, shared with the console: two documents per
+#: project at the full portfolio budget, plus a registry and a ledger entry,
+#: still fit with headroom.
+MAX_SOURCES = 1200
+#: Warnings budget per project and for the snapshot itself, shared with the
+#: console: a snapshot that would exceed it is truncated WITH a marker, so
+#: every producer-valid snapshot stays renderable and the truncation shows.
+MAX_WARNINGS = 5000
+
+
+def _bounded_warnings(entries: Sequence[str]) -> tuple[str, ...]:
+    if len(entries) <= MAX_WARNINGS:
+        return tuple(entries)
+    kept = list(entries[: MAX_WARNINGS - 1])
+    kept.append(
+        f"{len(entries) - (MAX_WARNINGS - 1)} more warnings were truncated; "
+        "resolve the ones above to surface them"
+    )
+    return tuple(kept)
+
 
 #: A tracker reference charset: ``owner/repo#123`` and ``owner/repo!123`` both
 #: fit, so a GitHub issue and a GitLab merge request need no re-encoding. The
@@ -1507,7 +1527,7 @@ def build_control_center_snapshot(
             for item in items:
                 references.extend(
                     (reference, item.source_provider)
-                    for reference in (item.item_id, item.issue_ref)
+                    for reference in (item.item_id, item.issue_ref, item.parent_id)
                 )
             for status in statuses.values():
                 references.extend(
@@ -1715,16 +1735,22 @@ def build_control_center_snapshot(
                 attention=attention,
                 backlog=tree,
                 incidents=project_incidents,
-                warnings=tuple(view_warnings),
+                warnings=_bounded_warnings(view_warnings),
                 **fields,
             )
         )
 
+    sources_tuple = _string_tuple(list(sources), "sources")
+    _require(
+        len(sources_tuple) <= MAX_SOURCES,
+        f"snapshot would record {len(sources_tuple)} sources, more than the read "
+        f"model's {MAX_SOURCES}-source budget",
+    )
     return ControlCenterSnapshot(
         generated_at=generated_at,
         projects=tuple(views),
-        sources=_string_tuple(list(sources), "sources"),
-        warnings=tuple(warnings),
+        sources=sources_tuple,
+        warnings=_bounded_warnings(warnings),
     )
 
 

@@ -2804,11 +2804,14 @@ def test_a_non_string_pull_state_is_a_controlled_error():
 def test_a_bare_sub_issue_record_without_a_parent_is_rejected():
     for record in (
         {"number": 5},
-        {"number": 5, "parent_issue_url": "https://api.github.com/not-an-issue"},
         {"number": 5, "parent_issue_url": None},
     ):
         with pytest.raises(ControlCenterError, match="no usable parent_issue_url"):
             parent_links([record])
+    # A string that is not the recognized API shape is its own controlled
+    # error: a web URL's trailing number must never become a parent.
+    with pytest.raises(ControlCenterError, match="not a recognized GitHub issue URL"):
+        parent_links([{"number": 5, "parent_issue_url": "https://api.github.com/not-an-issue"}])
 
 
 def test_a_failed_replacement_restores_the_previous_pair(tmp_path, monkeypatch):
@@ -4349,5 +4352,83 @@ def test_the_console_derives_health_and_bounds_top_level_collections():
     # Top-level collections share the validator's budget enforcement.
     assert (
         'arrayField(value, "warnings", "snapshot", 5000) || '
-        'arrayField(value, "sources", "snapshot", 100)' in html
+        'arrayField(value, "sources", "snapshot", 1200)' in html
     )
+
+
+def test_pull_references_carry_the_validated_provider_spelling():
+    pull = {
+        "number": 7,
+        "state": "open",
+        "draft": False,
+        "title": "cased",
+        "mergeable_state": "clean",
+        "base": {"repo": {"full_name": "Acme/Forge"}},
+    }
+    incidents = incidents_from_change_requests(
+        [pull], project_id="forge", repository="acme/forge", observed_at=NOW
+    )
+    # The ledger carries the provider's own spelling, and change-request
+    # retirement joins by exact string equality, so the caller's casing must
+    # never leak into the exported reference.
+    assert [item["evidenceRef"] for item in incidents] == ["Acme/Forge!7"]
+    assert incidents[0]["incidentId"].startswith("Acme/Forge!7:")
+
+
+def test_a_web_shaped_parent_url_cannot_reparent_a_child():
+    foreign_web = [
+        {
+            "number": 7,
+            "repository_url": "https://api.github.com/repos/acme/forge",
+            "parent_issue_url": "https://github.com/other/repo/issues/1",
+        }
+    ]
+    with pytest.raises(ControlCenterError, match="not a recognized GitHub issue URL"):
+        parent_links((foreign_web, 2), repository="acme/forge")
+    with pytest.raises(ControlCenterError, match="not a recognized GitHub issue URL"):
+        parent_links(foreign_web)
+
+
+def test_missing_parents_participate_in_ownership_checks():
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        backlog=load_backlog_document(
+            _document(
+                _backlog(itemId="acme/forge#2", issueRef="acme/forge#2", parentId="other/repo#7")
+            )
+        ),
+    )
+    assert any(
+        "references repository other/repo" in warning for warning in snapshot.get("forge").warnings
+    )
+
+
+def test_warnings_are_bounded_with_a_truncation_marker():
+    from agentic_sdlc.control_center import MAX_WARNINGS, _bounded_warnings
+
+    entries = [f"warning {index}" for index in range(MAX_WARNINGS + 7)]
+    bounded = _bounded_warnings(entries)
+    assert len(bounded) == MAX_WARNINGS
+    assert bounded[-1] == "8 more warnings were truncated; resolve the ones above to surface them"
+    assert bounded[:-1] == tuple(entries[: MAX_WARNINGS - 1])
+    assert _bounded_warnings(entries[:3]) == tuple(entries[:3])
+
+
+def test_the_snapshot_enforces_the_shared_source_budget():
+    with pytest.raises(ControlCenterError, match="1200-source budget"):
+        build_control_center_snapshot(
+            generated_at=NOW,
+            registry=REGISTRY,
+            sources=[f"backlog:file-{index}.json" for index in range(1201)],
+        )
+
+
+def test_the_console_derives_work_units_from_the_validated_state_counts():
+    from pathlib import Path
+
+    html = Path("examples/control-center/control-center.html").read_text(encoding="utf-8")
+    assert "counts.byState must be an object" in html
+    assert "for (const key of Object.keys(byState)) workUnits += byState[key];" in html
+    # The commit-ready draft form enforces the registry's shared length cap.
+    assert "at most 255 characters - the registry rejects longer ones" in html
