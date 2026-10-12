@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-10-12T08:30:00Z",
+  "generatedAt": "2026-10-12T08:45:00Z",
   "projects": [
     {
       "active": [],
@@ -1077,7 +1077,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#140",
           "incidentId": "atulg4/agentic-sdlc#140:untriaged",
           "kind": "awaiting-human-approval",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1099,7 +1099,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#132",
           "incidentId": "atulg4/agentic-sdlc#132:eligible-awaiting-dispatch-evidence",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1129,7 +1129,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#131",
           "incidentId": "atulg4/agentic-sdlc#131:eligible-awaiting-dispatch-evidence",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1159,7 +1159,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#130",
           "incidentId": "atulg4/agentic-sdlc#130:eligible-awaiting-dispatch-evidence",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1189,7 +1189,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#129",
           "incidentId": "atulg4/agentic-sdlc#129:eligible-awaiting-dispatch-evidence",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1219,7 +1219,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#128",
           "incidentId": "atulg4/agentic-sdlc#128:eligible-awaiting-dispatch-evidence",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1249,7 +1249,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#127",
           "incidentId": "atulg4/agentic-sdlc#127:eligible-awaiting-dispatch-evidence",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1279,7 +1279,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#121",
           "incidentId": "atulg4/agentic-sdlc#121:approved-without-agent-ready",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1309,7 +1309,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#120",
           "incidentId": "atulg4/agentic-sdlc#120:approved-without-agent-ready",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1339,7 +1339,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#119",
           "incidentId": "atulg4/agentic-sdlc#119:approved-without-agent-ready",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1369,7 +1369,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#118",
           "incidentId": "atulg4/agentic-sdlc#118:approved-without-agent-ready",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1399,7 +1399,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#110",
           "incidentId": "atulg4/agentic-sdlc#110:eligible-awaiting-dispatch-evidence",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1429,7 +1429,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#109",
           "incidentId": "atulg4/agentic-sdlc#109:eligible-awaiting-dispatch-evidence",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1459,7 +1459,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#108",
           "incidentId": "atulg4/agentic-sdlc#108:approved-without-agent-ready",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1489,7 +1489,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#107",
           "incidentId": "atulg4/agentic-sdlc#107:eligible-awaiting-dispatch-evidence",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1519,7 +1519,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#106",
           "incidentId": "atulg4/agentic-sdlc#106:eligible-awaiting-dispatch-evidence",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1549,7 +1549,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#51",
           "incidentId": "atulg4/agentic-sdlc#51:eligible-awaiting-dispatch-evidence",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1579,7 +1579,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#46",
           "incidentId": "atulg4/agentic-sdlc#46:eligible-awaiting-dispatch-evidence",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1609,7 +1609,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#45",
           "incidentId": "atulg4/agentic-sdlc#45:eligible-awaiting-dispatch-evidence",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1639,7 +1639,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#44",
           "incidentId": "atulg4/agentic-sdlc#44:eligible-awaiting-dispatch-evidence",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1669,7 +1669,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#43",
           "incidentId": "atulg4/agentic-sdlc#43:eligible-awaiting-dispatch-evidence",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1699,7 +1699,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#42",
           "incidentId": "atulg4/agentic-sdlc#42:eligible-awaiting-dispatch-evidence",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1729,7 +1729,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#41",
           "incidentId": "atulg4/agentic-sdlc#41:eligible-awaiting-dispatch-evidence",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1759,7 +1759,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#40",
           "incidentId": "atulg4/agentic-sdlc#40:eligible-awaiting-dispatch-evidence",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1789,7 +1789,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#39",
           "incidentId": "atulg4/agentic-sdlc#39:eligible-awaiting-dispatch-evidence",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1819,7 +1819,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#38",
           "incidentId": "atulg4/agentic-sdlc#38:eligible-awaiting-dispatch-evidence",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1849,7 +1849,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#35",
           "incidentId": "atulg4/agentic-sdlc#35:eligible-awaiting-dispatch-evidence",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1879,7 +1879,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#33",
           "incidentId": "atulg4/agentic-sdlc#33:eligible-awaiting-dispatch-evidence",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1909,7 +1909,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#22",
           "incidentId": "atulg4/agentic-sdlc#22:eligible-awaiting-dispatch-evidence",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1939,7 +1939,7 @@
           "evidenceRef": "atulg4/agentic-sdlc!148",
           "incidentId": "atulg4/agentic-sdlc!148:ci-failed",
           "kind": "deterministic-ci-failed",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1969,7 +1969,7 @@
           "evidenceRef": "atulg4/agentic-sdlc!145",
           "incidentId": "atulg4/agentic-sdlc!145:ci-failed",
           "kind": "deterministic-ci-failed",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1999,7 +1999,7 @@
           "evidenceRef": "atulg4/agentic-sdlc!139",
           "incidentId": "atulg4/agentic-sdlc!139:merge-state-blocked",
           "kind": "unclassified",
-          "observedAt": "2026-10-12T08:30:00Z",
+          "observedAt": "2026-10-12T08:45:00Z",
           "projectId": "forge",
           "remediations": [
             {

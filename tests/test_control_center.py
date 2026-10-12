@@ -1171,3 +1171,118 @@ def test_the_adapter_rejects_an_export_beyond_the_item_budget():
     issues = [_issue(number, f"issue {number}") for number in range(1, 5002)]
     with pytest.raises(ControlCenterError, match="5000-item budget"):
         backlog_document_from_issues(issues, project_id="forge", repository="acme/forge")
+
+
+def test_labels_are_case_folded_like_the_workflow_expressions():
+    document = _export(_issue(1, "mixed case", ["Implementation-Approved", "AGENT-READY"]))
+    assert document["items"][0]["declaredState"] == "approved"
+    incidents = incidents_from_issues(
+        [_issue(2, "mixed", ["Implementation-Approved", "Human-Review-Required"])],
+        project_id="forge",
+        repository="acme/forge",
+        observed_at=NOW,
+    )
+    assert incidents[0]["kind"] == "dispatch-blocked"
+    assert incidents[0]["severity"] == "blocker"
+
+
+def test_an_unreleased_spec_outranks_a_stale_approval_label():
+    document = _export(
+        _issue(1, "redrafted", ["implementation-approved", "agent-ready", "spec-drafted"]),
+        _issue(
+            2,
+            "released",
+            ["implementation-approved", "agent-ready", "spec-drafted", "spec-approved"],
+        ),
+    )
+    states = [item["declaredState"] for item in document["items"]]
+    assert states == ["specified", "approved"]
+
+
+def test_plan_ready_labels_without_approval_raise_the_ordering_advisory():
+    incidents = incidents_from_issues(
+        [_issue(1, "plan ready", ["agent-ready", "human-review-required"])],
+        project_id="forge",
+        repository="acme/forge",
+        observed_at=NOW,
+    )
+    assert len(incidents) == 1
+    assert incidents[0]["severity"] == "advisory"
+    assert "plan run" in incidents[0]["summary"]
+
+
+def test_ledger_proof_of_dispatch_retires_the_label_advisory():
+    advisory = _incident(
+        incidentId="acme/forge#7:eligible",
+        kind="dispatch-blocked",
+        severity="advisory",
+        backlogItemId="acme/forge#7",
+    )
+    ledger = _ledger(
+        *_chain(
+            TO_IMPLEMENTING,
+            workUnit={"projectId": "forge", "workUnitId": "wu-1", "issueRef": "acme/forge#7"},
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        backlog=load_backlog_document(
+            _document(_backlog(itemId="acme/forge#7", issueRef="acme/forge#7"))
+        ),
+        incidents=load_incident_document(_incidents(advisory)),
+    )
+    view = snapshot.get("forge")
+    assert view.incidents == ()
+    assert view.health == "running"
+
+
+def test_the_label_advisory_stays_while_the_ledger_shows_pre_dispatch_state():
+    advisory = _incident(
+        incidentId="acme/forge#7:eligible",
+        kind="dispatch-blocked",
+        severity="advisory",
+        backlogItemId="acme/forge#7",
+    )
+    ledger = _ledger(
+        *_chain(
+            TO_PLANNED,
+            workUnit={"projectId": "forge", "workUnitId": "wu-1", "issueRef": "acme/forge#7"},
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        backlog=load_backlog_document(
+            _document(_backlog(itemId="acme/forge#7", issueRef="acme/forge#7"))
+        ),
+        incidents=load_incident_document(_incidents(advisory)),
+    )
+    assert len(snapshot.get("forge").incidents) == 1
+
+
+def test_a_blocker_incident_is_never_retired_by_ledger_evidence():
+    blocker = _incident(
+        incidentId="acme/forge#7:blocked",
+        kind="dispatch-blocked",
+        severity="blocker",
+        backlogItemId="acme/forge#7",
+    )
+    ledger = _ledger(
+        *_chain(
+            TO_IMPLEMENTING,
+            workUnit={"projectId": "forge", "workUnitId": "wu-1", "issueRef": "acme/forge#7"},
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        backlog=load_backlog_document(
+            _document(_backlog(itemId="acme/forge#7", issueRef="acme/forge#7"))
+        ),
+        incidents=load_incident_document(_incidents(blocker)),
+    )
+    assert len(snapshot.get("forge").incidents) == 1
