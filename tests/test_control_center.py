@@ -1044,13 +1044,35 @@ def test_only_ready_merge_states_wait_on_the_merge_authority():
     by_id = {item["incidentId"]: item for item in incidents}
     assert by_id["acme/forge!1:awaiting-merge"]["kind"] == "awaiting-human-merge"
     assert by_id["acme/forge!2:awaiting-merge"]["kind"] == "awaiting-human-merge"
-    for number, state in ((3, "blocked"), (4, "behind"), (5, "unstable")):
+    for number, state, kind in (
+        (3, "blocked", "unclassified"),
+        (4, "behind", "branch-behind"),
+        (5, "unstable", "unclassified"),
+    ):
         entry = by_id[f"acme/forge!{number}:merge-state-{state}"]
-        assert entry["kind"] == "unclassified"
+        assert entry["kind"] == kind
         assert entry["severity"] == "degraded"
         assert state in entry["summary"]
     assert "acme/forge!6:merge-state-unknown" not in by_id
     assert len(incidents) == 5
+
+
+def test_a_behind_change_request_carries_the_branch_refresh_remediation():
+    assert "branch-behind" in INCIDENT_KINDS
+    actions = remediations_for("branch-behind")
+    assert [action.action_id for action in actions] == ["update-change-request-branch"]
+    assert actions[0].authority is RemediationAuthority.AGENT
+
+
+def test_a_non_boolean_draft_flag_is_a_controlled_error():
+    for bad in ("false", 1, [], {}):
+        with pytest.raises(ControlCenterError, match="draft must be a boolean"):
+            incidents_from_change_requests(
+                [{"number": 1, "title": "odd draft", "draft": bad, "mergeable_state": "dirty"}],
+                project_id="forge",
+                repository="acme/forge",
+                observed_at=NOW,
+            )
 
 
 def test_a_missing_close_reason_declares_no_terminal_state():
@@ -1827,12 +1849,27 @@ def test_a_self_parent_sub_issue_listing_is_rejected():
 
 
 def test_malformed_labels_are_a_controlled_error():
-    with pytest.raises(ControlCenterError, match="labels must be an array"):
-        backlog_document_from_issues(
-            [{"number": 1, "title": "bad labels", "state": "open", "labels": 1}],
-            project_id="forge",
-            repository="acme/forge",
-        )
+    # Truthy and falsey malformed values alike: only a missing or null field
+    # may default to no labels.
+    for bad in (1, 0, False, "", "x", {}):
+        with pytest.raises(ControlCenterError, match="labels must be an array"):
+            backlog_document_from_issues(
+                [{"number": 1, "title": "bad labels", "state": "open", "labels": bad}],
+                project_id="forge",
+                repository="acme/forge",
+            )
+
+
+def test_a_null_or_absent_labels_field_defaults_to_no_labels():
+    document = backlog_document_from_issues(
+        [
+            {"number": 1, "title": "null labels", "state": "open", "labels": None},
+            {"number": 2, "title": "no labels", "state": "open"},
+        ],
+        project_id="forge",
+        repository="acme/forge",
+    )
+    assert [item["labels"] for item in document["items"]] == [[], []]
 
 
 def test_adapter_outputs_must_not_overwrite_inputs(tmp_path):
@@ -1993,7 +2030,7 @@ def test_a_failing_check_on_a_behind_branch_reports_both_requirements():
     )
     assert [item["kind"] for item in incidents] == [
         "deterministic-ci-failed",
-        "unclassified",
+        "branch-behind",
     ]
 
 

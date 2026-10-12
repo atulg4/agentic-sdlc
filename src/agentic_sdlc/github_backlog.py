@@ -68,8 +68,10 @@ CLOSED_STATES: Mapping[str, str] = {
 READY_MERGE_STATES = frozenset({"clean", "has_hooks"})
 
 #: Known non-ready verdicts, each a real impediment GitHub has already named.
-#: They surface as incidents the operator must classify; only an absent or
-#: ``unknown`` verdict is suppressed, because unknown is never fabricated.
+#: ``behind`` is precise enough to carry its own kind (branch-behind) with a
+#: branch-refresh remediation; the rest surface as incidents the operator must
+#: classify. Only an absent or ``unknown`` verdict is suppressed, because
+#: unknown is never fabricated.
 IMPEDED_MERGE_STATES: Mapping[str, str] = {
     "blocked": "a required review or required check is outstanding",
     "behind": "the head branch is out of date with its base",
@@ -217,7 +219,9 @@ def _issue_labels(issue: Mapping[str, Any]) -> frozenset[str]:
     comparison is case-insensitive, so ``Agent-Ready`` dispatches exactly like
     ``agent-ready`` and must evaluate the same here."""
 
-    raw = issue.get("labels") or []
+    raw = issue.get("labels")
+    if raw is None:
+        raw = []
     _require(
         isinstance(raw, list),
         f"issue {issue.get('number')}: labels must be an array",
@@ -381,7 +385,12 @@ def incidents_from_change_requests(
             # A merged or closed change request is not an open problem,
             # whatever its final mergeability read.
             continue
-        if pull.get("draft"):
+        draft = pull.get("draft")
+        _require(
+            draft is None or isinstance(draft, bool),
+            f"change request {pull.get('number')}: draft must be a boolean",
+        )
+        if draft:
             continue
         number = int(pull["number"])
         ref = f"{repository}!{number}"
@@ -455,7 +464,10 @@ def incidents_from_change_requests(
                 {
                     "incidentId": f"{ref}:merge-state-{state}",
                     "projectId": project_id,
-                    "kind": "unclassified",
+                    # "behind" is already a precise diagnosis with one known
+                    # fix, so it carries its own kind and the branch-refresh
+                    # remediation instead of asking the operator to classify.
+                    "kind": "branch-behind" if state == "behind" else "unclassified",
                     "severity": "degraded",
                     "summary": (
                         f"Change request mergeability is {state}: {IMPEDED_MERGE_STATES[state]}"

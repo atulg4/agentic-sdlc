@@ -69,6 +69,7 @@ set. Each kind maps to declared `RemediationAction` descriptors in
 | `deterministic-ci-failed` | the deterministic gate rejected the change |
 | `review-gate-failed` | the independent reviewer withheld approval |
 | `merge-conflict` | the change request conflicts with its base |
+| `branch-behind` | the change request head is out of date with its base |
 | `dependency-wait` | an upstream unit has not finished |
 | `awaiting-dispatch-evidence` | every label is present; confirm the trigger actually fired |
 | `awaiting-spec-review` | a drafted specification waits for its human release |
