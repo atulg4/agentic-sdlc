@@ -43,6 +43,10 @@ EPIC_TITLE = re.compile(r"^\s*(?:[A-Z][A-Za-z]*\s+)?EPIC\b", re.I)
 #: whose ``required`` labels are all present and whose ``absent`` labels are all
 #: missing decides the state.
 LABEL_STATES: tuple[tuple[frozenset[str], frozenset[str], str], ...] = (
+    # An unreleased spec wins over a stale approval: the spec stage re-drafts
+    # without clearing implementation-approved, and the safety gate blocks
+    # planning and implementation until the draft is released.
+    (frozenset({"spec-drafted"}), frozenset({"spec-approved"}), "specified"),
     (frozenset({"implementation-approved", "agent-ready"}), frozenset(), "approved"),
     (frozenset({"implementation-approved"}), frozenset({"agent-ready"}), "approved"),
     (frozenset({"spec-drafted"}), frozenset({"implementation-approved"}), "specified"),
@@ -151,6 +155,18 @@ DISPATCH_RULES: tuple[DispatchRule, ...] = (
         ),
     ),
     DispatchRule(
+        rule_id="plan-ready-awaiting-dispatch-evidence",
+        required=frozenset({"agent-ready", "human-review-required"}),
+        missing=frozenset({"implementation-approved", "spec-drafted"}),
+        kind="dispatch-blocked",
+        severity="advisory",
+        summary=(
+            "Both planning labels are present, but the bundled plan trigger fires "
+            "only on the agent-ready label event: confirm a plan run started, and "
+            "re-apply agent-ready to re-kick if none did"
+        ),
+    ),
+    DispatchRule(
         rule_id="untriaged",
         required=frozenset(),
         missing=frozenset(
@@ -169,12 +185,16 @@ def _require(condition: bool, message: str) -> None:
 
 
 def _issue_labels(issue: Mapping[str, Any]) -> frozenset[str]:
+    """Collect label names case-folded: GitHub's workflow ``contains()``
+    comparison is case-insensitive, so ``Agent-Ready`` dispatches exactly like
+    ``agent-ready`` and must evaluate the same here."""
+
     raw = issue.get("labels") or []
     names: set[str] = set()
     for entry in raw:
         name = entry.get("name") if isinstance(entry, Mapping) else entry
         if isinstance(name, str) and name.strip():
-            names.add(name.strip())
+            names.add(name.strip().lower())
     return frozenset(names)
 
 

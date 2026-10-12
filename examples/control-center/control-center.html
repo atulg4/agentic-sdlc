@@ -290,15 +290,28 @@
   });
 
   /* ---------- store ---------- */
-  function docId(value) {
+  async function docId(value) {
+    // Readable prefix plus a cryptographic digest of the FULL identifier, so
+    // two distinct incidents can never share a note document.
     const full = String(value);
-    let hash = 0x811c9dc5;
-    for (let index = 0; index < full.length; index += 1) {
-      hash ^= full.charCodeAt(index);
-      hash = Math.imul(hash, 0x01000193) >>> 0;
+    const readable = full.replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 80) || "item";
+    let digest = "";
+    try {
+      const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(full));
+      digest = [...new Uint8Array(bytes).slice(0, 16)]
+        .map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    } catch {
+      // No SubtleCrypto: fall back to two independent FNV-1a passes.
+      for (const seed of [0x811c9dc5, 0x01234567]) {
+        let hash = seed;
+        for (let index = 0; index < full.length; index += 1) {
+          hash ^= full.charCodeAt(index);
+          hash = Math.imul(hash, 0x01000193) >>> 0;
+        }
+        digest += hash.toString(16).padStart(8, "0");
+      }
     }
-    const readable = full.replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 100) || "item";
-    return readable + "." + hash.toString(36);
+    return readable + "." + digest;
   }
 
   function tryUse(name) {
@@ -389,6 +402,9 @@
         if (!isObj(incident)) return `${where} has an incident that is not an object.`;
         const problem = arrayField(incident, "remediations", `${where} incident`);
         if (problem) return problem;
+        for (const action of incident.remediations || []) {
+          if (!isObj(action)) return `${where} has a remediation entry that is not an object.`;
+        }
       }
       // Walk the backlog forest iteratively; depth stays bounded by the stack.
       const stack = [...(project.backlog || [])];
@@ -816,7 +832,7 @@
 
   async function saveNote(incident, status, text) {
     try {
-      await state.db.doc("notes/" + docId(incident.incidentId)).set({
+      await state.db.doc("notes/" + (await docId(incident.incidentId))).set({
         incidentId: incident.incidentId,
         projectId: incident.projectId || "",
         kind: incident.kind || "",
@@ -890,7 +906,7 @@
           const button = event.currentTarget;
           button.disabled = true;
           try {
-            await state.db.doc("projectDrafts/" + docId(entry.projectId)).set({
+            await state.db.doc("projectDrafts/" + (await docId(entry.projectId))).set({
               projectId: entry.projectId, entry, byId: state.viewer?.id || "", at: new Date().toISOString(),
             });
             output.append(el("div", { class: "banner ok", text: "Saved as a draft in the Control Center store. Commit the JSON above to the project registry to make it real." }));
@@ -916,7 +932,7 @@
             copyButton(JSON.stringify(draft.entry, null, 2), "Copy"),
             state.db ? el("button", { class: "btn sm", type: "button", on: { click: async (event) => {
               event.currentTarget.disabled = true;
-              try { await state.db.doc("projectDrafts/" + docId(draft.projectId)).delete(); } catch { event.currentTarget.textContent = "Failed"; }
+              try { await state.db.doc("projectDrafts/" + (await docId(draft.projectId))).delete(); } catch { event.currentTarget.textContent = "Failed"; }
             } } }, "Discard") : null,
           ),
         )),

@@ -79,6 +79,20 @@ AWAITING_HUMAN_STATES = frozenset(
     {FactoryState.APPROVAL_PENDING, FactoryState.READY_FOR_HUMAN_MERGE}
 )
 
+#: States that prove dispatch happened: everything past the approval gates.
+#: A label-only "confirm a run started" advisory is retired once a joined
+#: ledger projection shows one of these.
+PRE_DISPATCH_STATES = frozenset(
+    {
+        FactoryState.INTAKE,
+        FactoryState.TRIAGED,
+        FactoryState.SPECIFIED,
+        FactoryState.PLANNED,
+        FactoryState.APPROVAL_PENDING,
+        FactoryState.APPROVED,
+    }
+)
+
 #: States in which something is executing *right now*. Backlog-shaped states
 #: (intake through approved) and settled ones (merged, live) are deliberately
 #: excluded: ``live`` is not terminal — a rollback stays possible — but a live
@@ -1174,6 +1188,25 @@ def build_control_center_snapshot(
 
         known_units = frozenset(statuses)
         known_items = frozenset(item.item_id for item in items)
+        item_status: dict[str, WorkUnitStatus] = {}
+        for item in items:
+            _, basis, status = _resolve_state(item, statuses, by_issue_ref)
+            if basis == STATE_BASIS_LEDGER and status is not None:
+                item_status[item.item_id] = status
+        retained: list[Incident] = []
+        for incident in project_incidents:
+            proven = item_status.get(incident.backlog_item_id)
+            if (
+                incident.kind == "dispatch-blocked"
+                and incident.severity is IncidentSeverity.ADVISORY
+                and proven is not None
+                and proven.state not in PRE_DISPATCH_STATES
+            ):
+                # The ledger already proves dispatch for this item; the
+                # label-only "confirm a run started" advisory is moot.
+                continue
+            retained.append(incident)
+        project_incidents = tuple(retained)
         for incident in project_incidents:
             if incident.work_unit_id and incident.work_unit_id not in known_units:
                 view_warnings.append(
