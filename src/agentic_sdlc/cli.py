@@ -185,14 +185,17 @@ def _write_group(documents: list[tuple[Any, str | None]]) -> None:
 
     def _scratch(destination: Path, tag: str) -> Path:
         # Staging and backup paths must stay disjoint from every destination
-        # and every existing file: a sibling output that happens to be named
-        # like a scratch path must never be overwritten or unlinked by this
-        # group's bookkeeping.
+        # and every existing path, a dangling symlink included: a scratch name
+        # that is secretly a symlink must never be written through or moved.
         counter = 0
         while True:
             candidate = destination.with_name(f"{destination.name}.{tag}-{os.getpid()}-{counter}")
             resolved = candidate.resolve()
-            if resolved not in destinations and resolved not in taken and not candidate.exists():
+            if (
+                resolved not in destinations
+                and resolved not in taken
+                and not os.path.lexists(candidate)
+            ):
                 taken.add(resolved)
                 return candidate
             counter += 1
@@ -206,12 +209,18 @@ def _write_group(documents: list[tuple[Any, str | None]]) -> None:
             if destination.is_dir():
                 raise OSError(f"output names an existing directory: {destination}")
             temp = _scratch(destination, "staged")
-            temp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-            if destination.exists():
-                # The replacement must not reset deliberate permissions: a
-                # 0660 shared output stays group-writable, a 0600 one private.
-                temp.chmod(destination.stat().st_mode & 0o7777)
+            # Exclusive creation never follows a pre-created symlink, and the
+            # destination's own mode applies BEFORE any content is written: a
+            # 0600 output is never readable through a loose staging file, a
+            # 0660 shared output stays group-writable after replacement.
+            mode = destination.stat().st_mode & 0o7777 if destination.exists() else 0o666
+            # Tracked before writing, so a failed write is cleaned up too.
             staged.append((temp, destination))
+            handle = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                if destination.exists():
+                    os.fchmod(handle, mode)
+                stream.write(json.dumps(data, indent=2, sort_keys=True) + "\n")
     except BaseException:
         for temp, _ in staged:
             temp.unlink(missing_ok=True)

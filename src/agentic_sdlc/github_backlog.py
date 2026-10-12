@@ -69,6 +69,19 @@ PULL_STATES = frozenset({"open", "closed"})
 ISSUE_STATES = PULL_STATES
 
 
+def _record_number(record: Mapping[str, Any], label: str) -> int:
+    """The record's number as a positive non-boolean integer, validated here
+    in the adapter itself: a float, boolean or numeric string silently coerced
+    by ``int()`` could attach items and incidents to a DIFFERENT real issue."""
+
+    number = record.get("number")
+    _require(
+        isinstance(number, int) and not isinstance(number, bool) and number > 0,
+        f"{label} number must be a positive integer: {number!r}",
+    )
+    return number
+
+
 def _issue_state(issue: Mapping[str, Any]) -> str:
     """The issue's explicit state, or a controlled error: a record without
     "open" or "closed" must never silently classify as open."""
@@ -405,12 +418,12 @@ def backlog_document_from_issues(
     states = label_states(labels or DEFAULT_LABELS)
     links = dict(parents or {})
     rows = [issue for issue in issues if "pull_request" not in issue]
-    numbers = {int(issue["number"]) for issue in rows}
+    numbers = {_record_number(issue, "issue") for issue in rows}
     parent_of_children = {parent for parent in links.values() if parent in numbers}
 
     items: list[dict[str, Any]] = []
     for issue in rows:
-        number = int(issue["number"])
+        number = _record_number(issue, "issue")
         labels = _issue_labels(issue)
         parent = links.get(number)
         item: dict[str, Any] = {
@@ -464,7 +477,7 @@ def incidents_from_issues(
     for issue in issues:
         if "pull_request" in issue or _issue_state(issue) == "closed":
             continue
-        number = int(issue["number"])
+        number = _record_number(issue, "issue")
         issue_labels = _issue_labels(issue)
         for rule in rules:
             if not rule.matches(issue_labels):
@@ -523,13 +536,16 @@ def incidents_from_change_requests(
             # whatever its final mergeability read.
             continue
         draft = pull.get("draft")
+        # GitHub's pull-detail schema defines draft as a boolean; a partial
+        # payload without it carries no evidence the pull is ready for
+        # review, so it must not classify as non-draft.
         _require(
-            draft is None or isinstance(draft, bool),
+            isinstance(draft, bool),
             f"change request {pull.get('number')}: draft must be a boolean",
         )
         if draft:
             continue
-        number = int(pull["number"])
+        number = _record_number(pull, "change request")
         ref = f"{repository}!{number}"
         title = str(pull.get("title") or "")[:512]
         state = pull.get("mergeable_state")
