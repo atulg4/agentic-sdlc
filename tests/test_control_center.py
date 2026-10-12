@@ -4165,3 +4165,81 @@ def test_an_unmerged_change_request_keeps_its_incidents():
     )
     kept = snapshot.get("forge").incidents
     assert [item.incident_id for item in kept] == ["acme/forge!7:awaiting-merge"]
+
+
+def test_long_registry_valid_references_fit_the_identifier_budget():
+    # The registry accepts long repository identifiers; the tracker suffix
+    # must still fit, so the reference budget is the read model's own text
+    # budget rather than the repository length.
+    repository = "g" * 127 + "/" + "r" * 127
+    reference = f"{repository}#1"
+    items = load_backlog_document(_document(_backlog(itemId=reference, issueRef=reference)))
+    assert items[0].item_id == reference
+
+
+def test_a_shared_change_request_reference_retires_only_on_unambiguous_proof():
+    ledger = _ledger(
+        *_chain(
+            TO_MERGED,
+            work_unit="wu-1",
+            prefix="m",
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "changeRequestRef": "acme/forge!7",
+            },
+        ),
+        *_chain(
+            TO_IMPLEMENTING,
+            work_unit="wu-2",
+            prefix="r",
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-2",
+                "changeRequestRef": "acme/forge!7",
+            },
+        ),
+    )
+    named_unmerged = _incident(
+        incidentId="acme/forge!7:ci-failed",
+        kind="deterministic-ci-failed",
+        severity="blocker",
+        evidenceRef="acme/forge!7",
+        workUnitId="wu-2",
+    )
+    named_merged = _incident(
+        incidentId="acme/forge!7:merge-conflict",
+        kind="merge-conflict",
+        severity="blocker",
+        evidenceRef="acme/forge!7",
+        workUnitId="wu-1",
+    )
+    anonymous = _incident(
+        incidentId="acme/forge!7:awaiting-merge",
+        kind="awaiting-human-merge",
+        severity="advisory",
+        evidenceRef="acme/forge!7",
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        incidents=load_incident_document(_incidents(named_unmerged, named_merged, anonymous)),
+    )
+    kept = sorted(item.incident_id for item in snapshot.get("forge").incidents)
+    # The incident naming the merged unit retires on that unit's own history;
+    # the one naming the still-running unit stays, and the anonymous one
+    # stays too because the shared reference is ambiguous.
+    assert kept == ["acme/forge!7:awaiting-merge", "acme/forge!7:ci-failed"]
+
+
+def test_the_console_bounds_collections_before_validating():
+    from pathlib import Path
+
+    html = Path("examples/control-center/control-center.html").read_text(encoding="utf-8")
+    # Budgets are enforced inside the validator, before anything allocates
+    # over or iterates a snapshot collection.
+    assert "holds more than 500 projects" in html
+    assert "const BUDGETS = { backlog: 5000" in html
+    assert "holds more than ${budget} entries" in html
+    assert "holds more than 5000 children" in html
