@@ -6627,7 +6627,8 @@ def _may_change_shell_options(argv: list[str]) -> bool:
     pipefail: it names `set`/`shopt` anywhere, mentions either option, or runs a command named
     by an expansion (`$cmd +o pipefail`)."""
     return bool(argv) and (
-        argv[0][:1] in {"$", "`"}
+        # `s$x +o pipe$y` is `set +o pipefail` once expanded (Codex 4251246556).
+        bool(set(argv[0]) & _SHELL_EXPANSION_CHARS)
         or any(
             word in _SHELL_OPTION_WORDS or "pipefail" in word or "errexit" in word for word in argv
         )
@@ -6780,6 +6781,11 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                     opaque = True
                 argv.append(token)
                 subshell = _subshell_depth(subshell, token)  # shlex merges `)` into `);`
+                if "(" in token or ")" in token:
+                    # shlex drops quoting, so `echo ')'` would close a subshell early: from the
+                    # first parenthesis on, no `set` is trusted to run in the parent (Codex
+                    # 4251246570).
+                    opaque = True
                 continue
             condition = False
             while argv and (
@@ -6892,6 +6898,8 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
             started_in_subshell = False
             if token is not None:
                 subshell = _subshell_depth(subshell, token)
+                if "(" in token or ")" in token:
+                    opaque = True
             if token is None:  # a line ending in an operator continues the list
                 previous = previous if tokens[-1] in {"&&", "||", "|"} else ";"
             else:

@@ -2373,6 +2373,13 @@ def test_doctor_rejects_a_ci_gate_whose_failure_is_ignored(tmp_path, mutate):
         # `a | b &` backgrounds the whole pipeline (Codex 4251046354).
         ("true; pytest | true &", "bash", False),
         ("pytest | true & wait", "bash", False),
+        # An expansion anywhere in the command name may spell `set` (Codex 4251246556).
+        ("x=et; y=fail; s$x +o pipe$y; pytest | tee out", "bash", False),
+        ("`echo set` +o pipefail; pytest | tee out", "bash", False),
+        ('cd "$HOME" && pytest | tee out', "bash", True),
+        # shlex drops quoting: a quoted `)` must not end a subshell early (Codex 4251246570).
+        ("set +o pipefail; ( echo ')' ; set -o pipefail ) ; pytest | tee out", "bash", False),
+        ("( true ); set -o pipefail; pytest | tee out", None, False),
     ],
 )
 def test_shell_parse_enforces_a_piped_command_only_with_pipefail(script, shell, enforced):
