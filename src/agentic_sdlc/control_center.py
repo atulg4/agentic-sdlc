@@ -108,12 +108,6 @@ DISPATCH_PROVEN_STATES = frozenset(
     }
 )
 
-#: States that prove the factory owns the item: everything except the entry
-#: state and the terminal states reachable straight from it.
-TRIAGE_PROVEN_STATES = frozenset(FactoryState) - frozenset(
-    {FactoryState.INTAKE, FactoryState.CANCELLED, FactoryState.SUPERSEDED}
-)
-
 #: States that retire the plan-ordering advisory: a plan provably ran and the
 #: next gate is visible elsewhere. ``approved`` is deliberately NOT here: an
 #: approved unit whose implementation-approved label went missing can only be
@@ -131,7 +125,10 @@ APPROVAL_PROVEN_STATES = DISPATCH_PROVEN_STATES | frozenset({FactoryState.APPROV
 _LEDGER_RETIREMENT: Mapping[str, frozenset[FactoryState]] = {
     "dispatch-blocked": DISPATCH_PROVEN_STATES,
     "awaiting-dispatch-evidence": DISPATCH_PROVEN_STATES,
-    "triage-needed": TRIAGE_PROVEN_STATES,
+    # Labels are the dispatch mechanism, so losing every label matters right up
+    # to dispatch: a unit the ledger shows approved still cannot fire without a
+    # fresh label event.
+    "triage-needed": DISPATCH_PROVEN_STATES,
     # A fresh re-draft can hold work that already planned, so only dispatch
     # evidence retires the spec-review hold.
     "awaiting-spec-review": DISPATCH_PROVEN_STATES,

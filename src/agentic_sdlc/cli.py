@@ -575,8 +575,11 @@ def _record_array(value: Any, label: str, *, require_number: bool = False) -> li
     for index, entry in enumerate(value):
         if not isinstance(entry, dict):
             raise ControlCenterError(f"{label}[{index}] must be an object")
-        if require_number and not isinstance(entry.get("number"), int):
-            raise ControlCenterError(f"{label}[{index}] must carry an integer number")
+        number = entry.get("number")
+        if require_number and (
+            isinstance(number, bool) or not isinstance(number, int) or number <= 0
+        ):
+            raise ControlCenterError(f"{label}[{index}] must carry a positive integer number")
     return value
 
 
@@ -587,7 +590,9 @@ def _failing_checks(values: list[str]) -> dict[int, str]:
         number, _, name = entry.partition("=")
         if not number.strip().isdigit() or not name.strip():
             raise ControlCenterError(f"--failing expects NUMBER=check-name, got: {entry}")
-        failing[int(number)] = name.strip()
+        key = int(number)
+        # Repeated flags for one pull aggregate: every failing check is kept.
+        failing[key] = f"{failing[key]}, {name.strip()}" if key in failing else name.strip()
     return failing
 
 
@@ -625,11 +630,7 @@ def _github_backlog(args: argparse.Namespace) -> int:
     if args.pulls:
         pulls = _record_array(_json_file(args.pulls), "--pulls", require_number=True)
         failing = _failing_checks(args.failing)
-        present = {
-            int(pull["number"])
-            for pull in pulls
-            if isinstance(pull, dict) and isinstance(pull.get("number"), int)
-        }
+        present = {int(pull["number"]) for pull in pulls}
         missing = sorted(set(failing) - present)
         if missing:
             raise ControlCenterError(

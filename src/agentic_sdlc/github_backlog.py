@@ -439,6 +439,11 @@ def incidents_from_change_requests(
                 }
             )
             continue
+        if state == "unstable" and number in checks:
+            # "unstable" means a status check is failing, which the explicit
+            # failing-check incident already names; reporting both would
+            # double-count one condition.
+            continue
         if isinstance(state, str) and state in IMPEDED_MERGE_STATES:
             incidents.append(
                 {
