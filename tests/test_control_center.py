@@ -1705,3 +1705,86 @@ def test_colliding_output_paths_are_rejected(tmp_path):
         == 2
     )
     assert not same.exists()
+
+
+def test_a_review_state_without_activity_is_not_running():
+    waiting = _ledger(*_chain(TO_IMPLEMENTING + ("verifying", "reviewing")))
+    view = build_control_center_snapshot(
+        generated_at=NOW, registry=REGISTRY, projections=waiting.projections()
+    ).get("forge")
+    assert view.active == ()
+    reviewing = _ledger(
+        *_chain(TO_IMPLEMENTING + ("verifying", "reviewing"), activity="reading the diff")
+    )
+    view = build_control_center_snapshot(
+        generated_at=NOW, registry=REGISTRY, projections=reviewing.projections()
+    ).get("forge")
+    assert [unit.work_unit_id for unit in view.active] == ["wu-1"]
+
+
+def test_an_approved_unit_keeps_its_label_derived_incident_until_dispatch():
+    from agentic_sdlc.control_center import PLAN_EVIDENCE_RULE
+
+    plan_advisory = _incident(
+        incidentId=f"acme/forge#7:{PLAN_EVIDENCE_RULE}",
+        kind="dispatch-blocked",
+        severity="advisory",
+        backlogItemId="acme/forge#7",
+    )
+    approved = _ledger(
+        *_chain(
+            TO_PLANNED + ("approved",),
+            workUnit={"projectId": "forge", "workUnitId": "wu-1", "issueRef": "acme/forge#7"},
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=approved.projections(),
+        backlog=load_backlog_document(
+            _document(_backlog(itemId="acme/forge#7", issueRef="acme/forge#7"))
+        ),
+        incidents=load_incident_document(_incidents(plan_advisory)),
+    )
+    assert len(snapshot.get("forge").incidents) == 1
+
+
+def test_records_without_an_integer_number_are_a_controlled_error(tmp_path):
+    from agentic_sdlc.cli import main as cli_main
+
+    issues = tmp_path / "issues.json"
+    issues.write_text(json.dumps([{}]), encoding="utf-8")
+    assert (
+        cli_main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+            ]
+        )
+        == 2
+    )
+
+
+def test_the_snapshot_output_must_not_overwrite_an_input(tmp_path):
+    from agentic_sdlc.cli import main as cli_main
+
+    registry = tmp_path / "registry.json"
+    registry.write_text(json.dumps({"schemaVersion": 1, "projects": []}), encoding="utf-8")
+    assert (
+        cli_main(
+            [
+                "control-center",
+                "--registry",
+                str(registry),
+                "--output",
+                str(registry),
+            ]
+        )
+        == 2
+    )
+    assert "projects" in json.loads(registry.read_text(encoding="utf-8"))

@@ -400,6 +400,7 @@
       }
       for (const incident of project.incidents || []) {
         if (!isObj(incident)) return `${where} has an incident that is not an object.`;
+        if (typeof incident.incidentId !== "string" || !incident.incidentId) return `${where} has an incident without a string incidentId.`;
         const problem = arrayField(incident, "remediations", `${where} incident`);
         if (problem) return problem;
         for (const action of incident.remediations || []) {
