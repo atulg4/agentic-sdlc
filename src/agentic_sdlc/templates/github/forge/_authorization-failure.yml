@@ -1,0 +1,33 @@
+
+  # Codex 4239667541: when AUTHORIZE_JOB itself FAILS (the permission could not be read after its
+  # retries) or is cancelled, every job after it is skipped and no other notifier fires, so the
+  # one-shot label event would be consumed in silence. That is not a definitive "unauthorized"
+  # (AUTHORIZE_JOB then SUCCEEDS with authorized=false and nothing is reported): say on the issue
+  # that the labeler's authority could not be verified. GitHub-hosted like the authorization
+  # itself -- nothing reaches RUNS_ON for an unverified labeler -- with only `issues: write`.
+  # Codex 4240628982: removing an approval label cancels the run, so "cancelled" includes that
+  # (and Codex 4241196649: so does editing the issue's title or body).
+  # Not tunable: doctor requires this job and its runner exactly as generated.
+  authorization_failed:
+    needs: AUTHORIZE_JOB
+    if: >-
+      ${{ always() &&
+      (needs.AUTHORIZE_JOB.result == 'failure' || needs.AUTHORIZE_JOB.result == 'cancelled') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Report that the labeler's authority could not be verified
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number(process.env.ISSUE_NUMBER),
+              body: `AUTHORIZED_WORK was not started: the labeler's repository write authority could not be verified (the permission check failed or was cancelled -- a run is cancelled when an approval label is removed, or the issue is edited, while it is queued or running; this is not an "unauthorized" answer). Re-run the failed jobs of this run, or remove and re-apply the label. Inspect the run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
