@@ -6,7 +6,7 @@
       "evidenceRef": "atulg4/agentic-sdlc#140",
       "incidentId": "atulg4/agentic-sdlc#140:untriaged",
       "kind": "awaiting-human-approval",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "advisory",
       "summary": "Not triaged: no lifecycle label, so no stage owns this item"
@@ -17,7 +17,7 @@
       "evidenceRef": "atulg4/agentic-sdlc#132",
       "incidentId": "atulg4/agentic-sdlc#132:approved-without-agent-ready",
       "kind": "dispatch-blocked",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "blocker",
       "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires"
@@ -28,7 +28,7 @@
       "evidenceRef": "atulg4/agentic-sdlc#131",
       "incidentId": "atulg4/agentic-sdlc#131:approved-without-agent-ready",
       "kind": "dispatch-blocked",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "blocker",
       "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires"
@@ -39,7 +39,7 @@
       "evidenceRef": "atulg4/agentic-sdlc#130",
       "incidentId": "atulg4/agentic-sdlc#130:approved-without-agent-ready",
       "kind": "dispatch-blocked",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "blocker",
       "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires"
@@ -50,7 +50,7 @@
       "evidenceRef": "atulg4/agentic-sdlc#129",
       "incidentId": "atulg4/agentic-sdlc#129:approved-without-agent-ready",
       "kind": "dispatch-blocked",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "blocker",
       "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires"
@@ -61,7 +61,7 @@
       "evidenceRef": "atulg4/agentic-sdlc#128",
       "incidentId": "atulg4/agentic-sdlc#128:approved-without-agent-ready",
       "kind": "dispatch-blocked",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "blocker",
       "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires"
@@ -72,7 +72,7 @@
       "evidenceRef": "atulg4/agentic-sdlc#127",
       "incidentId": "atulg4/agentic-sdlc#127:approved-without-agent-ready",
       "kind": "dispatch-blocked",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "blocker",
       "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires"
@@ -83,7 +83,7 @@
       "evidenceRef": "atulg4/agentic-sdlc#121",
       "incidentId": "atulg4/agentic-sdlc#121:approved-without-agent-ready",
       "kind": "dispatch-blocked",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "blocker",
       "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires"
@@ -94,7 +94,7 @@
       "evidenceRef": "atulg4/agentic-sdlc#120",
       "incidentId": "atulg4/agentic-sdlc#120:approved-without-agent-ready",
       "kind": "dispatch-blocked",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "blocker",
       "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires"
@@ -105,7 +105,7 @@
       "evidenceRef": "atulg4/agentic-sdlc#119",
       "incidentId": "atulg4/agentic-sdlc#119:approved-without-agent-ready",
       "kind": "dispatch-blocked",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "blocker",
       "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires"
@@ -116,7 +116,7 @@
       "evidenceRef": "atulg4/agentic-sdlc#118",
       "incidentId": "atulg4/agentic-sdlc#118:approved-without-agent-ready",
       "kind": "dispatch-blocked",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "blocker",
       "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires"
@@ -127,7 +127,7 @@
       "evidenceRef": "atulg4/agentic-sdlc#110",
       "incidentId": "atulg4/agentic-sdlc#110:approved-without-agent-ready",
       "kind": "dispatch-blocked",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "blocker",
       "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires"
@@ -138,7 +138,7 @@
       "evidenceRef": "atulg4/agentic-sdlc#109",
       "incidentId": "atulg4/agentic-sdlc#109:approved-without-agent-ready",
       "kind": "dispatch-blocked",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "blocker",
       "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires"
@@ -149,7 +149,7 @@
       "evidenceRef": "atulg4/agentic-sdlc#108",
       "incidentId": "atulg4/agentic-sdlc#108:approved-without-agent-ready",
       "kind": "dispatch-blocked",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "blocker",
       "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires"
@@ -160,7 +160,7 @@
       "evidenceRef": "atulg4/agentic-sdlc#107",
       "incidentId": "atulg4/agentic-sdlc#107:approved-without-agent-ready",
       "kind": "dispatch-blocked",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "blocker",
       "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires"
@@ -171,7 +171,7 @@
       "evidenceRef": "atulg4/agentic-sdlc#106",
       "incidentId": "atulg4/agentic-sdlc#106:approved-without-agent-ready",
       "kind": "dispatch-blocked",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "blocker",
       "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires"
@@ -182,7 +182,7 @@
       "evidenceRef": "atulg4/agentic-sdlc#51",
       "incidentId": "atulg4/agentic-sdlc#51:approved-without-agent-ready",
       "kind": "dispatch-blocked",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "blocker",
       "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires"
@@ -193,7 +193,7 @@
       "evidenceRef": "atulg4/agentic-sdlc#46",
       "incidentId": "atulg4/agentic-sdlc#46:approved-without-agent-ready",
       "kind": "dispatch-blocked",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "blocker",
       "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires"
@@ -204,7 +204,7 @@
       "evidenceRef": "atulg4/agentic-sdlc#45",
       "incidentId": "atulg4/agentic-sdlc#45:approved-without-agent-ready",
       "kind": "dispatch-blocked",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "blocker",
       "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires"
@@ -215,7 +215,7 @@
       "evidenceRef": "atulg4/agentic-sdlc#44",
       "incidentId": "atulg4/agentic-sdlc#44:approved-without-agent-ready",
       "kind": "dispatch-blocked",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "blocker",
       "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires"
@@ -226,7 +226,7 @@
       "evidenceRef": "atulg4/agentic-sdlc#43",
       "incidentId": "atulg4/agentic-sdlc#43:approved-without-agent-ready",
       "kind": "dispatch-blocked",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "blocker",
       "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires"
@@ -237,7 +237,7 @@
       "evidenceRef": "atulg4/agentic-sdlc#42",
       "incidentId": "atulg4/agentic-sdlc#42:approved-without-agent-ready",
       "kind": "dispatch-blocked",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "blocker",
       "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires"
@@ -248,7 +248,7 @@
       "evidenceRef": "atulg4/agentic-sdlc#41",
       "incidentId": "atulg4/agentic-sdlc#41:approved-without-agent-ready",
       "kind": "dispatch-blocked",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "blocker",
       "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires"
@@ -259,7 +259,7 @@
       "evidenceRef": "atulg4/agentic-sdlc#40",
       "incidentId": "atulg4/agentic-sdlc#40:approved-without-agent-ready",
       "kind": "dispatch-blocked",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "blocker",
       "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires"
@@ -270,7 +270,7 @@
       "evidenceRef": "atulg4/agentic-sdlc#39",
       "incidentId": "atulg4/agentic-sdlc#39:approved-without-agent-ready",
       "kind": "dispatch-blocked",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "blocker",
       "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires"
@@ -281,7 +281,7 @@
       "evidenceRef": "atulg4/agentic-sdlc#38",
       "incidentId": "atulg4/agentic-sdlc#38:approved-without-agent-ready",
       "kind": "dispatch-blocked",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "blocker",
       "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires"
@@ -292,7 +292,7 @@
       "evidenceRef": "atulg4/agentic-sdlc#35",
       "incidentId": "atulg4/agentic-sdlc#35:approved-without-agent-ready",
       "kind": "dispatch-blocked",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "blocker",
       "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires"
@@ -303,7 +303,7 @@
       "evidenceRef": "atulg4/agentic-sdlc#33",
       "incidentId": "atulg4/agentic-sdlc#33:approved-without-agent-ready",
       "kind": "dispatch-blocked",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "blocker",
       "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires"
@@ -314,7 +314,7 @@
       "evidenceRef": "atulg4/agentic-sdlc#22",
       "incidentId": "atulg4/agentic-sdlc#22:approved-without-agent-ready",
       "kind": "dispatch-blocked",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "blocker",
       "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires"
@@ -324,7 +324,7 @@
       "evidenceRef": "atulg4/agentic-sdlc!148",
       "incidentId": "atulg4/agentic-sdlc!148:ci-failed",
       "kind": "deterministic-ci-failed",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "blocker",
       "summary": "Deterministic verification failed: test"
@@ -334,7 +334,7 @@
       "evidenceRef": "atulg4/agentic-sdlc!145",
       "incidentId": "atulg4/agentic-sdlc!145:ci-failed",
       "kind": "deterministic-ci-failed",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "blocker",
       "summary": "Deterministic verification failed: test"
@@ -344,7 +344,7 @@
       "evidenceRef": "atulg4/agentic-sdlc!139",
       "incidentId": "atulg4/agentic-sdlc!139:awaiting-merge",
       "kind": "awaiting-human-merge",
-      "observedAt": "2026-10-11T21:30:00Z",
+      "observedAt": "2026-10-12T00:41:15Z",
       "projectId": "forge",
       "severity": "advisory",
       "summary": "Change request is ready and waiting on the human merge authority"
