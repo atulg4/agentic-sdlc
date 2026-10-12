@@ -29,6 +29,8 @@ from typing import Any
 from .control_center import (
     BACKLOG_SCHEMA_VERSION,
     INCIDENT_SCHEMA_VERSION,
+    MAX_BACKLOG_ITEMS,
+    MAX_INCIDENTS,
     ControlCenterError,
 )
 
@@ -57,9 +59,17 @@ CLOSED_STATES: Mapping[str, str] = {
 }
 
 #: Mergeability verdicts in which a change request is actually waiting on the
-#: human merge authority. ``blocked``, ``behind``, ``unstable`` and ``unknown``
-#: mean something else is owed first, so they raise no "ready" incident.
+#: human merge authority.
 READY_MERGE_STATES = frozenset({"clean", "has_hooks"})
+
+#: Known non-ready verdicts, each a real impediment GitHub has already named.
+#: They surface as incidents the operator must classify; only an absent or
+#: ``unknown`` verdict is suppressed, because unknown is never fabricated.
+IMPEDED_MERGE_STATES: Mapping[str, str] = {
+    "blocked": "a required review or required check is outstanding",
+    "behind": "the head branch is out of date with its base",
+    "unstable": "a status check on the head commit is not passing",
+}
 
 
 @dataclass(frozen=True)
@@ -127,6 +137,18 @@ DISPATCH_RULES: tuple[DispatchRule, ...] = (
         kind="awaiting-human-approval",
         severity="degraded",
         summary="Specification drafted and waiting on a human implementation approval",
+    ),
+    DispatchRule(
+        rule_id="eligible-awaiting-dispatch-evidence",
+        required=frozenset({"implementation-approved", "human-review-required", "agent-ready"}),
+        missing=frozenset(),
+        kind="dispatch-blocked",
+        severity="advisory",
+        summary=(
+            "Every dispatch label is present, but the bundled implementation trigger "
+            "fires only on the implementation-approved label event: confirm a run "
+            "started, and re-apply implementation-approved to re-kick if none did"
+        ),
     ),
     DispatchRule(
         rule_id="untriaged",
@@ -230,6 +252,11 @@ def backlog_document_from_issues(
         items.append(item)
 
     _require(len(items) == len(rows), "every issue must produce exactly one backlog item")
+    _require(
+        len(items) <= MAX_BACKLOG_ITEMS,
+        f"{len(items)} issues exceed the read model's {MAX_BACKLOG_ITEMS}-item budget; "
+        "narrow the export (open issues only, or one project area at a time)",
+    )
     return {"schemaVersion": BACKLOG_SCHEMA_VERSION, "source": source, "items": items}
 
 
@@ -326,20 +353,35 @@ def incidents_from_change_requests(
                 }
             )
             continue
-        if state not in READY_MERGE_STATES:
+        if state in READY_MERGE_STATES:
+            incidents.append(
+                {
+                    "incidentId": f"{ref}:awaiting-merge",
+                    "projectId": project_id,
+                    "kind": "awaiting-human-merge",
+                    "severity": "advisory",
+                    "summary": "Change request is ready and waiting on the human merge authority",
+                    "detail": title,
+                    "observedAt": observed_at,
+                    "evidenceRef": ref,
+                }
+            )
             continue
-        incidents.append(
-            {
-                "incidentId": f"{ref}:awaiting-merge",
-                "projectId": project_id,
-                "kind": "awaiting-human-merge",
-                "severity": "advisory",
-                "summary": "Change request is ready and waiting on the human merge authority",
-                "detail": title,
-                "observedAt": observed_at,
-                "evidenceRef": ref,
-            }
-        )
+        if isinstance(state, str) and state in IMPEDED_MERGE_STATES:
+            incidents.append(
+                {
+                    "incidentId": f"{ref}:merge-state-{state}",
+                    "projectId": project_id,
+                    "kind": "unclassified",
+                    "severity": "degraded",
+                    "summary": (
+                        f"Change request mergeability is {state}: {IMPEDED_MERGE_STATES[state]}"
+                    ),
+                    "detail": title,
+                    "observedAt": observed_at,
+                    "evidenceRef": ref,
+                }
+            )
     return incidents
 
 
@@ -357,6 +399,11 @@ def incident_document(
             _require(incident_id not in seen, f"duplicate incidentId: {incident_id}")
             seen.add(incident_id)
             incidents.append(incident)
+    _require(
+        len(incidents) <= MAX_INCIDENTS,
+        f"{len(incidents)} incidents exceed the read model's {MAX_INCIDENTS}-incident "
+        "budget; narrow the export",
+    )
     return {
         "schemaVersion": INCIDENT_SCHEMA_VERSION,
         "source": source,

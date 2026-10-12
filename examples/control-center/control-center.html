@@ -363,12 +363,47 @@
   }
 
   function validateSnapshot(value) {
-    if (!value || typeof value !== "object") return "That is not a snapshot document.";
+    // Deep structural validation: a malformed document saved to the shared
+    // store would crash every viewer, so every shape a renderer touches is
+    // checked before the document is adopted or persisted.
+    const isObj = (entry) => entry !== null && typeof entry === "object" && !Array.isArray(entry);
+    if (!isObj(value)) return "That is not a snapshot document.";
     if (value.schemaVersion !== SCHEMA) return `Unsupported snapshot schemaVersion: ${value.schemaVersion}. This page renders version ${SCHEMA}.`;
     if (!Array.isArray(value.projects)) return "The snapshot has no projects array.";
+    const arrayField = (owner, key, where) =>
+      owner[key] === undefined || Array.isArray(owner[key]) ? "" : `${where}.${key} must be an array.`;
     for (const project of value.projects) {
-      if (!project || typeof project.projectId !== "string" || !project.projectId) return "Every project needs a projectId.";
+      if (!isObj(project) || typeof project.projectId !== "string" || !project.projectId) {
+        return "Every project needs a projectId.";
+      }
+      const where = `project ${project.projectId}`;
+      for (const key of ["backlog", "active", "attention", "incidents", "warnings", "repositories", "capabilities", "environments"]) {
+        const problem = arrayField(project, key, where);
+        if (problem) return problem;
+      }
+      if (project.counts !== undefined && !isObj(project.counts)) return `${where}.counts must be an object.`;
+      for (const unit of [...(project.active || []), ...(project.attention || [])]) {
+        if (!isObj(unit)) return `${where} has a work unit that is not an object.`;
+      }
+      for (const incident of project.incidents || []) {
+        if (!isObj(incident)) return `${where} has an incident that is not an object.`;
+        const problem = arrayField(incident, "remediations", `${where} incident`);
+        if (problem) return problem;
+      }
+      // Walk the backlog forest iteratively; depth stays bounded by the stack.
+      const stack = [...(project.backlog || [])];
+      let visited = 0;
+      while (stack.length) {
+        const node = stack.pop();
+        if (!isObj(node) || typeof node.title !== "string") return `${where} has a malformed backlog node.`;
+        if (node.children !== undefined && !Array.isArray(node.children)) return `${where} backlog node ${node.itemId || ""} children must be an array.`;
+        visited += 1;
+        if (visited > 10000) return `${where} backlog is too large or cyclic to render.`;
+        for (const child of node.children || []) stack.push(child);
+      }
     }
+    if (value.totals !== undefined && !isObj(value.totals)) return "totals must be an object.";
+    if (value.warnings !== undefined && !Array.isArray(value.warnings)) return "warnings must be an array.";
     return "";
   }
 

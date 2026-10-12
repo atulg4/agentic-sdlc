@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-10-12T00:41:15Z",
+  "generatedAt": "2026-10-12T08:30:00Z",
   "projects": [
     {
       "active": [],
@@ -30,10 +30,12 @@
           "itemId": "atulg4/agentic-sdlc#132",
           "kind": "task",
           "labels": [
+            "agent-ready",
             "cloud-ready",
             "enhancement",
             "human-review-required",
             "implementation-approved",
+            "spec-approved",
             "spec-drafted"
           ],
           "parentId": "",
@@ -43,7 +45,7 @@
           "stateBasis": "state declared by the backlog source",
           "status": null,
           "title": "P2: Evaluate Jev reranking of optional context while preserving mandatory evidence and provenance",
-          "updatedAt": "2026-09-26T05:18:54Z",
+          "updatedAt": "2026-10-12T08:15:46Z",
           "url": "https://github.com/atulg4/agentic-sdlc/issues/132",
           "workUnitId": ""
         },
@@ -54,10 +56,12 @@
           "itemId": "atulg4/agentic-sdlc#131",
           "kind": "task",
           "labels": [
+            "agent-ready",
             "cloud-ready",
             "enhancement",
             "human-review-required",
             "implementation-approved",
+            "spec-approved",
             "spec-drafted"
           ],
           "parentId": "",
@@ -67,7 +71,7 @@
           "stateBasis": "state declared by the backlog source",
           "status": null,
           "title": "P2: Add Jev task and mission-fit advice alongside Forge's deterministic executor router",
-          "updatedAt": "2026-09-26T05:18:53Z",
+          "updatedAt": "2026-10-12T08:15:45Z",
           "url": "https://github.com/atulg4/agentic-sdlc/issues/131",
           "workUnitId": ""
         },
@@ -78,10 +82,12 @@
           "itemId": "atulg4/agentic-sdlc#130",
           "kind": "task",
           "labels": [
+            "agent-ready",
             "cloud-ready",
             "enhancement",
             "human-review-required",
             "implementation-approved",
+            "spec-approved",
             "spec-drafted"
           ],
           "parentId": "",
@@ -91,7 +97,7 @@
           "stateBasis": "state declared by the backlog source",
           "status": null,
           "title": "P2: Use Jev to advise on unknown failures without changing exact-head retry or repair authority",
-          "updatedAt": "2026-09-26T05:18:51Z",
+          "updatedAt": "2026-10-12T08:15:43Z",
           "url": "https://github.com/atulg4/agentic-sdlc/issues/130",
           "workUnitId": ""
         },
@@ -102,10 +108,12 @@
           "itemId": "atulg4/agentic-sdlc#129",
           "kind": "task",
           "labels": [
+            "agent-ready",
             "cloud-ready",
             "enhancement",
             "human-review-required",
             "implementation-approved",
+            "spec-approved",
             "spec-drafted"
           ],
           "parentId": "",
@@ -115,7 +123,7 @@
           "stateBasis": "state declared by the backlog source",
           "status": null,
           "title": "P1: Benchmark Jev in shadow mode with calibrated decisions and honest end-to-end cost accounting",
-          "updatedAt": "2026-09-26T05:18:50Z",
+          "updatedAt": "2026-10-12T08:15:41Z",
           "url": "https://github.com/atulg4/agentic-sdlc/issues/129",
           "workUnitId": ""
         },
@@ -126,10 +134,12 @@
           "itemId": "atulg4/agentic-sdlc#128",
           "kind": "task",
           "labels": [
+            "agent-ready",
             "cloud-ready",
             "enhancement",
             "human-review-required",
             "implementation-approved",
+            "spec-approved",
             "spec-drafted"
           ],
           "parentId": "",
@@ -139,7 +149,7 @@
           "stateBasis": "state declared by the backlog source",
           "status": null,
           "title": "P1: Add an optional Jev decision adapter with strict schemas, egress controls and bounded cost",
-          "updatedAt": "2026-09-26T05:18:49Z",
+          "updatedAt": "2026-10-12T08:15:40Z",
           "url": "https://github.com/atulg4/agentic-sdlc/issues/128",
           "workUnitId": ""
         },
@@ -150,10 +160,12 @@
           "itemId": "atulg4/agentic-sdlc#127",
           "kind": "epic",
           "labels": [
+            "agent-ready",
             "cloud-ready",
             "enhancement",
             "human-review-required",
             "implementation-approved",
+            "spec-approved",
             "spec-drafted"
           ],
           "parentId": "",
@@ -163,7 +175,7 @@
           "stateBasis": "state declared by the backlog source",
           "status": null,
           "title": "EPIC P1: Evaluate Jev as a policy-bounded decision adviser for Forge",
-          "updatedAt": "2026-09-26T05:18:44Z",
+          "updatedAt": "2026-10-12T08:15:38Z",
           "url": "https://github.com/atulg4/agentic-sdlc/issues/127",
           "workUnitId": ""
         },
@@ -262,9 +274,11 @@
           "itemId": "atulg4/agentic-sdlc#110",
           "kind": "epic",
           "labels": [
+            "agent-ready",
             "cloud-ready",
             "human-review-required",
             "implementation-approved",
+            "spec-approved",
             "spec-drafted"
           ],
           "parentId": "",
@@ -274,7 +288,7 @@
           "stateBasis": "state declared by the backlog source",
           "status": null,
           "title": "EPIC: Launch Marketing Maestro \u2014 AI marketing factory for any Forge-managed product",
-          "updatedAt": "2026-09-26T05:21:28Z",
+          "updatedAt": "2026-10-12T08:15:37Z",
           "url": "https://github.com/atulg4/agentic-sdlc/issues/110",
           "workUnitId": ""
         },
@@ -309,9 +323,11 @@
               "itemId": "atulg4/agentic-sdlc#107",
               "kind": "task",
               "labels": [
+                "agent-ready",
                 "cloud-ready",
                 "human-review-required",
                 "implementation-approved",
+                "spec-approved",
                 "spec-drafted"
               ],
               "parentId": "atulg4/agentic-sdlc#109",
@@ -321,7 +337,7 @@
               "stateBasis": "state declared by the backlog source",
               "status": null,
               "title": "P1: Real-time multi-project Forge Control Center with backlog lifecycle, cost and effectiveness views",
-              "updatedAt": "2026-09-26T05:18:41Z",
+              "updatedAt": "2026-10-12T08:15:34Z",
               "url": "https://github.com/atulg4/agentic-sdlc/issues/107",
               "workUnitId": ""
             },
@@ -332,9 +348,11 @@
               "itemId": "atulg4/agentic-sdlc#106",
               "kind": "task",
               "labels": [
+                "agent-ready",
                 "cloud-ready",
                 "human-review-required",
                 "implementation-approved",
+                "spec-approved",
                 "spec-drafted"
               ],
               "parentId": "atulg4/agentic-sdlc#109",
@@ -344,7 +362,7 @@
               "stateBasis": "state declared by the backlog source",
               "status": null,
               "title": "P1: Outcome effectiveness, learning ledger and value-per-agent-hour scoring",
-              "updatedAt": "2026-09-26T05:18:40Z",
+              "updatedAt": "2026-10-12T08:15:32Z",
               "url": "https://github.com/atulg4/agentic-sdlc/issues/106",
               "workUnitId": ""
             },
@@ -409,9 +427,11 @@
               "itemId": "atulg4/agentic-sdlc#46",
               "kind": "task",
               "labels": [
+                "agent-ready",
                 "cloud-ready",
                 "human-review-required",
                 "implementation-approved",
+                "spec-approved",
                 "spec-drafted"
               ],
               "parentId": "atulg4/agentic-sdlc#109",
@@ -421,7 +441,7 @@
               "stateBasis": "state declared by the backlog source",
               "status": null,
               "title": "P0: Forge scheduler \u2014 ETA, critical path, parallelism, capacity, and blocking reasons",
-              "updatedAt": "2026-09-26T05:21:18Z",
+              "updatedAt": "2026-10-12T08:14:57Z",
               "url": "https://github.com/atulg4/agentic-sdlc/issues/46",
               "workUnitId": ""
             },
@@ -432,9 +452,11 @@
               "itemId": "atulg4/agentic-sdlc#44",
               "kind": "task",
               "labels": [
+                "agent-ready",
                 "cloud-ready",
                 "human-review-required",
                 "implementation-approved",
+                "spec-approved",
                 "spec-drafted"
               ],
               "parentId": "atulg4/agentic-sdlc#109",
@@ -444,7 +466,7 @@
               "stateBasis": "state declared by the backlog source",
               "status": null,
               "title": "P1: Forge mobile control plane \u2014 mission status, approvals, budgets, and natural-language steering",
-              "updatedAt": "2026-09-26T05:21:06Z",
+              "updatedAt": "2026-10-12T08:14:54Z",
               "url": "https://github.com/atulg4/agentic-sdlc/issues/44",
               "workUnitId": ""
             },
@@ -455,9 +477,11 @@
               "itemId": "atulg4/agentic-sdlc#43",
               "kind": "task",
               "labels": [
+                "agent-ready",
                 "cloud-ready",
                 "human-review-required",
                 "implementation-approved",
+                "spec-approved",
                 "spec-drafted"
               ],
               "parentId": "atulg4/agentic-sdlc#109",
@@ -467,7 +491,7 @@
               "stateBasis": "state declared by the backlog source",
               "status": null,
               "title": "P0: Forge planning intelligence \u2014 risk-adaptive frontier planning and independent plan critique",
-              "updatedAt": "2026-09-26T06:36:11Z",
+              "updatedAt": "2026-10-12T08:14:52Z",
               "url": "https://github.com/atulg4/agentic-sdlc/issues/43",
               "workUnitId": ""
             },
@@ -478,9 +502,11 @@
               "itemId": "atulg4/agentic-sdlc#42",
               "kind": "task",
               "labels": [
+                "agent-ready",
                 "cloud-ready",
                 "human-review-required",
                 "implementation-approved",
+                "spec-approved",
                 "spec-drafted"
               ],
               "parentId": "atulg4/agentic-sdlc#109",
@@ -490,7 +516,7 @@
               "stateBasis": "state declared by the backlog source",
               "status": null,
               "title": "P0: Forge Benchmark Lab \u2014 empirical agent bakeoffs and quality/cost frontier",
-              "updatedAt": "2026-09-26T06:36:08Z",
+              "updatedAt": "2026-10-12T08:14:51Z",
               "url": "https://github.com/atulg4/agentic-sdlc/issues/42",
               "workUnitId": ""
             },
@@ -501,9 +527,11 @@
               "itemId": "atulg4/agentic-sdlc#41",
               "kind": "task",
               "labels": [
+                "agent-ready",
                 "cloud-ready",
                 "human-review-required",
                 "implementation-approved",
+                "spec-approved",
                 "spec-drafted"
               ],
               "parentId": "atulg4/agentic-sdlc#109",
@@ -513,7 +541,7 @@
               "stateBasis": "state declared by the backlog source",
               "status": null,
               "title": "P0: Forge reliability kernel \u2014 typed failures, retries, checkpoints, and resumable missions",
-              "updatedAt": "2026-09-26T06:36:05Z",
+              "updatedAt": "2026-10-12T08:14:50Z",
               "url": "https://github.com/atulg4/agentic-sdlc/issues/41",
               "workUnitId": ""
             },
@@ -524,9 +552,11 @@
               "itemId": "atulg4/agentic-sdlc#40",
               "kind": "task",
               "labels": [
+                "agent-ready",
                 "cloud-ready",
                 "human-review-required",
                 "implementation-approved",
+                "spec-approved",
                 "spec-drafted"
               ],
               "parentId": "atulg4/agentic-sdlc#109",
@@ -536,7 +566,7 @@
               "stateBasis": "state declared by the backlog source",
               "status": null,
               "title": "P1: Multi-provider adapters for Vertex, Bedrock, DeepSeek, Kimi and direct APIs",
-              "updatedAt": "2026-09-26T06:36:01Z",
+              "updatedAt": "2026-10-12T08:14:48Z",
               "url": "https://github.com/atulg4/agentic-sdlc/issues/40",
               "workUnitId": ""
             },
@@ -547,9 +577,11 @@
               "itemId": "atulg4/agentic-sdlc#39",
               "kind": "task",
               "labels": [
+                "agent-ready",
                 "cloud-ready",
                 "human-review-required",
                 "implementation-approved",
+                "spec-approved",
                 "spec-drafted"
               ],
               "parentId": "atulg4/agentic-sdlc#109",
@@ -559,7 +591,7 @@
               "stateBasis": "state declared by the backlog source",
               "status": null,
               "title": "P1: ChatGPT-plan Codex subscription-cloud executor",
-              "updatedAt": "2026-09-26T06:35:58Z",
+              "updatedAt": "2026-10-12T08:14:47Z",
               "url": "https://github.com/atulg4/agentic-sdlc/issues/39",
               "workUnitId": ""
             },
@@ -570,9 +602,11 @@
               "itemId": "atulg4/agentic-sdlc#38",
               "kind": "task",
               "labels": [
+                "agent-ready",
                 "cloud-ready",
                 "human-review-required",
                 "implementation-approved",
+                "spec-approved",
                 "spec-drafted"
               ],
               "parentId": "atulg4/agentic-sdlc#109",
@@ -582,7 +616,7 @@
               "stateBasis": "state declared by the backlog source",
               "status": null,
               "title": "P0: Quality evidence engine and learning store",
-              "updatedAt": "2026-09-26T06:35:55Z",
+              "updatedAt": "2026-10-12T08:14:46Z",
               "url": "https://github.com/atulg4/agentic-sdlc/issues/38",
               "workUnitId": ""
             }
@@ -592,9 +626,11 @@
           "itemId": "atulg4/agentic-sdlc#109",
           "kind": "epic",
           "labels": [
+            "agent-ready",
             "cloud-ready",
             "human-review-required",
             "implementation-approved",
+            "spec-approved",
             "spec-drafted"
           ],
           "parentId": "",
@@ -604,7 +640,7 @@
           "stateBasis": "state declared by the backlog source",
           "status": null,
           "title": "EPIC: Forge as an open, general-purpose AI software factory",
-          "updatedAt": "2026-09-26T05:18:43Z",
+          "updatedAt": "2026-10-12T08:15:36Z",
           "url": "https://github.com/atulg4/agentic-sdlc/issues/109",
           "workUnitId": ""
         },
@@ -690,9 +726,11 @@
           "itemId": "atulg4/agentic-sdlc#51",
           "kind": "task",
           "labels": [
+            "agent-ready",
             "cloud-ready",
             "human-review-required",
             "implementation-approved",
+            "spec-approved",
             "spec-drafted"
           ],
           "parentId": "",
@@ -702,7 +740,7 @@
           "stateBasis": "state declared by the backlog source",
           "status": null,
           "title": "P0: Event-driven autonomous intake dispatcher for Forge-managed work",
-          "updatedAt": "2026-09-26T05:21:23Z",
+          "updatedAt": "2026-10-12T08:15:31Z",
           "url": "https://github.com/atulg4/agentic-sdlc/issues/51",
           "workUnitId": ""
         },
@@ -713,9 +751,11 @@
           "itemId": "atulg4/agentic-sdlc#45",
           "kind": "task",
           "labels": [
+            "agent-ready",
             "cloud-ready",
             "human-review-required",
             "implementation-approved",
+            "spec-approved",
             "spec-drafted"
           ],
           "parentId": "",
@@ -725,7 +765,7 @@
           "stateBasis": "state declared by the backlog source",
           "status": null,
           "title": "P0: Forge dashboard \u2014 responsive portfolio, mission progress, quality, cost, and next actions",
-          "updatedAt": "2026-09-26T05:21:12Z",
+          "updatedAt": "2026-10-12T08:14:55Z",
           "url": "https://github.com/atulg4/agentic-sdlc/issues/45",
           "workUnitId": ""
         },
@@ -777,9 +817,11 @@
           "itemId": "atulg4/agentic-sdlc#35",
           "kind": "epic",
           "labels": [
+            "agent-ready",
             "cloud-ready",
             "human-review-required",
             "implementation-approved",
+            "spec-approved",
             "spec-drafted"
           ],
           "parentId": "",
@@ -789,7 +831,7 @@
           "stateBasis": "state declared by the backlog source",
           "status": null,
           "title": "FORGE Epic: Adaptive intelligence, cloud execution, quality learning, and autonomous governance",
-          "updatedAt": "2026-09-26T05:21:01Z",
+          "updatedAt": "2026-10-12T08:14:44Z",
           "url": "https://github.com/atulg4/agentic-sdlc/issues/35",
           "workUnitId": ""
         },
@@ -800,9 +842,11 @@
           "itemId": "atulg4/agentic-sdlc#33",
           "kind": "task",
           "labels": [
+            "agent-ready",
             "cloud-ready",
             "human-review-required",
             "implementation-approved",
+            "spec-approved",
             "spec-drafted"
           ],
           "parentId": "",
@@ -812,7 +856,7 @@
           "stateBasis": "state declared by the backlog source",
           "status": null,
           "title": "Add explicit implementer model pin and risk-based Sol escalation",
-          "updatedAt": "2026-09-26T06:35:51Z",
+          "updatedAt": "2026-10-12T08:14:43Z",
           "url": "https://github.com/atulg4/agentic-sdlc/issues/33",
           "workUnitId": ""
         },
@@ -823,10 +867,12 @@
           "itemId": "atulg4/agentic-sdlc#22",
           "kind": "task",
           "labels": [
+            "agent-ready",
             "cloud-ready",
             "enhancement",
             "human-review-required",
             "implementation-approved",
+            "spec-approved",
             "spec-drafted"
           ],
           "parentId": "",
@@ -836,7 +882,7 @@
           "stateBasis": "state declared by the backlog source",
           "status": null,
           "title": "P0: Provider-neutral agent message bus over Pub/Sub-compatible transports",
-          "updatedAt": "2026-09-26T05:18:38Z",
+          "updatedAt": "2026-10-12T08:14:41Z",
           "url": "https://github.com/atulg4/agentic-sdlc/issues/22",
           "workUnitId": ""
         },
@@ -1016,7 +1062,7 @@
         "blockers": 7,
         "byStage": {},
         "byState": {},
-        "incidents": 31,
+        "incidents": 32,
         "workUnits": 0
       },
       "defaultBranch": "main",
@@ -1031,7 +1077,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#140",
           "incidentId": "atulg4/agentic-sdlc#140:untriaged",
           "kind": "awaiting-human-approval",
-          "observedAt": "2026-10-12T00:41:15Z",
+          "observedAt": "2026-10-12T08:30:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1051,132 +1097,180 @@
           "backlogItemId": "atulg4/agentic-sdlc#132",
           "detail": "P2: Evaluate Jev reranking of optional context while preserving mandatory evidence and provenance",
           "evidenceRef": "atulg4/agentic-sdlc#132",
-          "incidentId": "atulg4/agentic-sdlc#132:spec-awaiting-human-review",
-          "kind": "awaiting-human-approval",
-          "observedAt": "2026-10-12T00:41:15Z",
+          "incidentId": "atulg4/agentic-sdlc#132:eligible-awaiting-dispatch-evidence",
+          "kind": "dispatch-blocked",
+          "observedAt": "2026-10-12T08:30:00Z",
           "projectId": "forge",
           "remediations": [
             {
-              "actionId": "record-approval-decision",
+              "actionId": "complete-dispatch-preconditions",
               "authority": "human-only",
               "command": "",
-              "description": "The factory stops here by design until a person approves or rejects the plan.",
-              "handoff": "Review the plan and record an approval or a rejection.",
-              "title": "Record the approval decision"
+              "description": "Dispatch is gated on declared labels and an approval; supply the missing one.",
+              "handoff": "Apply the approval label the mission requires, or record the approval event.",
+              "title": "Complete the dispatch preconditions"
+            },
+            {
+              "actionId": "re-run-dispatch",
+              "authority": "operator",
+              "command": "sdlcctl dispatch-mission --config agentic-sdlc.toml --mission-id <mission> --agents agents.json --work-ref <work-ref> --prompt prompt.md",
+              "description": "Once preconditions hold, re-dispatch the mission for this work unit.",
+              "handoff": "",
+              "title": "Re-run mission dispatch"
             }
           ],
-          "severity": "degraded",
-          "summary": "Specification draft held for human spec review: planning and implementation stay blocked until spec-drafted is removed or spec-approved is added",
+          "severity": "advisory",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
           "workUnitId": ""
         },
         {
           "backlogItemId": "atulg4/agentic-sdlc#131",
           "detail": "P2: Add Jev task and mission-fit advice alongside Forge's deterministic executor router",
           "evidenceRef": "atulg4/agentic-sdlc#131",
-          "incidentId": "atulg4/agentic-sdlc#131:spec-awaiting-human-review",
-          "kind": "awaiting-human-approval",
-          "observedAt": "2026-10-12T00:41:15Z",
+          "incidentId": "atulg4/agentic-sdlc#131:eligible-awaiting-dispatch-evidence",
+          "kind": "dispatch-blocked",
+          "observedAt": "2026-10-12T08:30:00Z",
           "projectId": "forge",
           "remediations": [
             {
-              "actionId": "record-approval-decision",
+              "actionId": "complete-dispatch-preconditions",
               "authority": "human-only",
               "command": "",
-              "description": "The factory stops here by design until a person approves or rejects the plan.",
-              "handoff": "Review the plan and record an approval or a rejection.",
-              "title": "Record the approval decision"
+              "description": "Dispatch is gated on declared labels and an approval; supply the missing one.",
+              "handoff": "Apply the approval label the mission requires, or record the approval event.",
+              "title": "Complete the dispatch preconditions"
+            },
+            {
+              "actionId": "re-run-dispatch",
+              "authority": "operator",
+              "command": "sdlcctl dispatch-mission --config agentic-sdlc.toml --mission-id <mission> --agents agents.json --work-ref <work-ref> --prompt prompt.md",
+              "description": "Once preconditions hold, re-dispatch the mission for this work unit.",
+              "handoff": "",
+              "title": "Re-run mission dispatch"
             }
           ],
-          "severity": "degraded",
-          "summary": "Specification draft held for human spec review: planning and implementation stay blocked until spec-drafted is removed or spec-approved is added",
+          "severity": "advisory",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
           "workUnitId": ""
         },
         {
           "backlogItemId": "atulg4/agentic-sdlc#130",
           "detail": "P2: Use Jev to advise on unknown failures without changing exact-head retry or repair authority",
           "evidenceRef": "atulg4/agentic-sdlc#130",
-          "incidentId": "atulg4/agentic-sdlc#130:spec-awaiting-human-review",
-          "kind": "awaiting-human-approval",
-          "observedAt": "2026-10-12T00:41:15Z",
+          "incidentId": "atulg4/agentic-sdlc#130:eligible-awaiting-dispatch-evidence",
+          "kind": "dispatch-blocked",
+          "observedAt": "2026-10-12T08:30:00Z",
           "projectId": "forge",
           "remediations": [
             {
-              "actionId": "record-approval-decision",
+              "actionId": "complete-dispatch-preconditions",
               "authority": "human-only",
               "command": "",
-              "description": "The factory stops here by design until a person approves or rejects the plan.",
-              "handoff": "Review the plan and record an approval or a rejection.",
-              "title": "Record the approval decision"
+              "description": "Dispatch is gated on declared labels and an approval; supply the missing one.",
+              "handoff": "Apply the approval label the mission requires, or record the approval event.",
+              "title": "Complete the dispatch preconditions"
+            },
+            {
+              "actionId": "re-run-dispatch",
+              "authority": "operator",
+              "command": "sdlcctl dispatch-mission --config agentic-sdlc.toml --mission-id <mission> --agents agents.json --work-ref <work-ref> --prompt prompt.md",
+              "description": "Once preconditions hold, re-dispatch the mission for this work unit.",
+              "handoff": "",
+              "title": "Re-run mission dispatch"
             }
           ],
-          "severity": "degraded",
-          "summary": "Specification draft held for human spec review: planning and implementation stay blocked until spec-drafted is removed or spec-approved is added",
+          "severity": "advisory",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
           "workUnitId": ""
         },
         {
           "backlogItemId": "atulg4/agentic-sdlc#129",
           "detail": "P1: Benchmark Jev in shadow mode with calibrated decisions and honest end-to-end cost accounting",
           "evidenceRef": "atulg4/agentic-sdlc#129",
-          "incidentId": "atulg4/agentic-sdlc#129:spec-awaiting-human-review",
-          "kind": "awaiting-human-approval",
-          "observedAt": "2026-10-12T00:41:15Z",
+          "incidentId": "atulg4/agentic-sdlc#129:eligible-awaiting-dispatch-evidence",
+          "kind": "dispatch-blocked",
+          "observedAt": "2026-10-12T08:30:00Z",
           "projectId": "forge",
           "remediations": [
             {
-              "actionId": "record-approval-decision",
+              "actionId": "complete-dispatch-preconditions",
               "authority": "human-only",
               "command": "",
-              "description": "The factory stops here by design until a person approves or rejects the plan.",
-              "handoff": "Review the plan and record an approval or a rejection.",
-              "title": "Record the approval decision"
+              "description": "Dispatch is gated on declared labels and an approval; supply the missing one.",
+              "handoff": "Apply the approval label the mission requires, or record the approval event.",
+              "title": "Complete the dispatch preconditions"
+            },
+            {
+              "actionId": "re-run-dispatch",
+              "authority": "operator",
+              "command": "sdlcctl dispatch-mission --config agentic-sdlc.toml --mission-id <mission> --agents agents.json --work-ref <work-ref> --prompt prompt.md",
+              "description": "Once preconditions hold, re-dispatch the mission for this work unit.",
+              "handoff": "",
+              "title": "Re-run mission dispatch"
             }
           ],
-          "severity": "degraded",
-          "summary": "Specification draft held for human spec review: planning and implementation stay blocked until spec-drafted is removed or spec-approved is added",
+          "severity": "advisory",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
           "workUnitId": ""
         },
         {
           "backlogItemId": "atulg4/agentic-sdlc#128",
           "detail": "P1: Add an optional Jev decision adapter with strict schemas, egress controls and bounded cost",
           "evidenceRef": "atulg4/agentic-sdlc#128",
-          "incidentId": "atulg4/agentic-sdlc#128:spec-awaiting-human-review",
-          "kind": "awaiting-human-approval",
-          "observedAt": "2026-10-12T00:41:15Z",
+          "incidentId": "atulg4/agentic-sdlc#128:eligible-awaiting-dispatch-evidence",
+          "kind": "dispatch-blocked",
+          "observedAt": "2026-10-12T08:30:00Z",
           "projectId": "forge",
           "remediations": [
             {
-              "actionId": "record-approval-decision",
+              "actionId": "complete-dispatch-preconditions",
               "authority": "human-only",
               "command": "",
-              "description": "The factory stops here by design until a person approves or rejects the plan.",
-              "handoff": "Review the plan and record an approval or a rejection.",
-              "title": "Record the approval decision"
+              "description": "Dispatch is gated on declared labels and an approval; supply the missing one.",
+              "handoff": "Apply the approval label the mission requires, or record the approval event.",
+              "title": "Complete the dispatch preconditions"
+            },
+            {
+              "actionId": "re-run-dispatch",
+              "authority": "operator",
+              "command": "sdlcctl dispatch-mission --config agentic-sdlc.toml --mission-id <mission> --agents agents.json --work-ref <work-ref> --prompt prompt.md",
+              "description": "Once preconditions hold, re-dispatch the mission for this work unit.",
+              "handoff": "",
+              "title": "Re-run mission dispatch"
             }
           ],
-          "severity": "degraded",
-          "summary": "Specification draft held for human spec review: planning and implementation stay blocked until spec-drafted is removed or spec-approved is added",
+          "severity": "advisory",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
           "workUnitId": ""
         },
         {
           "backlogItemId": "atulg4/agentic-sdlc#127",
           "detail": "EPIC P1: Evaluate Jev as a policy-bounded decision adviser for Forge",
           "evidenceRef": "atulg4/agentic-sdlc#127",
-          "incidentId": "atulg4/agentic-sdlc#127:spec-awaiting-human-review",
-          "kind": "awaiting-human-approval",
-          "observedAt": "2026-10-12T00:41:15Z",
+          "incidentId": "atulg4/agentic-sdlc#127:eligible-awaiting-dispatch-evidence",
+          "kind": "dispatch-blocked",
+          "observedAt": "2026-10-12T08:30:00Z",
           "projectId": "forge",
           "remediations": [
             {
-              "actionId": "record-approval-decision",
+              "actionId": "complete-dispatch-preconditions",
               "authority": "human-only",
               "command": "",
-              "description": "The factory stops here by design until a person approves or rejects the plan.",
-              "handoff": "Review the plan and record an approval or a rejection.",
-              "title": "Record the approval decision"
+              "description": "Dispatch is gated on declared labels and an approval; supply the missing one.",
+              "handoff": "Apply the approval label the mission requires, or record the approval event.",
+              "title": "Complete the dispatch preconditions"
+            },
+            {
+              "actionId": "re-run-dispatch",
+              "authority": "operator",
+              "command": "sdlcctl dispatch-mission --config agentic-sdlc.toml --mission-id <mission> --agents agents.json --work-ref <work-ref> --prompt prompt.md",
+              "description": "Once preconditions hold, re-dispatch the mission for this work unit.",
+              "handoff": "",
+              "title": "Re-run mission dispatch"
             }
           ],
-          "severity": "degraded",
-          "summary": "Specification draft held for human spec review: planning and implementation stay blocked until spec-drafted is removed or spec-approved is added",
+          "severity": "advisory",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
           "workUnitId": ""
         },
         {
@@ -1185,7 +1279,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#121",
           "incidentId": "atulg4/agentic-sdlc#121:approved-without-agent-ready",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T00:41:15Z",
+          "observedAt": "2026-10-12T08:30:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1215,7 +1309,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#120",
           "incidentId": "atulg4/agentic-sdlc#120:approved-without-agent-ready",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T00:41:15Z",
+          "observedAt": "2026-10-12T08:30:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1245,7 +1339,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#119",
           "incidentId": "atulg4/agentic-sdlc#119:approved-without-agent-ready",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T00:41:15Z",
+          "observedAt": "2026-10-12T08:30:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1275,7 +1369,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#118",
           "incidentId": "atulg4/agentic-sdlc#118:approved-without-agent-ready",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T00:41:15Z",
+          "observedAt": "2026-10-12T08:30:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1303,44 +1397,60 @@
           "backlogItemId": "atulg4/agentic-sdlc#110",
           "detail": "EPIC: Launch Marketing Maestro \u2014 AI marketing factory for any Forge-managed product",
           "evidenceRef": "atulg4/agentic-sdlc#110",
-          "incidentId": "atulg4/agentic-sdlc#110:spec-awaiting-human-review",
-          "kind": "awaiting-human-approval",
-          "observedAt": "2026-10-12T00:41:15Z",
+          "incidentId": "atulg4/agentic-sdlc#110:eligible-awaiting-dispatch-evidence",
+          "kind": "dispatch-blocked",
+          "observedAt": "2026-10-12T08:30:00Z",
           "projectId": "forge",
           "remediations": [
             {
-              "actionId": "record-approval-decision",
+              "actionId": "complete-dispatch-preconditions",
               "authority": "human-only",
               "command": "",
-              "description": "The factory stops here by design until a person approves or rejects the plan.",
-              "handoff": "Review the plan and record an approval or a rejection.",
-              "title": "Record the approval decision"
+              "description": "Dispatch is gated on declared labels and an approval; supply the missing one.",
+              "handoff": "Apply the approval label the mission requires, or record the approval event.",
+              "title": "Complete the dispatch preconditions"
+            },
+            {
+              "actionId": "re-run-dispatch",
+              "authority": "operator",
+              "command": "sdlcctl dispatch-mission --config agentic-sdlc.toml --mission-id <mission> --agents agents.json --work-ref <work-ref> --prompt prompt.md",
+              "description": "Once preconditions hold, re-dispatch the mission for this work unit.",
+              "handoff": "",
+              "title": "Re-run mission dispatch"
             }
           ],
-          "severity": "degraded",
-          "summary": "Specification draft held for human spec review: planning and implementation stay blocked until spec-drafted is removed or spec-approved is added",
+          "severity": "advisory",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
           "workUnitId": ""
         },
         {
           "backlogItemId": "atulg4/agentic-sdlc#109",
           "detail": "EPIC: Forge as an open, general-purpose AI software factory",
           "evidenceRef": "atulg4/agentic-sdlc#109",
-          "incidentId": "atulg4/agentic-sdlc#109:spec-awaiting-human-review",
-          "kind": "awaiting-human-approval",
-          "observedAt": "2026-10-12T00:41:15Z",
+          "incidentId": "atulg4/agentic-sdlc#109:eligible-awaiting-dispatch-evidence",
+          "kind": "dispatch-blocked",
+          "observedAt": "2026-10-12T08:30:00Z",
           "projectId": "forge",
           "remediations": [
             {
-              "actionId": "record-approval-decision",
+              "actionId": "complete-dispatch-preconditions",
               "authority": "human-only",
               "command": "",
-              "description": "The factory stops here by design until a person approves or rejects the plan.",
-              "handoff": "Review the plan and record an approval or a rejection.",
-              "title": "Record the approval decision"
+              "description": "Dispatch is gated on declared labels and an approval; supply the missing one.",
+              "handoff": "Apply the approval label the mission requires, or record the approval event.",
+              "title": "Complete the dispatch preconditions"
+            },
+            {
+              "actionId": "re-run-dispatch",
+              "authority": "operator",
+              "command": "sdlcctl dispatch-mission --config agentic-sdlc.toml --mission-id <mission> --agents agents.json --work-ref <work-ref> --prompt prompt.md",
+              "description": "Once preconditions hold, re-dispatch the mission for this work unit.",
+              "handoff": "",
+              "title": "Re-run mission dispatch"
             }
           ],
-          "severity": "degraded",
-          "summary": "Specification draft held for human spec review: planning and implementation stay blocked until spec-drafted is removed or spec-approved is added",
+          "severity": "advisory",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
           "workUnitId": ""
         },
         {
@@ -1349,7 +1459,7 @@
           "evidenceRef": "atulg4/agentic-sdlc#108",
           "incidentId": "atulg4/agentic-sdlc#108:approved-without-agent-ready",
           "kind": "dispatch-blocked",
-          "observedAt": "2026-10-12T00:41:15Z",
+          "observedAt": "2026-10-12T08:30:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1377,330 +1487,450 @@
           "backlogItemId": "atulg4/agentic-sdlc#107",
           "detail": "P1: Real-time multi-project Forge Control Center with backlog lifecycle, cost and effectiveness views",
           "evidenceRef": "atulg4/agentic-sdlc#107",
-          "incidentId": "atulg4/agentic-sdlc#107:spec-awaiting-human-review",
-          "kind": "awaiting-human-approval",
-          "observedAt": "2026-10-12T00:41:15Z",
+          "incidentId": "atulg4/agentic-sdlc#107:eligible-awaiting-dispatch-evidence",
+          "kind": "dispatch-blocked",
+          "observedAt": "2026-10-12T08:30:00Z",
           "projectId": "forge",
           "remediations": [
             {
-              "actionId": "record-approval-decision",
+              "actionId": "complete-dispatch-preconditions",
               "authority": "human-only",
               "command": "",
-              "description": "The factory stops here by design until a person approves or rejects the plan.",
-              "handoff": "Review the plan and record an approval or a rejection.",
-              "title": "Record the approval decision"
+              "description": "Dispatch is gated on declared labels and an approval; supply the missing one.",
+              "handoff": "Apply the approval label the mission requires, or record the approval event.",
+              "title": "Complete the dispatch preconditions"
+            },
+            {
+              "actionId": "re-run-dispatch",
+              "authority": "operator",
+              "command": "sdlcctl dispatch-mission --config agentic-sdlc.toml --mission-id <mission> --agents agents.json --work-ref <work-ref> --prompt prompt.md",
+              "description": "Once preconditions hold, re-dispatch the mission for this work unit.",
+              "handoff": "",
+              "title": "Re-run mission dispatch"
             }
           ],
-          "severity": "degraded",
-          "summary": "Specification draft held for human spec review: planning and implementation stay blocked until spec-drafted is removed or spec-approved is added",
+          "severity": "advisory",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
           "workUnitId": ""
         },
         {
           "backlogItemId": "atulg4/agentic-sdlc#106",
           "detail": "P1: Outcome effectiveness, learning ledger and value-per-agent-hour scoring",
           "evidenceRef": "atulg4/agentic-sdlc#106",
-          "incidentId": "atulg4/agentic-sdlc#106:spec-awaiting-human-review",
-          "kind": "awaiting-human-approval",
-          "observedAt": "2026-10-12T00:41:15Z",
+          "incidentId": "atulg4/agentic-sdlc#106:eligible-awaiting-dispatch-evidence",
+          "kind": "dispatch-blocked",
+          "observedAt": "2026-10-12T08:30:00Z",
           "projectId": "forge",
           "remediations": [
             {
-              "actionId": "record-approval-decision",
+              "actionId": "complete-dispatch-preconditions",
               "authority": "human-only",
               "command": "",
-              "description": "The factory stops here by design until a person approves or rejects the plan.",
-              "handoff": "Review the plan and record an approval or a rejection.",
-              "title": "Record the approval decision"
+              "description": "Dispatch is gated on declared labels and an approval; supply the missing one.",
+              "handoff": "Apply the approval label the mission requires, or record the approval event.",
+              "title": "Complete the dispatch preconditions"
+            },
+            {
+              "actionId": "re-run-dispatch",
+              "authority": "operator",
+              "command": "sdlcctl dispatch-mission --config agentic-sdlc.toml --mission-id <mission> --agents agents.json --work-ref <work-ref> --prompt prompt.md",
+              "description": "Once preconditions hold, re-dispatch the mission for this work unit.",
+              "handoff": "",
+              "title": "Re-run mission dispatch"
             }
           ],
-          "severity": "degraded",
-          "summary": "Specification draft held for human spec review: planning and implementation stay blocked until spec-drafted is removed or spec-approved is added",
+          "severity": "advisory",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
           "workUnitId": ""
         },
         {
           "backlogItemId": "atulg4/agentic-sdlc#51",
           "detail": "P0: Event-driven autonomous intake dispatcher for Forge-managed work",
           "evidenceRef": "atulg4/agentic-sdlc#51",
-          "incidentId": "atulg4/agentic-sdlc#51:spec-awaiting-human-review",
-          "kind": "awaiting-human-approval",
-          "observedAt": "2026-10-12T00:41:15Z",
+          "incidentId": "atulg4/agentic-sdlc#51:eligible-awaiting-dispatch-evidence",
+          "kind": "dispatch-blocked",
+          "observedAt": "2026-10-12T08:30:00Z",
           "projectId": "forge",
           "remediations": [
             {
-              "actionId": "record-approval-decision",
+              "actionId": "complete-dispatch-preconditions",
               "authority": "human-only",
               "command": "",
-              "description": "The factory stops here by design until a person approves or rejects the plan.",
-              "handoff": "Review the plan and record an approval or a rejection.",
-              "title": "Record the approval decision"
+              "description": "Dispatch is gated on declared labels and an approval; supply the missing one.",
+              "handoff": "Apply the approval label the mission requires, or record the approval event.",
+              "title": "Complete the dispatch preconditions"
+            },
+            {
+              "actionId": "re-run-dispatch",
+              "authority": "operator",
+              "command": "sdlcctl dispatch-mission --config agentic-sdlc.toml --mission-id <mission> --agents agents.json --work-ref <work-ref> --prompt prompt.md",
+              "description": "Once preconditions hold, re-dispatch the mission for this work unit.",
+              "handoff": "",
+              "title": "Re-run mission dispatch"
             }
           ],
-          "severity": "degraded",
-          "summary": "Specification draft held for human spec review: planning and implementation stay blocked until spec-drafted is removed or spec-approved is added",
+          "severity": "advisory",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
           "workUnitId": ""
         },
         {
           "backlogItemId": "atulg4/agentic-sdlc#46",
           "detail": "P0: Forge scheduler \u2014 ETA, critical path, parallelism, capacity, and blocking reasons",
           "evidenceRef": "atulg4/agentic-sdlc#46",
-          "incidentId": "atulg4/agentic-sdlc#46:spec-awaiting-human-review",
-          "kind": "awaiting-human-approval",
-          "observedAt": "2026-10-12T00:41:15Z",
+          "incidentId": "atulg4/agentic-sdlc#46:eligible-awaiting-dispatch-evidence",
+          "kind": "dispatch-blocked",
+          "observedAt": "2026-10-12T08:30:00Z",
           "projectId": "forge",
           "remediations": [
             {
-              "actionId": "record-approval-decision",
+              "actionId": "complete-dispatch-preconditions",
               "authority": "human-only",
               "command": "",
-              "description": "The factory stops here by design until a person approves or rejects the plan.",
-              "handoff": "Review the plan and record an approval or a rejection.",
-              "title": "Record the approval decision"
+              "description": "Dispatch is gated on declared labels and an approval; supply the missing one.",
+              "handoff": "Apply the approval label the mission requires, or record the approval event.",
+              "title": "Complete the dispatch preconditions"
+            },
+            {
+              "actionId": "re-run-dispatch",
+              "authority": "operator",
+              "command": "sdlcctl dispatch-mission --config agentic-sdlc.toml --mission-id <mission> --agents agents.json --work-ref <work-ref> --prompt prompt.md",
+              "description": "Once preconditions hold, re-dispatch the mission for this work unit.",
+              "handoff": "",
+              "title": "Re-run mission dispatch"
             }
           ],
-          "severity": "degraded",
-          "summary": "Specification draft held for human spec review: planning and implementation stay blocked until spec-drafted is removed or spec-approved is added",
+          "severity": "advisory",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
           "workUnitId": ""
         },
         {
           "backlogItemId": "atulg4/agentic-sdlc#45",
           "detail": "P0: Forge dashboard \u2014 responsive portfolio, mission progress, quality, cost, and next actions",
           "evidenceRef": "atulg4/agentic-sdlc#45",
-          "incidentId": "atulg4/agentic-sdlc#45:spec-awaiting-human-review",
-          "kind": "awaiting-human-approval",
-          "observedAt": "2026-10-12T00:41:15Z",
+          "incidentId": "atulg4/agentic-sdlc#45:eligible-awaiting-dispatch-evidence",
+          "kind": "dispatch-blocked",
+          "observedAt": "2026-10-12T08:30:00Z",
           "projectId": "forge",
           "remediations": [
             {
-              "actionId": "record-approval-decision",
+              "actionId": "complete-dispatch-preconditions",
               "authority": "human-only",
               "command": "",
-              "description": "The factory stops here by design until a person approves or rejects the plan.",
-              "handoff": "Review the plan and record an approval or a rejection.",
-              "title": "Record the approval decision"
+              "description": "Dispatch is gated on declared labels and an approval; supply the missing one.",
+              "handoff": "Apply the approval label the mission requires, or record the approval event.",
+              "title": "Complete the dispatch preconditions"
+            },
+            {
+              "actionId": "re-run-dispatch",
+              "authority": "operator",
+              "command": "sdlcctl dispatch-mission --config agentic-sdlc.toml --mission-id <mission> --agents agents.json --work-ref <work-ref> --prompt prompt.md",
+              "description": "Once preconditions hold, re-dispatch the mission for this work unit.",
+              "handoff": "",
+              "title": "Re-run mission dispatch"
             }
           ],
-          "severity": "degraded",
-          "summary": "Specification draft held for human spec review: planning and implementation stay blocked until spec-drafted is removed or spec-approved is added",
+          "severity": "advisory",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
           "workUnitId": ""
         },
         {
           "backlogItemId": "atulg4/agentic-sdlc#44",
           "detail": "P1: Forge mobile control plane \u2014 mission status, approvals, budgets, and natural-language steering",
           "evidenceRef": "atulg4/agentic-sdlc#44",
-          "incidentId": "atulg4/agentic-sdlc#44:spec-awaiting-human-review",
-          "kind": "awaiting-human-approval",
-          "observedAt": "2026-10-12T00:41:15Z",
+          "incidentId": "atulg4/agentic-sdlc#44:eligible-awaiting-dispatch-evidence",
+          "kind": "dispatch-blocked",
+          "observedAt": "2026-10-12T08:30:00Z",
           "projectId": "forge",
           "remediations": [
             {
-              "actionId": "record-approval-decision",
+              "actionId": "complete-dispatch-preconditions",
               "authority": "human-only",
               "command": "",
-              "description": "The factory stops here by design until a person approves or rejects the plan.",
-              "handoff": "Review the plan and record an approval or a rejection.",
-              "title": "Record the approval decision"
+              "description": "Dispatch is gated on declared labels and an approval; supply the missing one.",
+              "handoff": "Apply the approval label the mission requires, or record the approval event.",
+              "title": "Complete the dispatch preconditions"
+            },
+            {
+              "actionId": "re-run-dispatch",
+              "authority": "operator",
+              "command": "sdlcctl dispatch-mission --config agentic-sdlc.toml --mission-id <mission> --agents agents.json --work-ref <work-ref> --prompt prompt.md",
+              "description": "Once preconditions hold, re-dispatch the mission for this work unit.",
+              "handoff": "",
+              "title": "Re-run mission dispatch"
             }
           ],
-          "severity": "degraded",
-          "summary": "Specification draft held for human spec review: planning and implementation stay blocked until spec-drafted is removed or spec-approved is added",
+          "severity": "advisory",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
           "workUnitId": ""
         },
         {
           "backlogItemId": "atulg4/agentic-sdlc#43",
           "detail": "P0: Forge planning intelligence \u2014 risk-adaptive frontier planning and independent plan critique",
           "evidenceRef": "atulg4/agentic-sdlc#43",
-          "incidentId": "atulg4/agentic-sdlc#43:spec-awaiting-human-review",
-          "kind": "awaiting-human-approval",
-          "observedAt": "2026-10-12T00:41:15Z",
+          "incidentId": "atulg4/agentic-sdlc#43:eligible-awaiting-dispatch-evidence",
+          "kind": "dispatch-blocked",
+          "observedAt": "2026-10-12T08:30:00Z",
           "projectId": "forge",
           "remediations": [
             {
-              "actionId": "record-approval-decision",
+              "actionId": "complete-dispatch-preconditions",
               "authority": "human-only",
               "command": "",
-              "description": "The factory stops here by design until a person approves or rejects the plan.",
-              "handoff": "Review the plan and record an approval or a rejection.",
-              "title": "Record the approval decision"
+              "description": "Dispatch is gated on declared labels and an approval; supply the missing one.",
+              "handoff": "Apply the approval label the mission requires, or record the approval event.",
+              "title": "Complete the dispatch preconditions"
+            },
+            {
+              "actionId": "re-run-dispatch",
+              "authority": "operator",
+              "command": "sdlcctl dispatch-mission --config agentic-sdlc.toml --mission-id <mission> --agents agents.json --work-ref <work-ref> --prompt prompt.md",
+              "description": "Once preconditions hold, re-dispatch the mission for this work unit.",
+              "handoff": "",
+              "title": "Re-run mission dispatch"
             }
           ],
-          "severity": "degraded",
-          "summary": "Specification draft held for human spec review: planning and implementation stay blocked until spec-drafted is removed or spec-approved is added",
+          "severity": "advisory",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
           "workUnitId": ""
         },
         {
           "backlogItemId": "atulg4/agentic-sdlc#42",
           "detail": "P0: Forge Benchmark Lab \u2014 empirical agent bakeoffs and quality/cost frontier",
           "evidenceRef": "atulg4/agentic-sdlc#42",
-          "incidentId": "atulg4/agentic-sdlc#42:spec-awaiting-human-review",
-          "kind": "awaiting-human-approval",
-          "observedAt": "2026-10-12T00:41:15Z",
+          "incidentId": "atulg4/agentic-sdlc#42:eligible-awaiting-dispatch-evidence",
+          "kind": "dispatch-blocked",
+          "observedAt": "2026-10-12T08:30:00Z",
           "projectId": "forge",
           "remediations": [
             {
-              "actionId": "record-approval-decision",
+              "actionId": "complete-dispatch-preconditions",
               "authority": "human-only",
               "command": "",
-              "description": "The factory stops here by design until a person approves or rejects the plan.",
-              "handoff": "Review the plan and record an approval or a rejection.",
-              "title": "Record the approval decision"
+              "description": "Dispatch is gated on declared labels and an approval; supply the missing one.",
+              "handoff": "Apply the approval label the mission requires, or record the approval event.",
+              "title": "Complete the dispatch preconditions"
+            },
+            {
+              "actionId": "re-run-dispatch",
+              "authority": "operator",
+              "command": "sdlcctl dispatch-mission --config agentic-sdlc.toml --mission-id <mission> --agents agents.json --work-ref <work-ref> --prompt prompt.md",
+              "description": "Once preconditions hold, re-dispatch the mission for this work unit.",
+              "handoff": "",
+              "title": "Re-run mission dispatch"
             }
           ],
-          "severity": "degraded",
-          "summary": "Specification draft held for human spec review: planning and implementation stay blocked until spec-drafted is removed or spec-approved is added",
+          "severity": "advisory",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
           "workUnitId": ""
         },
         {
           "backlogItemId": "atulg4/agentic-sdlc#41",
           "detail": "P0: Forge reliability kernel \u2014 typed failures, retries, checkpoints, and resumable missions",
           "evidenceRef": "atulg4/agentic-sdlc#41",
-          "incidentId": "atulg4/agentic-sdlc#41:spec-awaiting-human-review",
-          "kind": "awaiting-human-approval",
-          "observedAt": "2026-10-12T00:41:15Z",
+          "incidentId": "atulg4/agentic-sdlc#41:eligible-awaiting-dispatch-evidence",
+          "kind": "dispatch-blocked",
+          "observedAt": "2026-10-12T08:30:00Z",
           "projectId": "forge",
           "remediations": [
             {
-              "actionId": "record-approval-decision",
+              "actionId": "complete-dispatch-preconditions",
               "authority": "human-only",
               "command": "",
-              "description": "The factory stops here by design until a person approves or rejects the plan.",
-              "handoff": "Review the plan and record an approval or a rejection.",
-              "title": "Record the approval decision"
+              "description": "Dispatch is gated on declared labels and an approval; supply the missing one.",
+              "handoff": "Apply the approval label the mission requires, or record the approval event.",
+              "title": "Complete the dispatch preconditions"
+            },
+            {
+              "actionId": "re-run-dispatch",
+              "authority": "operator",
+              "command": "sdlcctl dispatch-mission --config agentic-sdlc.toml --mission-id <mission> --agents agents.json --work-ref <work-ref> --prompt prompt.md",
+              "description": "Once preconditions hold, re-dispatch the mission for this work unit.",
+              "handoff": "",
+              "title": "Re-run mission dispatch"
             }
           ],
-          "severity": "degraded",
-          "summary": "Specification draft held for human spec review: planning and implementation stay blocked until spec-drafted is removed or spec-approved is added",
+          "severity": "advisory",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
           "workUnitId": ""
         },
         {
           "backlogItemId": "atulg4/agentic-sdlc#40",
           "detail": "P1: Multi-provider adapters for Vertex, Bedrock, DeepSeek, Kimi and direct APIs",
           "evidenceRef": "atulg4/agentic-sdlc#40",
-          "incidentId": "atulg4/agentic-sdlc#40:spec-awaiting-human-review",
-          "kind": "awaiting-human-approval",
-          "observedAt": "2026-10-12T00:41:15Z",
+          "incidentId": "atulg4/agentic-sdlc#40:eligible-awaiting-dispatch-evidence",
+          "kind": "dispatch-blocked",
+          "observedAt": "2026-10-12T08:30:00Z",
           "projectId": "forge",
           "remediations": [
             {
-              "actionId": "record-approval-decision",
+              "actionId": "complete-dispatch-preconditions",
               "authority": "human-only",
               "command": "",
-              "description": "The factory stops here by design until a person approves or rejects the plan.",
-              "handoff": "Review the plan and record an approval or a rejection.",
-              "title": "Record the approval decision"
+              "description": "Dispatch is gated on declared labels and an approval; supply the missing one.",
+              "handoff": "Apply the approval label the mission requires, or record the approval event.",
+              "title": "Complete the dispatch preconditions"
+            },
+            {
+              "actionId": "re-run-dispatch",
+              "authority": "operator",
+              "command": "sdlcctl dispatch-mission --config agentic-sdlc.toml --mission-id <mission> --agents agents.json --work-ref <work-ref> --prompt prompt.md",
+              "description": "Once preconditions hold, re-dispatch the mission for this work unit.",
+              "handoff": "",
+              "title": "Re-run mission dispatch"
             }
           ],
-          "severity": "degraded",
-          "summary": "Specification draft held for human spec review: planning and implementation stay blocked until spec-drafted is removed or spec-approved is added",
+          "severity": "advisory",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
           "workUnitId": ""
         },
         {
           "backlogItemId": "atulg4/agentic-sdlc#39",
           "detail": "P1: ChatGPT-plan Codex subscription-cloud executor",
           "evidenceRef": "atulg4/agentic-sdlc#39",
-          "incidentId": "atulg4/agentic-sdlc#39:spec-awaiting-human-review",
-          "kind": "awaiting-human-approval",
-          "observedAt": "2026-10-12T00:41:15Z",
+          "incidentId": "atulg4/agentic-sdlc#39:eligible-awaiting-dispatch-evidence",
+          "kind": "dispatch-blocked",
+          "observedAt": "2026-10-12T08:30:00Z",
           "projectId": "forge",
           "remediations": [
             {
-              "actionId": "record-approval-decision",
+              "actionId": "complete-dispatch-preconditions",
               "authority": "human-only",
               "command": "",
-              "description": "The factory stops here by design until a person approves or rejects the plan.",
-              "handoff": "Review the plan and record an approval or a rejection.",
-              "title": "Record the approval decision"
+              "description": "Dispatch is gated on declared labels and an approval; supply the missing one.",
+              "handoff": "Apply the approval label the mission requires, or record the approval event.",
+              "title": "Complete the dispatch preconditions"
+            },
+            {
+              "actionId": "re-run-dispatch",
+              "authority": "operator",
+              "command": "sdlcctl dispatch-mission --config agentic-sdlc.toml --mission-id <mission> --agents agents.json --work-ref <work-ref> --prompt prompt.md",
+              "description": "Once preconditions hold, re-dispatch the mission for this work unit.",
+              "handoff": "",
+              "title": "Re-run mission dispatch"
             }
           ],
-          "severity": "degraded",
-          "summary": "Specification draft held for human spec review: planning and implementation stay blocked until spec-drafted is removed or spec-approved is added",
+          "severity": "advisory",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
           "workUnitId": ""
         },
         {
           "backlogItemId": "atulg4/agentic-sdlc#38",
           "detail": "P0: Quality evidence engine and learning store",
           "evidenceRef": "atulg4/agentic-sdlc#38",
-          "incidentId": "atulg4/agentic-sdlc#38:spec-awaiting-human-review",
-          "kind": "awaiting-human-approval",
-          "observedAt": "2026-10-12T00:41:15Z",
+          "incidentId": "atulg4/agentic-sdlc#38:eligible-awaiting-dispatch-evidence",
+          "kind": "dispatch-blocked",
+          "observedAt": "2026-10-12T08:30:00Z",
           "projectId": "forge",
           "remediations": [
             {
-              "actionId": "record-approval-decision",
+              "actionId": "complete-dispatch-preconditions",
               "authority": "human-only",
               "command": "",
-              "description": "The factory stops here by design until a person approves or rejects the plan.",
-              "handoff": "Review the plan and record an approval or a rejection.",
-              "title": "Record the approval decision"
+              "description": "Dispatch is gated on declared labels and an approval; supply the missing one.",
+              "handoff": "Apply the approval label the mission requires, or record the approval event.",
+              "title": "Complete the dispatch preconditions"
+            },
+            {
+              "actionId": "re-run-dispatch",
+              "authority": "operator",
+              "command": "sdlcctl dispatch-mission --config agentic-sdlc.toml --mission-id <mission> --agents agents.json --work-ref <work-ref> --prompt prompt.md",
+              "description": "Once preconditions hold, re-dispatch the mission for this work unit.",
+              "handoff": "",
+              "title": "Re-run mission dispatch"
             }
           ],
-          "severity": "degraded",
-          "summary": "Specification draft held for human spec review: planning and implementation stay blocked until spec-drafted is removed or spec-approved is added",
+          "severity": "advisory",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
           "workUnitId": ""
         },
         {
           "backlogItemId": "atulg4/agentic-sdlc#35",
           "detail": "FORGE Epic: Adaptive intelligence, cloud execution, quality learning, and autonomous governance",
           "evidenceRef": "atulg4/agentic-sdlc#35",
-          "incidentId": "atulg4/agentic-sdlc#35:spec-awaiting-human-review",
-          "kind": "awaiting-human-approval",
-          "observedAt": "2026-10-12T00:41:15Z",
+          "incidentId": "atulg4/agentic-sdlc#35:eligible-awaiting-dispatch-evidence",
+          "kind": "dispatch-blocked",
+          "observedAt": "2026-10-12T08:30:00Z",
           "projectId": "forge",
           "remediations": [
             {
-              "actionId": "record-approval-decision",
+              "actionId": "complete-dispatch-preconditions",
               "authority": "human-only",
               "command": "",
-              "description": "The factory stops here by design until a person approves or rejects the plan.",
-              "handoff": "Review the plan and record an approval or a rejection.",
-              "title": "Record the approval decision"
+              "description": "Dispatch is gated on declared labels and an approval; supply the missing one.",
+              "handoff": "Apply the approval label the mission requires, or record the approval event.",
+              "title": "Complete the dispatch preconditions"
+            },
+            {
+              "actionId": "re-run-dispatch",
+              "authority": "operator",
+              "command": "sdlcctl dispatch-mission --config agentic-sdlc.toml --mission-id <mission> --agents agents.json --work-ref <work-ref> --prompt prompt.md",
+              "description": "Once preconditions hold, re-dispatch the mission for this work unit.",
+              "handoff": "",
+              "title": "Re-run mission dispatch"
             }
           ],
-          "severity": "degraded",
-          "summary": "Specification draft held for human spec review: planning and implementation stay blocked until spec-drafted is removed or spec-approved is added",
+          "severity": "advisory",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
           "workUnitId": ""
         },
         {
           "backlogItemId": "atulg4/agentic-sdlc#33",
           "detail": "Add explicit implementer model pin and risk-based Sol escalation",
           "evidenceRef": "atulg4/agentic-sdlc#33",
-          "incidentId": "atulg4/agentic-sdlc#33:spec-awaiting-human-review",
-          "kind": "awaiting-human-approval",
-          "observedAt": "2026-10-12T00:41:15Z",
+          "incidentId": "atulg4/agentic-sdlc#33:eligible-awaiting-dispatch-evidence",
+          "kind": "dispatch-blocked",
+          "observedAt": "2026-10-12T08:30:00Z",
           "projectId": "forge",
           "remediations": [
             {
-              "actionId": "record-approval-decision",
+              "actionId": "complete-dispatch-preconditions",
               "authority": "human-only",
               "command": "",
-              "description": "The factory stops here by design until a person approves or rejects the plan.",
-              "handoff": "Review the plan and record an approval or a rejection.",
-              "title": "Record the approval decision"
+              "description": "Dispatch is gated on declared labels and an approval; supply the missing one.",
+              "handoff": "Apply the approval label the mission requires, or record the approval event.",
+              "title": "Complete the dispatch preconditions"
+            },
+            {
+              "actionId": "re-run-dispatch",
+              "authority": "operator",
+              "command": "sdlcctl dispatch-mission --config agentic-sdlc.toml --mission-id <mission> --agents agents.json --work-ref <work-ref> --prompt prompt.md",
+              "description": "Once preconditions hold, re-dispatch the mission for this work unit.",
+              "handoff": "",
+              "title": "Re-run mission dispatch"
             }
           ],
-          "severity": "degraded",
-          "summary": "Specification draft held for human spec review: planning and implementation stay blocked until spec-drafted is removed or spec-approved is added",
+          "severity": "advisory",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
           "workUnitId": ""
         },
         {
           "backlogItemId": "atulg4/agentic-sdlc#22",
           "detail": "P0: Provider-neutral agent message bus over Pub/Sub-compatible transports",
           "evidenceRef": "atulg4/agentic-sdlc#22",
-          "incidentId": "atulg4/agentic-sdlc#22:spec-awaiting-human-review",
-          "kind": "awaiting-human-approval",
-          "observedAt": "2026-10-12T00:41:15Z",
+          "incidentId": "atulg4/agentic-sdlc#22:eligible-awaiting-dispatch-evidence",
+          "kind": "dispatch-blocked",
+          "observedAt": "2026-10-12T08:30:00Z",
           "projectId": "forge",
           "remediations": [
             {
-              "actionId": "record-approval-decision",
+              "actionId": "complete-dispatch-preconditions",
               "authority": "human-only",
               "command": "",
-              "description": "The factory stops here by design until a person approves or rejects the plan.",
-              "handoff": "Review the plan and record an approval or a rejection.",
-              "title": "Record the approval decision"
+              "description": "Dispatch is gated on declared labels and an approval; supply the missing one.",
+              "handoff": "Apply the approval label the mission requires, or record the approval event.",
+              "title": "Complete the dispatch preconditions"
+            },
+            {
+              "actionId": "re-run-dispatch",
+              "authority": "operator",
+              "command": "sdlcctl dispatch-mission --config agentic-sdlc.toml --mission-id <mission> --agents agents.json --work-ref <work-ref> --prompt prompt.md",
+              "description": "Once preconditions hold, re-dispatch the mission for this work unit.",
+              "handoff": "",
+              "title": "Re-run mission dispatch"
             }
           ],
-          "severity": "degraded",
-          "summary": "Specification draft held for human spec review: planning and implementation stay blocked until spec-drafted is removed or spec-approved is added",
+          "severity": "advisory",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
           "workUnitId": ""
         },
         {
@@ -1709,7 +1939,7 @@
           "evidenceRef": "atulg4/agentic-sdlc!148",
           "incidentId": "atulg4/agentic-sdlc!148:ci-failed",
           "kind": "deterministic-ci-failed",
-          "observedAt": "2026-10-12T00:41:15Z",
+          "observedAt": "2026-10-12T08:30:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1739,7 +1969,7 @@
           "evidenceRef": "atulg4/agentic-sdlc!145",
           "incidentId": "atulg4/agentic-sdlc!145:ci-failed",
           "kind": "deterministic-ci-failed",
-          "observedAt": "2026-10-12T00:41:15Z",
+          "observedAt": "2026-10-12T08:30:00Z",
           "projectId": "forge",
           "remediations": [
             {
@@ -1761,6 +1991,28 @@
           ],
           "severity": "blocker",
           "summary": "Deterministic verification failed: test",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "",
+          "detail": "Add sdlcctl onboard + doctor: one-command Forge onboarding",
+          "evidenceRef": "atulg4/agentic-sdlc!139",
+          "incidentId": "atulg4/agentic-sdlc!139:merge-state-blocked",
+          "kind": "unclassified",
+          "observedAt": "2026-10-12T08:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "classify-incident",
+              "authority": "operator",
+              "command": "",
+              "description": "An unclassified incident has no declared remediation; classify it first.",
+              "handoff": "",
+              "title": "Classify the incident"
+            }
+          ],
+          "severity": "degraded",
+          "summary": "Change request mergeability is blocked: a required review or required check is outstanding",
           "workUnitId": ""
         }
       ],
@@ -1841,7 +2093,7 @@
     }
   ],
   "schemaVersion": 1,
-  "snapshotSha256": "e979488a193b7b9fd3ef266d5ac49247ae3fc0e207469ba148e6bf21dd5b673d",
+  "snapshotSha256": "eaf59a539b8b4b276f540ed1f7bb25f1250766d3f5cc8ff2820c2dc048fbcf96",
   "sources": [
     "registry:examples/control-center/project-registry.json",
     "backlog:examples/control-center/backlog.json",
@@ -1852,7 +2104,7 @@
     "attention": 0,
     "backlogItems": 46,
     "blockers": 7,
-    "incidents": 31,
+    "incidents": 32,
     "projects": 3,
     "unregistered": 0,
     "workUnits": 0

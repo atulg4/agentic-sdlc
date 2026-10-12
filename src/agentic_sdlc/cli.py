@@ -523,8 +523,8 @@ def _project_state(args: argparse.Namespace) -> int:
 def _control_center(args: argparse.Namespace) -> int:
     registry, backlog, incidents = read_control_center_inputs(
         registry_path=args.registry,
-        backlog_path=args.backlog,
-        incidents_path=args.incidents,
+        backlog_paths=tuple(args.backlog),
+        incidents_paths=tuple(args.incidents),
     )
     projections: tuple[Any, ...] = ()
     sources: list[str] = []
@@ -536,10 +536,8 @@ def _control_center(args: argparse.Namespace) -> int:
         ledger = EventLedger.from_dict(json.loads(Path(args.ledger).read_text(encoding="utf-8")))
         projections = ledger.projections()
         sources.append(f"ledger:{args.ledger}")
-    if args.backlog:
-        sources.append(f"backlog:{args.backlog}")
-    if args.incidents:
-        sources.append(f"incidents:{args.incidents}")
+    sources.extend(f"backlog:{path}" for path in args.backlog)
+    sources.extend(f"incidents:{path}" for path in args.incidents)
     generated_at = args.generated_at or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     snapshot = build_control_center_snapshot(
         generated_at=generated_at,
@@ -1030,8 +1028,8 @@ def build_parser() -> argparse.ArgumentParser:
     control_center = commands.add_parser("control-center")
     control_center.add_argument("--registry")
     control_center.add_argument("--ledger")
-    control_center.add_argument("--backlog")
-    control_center.add_argument("--incidents")
+    control_center.add_argument("--backlog", action="append", default=[])
+    control_center.add_argument("--incidents", action="append", default=[])
     control_center.add_argument("--project-id", action="append", default=[])
     control_center.add_argument("--generated-at")
     control_center.add_argument("--output")
