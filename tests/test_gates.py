@@ -227,3 +227,77 @@ def test_the_real_interpreter_is_probed(tmp_path: Path) -> None:
     found, version = gate_python_version({"PATH": f"{Path(sys.executable).parent}"}, tmp_path)
     assert version.split(".")[:2] == [str(sys.version_info[0]), str(sys.version_info[1])]
     assert Path(found).name == "python3"
+
+
+# Codex 4246082577: the default setup/quality commands invoke `python`, not `python3`; both are
+# probed, and a mismatch on either is a warning (never a failure).
+
+
+def _fake_interpreters(directory: Path, **versions: str) -> dict[str, str]:
+    directory.mkdir()
+    for name, version in versions.items():
+        script = directory / name
+        script.write_text(f"#!/bin/sh\necho {version}\n", encoding="utf-8")
+        script.chmod(0o755)
+    return {"PATH": str(directory)}
+
+
+def test_a_python_other_than_python3_is_warned_about(tmp_path: Path) -> None:
+    from agentic_sdlc.gates import check_gate_python
+
+    env = _fake_interpreters(tmp_path / "bin", python3="3.12.7", python="3.11.2")
+    warning = check_gate_python("3.12", env, tmp_path)
+    assert warning is not None
+    assert f"{tmp_path / 'bin' / 'python'} (Python 3.11.2)" in warning
+    assert "python3 (Python" not in warning  # the matching one is not blamed
+    assert "python_version is 3.12" in warning
+
+
+def test_python_and_python3_both_matching_is_quiet(tmp_path: Path) -> None:
+    from agentic_sdlc.gates import check_gate_python
+
+    env = _fake_interpreters(tmp_path / "bin", python3="3.12.7", python="3.12.1")
+    assert check_gate_python("3.12", env, tmp_path) is None
+
+
+def test_only_one_interpreter_name_on_path_is_enough(tmp_path: Path) -> None:
+    from agentic_sdlc.gates import check_gate_python
+
+    assert (
+        check_gate_python("3.12", _fake_interpreters(tmp_path / "a", python3="3.12.7"), tmp_path)
+        is None
+    )
+    assert (
+        check_gate_python("3.12", _fake_interpreters(tmp_path / "b", python="3.12.7"), tmp_path)
+        is None
+    )
+    warning = check_gate_python(
+        "3.12", _fake_interpreters(tmp_path / "c", python="3.10.4"), tmp_path
+    )
+    assert warning is not None and "Python 3.10.4" in warning
+
+
+def test_an_unreadable_python_is_warned_about(tmp_path: Path) -> None:
+    from agentic_sdlc.gates import check_gate_python
+
+    env = _fake_interpreters(tmp_path / "bin", python3="3.12.7", python="not-a-version")
+    warning = check_gate_python("3.12", env, tmp_path)
+    assert warning is not None and "did not report a Python version" in warning
+
+
+def test_the_gates_still_run_when_python_mismatches(monkeypatch, tmp_path: Path, capsys) -> None:
+    env = _fake_interpreters(tmp_path / "bin", python3="3.12.7", python="3.9.0")
+    monkeypatch.setenv("PATH", env["PATH"])
+    report = run_gates(_python_config(tmp_path / "policy.toml", "3.12"), tmp_path)
+    assert report["passed"] is True  # a warning, never a failure
+    err = capsys.readouterr().err
+    assert "::warning::" in err and "Python 3.9.0" in err
+
+
+def test_unset_python_version_lists_both_interpreters(tmp_path: Path) -> None:
+    from agentic_sdlc.gates import check_gate_python
+
+    env = _fake_interpreters(tmp_path / "bin", python3="3.12.7", python="3.11.2")
+    warning = check_gate_python(None, env, tmp_path)
+    assert warning is not None and "python_version is not set" in warning
+    assert "Python 3.12.7" in warning and "Python 3.11.2" in warning
