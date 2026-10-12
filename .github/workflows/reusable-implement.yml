@@ -8,6 +8,14 @@ on:
         required: false
         type: string
         default: '"ubuntu-latest"'
+      lease_cleanup_runs_on:
+        description: >-
+          JSON runner target for release_lease_on_failure only. It makes API calls and
+          nothing else, so it runs apart from runs_on: a runner that went offline mid-run
+          must not also be the one that would release its lease.
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
       issue_number:
         description: Approved issue to implement
         required: true
@@ -99,7 +107,15 @@ jobs:
       selected_auth_mode: ${{ steps.route.outputs.selected_auth_mode }}
       routing_policy_version: ${{ steps.route.outputs.routing_policy_version }}
       fallback_reason: ${{ steps.route.outputs.fallback_reason }}
+      # How far the lease claim got: not-started, started, claimed or refused. Empty (the
+      # runner was lost) counts as started. release_lease_on_failure runs for everything
+      # except not-started and refused, so a prepare that fails, is cancelled or fails in a
+      # post step after the claim posted still releases it.
+      claim: ${{ steps.claim.outputs.state || steps.claim-start.outputs.state || steps.claim-init.outputs.state }}
     steps:
+      - name: Record that no lease has been claimed yet
+        id: claim-init
+        run: printf 'state=not-started\n' >> "$GITHUB_OUTPUT"
       - name: Check out consumer repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -326,6 +342,60 @@ jobs:
           if-no-files-found: error
           include-hidden-files: true
           retention-days: 3
+      - name: Stage the protected-base policy for the lease jobs
+        env:
+          CONFIG_PATH: ${{ inputs.config_path }}
+        run: |
+          set -euo pipefail
+          mkdir -p .agentic-lease
+          cp -- "$CONFIG_PATH" .agentic-lease/agentic-sdlc.toml
+      # The renewals and releases read the same policy the claim reads (TTL, Publisher bot).
+      - name: Store the lease policy for the lease jobs
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: lease-policy-${{ github.run_id }}
+          path: .agentic-lease/agentic-sdlc.toml
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 3
+      # Claim LAST, after every upload the lease jobs need; the claim output above tells
+      # release_lease_on_failure whether a claim may have been posted.
+      - name: Create short-lived issue-lease token (publisher App, issues + PR read)
+        id: lease-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ inputs.publisher_app_client_id }}
+          private-key: ${{ secrets.PUBLISHER_APP_PRIVATE_KEY }}
+          permission-issues: write
+          permission-pull-requests: read
+      - name: Record that the claim is starting
+        id: claim-start
+        run: printf 'state=started\n' >> "$GITHUB_OUTPUT"
+      - name: Lease the issue for this run (refuse if another agent holds it)
+        id: claim
+        env:
+          GH_TOKEN: ${{ steps.lease-token.outputs.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          CONFIG_PATH: ${{ inputs.config_path }}
+        run: |
+          set -euo pipefail
+          status=0
+          PYTHONPATH="${GITHUB_WORKSPACE}/.agentic-platform/src" \
+            python3 -m agentic_sdlc claim \
+              --project "$GITHUB_REPOSITORY" \
+              --issue "$ISSUE_NUMBER" \
+              --agent forge-actions \
+              --session "run-${GITHUB_RUN_ID}" \
+              --branch "agent/issue-${ISSUE_NUMBER}-${GITHUB_RUN_ID}" \
+              --config "$CONFIG_PATH" \
+              --output "${RUNNER_TEMP}/claim.json" || status=$?
+          if [ "$status" -eq 0 ]; then
+            printf 'state=claimed\n' >> "$GITHUB_OUTPUT"
+          elif [ "$(jq -r '.ok' "${RUNNER_TEMP}/claim.json" 2>/dev/null)" = "false" ]; then
+            # A refusal posts nothing, or retracts what it posted: nothing of this run to release.
+            printf 'state=refused\n' >> "$GITHUB_OUTPUT"
+          fi
+          exit "$status"
 
   generate_patch:
     needs: prepare
@@ -510,8 +580,52 @@ jobs:
           include-hidden-files: true
           retention-days: 3
 
-  verify:
+  renew_lease_before_verify:
+    # Stage boundary: renew this run's lease before verification, so a TTL shorter than the
+    # run (or runner queues) cannot let another agent take the issue over while this run is
+    # still working. `renew` also refuses once the issue is closed or has an open PR, and a
+    # lease that already expired is never renewed: the run then stops instead of publishing.
+    # A job of its own, because the jobs it sits between run AI or project code and never
+    # hold an installation token.
     needs: [prepare, generate_patch]
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Restore pinned policy engine
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: policy-engine-${{ github.run_id }}
+          path: ${{ runner.temp }}/lease/engine/agentic_sdlc
+      - name: Restore lease policy
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: lease-policy-${{ github.run_id }}
+          path: ${{ runner.temp }}/lease/policy
+      - name: Create short-lived issue-lease token (publisher App, issues + PR read)
+        id: lease-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ inputs.publisher_app_client_id }}
+          private-key: ${{ secrets.PUBLISHER_APP_PRIVATE_KEY }}
+          permission-issues: write
+          permission-pull-requests: read
+      - name: Renew the issue lease (fail if this run no longer holds it)
+        env:
+          GH_TOKEN: ${{ steps.lease-token.outputs.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}/lease/policy"
+          PYTHONPATH="${RUNNER_TEMP}/lease/engine" \
+            python3 -m agentic_sdlc renew \
+              --project "$GITHUB_REPOSITORY" \
+              --issue "$ISSUE_NUMBER" \
+              --session "run-${GITHUB_RUN_ID}" \
+              --config agentic-sdlc.toml
+
+  verify:
+    needs: [prepare, generate_patch, renew_lease_before_verify]
     runs-on: ${{ fromJSON(inputs.runs_on) }}
     timeout-minutes: 60
     permissions:
@@ -575,18 +689,89 @@ jobs:
           git config user.email "agentic-sdlc-verifier@users.noreply.github.com"
           git config core.hooksPath /dev/null
           git commit -m "Agentic SDLC verification snapshot"
+      # The gates must run under the interpreter the repository's own ci.yml installs
+      # ([ci] python_version, read from the protected-base policy). Unset: the runner's own.
+      - name: Read the policy's CI Python version
+        id: ci-python
+        run: |
+          set -euo pipefail
+          # The policy engine keeps the runner's interpreter (it needs 3.11+), whatever
+          # version the gates get.
+          printf 'engine=%s\n' "$(command -v python3)" >> "$GITHUB_OUTPUT"
+          version="$(python3 -I - "${RUNNER_TEMP}/trusted-policy.toml" <<'PY'
+          import re
+          import sys
+          import tomllib
+
+          with open(sys.argv[1], "rb") as handle:
+              ci = tomllib.load(handle).get("ci", {})
+          version = ci.get("python_version") if isinstance(ci, dict) else None
+          if version is None:
+              raise SystemExit(0)
+          if not isinstance(version, str) or not re.fullmatch(r"\d+\.\d+(?:\.\d+)?", version):
+              raise SystemExit("ci.python_version must look like 3.12 or 3.12.4")
+          print(version)
+          PY
+          )"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+      - name: Install the policy's CI Python for the gates
+        if: steps.ci-python.outputs.version != ''
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ steps.ci-python.outputs.version }}
       - name: Run project-defined deterministic gates
+        env:
+          ENGINE_PYTHON: ${{ steps.ci-python.outputs.engine }}
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/verification"
           PYTHONPATH="${GITHUB_WORKSPACE}/.agentic-platform/src" \
-            python3 -m agentic_sdlc run-gates \
+            "$ENGINE_PYTHON" -m agentic_sdlc run-gates \
               --config "${RUNNER_TEMP}/trusted-policy.toml" \
               --repository . \
               --output "${RUNNER_TEMP}/verification/report.json"
 
+  renew_lease_before_attest:
+    # Stage boundary after verification: see renew_lease_before_verify.
+    needs: [prepare, verify]
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Restore pinned policy engine
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: policy-engine-${{ github.run_id }}
+          path: ${{ runner.temp }}/lease/engine/agentic_sdlc
+      - name: Restore lease policy
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: lease-policy-${{ github.run_id }}
+          path: ${{ runner.temp }}/lease/policy
+      - name: Create short-lived issue-lease token (publisher App, issues + PR read)
+        id: lease-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ inputs.publisher_app_client_id }}
+          private-key: ${{ secrets.PUBLISHER_APP_PRIVATE_KEY }}
+          permission-issues: write
+          permission-pull-requests: read
+      - name: Renew the issue lease (fail if this run no longer holds it)
+        env:
+          GH_TOKEN: ${{ steps.lease-token.outputs.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}/lease/policy"
+          PYTHONPATH="${RUNNER_TEMP}/lease/engine" \
+            python3 -m agentic_sdlc renew \
+              --project "$GITHUB_REPOSITORY" \
+              --issue "$ISSUE_NUMBER" \
+              --session "run-${GITHUB_RUN_ID}" \
+              --config agentic-sdlc.toml
+
   attest_patch:
-    needs: [prepare, generate_patch, verify]
+    needs: [prepare, generate_patch, verify, renew_lease_before_attest]
     runs-on: ${{ fromJSON(inputs.runs_on) }}
     timeout-minutes: 10
     permissions:
@@ -664,6 +849,11 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+    outputs:
+      pr_url: ${{ steps.open-pr.outputs.pr_url }}
+      # 'true' only once this job's release succeeded; anything else makes
+      # release_lease_on_failure retry it, even though this job (and its PR) succeeded.
+      lease_released: ${{ steps.release.outputs.released }}
     steps:
       - name: Create short-lived repository publisher token
         id: publisher-token
@@ -674,6 +864,18 @@ jobs:
           permission-contents: read
           permission-issues: write
           permission-pull-requests: write
+      # The lease commands run from RUNNER_TEMP, outside the checkout the patch is applied to,
+      # so nothing the patch adds can shadow the policy engine while it holds the App token.
+      - name: Restore pinned policy engine for the lease
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: policy-engine-${{ github.run_id }}
+          path: ${{ runner.temp }}/lease/engine/agentic_sdlc
+      - name: Restore lease policy
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: lease-policy-${{ github.run_id }}
+          path: ${{ runner.temp }}/lease/policy
       - name: Check out exact verified base
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -714,6 +916,21 @@ jobs:
           if any(manifest.get(key) != value for key, value in expected.items()):
               raise SystemExit("verified patch manifest mismatch")
           PY
+      # Last gate before anything is published: no push and no PR unless this run still holds
+      # a live lease on an open issue that has no open PR (`renew` checks all three).
+      - name: Renew the issue lease immediately before publishing
+        env:
+          GH_TOKEN: ${{ steps.publisher-token.outputs.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}/lease/policy"
+          PYTHONPATH="${RUNNER_TEMP}/lease/engine" \
+            python3 -m agentic_sdlc renew \
+              --project "$GITHUB_REPOSITORY" \
+              --issue "$ISSUE_NUMBER" \
+              --session "run-${GITHUB_RUN_ID}" \
+              --config agentic-sdlc.toml
       - name: Create branch containing exact verified patch
         env:
           BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
@@ -733,6 +950,7 @@ jobs:
           git push origin "HEAD:refs/heads/${branch}"
           printf 'branch=%s\n' "$branch" >> "$GITHUB_ENV"
       - name: Open draft pull request
+        id: open-pr
         env:
           GH_TOKEN: ${{ steps.publisher-token.outputs.token }}
           ISSUE_NUMBER: ${{ inputs.issue_number }}
@@ -748,4 +966,131 @@ jobs:
             --head "$branch" \
             --title "Agent implementation for issue #${ISSUE_NUMBER}" \
             --body "$body")"
+          printf 'pr_url=%s\n' "$pr_url" >> "$GITHUB_OUTPUT"
           gh issue comment "$ISSUE_NUMBER" --body "Verified draft pull request: ${pr_url}"
+      # Runs whatever happened above, with a note that says whether a PR was opened. A failure
+      # here does not fail the job (the PR stands); lease_released stays unset and
+      # release_lease_on_failure retries the release.
+      - name: Release the issue lease
+        id: release
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.publisher-token.outputs.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          PR_URL: ${{ steps.open-pr.outputs.pr_url }}
+        run: |
+          set -euo pipefail
+          if [ -n "$PR_URL" ]; then
+            note="Draft pull request opened by this run: ${PR_URL}"
+          else
+            note="This run did not open a draft pull request: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          fi
+          cd "${RUNNER_TEMP}/lease/policy"
+          PYTHONPATH="${RUNNER_TEMP}/lease/engine" \
+            python3 -m agentic_sdlc release \
+              --project "$GITHUB_REPOSITORY" \
+              --issue "$ISSUE_NUMBER" \
+              --session "run-${GITHUB_RUN_ID}" \
+              --note "$note"
+          printf 'released=true\n' >> "$GITHUB_OUTPUT"
+
+  release_lease_on_failure:
+    needs:
+      - prepare
+      - generate_patch
+      - renew_lease_before_verify
+      - verify
+      - renew_lease_before_attest
+      - attest_patch
+      - publish_draft
+    # Whenever a claim may have been posted (prepare's claim output is anything but
+    # not-started or refused -- so a prepare that failed, was cancelled, or failed in a post
+    # step after claiming is covered) and the run did not end with publish_draft's own
+    # release. `release` is idempotent and scoped to this run's session.
+    if: >-
+      ${{ always() && needs.prepare.result != 'skipped' &&
+      needs.prepare.outputs.claim != 'not-started' && needs.prepare.outputs.claim != 'refused' &&
+      (needs.prepare.result != 'success' || needs.generate_patch.result != 'success' ||
+       needs.renew_lease_before_verify.result != 'success' || needs.verify.result != 'success' ||
+       needs.renew_lease_before_attest.result != 'success' ||
+       needs.attest_patch.result != 'success' || needs.publish_draft.result != 'success' ||
+       needs.publish_draft.outputs.lease_released != 'true') }}
+    # API calls only, so not on runs_on: the runner this recovers from may be the one lost.
+    runs-on: ${{ fromJSON(inputs.lease_cleanup_runs_on) }}
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      # prepare uploads both before claim-start, so for every run this job admits (a claim
+      # output of started, claimed, or empty from a lost runner) the material was uploaded or
+      # the claim was never posted. A failed restore is therefore NOT proof that nothing was
+      # claimed (Codex 4246082563): retry once, and if it still fails, fail this job -- red and
+      # re-runnable -- rather than succeed with the lease held until its TTL.
+      - name: Restore pinned policy engine
+        id: engine
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: policy-engine-${{ github.run_id }}
+          path: ${{ runner.temp }}/lease/engine/agentic_sdlc
+      - name: Restore lease policy
+        id: lease-policy
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: lease-policy-${{ github.run_id }}
+          path: ${{ runner.temp }}/lease/policy
+      - name: Wait before retrying a failed restore
+        if: steps.engine.outcome != 'success' || steps.lease-policy.outcome != 'success'
+        run: sleep 15
+      - name: Retry restoring pinned policy engine
+        id: engine-retry
+        if: steps.engine.outcome != 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: policy-engine-${{ github.run_id }}
+          path: ${{ runner.temp }}/lease/engine/agentic_sdlc
+      - name: Retry restoring lease policy
+        id: lease-policy-retry
+        if: steps.lease-policy.outcome != 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: lease-policy-${{ github.run_id }}
+          path: ${{ runner.temp }}/lease/policy
+      - name: Fail if the lease material could not be restored (the claim may be held)
+        if: >-
+          (steps.engine.outcome != 'success' && steps.engine-retry.outcome != 'success') ||
+          (steps.lease-policy.outcome != 'success' && steps.lease-policy-retry.outcome != 'success')
+        env:
+          CLAIM: ${{ needs.prepare.outputs.claim }}
+        run: |
+          printf '::error::Could not restore the lease material prepare uploaded (claim state: %s). The issue lease may still be held by this run; re-run this job to release it, or it expires at its TTL.\n' "${CLAIM:-unknown, runner lost}"
+          exit 1
+      - name: Create short-lived issue-lease token (publisher App, issues only)
+        id: lease-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ inputs.publisher_app_client_id }}
+          private-key: ${{ secrets.PUBLISHER_APP_PRIVATE_KEY }}
+          permission-issues: write
+      - name: Release the issue lease so another agent can retry
+        env:
+          GH_TOKEN: ${{ steps.lease-token.outputs.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          PR_URL: ${{ needs.publish_draft.outputs.pr_url }}
+        run: |
+          set -euo pipefail
+          if [ -n "$PR_URL" ]; then
+            note="Draft pull request opened by this run: ${PR_URL}"
+          else
+            note="Run did not produce a draft PR: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          fi
+          cd "${RUNNER_TEMP}/lease/policy"
+          PYTHONPATH="${RUNNER_TEMP}/lease/engine" \
+            python3 -m agentic_sdlc release \
+              --project "$GITHUB_REPOSITORY" \
+              --issue "$ISSUE_NUMBER" \
+              --session "run-${GITHUB_RUN_ID}" \
+              --note "$note"
