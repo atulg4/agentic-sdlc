@@ -599,7 +599,7 @@ def _sub_issue_group(entry: str) -> tuple[Any, int | None]:
         payload, parent = _json_file(path), int(number)
     else:
         payload, parent = _json_file(entry), None
-    return _record_array(payload, f"--sub-issues ({entry})"), parent
+    return _record_array(payload, f"--sub-issues ({entry})", require_number=True), parent
 
 
 def _github_backlog(args: argparse.Namespace) -> int:

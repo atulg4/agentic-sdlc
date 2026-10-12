@@ -384,6 +384,10 @@ def incidents_from_change_requests(
         ref = f"{repository}!{number}"
         title = str(pull.get("title") or "")[:512]
         state = pull.get("mergeable_state")
+        _require(
+            state is None or isinstance(state, str),
+            f"change request {number}: mergeable_state must be a string",
+        )
         if state == "dirty":
             incidents.append(
                 {
@@ -397,7 +401,8 @@ def incidents_from_change_requests(
                     "evidenceRef": ref,
                 }
             )
-            continue
+            # No continue: a conflicted pull can also carry a declared CI
+            # failure, and both blockers are real.
         if number in checks:
             incidents.append(
                 {
@@ -411,6 +416,8 @@ def incidents_from_change_requests(
                     "evidenceRef": ref,
                 }
             )
+            continue
+        if state == "dirty":
             continue
         if state in READY_MERGE_STATES:
             incidents.append(

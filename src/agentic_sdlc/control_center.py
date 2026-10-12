@@ -108,6 +108,12 @@ DISPATCH_PROVEN_STATES = frozenset(
     }
 )
 
+#: States that prove the factory owns the item: everything except the entry
+#: state and the terminal states reachable straight from it.
+TRIAGE_PROVEN_STATES = frozenset(FactoryState) - frozenset(
+    {FactoryState.INTAKE, FactoryState.CANCELLED, FactoryState.SUPERSEDED}
+)
+
 #: States that retire the plan-ordering advisory: a plan provably ran and the
 #: next gate is visible elsewhere. ``approved`` is deliberately NOT here: an
 #: approved unit whose implementation-approved label went missing can only be
@@ -116,6 +122,18 @@ DISPATCH_PROVEN_STATES = frozenset(
 PLAN_PROVEN_STATES = DISPATCH_PROVEN_STATES | frozenset(
     {FactoryState.PLANNED, FactoryState.APPROVAL_PENDING}
 )
+
+#: States that prove the implementation approval was granted.
+APPROVAL_PROVEN_STATES = DISPATCH_PROVEN_STATES | frozenset({FactoryState.APPROVED})
+
+#: Per incident kind, the ledger states that retire a label-derived incident:
+#: durable evidence that the gate the labels describe was already passed.
+_LEDGER_RETIREMENT: Mapping[str, frozenset[FactoryState]] = {
+    "dispatch-blocked": DISPATCH_PROVEN_STATES,
+    "triage-needed": TRIAGE_PROVEN_STATES,
+    "awaiting-spec-review": PLAN_PROVEN_STATES,
+    "awaiting-human-approval": APPROVAL_PROVEN_STATES,
+}
 
 #: States in which something is executing *right now*. Backlog-shaped states
 #: (intake through approved), queued ones (dispatched — a worker has not
@@ -1268,17 +1286,17 @@ def build_control_center_snapshot(
         retained: list[Incident] = []
         for incident in project_incidents:
             proven = item_status.get(incident.backlog_item_id)
-            if incident.kind == "dispatch-blocked" and proven is not None:
-                # Every dispatch-blocked incident is label-derived, so durable
-                # ledger proof outranks it at any severity: a label removed
-                # after dispatch must not report a running project as blocked.
-                # The plan advisory is moot once a plan provably ran; the rest
-                # need dispatch itself. A state that does not imply the
-                # threshold (blocked, cancelled) retires nothing.
+            if incident.kind in _LEDGER_RETIREMENT and proven is not None:
+                # Label-derived incidents are outranked by durable ledger
+                # proof that their gate was already passed: a label removed
+                # after dispatch must not report a running project as blocked,
+                # and a unit the ledger shows implementing needs no triage.
+                # A state that does not imply the threshold (blocked,
+                # cancelled) retires nothing.
                 proven_states = (
                     PLAN_PROVEN_STATES
                     if incident.incident_id.endswith(":" + PLAN_EVIDENCE_RULE)
-                    else DISPATCH_PROVEN_STATES
+                    else _LEDGER_RETIREMENT[incident.kind]
                 )
                 if proven.state in proven_states:
                     continue

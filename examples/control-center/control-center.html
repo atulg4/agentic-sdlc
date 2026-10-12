@@ -384,6 +384,7 @@
     if (value.schemaVersion !== SCHEMA) return `Unsupported snapshot schemaVersion: ${value.schemaVersion}. This page renders version ${SCHEMA}.`;
     if (!Array.isArray(value.projects)) return "The snapshot has no projects array.";
     const seenProjects = new Set();
+    const seenIncidents = new Set();
     const arrayField = (owner, key, where) =>
       owner[key] === undefined || Array.isArray(owner[key]) ? "" : `${where}.${key} must be an array.`;
     for (const project of value.projects) {
@@ -404,6 +405,8 @@
       for (const incident of project.incidents || []) {
         if (!isObj(incident)) return `${where} has an incident that is not an object.`;
         if (typeof incident.incidentId !== "string" || !incident.incidentId) return `${where} has an incident without a string incidentId.`;
+        if (seenIncidents.has(incident.incidentId)) return `Duplicate incidentId: ${incident.incidentId}.`;
+        seenIncidents.add(incident.incidentId);
         const problem = arrayField(incident, "remediations", `${where} incident`);
         if (problem) return problem;
         for (const action of incident.remediations || []) {
