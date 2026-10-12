@@ -6614,6 +6614,22 @@ _ERREXIT_SHELLS = {None, "bash", "sh"}
 _PIPEFAIL_SHELLS = {"bash"}
 
 
+#: Words that name, or spell the arguments of, the builtins that change shell options.
+_SHELL_OPTION_WORDS = {"set", "shopt"}
+
+
+def _may_change_shell_options(argv: list[str]) -> bool:
+    """Whether a command that `_set_invocation` cannot read may still change errexit or
+    pipefail: it names `set`/`shopt` anywhere, mentions either option, or runs a command named
+    by an expansion (`$cmd +o pipefail`)."""
+    return bool(argv) and (
+        argv[0][:1] in {"$", "`"}
+        or any(
+            word in _SHELL_OPTION_WORDS or "pipefail" in word or "errexit" in word for word in argv
+        )
+    )
+
+
 #: Prefixes that run the next word as the shell builtin itself, in the current shell.
 _BUILTIN_WRAPPERS = {"builtin", "command"}
 
@@ -6803,6 +6819,19 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                 elif argv[0] == "eval":
                     out.evals = True
                 invocation = _set_invocation(tuple(argv))
+                if invocation is not None and not invocation[1]:
+                    invocation = None  # `command -v set ...`: not a call we can read
+                if invocation is not None and any(
+                    "$" in word or "`" in word for word in invocation[0]
+                ):
+                    invocation = None  # `set -o pipefail $x`: $x may expand to `+o pipefail`
+                if invocation is None and _may_change_shell_options(argv):
+                    # Anything else that could touch errexit or pipefail -- a redirected or
+                    # timed `set`, `shopt`, a `trap` string, a command run through a variable
+                    # (Codex 4250836628/4250836632) -- is read as turning both OFF. Recognising
+                    # every way to spell `set +o pipefail` cannot be done; failing closed can.
+                    errexit = False
+                    pipefail = False
                 if invocation is not None:
                     arguments, plain = invocation
                     # Turning an option ON counts only when the parent shell surely runs this

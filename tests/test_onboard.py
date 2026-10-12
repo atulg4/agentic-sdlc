@@ -2352,6 +2352,15 @@ def test_doctor_rejects_a_ci_gate_whose_failure_is_ignored(tmp_path, mutate):
         ("cat <<EOF\nset -o pipefail\nEOF\npytest | tee out", None, False),
         ("echo 'a\nset -o pipefail\nb'\npytest | tee out", None, False),
         ("cat <<EOF\nhi\nEOF\npytest | tee out", "bash", True),
+        # Any other command that may change the options turns both OFF (Codex 4250836628/-32).
+        (">/tmp/x set +o pipefail; pytest | tee out", "bash", False),
+        ("time -p set +o pipefail; pytest | tee out", "bash", False),
+        ("shopt -u -o pipefail; pytest | tee out", "bash", False),
+        ("trap 'set +o pipefail' DEBUG; pytest | tee out", "bash", False),
+        ('o="+o pipefail"; set $o; pytest | tee out', "bash", False),
+        ("$SETTER +o pipefail; pytest | tee out", "bash", False),
+        ("set -o pipefail >/dev/null; pytest | tee out", None, True),
+        ("set -o pipefail; echo ok; pytest | tee out", None, True),
     ],
 )
 def test_shell_parse_enforces_a_piped_command_only_with_pipefail(script, shell, enforced):
@@ -2372,6 +2381,8 @@ def test_shell_parse_enforces_a_piped_command_only_with_pipefail(script, shell, 
         ("set -- -e\nfalse\npytest", False),  # positional parameters, not an option
         ("set -e | cat\nfalse\npytest", False),  # runs in a child of the pipe
         ("set -e\nbuiltin set +e\nfalse\npytest", False),
+        ("set -e\n2>/dev/null set +e\nfalse\npytest", False),
+        ("set -e\ntime -p set +e\nfalse\npytest", False),
     ],
 )
 def test_shell_parse_reads_errexit_from_set_like_bash(script, enforced):
