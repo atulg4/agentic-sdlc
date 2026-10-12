@@ -128,6 +128,17 @@ DISPATCH_RULES: tuple[DispatchRule, ...] = (
         summary="Approved for implementation but not labelled agent-ready, so no trigger fires",
     ),
     DispatchRule(
+        rule_id="approved-without-human-review",
+        required=frozenset({"implementation-approved", "agent-ready"}),
+        missing=frozenset({"human-review-required"}),
+        kind="dispatch-blocked",
+        severity="blocker",
+        summary=(
+            "Approved and agent-ready but missing human-review-required, which both "
+            "bundled triggers require, so nothing fires"
+        ),
+    ),
+    DispatchRule(
         rule_id="agent-ready-without-human-review",
         required=frozenset({"agent-ready"}),
         missing=frozenset({"human-review-required"}),
@@ -173,6 +184,17 @@ DISPATCH_RULES: tuple[DispatchRule, ...] = (
         ),
     ),
     DispatchRule(
+        rule_id="released-spec-without-dispatch-labels",
+        required=frozenset({"spec-drafted", "spec-approved"}),
+        missing=frozenset({"implementation-approved", "agent-ready", "human-review-required"}),
+        kind="awaiting-human-approval",
+        severity="degraded",
+        summary=(
+            "Specification released, but no dispatch label follows it: the work "
+            "waits on an implementation approval and the dispatch labels"
+        ),
+    ),
+    DispatchRule(
         rule_id="untriaged",
         required=frozenset(),
         missing=frozenset(
@@ -196,6 +218,10 @@ def _issue_labels(issue: Mapping[str, Any]) -> frozenset[str]:
     ``agent-ready`` and must evaluate the same here."""
 
     raw = issue.get("labels") or []
+    _require(
+        isinstance(raw, list),
+        f"issue {issue.get('number')}: labels must be an array",
+    )
     names: set[str] = set()
     for entry in raw:
         name = entry.get("name") if isinstance(entry, Mapping) else entry
@@ -461,8 +487,7 @@ def parent_links(
     links: dict[int, int] = {}
 
     def link(child: int, parent: int) -> None:
-        if child == parent:
-            return
+        _require(child != parent, f"issue {child} is listed as its own parent")
         existing = links.get(child)
         _require(
             existing is None or existing == parent,

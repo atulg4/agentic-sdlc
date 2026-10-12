@@ -650,6 +650,20 @@ def _github_backlog(args: argparse.Namespace) -> int:
         and Path(args.incidents_output).resolve() == Path(args.backlog_output or "").resolve()
     ):
         raise ControlCenterError("--backlog-output and --incidents-output name the same file")
+    sub_issue_paths = [
+        entry.partition("=")[2]
+        if "=" in entry and entry.partition("=")[0].strip().isdigit()
+        else entry
+        for entry in args.sub_issues
+    ]
+    input_paths = [args.issues, args.pulls, *sub_issue_paths]
+    for output in (args.backlog_output, args.incidents_output):
+        if not output:
+            continue
+        resolved = Path(output).resolve()
+        for declared in input_paths:
+            if declared and Path(declared).resolve() == resolved:
+                raise ControlCenterError(f"an output would overwrite an input: {declared}")
     # Round-trip every generated document through its own loader BEFORE
     # writing any of them, so a bad input (e.g. a malformed --observed-at)
     # fails the export without leaving a mismatched pair on disk.
