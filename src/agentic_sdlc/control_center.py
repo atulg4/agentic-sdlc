@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any
 
 from .event_ledger import (
+    MAX_WORK_UNIT_ID_LENGTH,
     FactoryState,
     LifecycleStage,
     WorkUnitProjection,
@@ -57,6 +58,10 @@ STATE_BASIS_DECLARED = "state declared by the backlog source"
 STATE_BASIS_UNKNOWN = "state unknown: no ledger events and no declared state"
 
 MAX_TEXT_LENGTH = 512
+# The snapshot loaders validate workUnitId with _text (bounded by
+# MAX_TEXT_LENGTH), which must stay the ledger's own identifier contract: an
+# id the ledger accepts must remain addressable from backlog and incidents.
+assert MAX_TEXT_LENGTH == MAX_WORK_UNIT_ID_LENGTH
 MAX_BACKLOG_ITEMS = 5000
 MAX_BACKLOG_DEPTH = 32
 MAX_INCIDENTS = 2000
@@ -496,7 +501,7 @@ REMEDIATION_CATALOGUE: Mapping[str, tuple[RemediationAction, ...]] = {
                 "sdlcctl decide-infra-retry --repository <owner/repo> "
                 "--pull-request-number <pull-number> --run-id <run-id> --head-sha <sha> "
                 "--current-head-sha <sha> --failure-class transient_infrastructure "
-                "--output decision.json"
+                "--state <retry-state-file> --output decision.json"
             ),
         ),
     ),
