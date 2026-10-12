@@ -558,6 +558,16 @@ def _json_file(path: str) -> Any:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
+def _record_array(value: Any, label: str) -> list[dict[str, Any]]:
+    """Require a JSON array whose every element is an object."""
+    if not isinstance(value, list):
+        raise ControlCenterError(f"{label} must hold a JSON array")
+    for index, entry in enumerate(value):
+        if not isinstance(entry, dict):
+            raise ControlCenterError(f"{label}[{index}] must be an object")
+    return value
+
+
 def _failing_checks(values: list[str]) -> dict[int, str]:
     """Parse ``--failing NUMBER=check`` pairs the caller read from its CI API."""
     failing: dict[int, str] = {}
@@ -577,17 +587,11 @@ def _sub_issue_group(entry: str) -> tuple[Any, int | None]:
         payload, parent = _json_file(path), int(number)
     else:
         payload, parent = _json_file(entry), None
-    if not isinstance(payload, list):
-        raise ControlCenterError(
-            f"--sub-issues must hold a JSON array of sub-issue payloads: {entry}"
-        )
-    return payload, parent
+    return _record_array(payload, f"--sub-issues ({entry})"), parent
 
 
 def _github_backlog(args: argparse.Namespace) -> int:
-    issues = _json_file(args.issues)
-    if not isinstance(issues, list):
-        raise ControlCenterError("--issues must hold a JSON array of issue payloads")
+    issues = _record_array(_json_file(args.issues), "--issues")
     links = parent_links(*(_sub_issue_group(entry) for entry in args.sub_issues))
     backlog = backlog_document_from_issues(
         issues,
@@ -607,9 +611,7 @@ def _github_backlog(args: argparse.Namespace) -> int:
     if args.failing and not args.pulls:
         raise ControlCenterError("--failing names change-request checks, so it requires --pulls")
     if args.pulls:
-        pulls = _json_file(args.pulls)
-        if not isinstance(pulls, list):
-            raise ControlCenterError("--pulls must hold a JSON array of change requests")
+        pulls = _record_array(_json_file(args.pulls), "--pulls")
         failing = _failing_checks(args.failing)
         present = {
             int(pull["number"])
@@ -631,6 +633,11 @@ def _github_backlog(args: argparse.Namespace) -> int:
                 failing=failing,
             )
         )
+    if (
+        args.incidents_output
+        and Path(args.incidents_output).resolve() == Path(args.backlog_output or "").resolve()
+    ):
+        raise ControlCenterError("--backlog-output and --incidents-output name the same file")
     # Round-trip every generated document through its own loader BEFORE
     # writing any of them, so a bad input (e.g. a malformed --observed-at)
     # fails the export without leaving a mismatched pair on disk.

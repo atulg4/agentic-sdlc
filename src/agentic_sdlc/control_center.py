@@ -32,6 +32,7 @@ import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -214,6 +215,10 @@ def _timestamp(entry: Mapping[str, Any], key: str, label: str, *, required: bool
         bool(_TIMESTAMP.fullmatch(value)),
         f"{label}.{key} must be an RFC 3339 timestamp: {value}",
     )
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        _require(False, f"{label}.{key} is not a real instant: {value}")
     return value
 
 
@@ -453,6 +458,18 @@ REMEDIATION_CATALOGUE: Mapping[str, tuple[RemediationAction, ...]] = {
                 "--pull-request-number 123 --run-id 456 --head-sha <sha> "
                 "--current-head-sha <sha> --failure-class transient_infrastructure "
                 "--output decision.json"
+            ),
+        ),
+    ),
+    "awaiting-spec-review": (
+        _action(
+            "release-or-reject-the-spec",
+            "Release or reject the drafted specification",
+            "The spec stage holds the work until a human releases the draft.",
+            _HUMAN,
+            handoff=(
+                "Review the drafted specification: add spec-approved to release it, or "
+                "remove spec-drafted to reject it."
             ),
         ),
     ),
@@ -1178,11 +1195,23 @@ def build_control_center_snapshot(
         _require(item.item_id not in seen_items, f"duplicate backlog itemId: {item.item_id}")
         seen_items.add(item.item_id)
         by_project_backlog.setdefault(item.project_id, []).append(item)
-    for project_items in by_project_backlog.values():
-        # Documents are validated one by one, so a parent cycle or an
-        # over-deep chain can appear only once they are combined: reject it
-        # here, before any tree construction could loop or lose both items.
+    all_items = {item.item_id: item for items in by_project_backlog.values() for item in items}
+    for project_id, project_items in by_project_backlog.items():
+        # Documents are validated one by one, so a parent cycle, an over-deep
+        # chain, an over-budget combined set or a cross-project parent can
+        # appear only once they are combined: reject them here, before any
+        # tree construction could loop, crash a renderer or mislabel an edge.
+        _require(
+            len(project_items) <= MAX_BACKLOG_ITEMS,
+            f"project {project_id} combines more than {MAX_BACKLOG_ITEMS} backlog items",
+        )
         _detect_backlog_cycles({item.item_id: item for item in project_items})
+        for item in project_items:
+            parent = all_items.get(item.parent_id) if item.parent_id else None
+            _require(
+                parent is None or parent.project_id == item.project_id,
+                f"backlog item {item.item_id} has a parent in another project: {item.parent_id}",
+            )
 
     by_project_incidents: dict[str, list[Incident]] = {}
     seen_incidents: set[str] = set()
@@ -1232,15 +1261,13 @@ def build_control_center_snapshot(
         retained: list[Incident] = []
         for incident in project_incidents:
             proven = item_status.get(incident.backlog_item_id)
-            if (
-                incident.kind == "dispatch-blocked"
-                and incident.severity is IncidentSeverity.ADVISORY
-                and proven is not None
-            ):
-                # The plan advisory is moot once a plan provably ran; the
-                # implementation advisory needs dispatch itself. A state that
-                # does not imply the threshold (blocked, cancelled) retires
-                # nothing.
+            if incident.kind == "dispatch-blocked" and proven is not None:
+                # Every dispatch-blocked incident is label-derived, so durable
+                # ledger proof outranks it at any severity: a label removed
+                # after dispatch must not report a running project as blocked.
+                # The plan advisory is moot once a plan provably ran; the rest
+                # need dispatch itself. A state that does not imply the
+                # threshold (blocked, cancelled) retires nothing.
                 proven_states = (
                     PLAN_PROVEN_STATES
                     if incident.incident_id.endswith(":" + PLAN_EVIDENCE_RULE)

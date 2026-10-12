@@ -774,7 +774,7 @@ def test_each_issue_reports_only_its_highest_precedence_rule():
         observed_at=NOW,
     )
     assert len(incidents) == 1
-    assert incidents[0]["kind"] == "awaiting-human-approval"
+    assert incidents[0]["kind"] == "awaiting-spec-review"
 
 
 def test_every_dispatch_rule_names_a_declared_incident_kind():
@@ -1073,8 +1073,10 @@ def test_a_spec_draft_is_held_for_spec_review_not_implementation_approval():
     )
     for incidents in (alone, with_review):
         assert len(incidents) == 1
-        assert incidents[0]["kind"] == "awaiting-human-approval"
+        assert incidents[0]["kind"] == "awaiting-spec-review"
         assert "spec review" in incidents[0]["summary"]
+        remediations = load_incident_document(_incidents(*incidents))[0].as_dict()["remediations"]
+        assert remediations[0]["actionId"] == "release-or-reject-the-spec"
 
 
 def test_a_released_spec_waits_on_implementation_approval():
@@ -1272,14 +1274,14 @@ def test_the_label_advisory_stays_while_the_ledger_shows_pre_dispatch_state():
     assert len(snapshot.get("forge").incidents) == 1
 
 
-def test_a_blocker_incident_is_never_retired_by_ledger_evidence():
+def test_dispatch_proof_retires_even_a_label_derived_blocker():
     blocker = _incident(
         incidentId="acme/forge#7:blocked",
         kind="dispatch-blocked",
         severity="blocker",
         backlogItemId="acme/forge#7",
     )
-    ledger = _ledger(
+    proven = _ledger(
         *_chain(
             TO_IMPLEMENTING,
             workUnit={"projectId": "forge", "workUnitId": "wu-1", "issueRef": "acme/forge#7"},
@@ -1288,7 +1290,33 @@ def test_a_blocker_incident_is_never_retired_by_ledger_evidence():
     snapshot = build_control_center_snapshot(
         generated_at=NOW,
         registry=REGISTRY,
-        projections=ledger.projections(),
+        projections=proven.projections(),
+        backlog=load_backlog_document(
+            _document(_backlog(itemId="acme/forge#7", issueRef="acme/forge#7"))
+        ),
+        incidents=load_incident_document(_incidents(blocker)),
+    )
+    assert snapshot.get("forge").incidents == ()
+    assert snapshot.get("forge").health == "running"
+
+
+def test_a_label_derived_blocker_stays_while_evidence_is_pre_dispatch():
+    blocker = _incident(
+        incidentId="acme/forge#7:blocked",
+        kind="dispatch-blocked",
+        severity="blocker",
+        backlogItemId="acme/forge#7",
+    )
+    planned = _ledger(
+        *_chain(
+            TO_PLANNED,
+            workUnit={"projectId": "forge", "workUnitId": "wu-1", "issueRef": "acme/forge#7"},
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=planned.projections(),
         backlog=load_backlog_document(
             _document(_backlog(itemId="acme/forge#7", issueRef="acme/forge#7"))
         ),
@@ -1615,3 +1643,65 @@ def test_a_failed_export_writes_neither_output(tmp_path):
     )
     assert not backlog.exists()
     assert not incidents.exists()
+
+
+def test_a_digit_shaped_impossible_timestamp_is_rejected():
+    with pytest.raises(ControlCenterError, match="not a real instant"):
+        build_control_center_snapshot(generated_at="2026-99-99T99:99:99Z", registry=REGISTRY)
+
+
+def test_a_cross_project_parent_across_documents_is_rejected():
+    first = load_backlog_document(_document(_backlog(itemId="child", parentId="x")))
+    second = load_backlog_document(
+        _document(_backlog(itemId="x", projectId="ghost", title="Other"))
+    )
+    with pytest.raises(ControlCenterError, match="parent in another project"):
+        build_control_center_snapshot(generated_at=NOW, registry=REGISTRY, backlog=first + second)
+
+
+def test_a_null_issue_record_is_a_controlled_error(tmp_path):
+    from agentic_sdlc.cli import main as cli_main
+
+    issues = tmp_path / "issues.json"
+    issues.write_text(json.dumps([None]), encoding="utf-8")
+    assert (
+        cli_main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+            ]
+        )
+        == 2
+    )
+
+
+def test_colliding_output_paths_are_rejected(tmp_path):
+    from agentic_sdlc.cli import main as cli_main
+
+    issues = tmp_path / "issues.json"
+    issues.write_text(json.dumps([]), encoding="utf-8")
+    same = tmp_path / "out.json"
+    assert (
+        cli_main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+                "--backlog-output",
+                str(same),
+                "--incidents-output",
+                str(same),
+            ]
+        )
+        == 2
+    )
+    assert not same.exists()
