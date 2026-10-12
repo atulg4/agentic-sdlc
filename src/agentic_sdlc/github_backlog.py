@@ -32,6 +32,7 @@ from .control_center import (
     MAX_BACKLOG_ITEMS,
     MAX_INCIDENTS,
     PLAN_EVIDENCE_RULE,
+    RELEASED_SPEC_RULE,
     ControlCenterError,
 )
 
@@ -39,6 +40,22 @@ _PARENT_URL = re.compile(r"/issues/(\d+)/?$")
 
 #: The only pull states GitHub emits; anything else is malformed provider data.
 PULL_STATES = frozenset({"open", "closed"})
+
+#: Issues carry the same two states as pulls.
+ISSUE_STATES = PULL_STATES
+
+
+def _issue_state(issue: Mapping[str, Any]) -> str | None:
+    """The issue's state, or a controlled error for malformed provider data:
+    a non-string or unknown value must never silently classify as open."""
+
+    state = issue.get("state")
+    _require(
+        state is None or (isinstance(state, str) and state in ISSUE_STATES),
+        f'issue {issue.get("number")}: state must be "open" or "closed"',
+    )
+    return state
+
 
 #: An epic is declared by title convention or by owning sub-issues.
 EPIC_TITLE = re.compile(r"^\s*(?:[A-Z][A-Za-z]*\s+)?EPIC\b", re.I)
@@ -189,7 +206,7 @@ DISPATCH_RULES: tuple[DispatchRule, ...] = (
         ),
     ),
     DispatchRule(
-        rule_id="released-spec-without-dispatch-labels",
+        rule_id=RELEASED_SPEC_RULE,
         required=frozenset({"spec-drafted", "spec-approved"}),
         missing=frozenset({"implementation-approved", "agent-ready", "human-review-required"}),
         kind="awaiting-human-approval",
@@ -243,7 +260,7 @@ def _issue_labels(issue: Mapping[str, Any]) -> frozenset[str]:
 def _declared_state(issue: Mapping[str, Any], labels: frozenset[str]) -> str:
     """Resolve a declared state, or return "" so the console reports unknown."""
 
-    if issue.get("state") == "closed":
+    if _issue_state(issue) == "closed":
         reason = issue.get("state_reason")
         if not isinstance(reason, str):
             return ""
@@ -335,7 +352,7 @@ def incidents_from_issues(
 
     incidents: list[dict[str, Any]] = []
     for issue in issues:
-        if "pull_request" in issue or issue.get("state") == "closed":
+        if "pull_request" in issue or _issue_state(issue) == "closed":
             continue
         number = int(issue["number"])
         labels = _issue_labels(issue)

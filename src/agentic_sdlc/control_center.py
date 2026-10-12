@@ -85,6 +85,12 @@ AWAITING_HUMAN_STATES = frozenset(
 #: name is shared here rather than guessed from text.
 PLAN_EVIDENCE_RULE = "plan-ready-awaiting-dispatch-evidence"
 
+#: The adapter rule id for a released spec with no dispatch label after it.
+#: Approval proof alone must NOT retire it: the rule reports missing dispatch
+#: labels, which an approved unit still needs before anything can fire, so it
+#: holds until dispatch itself is proven.
+RELEASED_SPEC_RULE = "released-spec-without-dispatch-labels"
+
 #: States that PROVE dispatch happened: each is reachable only through a
 #: dispatched run. ``blocked``, ``cancelled`` and ``superseded`` are reachable
 #: from pre-dispatch states too, so they prove nothing and retire nothing.
@@ -1328,11 +1334,16 @@ def build_control_center_snapshot(
                 # and a unit the ledger shows implementing needs no triage.
                 # A state that does not imply the threshold (blocked,
                 # cancelled) retires nothing.
-                proven_states = (
-                    PLAN_PROVEN_STATES
-                    if incident.incident_id.endswith(":" + PLAN_EVIDENCE_RULE)
-                    else _LEDGER_RETIREMENT[incident.kind]
-                )
+                if incident.incident_id.endswith(":" + PLAN_EVIDENCE_RULE):
+                    proven_states = PLAN_PROVEN_STATES
+                elif incident.incident_id.endswith(":" + RELEASED_SPEC_RULE):
+                    # This rule reports missing dispatch labels, not the
+                    # approval wait its kind shares: an approved unit still
+                    # cannot fire without the label events, so only dispatch
+                    # proof retires it.
+                    proven_states = DISPATCH_PROVEN_STATES
+                else:
+                    proven_states = _LEDGER_RETIREMENT[incident.kind]
                 if proven.state in proven_states:
                     continue
             retained.append(incident)
