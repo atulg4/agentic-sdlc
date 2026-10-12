@@ -291,6 +291,12 @@
   });
 
   /* ---------- store ---------- */
+  function noteKey(projectId, incidentId) {
+    // Incident identity is project-scoped, so a note's key carries both: two
+    // projects sharing an incident id must never overwrite each other's note.
+    return (projectId || "") + "\u0000" + (incidentId || "");
+  }
+
   async function docId(value) {
     // Readable prefix plus a cryptographic digest of the FULL identifier, so
     // two distinct incidents can never share a note document.
@@ -373,18 +379,24 @@
     } catch (error) { state.error = describe(error); }
     subscribe("notes", (docs) => {
       state.notes = new Map();
-      for (const entry of docs) if (entry?.incidentId) state.notes.set(entry.incidentId, entry);
+      for (const entry of docs) if (entry?.incidentId) state.notes.set(noteKey(entry.projectId, entry.incidentId), entry);
+      // Out-of-window notes fetched exactly stay visible: every delivery
+      // replaces the map, so the backfilled overlay is re-applied.
+      for (const [key, entry] of backfilledEntries) if (!state.notes.has(key)) state.notes.set(key, entry);
     }, 1000);
-    subscribe("projectDrafts", (docs) => { state.drafts = docs; }, 500);
+    // Recency-ordered window: a newly saved draft is always retrievable.
+    subscribe("projectDrafts", (docs) => { state.drafts = docs; }, 500, "at");
     render();
   }
 
-  function subscribe(collection, adopt, bound) {
+  function subscribe(collection, adopt, bound, recencyField) {
     try {
       // Bounded: a long-lived store accumulates history, and an unrestricted
       // collection subscription would materialize every document on every
       // delivery for every viewer.
-      state.db.collection(collection).limit(bound).onSnapshot(
+      let query = state.db.collection(collection);
+      if (recencyField) query = query.orderBy(recencyField, "desc");
+      query.limit(bound).onSnapshot(
         (snapshot) => {
           adopt(snapshot.docs.map((entry) => entry.data()).filter(Boolean));
           render();
@@ -443,31 +455,42 @@
   }
 
   const backfilledNotes = new Set();
+  const backfilledEntries = new Map();
   async function backfillNotes(document_) {
     // The notes subscription is a bounded window, so a note outside it is
-    // fetched EXACTLY, by its deterministic per-incident document id, for
-    // every incident the adopted snapshot actually shows. A fetched absence
-    // is cached so each id is read at most once per page load.
+    // fetched EXACTLY, by its deterministic per-incident document id. The
+    // work is bounded: at most 200 incidents per adoption (later adoptions
+    // continue where this one capped out), read in small parallel batches,
+    // and each attempted key is read at most once per page load.
     if (!state.db) return;
     const wanted = [];
-    for (const project of document_.projects || []) {
+    outer: for (const project of document_.projects || []) {
       for (const incident of project.incidents || []) {
-        if (incident.incidentId && !state.notes.has(incident.incidentId) && !backfilledNotes.has(incident.incidentId)) {
-          wanted.push(incident.incidentId);
-          backfilledNotes.add(incident.incidentId);
-        }
+        const key = noteKey(project.projectId, incident.incidentId);
+        if (!incident.incidentId || state.notes.has(key) || backfilledNotes.has(key)) continue;
+        wanted.push([key, incident.incidentId]);
+        if (wanted.length >= 200) break outer;
       }
     }
     let found = 0;
-    for (const incidentId of wanted) {
-      try {
-        const snap = await state.db.doc("notes/" + (await docId(incidentId))).get();
-        const entry = snap?.data?.();
-        if (entry?.incidentId && !state.notes.has(entry.incidentId)) {
-          state.notes.set(entry.incidentId, entry);
-          found += 1;
-        }
-      } catch { /* an unreadable note renders as unacknowledged */ }
+    for (let start = 0; start < wanted.length; start += 10) {
+      await Promise.all(wanted.slice(start, start + 10).map(async ([key, incidentId]) => {
+        backfilledNotes.add(key);
+        try {
+          let snap = await state.db.doc("notes/" + (await docId(key))).get();
+          let entry = snap?.data?.();
+          if (!entry) {
+            // Notes recorded before keys were project-scoped live at the
+            // legacy id derived from the incident id alone.
+            snap = await state.db.doc("notes/" + (await docId(incidentId))).get();
+            entry = snap?.data?.();
+          }
+          if (entry?.incidentId) {
+            backfilledEntries.set(key, entry);
+            if (!state.notes.has(key)) { state.notes.set(key, entry); found += 1; }
+          }
+        } catch { /* an unreadable note renders as unacknowledged */ }
+      }));
     }
     if (found) render();
   }
@@ -559,6 +582,8 @@
     const seenProjects = new Set();
     const seenIncidents = new Set();
     const seenItems = new Set();
+    // Portfolio-wide budgets, mirroring the producer's aggregate limits.
+    let totalItems = 0, totalIncidents = 0, totalUnits = 0;
     const arrayField = (owner, key, where, budget) => {
       if (owner[key] === undefined) return "";
       if (!Array.isArray(owner[key])) return `${where}.${key} must be an array.`;
@@ -611,9 +636,15 @@
       if ((project.active || []).length + (project.attention || []).length > stateTotal) {
         return `${where} lists more visible work units than its state counts hold.`;
       }
+      const unitIds = new Set();
       for (const list of [project.active || [], project.attention || []]) {
         for (const unit of list) {
           if (!isObj(unit)) return `${where} has a work unit that is not an object.`;
+          // active and attention are disjoint views of one status map, so a
+          // unit appearing twice is never producer output.
+          if (typeof unit.workUnitId !== "string" || !unit.workUnitId) return `${where} has a work unit without a string workUnitId.`;
+          if (unitIds.has(unit.workUnitId)) return `${where} lists work unit ${unit.workUnitId} more than once.`;
+          unitIds.add(unit.workUnitId);
         }
       }
       for (const incident of project.incidents || []) {
@@ -660,6 +691,12 @@
         if (visited > 5000) return `${where} backlog holds more than 5000 nodes or is cyclic.`;
         for (const child of node.children || []) stack.push([child, depth + 1]);
       }
+      totalItems += visited;
+      totalIncidents += project.incidents.length;
+      totalUnits += stateTotal;
+      if (totalItems > 50000) return "The snapshot holds more than 50000 backlog items in all.";
+      if (totalIncidents > 10000) return "The snapshot holds more than 10000 incidents in all.";
+      if (totalUnits > 50000) return "The snapshot holds more than 50000 work units in all.";
     }
     if (value.totals !== undefined && !isObj(value.totals)) return "totals must be an object.";
     const topLevel = arrayField(value, "warnings", "snapshot", 5000) || arrayField(value, "sources", "snapshot", 1200);
@@ -990,7 +1027,7 @@
   }
 
   function incidentCard(incident, project) {
-    const note = state.notes.get(incident.incidentId);
+    const note = state.notes.get(noteKey(incident.projectId, incident.incidentId));
     // The incident being in the current snapshot already contradicts a
     // "resolved" note, whatever the timestamps say: export times are not
     // occurrence times, so no clock comparison decides this.
@@ -1303,7 +1340,7 @@
 
   async function saveNote(incident, status, text) {
     try {
-      await state.db.doc("notes/" + (await docId(incident.incidentId))).set({
+      await state.db.doc("notes/" + (await docId(noteKey(incident.projectId, incident.incidentId)))).set({
         incidentId: incident.incidentId,
         projectId: incident.projectId || "",
         kind: incident.kind || "",

@@ -4688,3 +4688,92 @@ def test_the_console_matches_the_producers_identity_and_unit_contracts():
     # Notes outside the bounded subscription are backfilled exactly.
     assert "async function backfillNotes(document_)" in html
     assert "backfillNotes(document_);" in html
+
+
+def test_the_snapshot_enforces_portfolio_wide_budgets():
+    # Per-project limits alone would let a wide portfolio materialize
+    # millions of records; the aggregate budget rejects it with a reason.
+    groups = [
+        load_incident_document(
+            _incidents(
+                *(
+                    _incident(
+                        incidentId=f"p{project}-i{index}",
+                        projectId=f"p{project}",
+                        backlogItemId="",
+                    )
+                    for index in range(2000)
+                )
+            )
+        )
+        for project in range(6)
+    ]
+    with pytest.raises(ControlCenterError, match="more than 10000 incidents in all"):
+        build_control_center_snapshot(
+            generated_at=NOW,
+            registry=EMPTY,
+            incidents=(item for group in groups for item in group),
+        )
+
+
+def test_a_malformed_document_source_is_rejected():
+    with pytest.raises(ControlCenterError, match="source must be a string"):
+        load_backlog_document(
+            {"schemaVersion": BACKLOG_SCHEMA_VERSION, "source": {"token": "x"}, "items": []}
+        )
+    with pytest.raises(ControlCenterError, match="source must be a string"):
+        load_incident_document(
+            {"schemaVersion": INCIDENT_SCHEMA_VERSION, "source": 7, "incidents": []}
+        )
+
+
+def test_rule_retirement_requires_the_adapter_identity():
+    from agentic_sdlc.control_center import PLAN_EVIDENCE_RULE
+
+    # The id merely ENDS in the rule spelling but does not tie to the named
+    # backlog item, so it is not the adapter's record and is never rewritten.
+    lookalike = _incident(
+        incidentId=f"custom:{PLAN_EVIDENCE_RULE}",
+        kind="awaiting-dispatch-evidence",
+        severity="advisory",
+        backlogItemId="acme/forge#7",
+        summary="A provider-neutral advisory that merely echoes the rule name",
+    )
+    approved = _ledger(
+        *_chain(
+            TO_PLANNED + ("approved",),
+            workUnit={"projectId": "forge", "workUnitId": "wu-1", "issueRef": "acme/forge#7"},
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=approved.projections(),
+        backlog=load_backlog_document(
+            _document(_backlog(itemId="acme/forge#7", issueRef="acme/forge#7"))
+        ),
+        incidents=load_incident_document(_incidents(lookalike)),
+    )
+    kept = snapshot.get("forge").incidents
+    assert [item.incident_id for item in kept] == [f"custom:{PLAN_EVIDENCE_RULE}"]
+    assert kept[0].kind == "awaiting-dispatch-evidence"
+    assert kept[0].summary == "A provider-neutral advisory that merely echoes the rule name"
+
+
+def test_the_console_scopes_notes_and_bounds_its_work():
+    from pathlib import Path
+
+    html = Path("examples/control-center/control-center.html").read_text(encoding="utf-8")
+    # Note identity carries the project, with a legacy-id fallback on reads.
+    assert "function noteKey(projectId, incidentId)" in html
+    assert "noteKey(incident.projectId, incident.incidentId)" in html
+    # Backfilled notes survive subscription deliveries and are bounded.
+    assert "for (const [key, entry] of backfilledEntries)" in html
+    assert "if (wanted.length >= 200) break outer;" in html
+    # Drafts window is recency-ordered; visible units are deduplicated; the
+    # portfolio-wide budgets mirror the producer's.
+    assert '}, 500, "at");' in html
+    assert "lists work unit ${unit.workUnitId} more than once" in html
+    assert "more than 50000 backlog items in all" in html
+    assert "more than 10000 incidents in all" in html
+    assert "more than 50000 work units in all" in html

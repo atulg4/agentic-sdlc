@@ -77,6 +77,12 @@ MAX_WARNINGS = 5000
 #: Work units per project, shared with the console's active/attention
 #: budgets: merged ledger exports beyond it fail with a reason.
 MAX_WORK_UNITS = 5000
+#: Portfolio-wide budgets, applied AFTER --project-id filtering and shared
+#: with the console: per-project limits alone would still let a full
+#: 500-project portfolio materialize millions of records.
+MAX_TOTAL_BACKLOG_ITEMS = 50_000
+MAX_TOTAL_INCIDENTS = 10_000
+MAX_TOTAL_WORK_UNITS = 50_000
 
 
 def _bounded_warnings(entries: Sequence[str]) -> tuple[str, ...]:
@@ -223,6 +229,18 @@ _CHANGE_REQUEST_RETIREMENT = frozenset(
         "deterministic-ci-failed",
     }
 )
+
+
+def _adapter_rule_incident(incident: Incident, rule: str) -> bool:
+    """The incident IS the adapter's label-derived record for ``rule``.
+
+    Its id is exactly the named backlog item plus the rule suffix - the shape
+    the GitHub adapter emits - so a provider-neutral incident whose id merely
+    ends in the rule spelling is never silently rewritten or retired.
+    """
+    return bool(incident.backlog_item_id) and (
+        incident.incident_id == f"{incident.backlog_item_id}:{rule}"
+    )
 
 
 def _change_request_scoped(incident: Incident) -> bool:
@@ -794,6 +812,8 @@ def load_backlog_document(document: Any) -> tuple[BacklogItem, ...]:
         and version == BACKLOG_SCHEMA_VERSION,
         f"unsupported backlog schemaVersion: {version!r}",
     )
+    if "source" in entry:
+        _text(entry, "source", "backlog document")
     _require(
         "items" in entry,
         "backlog document requires an items array; an intentional empty export "
@@ -966,6 +986,8 @@ def load_incident_document(document: Any) -> tuple[Incident, ...]:
         and version == INCIDENT_SCHEMA_VERSION,
         f"unsupported incident schemaVersion: {version!r}",
     )
+    if "source" in entry:
+        _text(entry, "source", "incident document")
     _require(
         "incidents" in entry,
         "incident document requires an incidents array; an intentional empty "
@@ -1480,6 +1502,9 @@ def build_control_center_snapshot(
 
     warnings: list[str] = []
     views: list[ProjectView] = []
+    total_items = 0
+    total_incidents = 0
+    total_units = 0
     for project_id in sorted(universe):
         registered = project_id in registry.project_ids()
         statuses = by_project_units.get(project_id, {})
@@ -1501,6 +1526,24 @@ def build_control_center_snapshot(
             len(statuses) <= MAX_WORK_UNITS,
             f"project {project_id} holds {len(statuses)} work units, more than the "
             f"read model's {MAX_WORK_UNITS}-unit budget; narrow the ledger export",
+        )
+        total_items += len(items)
+        total_incidents += len(project_incidents)
+        total_units += len(statuses)
+        _require(
+            total_items <= MAX_TOTAL_BACKLOG_ITEMS,
+            f"snapshot would hold more than {MAX_TOTAL_BACKLOG_ITEMS} backlog items "
+            "in all; narrow --project-id or the exports",
+        )
+        _require(
+            total_incidents <= MAX_TOTAL_INCIDENTS,
+            f"snapshot would hold more than {MAX_TOTAL_INCIDENTS} incidents in all; "
+            "narrow --project-id or the exports",
+        )
+        _require(
+            total_units <= MAX_TOTAL_WORK_UNITS,
+            f"snapshot would hold more than {MAX_TOTAL_WORK_UNITS} work units in all; "
+            "narrow --project-id or the ledger export",
         )
         _detect_backlog_cycles({item.item_id: item for item in items})
         # A parent id absent from this project is treated as a missing parent
@@ -1640,7 +1683,7 @@ def build_control_center_snapshot(
                 # and a unit the ledger shows implementing needs no triage.
                 # A state that does not imply the threshold (blocked,
                 # cancelled) retires nothing.
-                if incident.incident_id.endswith(":" + PLAN_EVIDENCE_RULE):
+                if _adapter_rule_incident(incident, PLAN_EVIDENCE_RULE):
                     # Dispatch proof (current or historical) moots the plan
                     # advisory entirely; proven approval replaces its guidance
                     # with the implementation hold; otherwise planned or
@@ -1676,8 +1719,8 @@ def build_control_center_snapshot(
                         continue
                     retained.append(incident)
                     continue
-                if incident.incident_id.endswith(
-                    (":" + RELEASED_SPEC_RULE, ":" + SPEC_WITHOUT_APPROVAL_RULE)
+                if _adapter_rule_incident(incident, RELEASED_SPEC_RULE) or _adapter_rule_incident(
+                    incident, SPEC_WITHOUT_APPROVAL_RULE
                 ):
                     # These rules report missing dispatch labels, not only the
                     # approval wait their kind shares: an approved unit still
