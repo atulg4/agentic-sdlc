@@ -173,6 +173,14 @@ IMPEDED_MERGE_STATES: Mapping[str, str] = {
     "unstable": "a status check on the head commit is not passing",
 }
 
+#: Every mergeability verdict this adapter understands. ``unknown`` and an
+#: absent field are deliberately unknown; anything else is malformed or newly
+#: introduced provider data that must fail closed rather than silently drop
+#: the change request from the snapshot.
+KNOWN_MERGE_STATES = (
+    frozenset({"dirty", "unknown"}) | READY_MERGE_STATES | frozenset(IMPEDED_MERGE_STATES)
+)
+
 
 @dataclass(frozen=True)
 class DispatchRule:
@@ -528,6 +536,10 @@ def incidents_from_change_requests(
         _require(
             state is None or isinstance(state, str),
             f"change request {number}: mergeable_state must be a string",
+        )
+        _require(
+            state is None or state in KNOWN_MERGE_STATES,
+            f"change request {number}: unrecognized mergeable_state: {state!r}",
         )
         if state == "dirty":
             incidents.append(
