@@ -407,13 +407,19 @@ def incidents_from_change_requests(
             # No continue: a conflicted pull can also carry a declared CI
             # failure, and both blockers are real.
         if number in checks:
+            summary = f"Deterministic verification failed: {checks[number]}"
+            _require(
+                len(summary) <= 512,
+                f"change request {number}: too many failing check names to record; "
+                "narrow --failing",
+            )
             incidents.append(
                 {
                     "incidentId": f"{ref}:ci-failed",
                     "projectId": project_id,
                     "kind": "deterministic-ci-failed",
                     "severity": "blocker",
-                    "summary": f"Deterministic verification failed: {checks[number]}"[:512],
+                    "summary": summary,
                     "detail": title,
                     "observedAt": observed_at,
                     "evidenceRef": ref,

@@ -480,7 +480,7 @@ REMEDIATION_CATALOGUE: Mapping[str, tuple[RemediationAction, ...]] = {
             _OPERATOR,
             command=(
                 "sdlcctl decide-infra-retry --repository <owner/repo> "
-                "--pull-request-number 123 --run-id 456 --head-sha <sha> "
+                "--pull-request-number <pull-number> --run-id <run-id> --head-sha <sha> "
                 "--current-head-sha <sha> --failure-class transient_infrastructure "
                 "--output decision.json"
             ),
@@ -640,7 +640,9 @@ def load_backlog_document(document: Any) -> tuple[BacklogItem, ...]:
     _known_keys(entry, _BACKLOG_DOCUMENT_KEYS, "backlog document")
     version = entry.get("schemaVersion")
     _require(
-        version == BACKLOG_SCHEMA_VERSION,
+        isinstance(version, int)
+        and not isinstance(version, bool)
+        and version == BACKLOG_SCHEMA_VERSION,
         f"unsupported backlog schemaVersion: {version!r}",
     )
     raw_items = entry.get("items", [])
@@ -799,7 +801,9 @@ def load_incident_document(document: Any) -> tuple[Incident, ...]:
     _known_keys(entry, _INCIDENT_DOCUMENT_KEYS, "incident document")
     version = entry.get("schemaVersion")
     _require(
-        version == INCIDENT_SCHEMA_VERSION,
+        isinstance(version, int)
+        and not isinstance(version, bool)
+        and version == INCIDENT_SCHEMA_VERSION,
         f"unsupported incident schemaVersion: {version!r}",
     )
     raw_items = entry.get("incidents", [])

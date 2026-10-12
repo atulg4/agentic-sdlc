@@ -601,7 +601,10 @@ def _sub_issue_group(entry: str) -> tuple[Any, int | None]:
     a bare path relies on each child's own parent reference."""
     number, separator, path = entry.partition("=")
     if separator and number.strip().isdigit():
-        payload, parent = _json_file(path), int(number)
+        parent = int(number)
+        if parent <= 0:
+            raise ControlCenterError(f"--sub-issues parent must be a positive number: {entry}")
+        payload = _json_file(path)
     else:
         payload, parent = _json_file(entry), None
     return _record_array(payload, f"--sub-issues ({entry})", require_number=True), parent
