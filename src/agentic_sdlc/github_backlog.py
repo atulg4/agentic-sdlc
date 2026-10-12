@@ -727,9 +727,9 @@ def parent_links(
             # ordinary payload of child records.
             payload, declared = group
         for entry in payload:
-            number = entry.get("number")
-            if not isinstance(number, int):
-                continue
+            # The shared validator, not a type check: bool is an int, so a
+            # record with number true would alias issue #1.
+            number = _record_number(entry, "sub-issue record")
             require_local(entry, number)
             referenced: int | None = None
             url = entry.get("parent_issue_url")

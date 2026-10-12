@@ -1067,11 +1067,9 @@ def _control_center(args: argparse.Namespace) -> int:
     sources.extend(f"backlog:{path}" for path in args.backlog)
     sources.extend(f"incidents:{path}" for path in args.incidents)
     if args.output:
-        output = Path(args.output).resolve()
-        inputs = [args.registry, args.ledger, *args.backlog, *args.incidents]
-        for declared in inputs:
-            if declared and Path(declared).resolve() == output:
-                raise ControlCenterError(f"--output would overwrite an input: {declared}")
+        _require_not_an_input(
+            args.output, [args.registry, args.ledger, *args.backlog, *args.incidents], "--output"
+        )
     generated_at = args.generated_at or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     snapshot = build_control_center_snapshot(
         generated_at=generated_at,
@@ -1082,8 +1080,27 @@ def _control_center(args: argparse.Namespace) -> int:
         sources=sources,
         project_ids=tuple(args.project_id) or None,
     )
-    _write(snapshot.as_document(), args.output)
+    # Staged replacement: even an alias the guard could not see (an exotic
+    # link arrangement) is replaced by a fresh inode, never truncated.
+    _write_group([(snapshot.as_document(), args.output)])
     return 0
+
+
+def _require_not_an_input(output: str, inputs: list[str | None], flag: str) -> None:
+    """Reject an output that IS an input, by path or by inode: a different
+    pathname hard-linked to an input shares its inode, which a resolved-path
+    comparison alone cannot see."""
+
+    resolved = Path(output).resolve()
+    for declared in inputs:
+        if not declared:
+            continue
+        declared_path = Path(declared)
+        same = declared_path.resolve() == resolved
+        if not same and declared_path.exists() and resolved.exists():
+            same = os.path.samefile(declared_path, resolved)
+        if same:
+            raise ControlCenterError(f"{flag} would overwrite an input: {declared}")
 
 
 def _json_file(path: str) -> Any:
@@ -1217,12 +1234,8 @@ def _github_backlog(args: argparse.Namespace) -> int:
     ]
     input_paths = [args.config, args.issues, args.pulls, *sub_issue_paths]
     for output in (args.backlog_output, args.incidents_output):
-        if not output:
-            continue
-        resolved = Path(output).resolve()
-        for declared in input_paths:
-            if declared and Path(declared).resolve() == resolved:
-                raise ControlCenterError(f"an output would overwrite an input: {declared}")
+        if output:
+            _require_not_an_input(output, input_paths, "an output")
     # Round-trip every generated document through its own loader BEFORE
     # writing any of them, so a bad input (e.g. a malformed --observed-at)
     # fails the export without leaving a mismatched pair on disk.
