@@ -374,14 +374,17 @@
     subscribe("notes", (docs) => {
       state.notes = new Map();
       for (const entry of docs) if (entry?.incidentId) state.notes.set(entry.incidentId, entry);
-    });
-    subscribe("projectDrafts", (docs) => { state.drafts = docs; });
+    }, 1000);
+    subscribe("projectDrafts", (docs) => { state.drafts = docs; }, 500);
     render();
   }
 
-  function subscribe(collection, adopt) {
+  function subscribe(collection, adopt, bound) {
     try {
-      state.db.collection(collection).onSnapshot(
+      // Bounded: a long-lived store accumulates history, and an unrestricted
+      // collection subscription would materialize every document on every
+      // delivery for every viewer.
+      state.db.collection(collection).limit(bound).onSnapshot(
         (snapshot) => {
           adopt(snapshot.docs.map((entry) => entry.data()).filter(Boolean));
           render();
@@ -539,6 +542,10 @@
       seenProjects.add(project.projectId);
       const where = `project ${project.projectId}`;
       for (const key of ["backlog", "active", "attention", "incidents", "warnings", "repositories", "capabilities", "environments"]) {
+        // The producer always emits every collection, so absence is evidence
+        // of tampering, never an empty set: a writer deleting incidents must
+        // not read as a healthy project.
+        if (project[key] === undefined) return `${where}.${key} is required.`;
         const problem = arrayField(project, key, where, BUDGETS[key]);
         if (problem) return problem;
       }
@@ -603,7 +610,9 @@
         if (node.children !== undefined && !Array.isArray(node.children)) return `${where} backlog node ${node.itemId || ""} children must be an array.`;
         if (node.children && node.children.length > 5000) return `${where} backlog node ${node.itemId || ""} holds more than 5000 children.`;
         visited += 1;
-        if (visited > 10000) return `${where} backlog is too large or cyclic to render.`;
+        // The producer's combined per-project budget counts EVERY node, so
+        // the traversal holds nested nodes to the same 5000-item limit.
+        if (visited > 5000) return `${where} backlog holds more than 5000 nodes or is cyclic.`;
         for (const child of node.children || []) stack.push([child, depth + 1]);
       }
     }
@@ -965,7 +974,11 @@
     const reference = incident.evidenceRef || incident.backlogItemId;
     if (!reference) return null;
     const match = /^([A-Za-z0-9._-]+\/[A-Za-z0-9._-]+)([#!])(\d+)$/.exec(reference);
-    const hosted = match && (project.repositories || []).includes("github:" + match[1]);
+    // GitHub repository identity is case-insensitive, and the adapter emits
+    // the provider's own spelling, so the declared entry is matched folded.
+    const hosted = match && (project.repositories || []).some(
+      (entry) => entry.toLowerCase() === ("github:" + match[1]).toLowerCase(),
+    );
     if (hosted) {
       const path = match[2] === "!" ? "pull" : "issues";
       return el("a", {

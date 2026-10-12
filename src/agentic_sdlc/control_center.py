@@ -1429,43 +1429,32 @@ def build_control_center_snapshot(
         units[projection.work_unit_id] = work_unit_status(projection)
 
     by_project_backlog: dict[str, list[BacklogItem]] = {}
-    seen_items: set[str] = set()
+    # Identity is scoped PER PROJECT: a portfolio may legitimately register
+    # github:acme/forge and gitlab:acme/forge to different projects, and both
+    # naturally use acme/forge#1 item ids. Within one project the ids stay
+    # unique, because its tree joins by them.
+    seen_items: set[tuple[str, str]] = set()
+    item_owners: dict[str, set[str]] = {}
     for item in backlog:
-        _require(item.item_id not in seen_items, f"duplicate backlog itemId: {item.item_id}")
-        seen_items.add(item.item_id)
-        by_project_backlog.setdefault(item.project_id, []).append(item)
-    all_items = {item.item_id: item for items in by_project_backlog.values() for item in items}
-    for project_id, project_items in by_project_backlog.items():
-        # Documents are validated one by one, so a parent cycle, an over-deep
-        # chain, an over-budget combined set or a cross-project parent can
-        # appear only once they are combined: reject them here, before any
-        # tree construction could loop, crash a renderer or mislabel an edge.
+        key = (item.project_id, item.item_id)
         _require(
-            len(project_items) <= MAX_BACKLOG_ITEMS,
-            f"project {project_id} combines more than {MAX_BACKLOG_ITEMS} backlog items",
+            key not in seen_items,
+            f"duplicate backlog itemId in project {item.project_id}: {item.item_id}",
         )
-        _detect_backlog_cycles({item.item_id: item for item in project_items})
-        for item in project_items:
-            parent = all_items.get(item.parent_id) if item.parent_id else None
-            _require(
-                parent is None or parent.project_id == item.project_id,
-                f"backlog item {item.item_id} has a parent in another project: {item.parent_id}",
-            )
+        seen_items.add(key)
+        item_owners.setdefault(item.item_id, set()).add(item.project_id)
+        by_project_backlog.setdefault(item.project_id, []).append(item)
 
     by_project_incidents: dict[str, list[Incident]] = {}
-    seen_incidents: set[str] = set()
+    seen_incidents: set[tuple[str, str]] = set()
     for incident in incidents:
+        key = (incident.project_id, incident.incident_id)
         _require(
-            incident.incident_id not in seen_incidents,
-            f"duplicate incidentId: {incident.incident_id}",
+            key not in seen_incidents,
+            f"duplicate incidentId in project {incident.project_id}: {incident.incident_id}",
         )
-        seen_incidents.add(incident.incident_id)
+        seen_incidents.add(key)
         by_project_incidents.setdefault(incident.project_id, []).append(incident)
-    for project_id, project_incident_list in by_project_incidents.items():
-        _require(
-            len(project_incident_list) <= MAX_INCIDENTS,
-            f"project {project_id} combines more than {MAX_INCIDENTS} incidents",
-        )
 
     universe = set(registry.project_ids())
     observed = set(by_project_units) | set(by_project_backlog) | set(by_project_incidents)
@@ -1488,14 +1477,33 @@ def build_control_center_snapshot(
         statuses = by_project_units.get(project_id, {})
         items = by_project_backlog.get(project_id, [])
         project_incidents = tuple(by_project_incidents.get(project_id, ()))
-        # Backlog items and incidents are already bounded per project where
-        # the inputs merge; work units gain the same shared console budget
-        # here, so a snapshot the producer emits is always renderable.
+        # The combined per-project budgets, cycle detection and cross-project
+        # parent checks run AFTER --project-id filtering, on the projects the
+        # snapshot actually renders: an oversized unselected project must not
+        # stop the documented narrowing option from producing this one.
+        _require(
+            len(items) <= MAX_BACKLOG_ITEMS,
+            f"project {project_id} combines more than {MAX_BACKLOG_ITEMS} backlog items",
+        )
+        _require(
+            len(project_incidents) <= MAX_INCIDENTS,
+            f"project {project_id} combines more than {MAX_INCIDENTS} incidents",
+        )
         _require(
             len(statuses) <= MAX_WORK_UNITS,
             f"project {project_id} holds {len(statuses)} work units, more than the "
             f"read model's {MAX_WORK_UNITS}-unit budget; narrow the ledger export",
         )
+        _detect_backlog_cycles({item.item_id: item for item in items})
+        local_ids = {item.item_id for item in items}
+        for item in items:
+            if not item.parent_id or item.parent_id in local_ids:
+                continue
+            foreign_parents = item_owners.get(item.parent_id, set()) - {project_id}
+            _require(
+                not foreign_parents,
+                f"backlog item {item.item_id} has a parent in another project: {item.parent_id}",
+            )
         by_issue_ref, reference_warnings = _index_by_issue_ref(statuses)
         tree, tree_warnings = _build_backlog_tree(items, statuses, by_issue_ref)
         view_warnings = list(reference_warnings) + list(tree_warnings)

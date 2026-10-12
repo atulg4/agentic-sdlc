@@ -4546,3 +4546,109 @@ def test_the_console_caps_the_summed_state_counts():
     # Per-state values are shape-checked, and the SUM is held to the same
     # shared budget the producer enforces per project.
     assert "stateTotal += count;" in html
+
+
+def test_issue_links_never_point_at_change_requests():
+    pull_link = _issue(1, "lure")
+    pull_link["html_url"] = "https://github.com/acme/forge/pull/1"
+    with pytest.raises(ControlCenterError, match="not a recognized GitHub issue URL"):
+        _export(pull_link)
+
+
+def test_sub_issue_children_missing_from_the_export_fail_closed():
+    links = parent_links(
+        (
+            [{"number": 2, "repository_url": "https://api.github.com/repos/acme/forge"}],
+            1,
+        ),
+        repository="acme/forge",
+    )
+    with pytest.raises(ControlCenterError, match=r"missing from the issues export: #2"):
+        backlog_document_from_issues(
+            [_issue(1, "parent only")],
+            project_id="forge",
+            repository="acme/forge",
+            parents=links,
+        )
+    # With the child exported too, the edge renders as declared.
+    document = backlog_document_from_issues(
+        [_issue(1, "parent"), _issue(2, "child")],
+        project_id="forge",
+        repository="acme/forge",
+        parents=links,
+    )
+    assert document["items"][1]["parentId"] == "acme/forge#1"
+
+
+def test_narrowing_skips_unselected_projects_budgets():
+    heavy = [
+        load_backlog_document(
+            _document(
+                *(
+                    _backlog(
+                        itemId=f"acme/other#{index}",
+                        projectId="other",
+                        issueRef="",
+                    )
+                    for index in range(start, start + 2501)
+                )
+            )
+        )
+        for start in (1, 2502)
+    ]
+    small = load_backlog_document(_document(_backlog()))
+    combined = (*heavy[0], *heavy[1], *small)
+    # Unfiltered, the oversized project fails the combined budget...
+    with pytest.raises(ControlCenterError, match="combines more than 5000 backlog items"):
+        build_control_center_snapshot(generated_at=NOW, registry=REGISTRY, backlog=combined)
+    # ...but narrowing to the selected project still produces its snapshot.
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW, registry=REGISTRY, backlog=combined, project_ids=("forge",)
+    )
+    assert [view.project_id for view in snapshot.projects] == ["forge"]
+
+
+def test_backlog_identity_is_scoped_per_project():
+    github_item = _backlog(itemId="acme/forge#1", projectId="forge", issueRef="")
+    gitlab_item = _backlog(itemId="acme/forge#1", projectId="lab", issueRef="")
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        backlog=(
+            *load_backlog_document(_document(github_item)),
+            *load_backlog_document(_document(gitlab_item)),
+        ),
+    )
+    assert {view.project_id for view in snapshot.projects} == {"forge", "lab"}
+    duplicate = _incident(incidentId="i-1", projectId="forge")
+    with pytest.raises(ControlCenterError, match="duplicate incidentId in project forge"):
+        build_control_center_snapshot(
+            generated_at=NOW,
+            registry=REGISTRY,
+            incidents=(
+                *load_incident_document(_incidents(duplicate)),
+                *load_incident_document(_incidents(duplicate)),
+            ),
+        )
+    # The same incident id under ANOTHER project coexists.
+    other = _incident(incidentId="i-1", projectId="lab")
+    twins = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        incidents=(
+            *load_incident_document(_incidents(duplicate)),
+            *load_incident_document(_incidents(other)),
+        ),
+    )
+    assert {view.project_id for view in twins.projects} == {"forge", "lab"}
+
+
+def test_the_console_requires_collections_and_bounds_its_views():
+    from pathlib import Path
+
+    html = Path("examples/control-center/control-center.html").read_text(encoding="utf-8")
+    assert "is required.`;" in html
+    assert "backlog holds more than 5000 nodes or is cyclic" in html
+    assert '("github:" + match[1]).toLowerCase()' in html
+    assert ".limit(bound).onSnapshot(" in html
+    assert "}, 1000);" in html
