@@ -1376,3 +1376,141 @@ def test_capacity_report_cli_fails_closed(tmp_path: Path) -> None:
         )
         == 2
     )
+
+
+def test_control_center_joins_registry_backlog_and_incidents(tmp_path):
+    registry = tmp_path / "registry.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "projects": [
+                    {
+                        "projectId": "forge",
+                        "displayName": "Forge",
+                        "defaultBranch": "main",
+                        "repositories": [{"provider": "github", "identifier": "acme/forge"}],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    issues = tmp_path / "issues.json"
+    issues.write_text(
+        json.dumps(
+            [
+                {
+                    "number": 1,
+                    "title": "EPIC: ship it",
+                    "state": "open",
+                    "labels": [
+                        {"name": "implementation-approved"},
+                        {"name": "human-review-required"},
+                    ],
+                    "html_url": "https://github.com/acme/forge/issues/1",
+                    "repository_url": "https://api.github.com/repos/acme/forge",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    backlog = tmp_path / "backlog.json"
+    incidents = tmp_path / "incidents.json"
+    assert (
+        main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+                "--observed-at",
+                "2026-10-11T21:30:00Z",
+                "--backlog-output",
+                str(backlog),
+                "--incidents-output",
+                str(incidents),
+            ]
+        )
+        == 0
+    )
+    snapshot = tmp_path / "snapshot.json"
+    assert (
+        main(
+            [
+                "control-center",
+                "--registry",
+                str(registry),
+                "--backlog",
+                str(backlog),
+                "--incidents",
+                str(incidents),
+                "--generated-at",
+                "2026-10-11T21:30:00Z",
+                "--output",
+                str(snapshot),
+            ]
+        )
+        == 0
+    )
+    document = json.loads(snapshot.read_text(encoding="utf-8"))
+    assert document["schemaVersion"] == 1
+    assert document["snapshotSha256"]
+    project = document["projects"][0]
+    assert project["projectId"] == "forge"
+    assert project["health"] == "blocked"
+    assert project["backlog"][0]["kind"] == "epic"
+    assert project["incidents"][0]["kind"] == "dispatch-blocked"
+    assert project["incidents"][0]["remediations"]
+    assert document["sources"] == [
+        f"registry:{registry}",
+        f"backlog:{backlog}",
+        f"incidents:{incidents}",
+    ]
+
+
+def test_control_center_rejects_a_malformed_failing_check_pair(tmp_path):
+    issues = tmp_path / "issues.json"
+    issues.write_text(json.dumps([]), encoding="utf-8")
+    pulls = tmp_path / "pulls.json"
+    pulls.write_text(json.dumps([]), encoding="utf-8")
+    assert (
+        main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--pulls",
+                str(pulls),
+                "--failing",
+                "not-a-number",
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+            ]
+        )
+        == 2
+    )
+
+
+def test_control_center_rejects_issues_that_are_not_an_array(tmp_path):
+    issues = tmp_path / "issues.json"
+    issues.write_text(json.dumps({"number": 1}), encoding="utf-8")
+    assert (
+        main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+            ]
+        )
+        == 2
+    )
