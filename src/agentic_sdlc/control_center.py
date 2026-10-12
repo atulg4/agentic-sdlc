@@ -900,6 +900,11 @@ class WorkUnitStatus:
     actor: str = ""
     model: str = ""
     worker: str = ""
+    #: Every state the unit durably reached, from the projection's transition
+    #: history. Retirement evidence, not render data: a unit that crossed a
+    #: gate and later re-entered a pre-gate state (dispatched, then blocked)
+    #: still proved the gate passed.
+    states_seen: frozenset[FactoryState] = frozenset()
 
     @property
     def awaits_human(self) -> bool:
@@ -959,6 +964,9 @@ def work_unit_status(projection: WorkUnitProjection) -> WorkUnitStatus:
         actor=projection.activity_actor,
         model=projection.activity_model,
         worker=projection.activity_worker,
+        states_seen=frozenset(
+            {projection.state} | {transition.to_state for transition in projection.transitions}
+        ),
     )
 
 
@@ -1372,6 +1380,11 @@ def build_control_center_snapshot(
                 # cancelled) retires nothing.
                 if incident.incident_id.endswith(":" + PLAN_EVIDENCE_RULE):
                     proven_states = PLAN_PROVEN_STATES
+                    # planned/approval-pending retire only as CURRENT states:
+                    # a unit already past them (approved) still needs a fresh
+                    # label event, so from history only durable dispatch
+                    # evidence counts.
+                    history_states = DISPATCH_PROVEN_STATES
                 elif incident.incident_id.endswith(
                     (":" + RELEASED_SPEC_RULE, ":" + SPEC_WITHOUT_APPROVAL_RULE)
                 ):
@@ -1380,9 +1393,14 @@ def build_control_center_snapshot(
                     # cannot fire without the label events, so only dispatch
                     # proof retires them.
                     proven_states = DISPATCH_PROVEN_STATES
+                    history_states = DISPATCH_PROVEN_STATES
                 else:
                     proven_states = _LEDGER_RETIREMENT[incident.kind]
-                if proven.state in proven_states:
+                    history_states = proven_states
+                # Current state or durable history: a unit that crossed the
+                # gate and later re-entered a pre-gate state (dispatched,
+                # then blocked) still proved the gate passed.
+                if proven.state in proven_states or proven.states_seen & history_states:
                     continue
             retained.append(incident)
         project_incidents = tuple(retained)

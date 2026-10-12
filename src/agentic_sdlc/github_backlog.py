@@ -418,6 +418,14 @@ def backlog_document_from_issues(
     _require_repository(repository)
     states = label_states(labels or DEFAULT_LABELS)
     links = dict(parents or {})
+    for child, parent in links.items():
+        # Key equality would let True or 1.0 silently attach the real issue
+        # #1, so direct callers get the same validation parent_links applies.
+        for value, role in ((child, "child"), (parent, "parent")):
+            _require(
+                isinstance(value, int) and not isinstance(value, bool) and value > 0,
+                f"parents map {role} must be a positive integer: {value!r}",
+            )
     rows = [issue for issue in issues if "pull_request" not in issue]
     numbers = {_record_number(issue, "issue") for issue in rows}
     parent_of_children = {parent for parent in links.values() if parent in numbers}

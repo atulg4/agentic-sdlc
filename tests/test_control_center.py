@@ -2987,6 +2987,46 @@ def test_approval_proof_does_not_retire_a_released_spec_label_loss():
     assert snapshot.get("forge").incidents == ()
 
 
+def test_a_malformed_parents_map_is_a_controlled_error():
+    # Key equality would let {True: 2} or {1.0: 2} attach the real issue #1.
+    for bad_map in ({True: 2}, {1.0: 2}, {0: 2}, {1: True}, {1: 0}):
+        with pytest.raises(ControlCenterError, match="parents map"):
+            backlog_document_from_issues(
+                [_issue(1, "child"), _issue(2, "parent")],
+                project_id="forge",
+                repository="acme/forge",
+                parents=bad_map,
+            )
+
+
+def test_crossed_gate_evidence_survives_a_later_pre_gate_state():
+    # approved -> dispatched -> blocked: the unit sits in a state reachable
+    # before dispatch, but its durable transitions prove dispatch fired, so
+    # the stale label incident must still retire.
+    stale = _incident(
+        incidentId="acme/forge#7:blocked-labels",
+        kind="dispatch-blocked",
+        severity="blocker",
+        backlogItemId="acme/forge#7",
+    )
+    ledger = _ledger(
+        *_chain(
+            TO_PLANNED + ("approved", "dispatched", "blocked"),
+            workUnit={"projectId": "forge", "workUnitId": "wu-1", "issueRef": "acme/forge#7"},
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        backlog=load_backlog_document(
+            _document(_backlog(itemId="acme/forge#7", issueRef="acme/forge#7"))
+        ),
+        incidents=load_incident_document(_incidents(stale)),
+    )
+    assert snapshot.get("forge").incidents == ()
+
+
 def test_a_malformed_declared_parent_is_a_controlled_error():
     for bad in (True, 0, -2):
         with pytest.raises(ControlCenterError, match="declared parent number"):

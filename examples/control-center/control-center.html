@@ -361,7 +361,10 @@
         (error) => {
           // A terminated subscription must be visible: the last snapshot
           // stays rendered, but operators are told updates stopped rather
-          // than left acting on stale data that still looks live.
+          // than left acting on stale data that still looks live. Bumping
+          // the counter also invalidates any digest verification still in
+          // flight, so a pending delivery cannot adopt and clear this error.
+          deliveries += 1;
           state.error = "Live snapshot updates stopped (" + describe(error)
             + "). Showing the last loaded snapshot; reload the page to reconnect.";
           render();
