@@ -92,10 +92,13 @@ be read, a name missing at repository scope is a WARN to confirm, not a failure.
 
 The `route` row is the generated `.forge/executors.json`: every executor the router can select for
 an implementation run needs its provider key and its `configured-by-NAME` model variable, because
-the router falls back across them after a recoverable failure (the preflight also insists on both
-DeepSeek model variables). Trimming executors from the registry, or providers from
-`.forge/routing-policy.json`, drops their rows; an executor with `authMode: "api-key"` on the
-`anthropic` provider needs `ANTHROPIC_API_KEY` instead of the OAuth token.
+the router falls back across them after a recoverable failure. Trimming executors from the
+registry, or providers from `.forge/routing-policy.json`, drops their rows: `doctor` derives this
+row from the router run over the installed registry and policy, and the generated `route`
+preflight checks only the Publisher App, never a provider's credentials (it cannot run the
+router, so a hard-coded provider would fail every run of a registry without it). An executor
+with `authMode: "api-key"` on the `anthropic` provider needs `ANTHROPIC_API_KEY` instead of the
+OAuth token.
 
 ### Fork-exposed repositories and self-hosted runners
 

@@ -109,13 +109,21 @@ _PYTHON_VERSION = re.compile(r"^\d+\.\d+(?:\.\d+)?$")
 _VERSION_PROBE = "import sys; print('%d.%d.%d' % sys.version_info[:3])"
 
 
-def gate_python_version(environment: dict[str, str], root: Path) -> tuple[str, str]:
-    """(path, `X.Y.Z`) of the `python3` the gates run: the first on the gate environment's PATH,
-    asked for its version in that same environment. GateError when there is none or it does not
-    answer as a Python."""
-    found = shutil.which("python3", path=environment.get("PATH", os.defpath))
+#: The interpreter names a gate command line may invoke: onboard's default setup and quality
+#: commands call `python`, the policy engine and many hand-written commands `python3`, and the
+#: two can be different installations on one PATH (Codex 4246082577).
+GATE_PYTHON_NAMES = ("python3", "python")
+
+
+def gate_python_version(
+    environment: dict[str, str], root: Path, name: str = "python3"
+) -> tuple[str, str]:
+    """(path, `X.Y.Z`) of the `name` interpreter the gates run: the first on the gate
+    environment's PATH, asked for its version in that same environment. GateError when there is
+    none or it does not answer as a Python."""
+    found = shutil.which(name, path=environment.get("PATH", os.defpath))
     if not found:
-        raise GateError("no python3 on the verification gates' PATH")
+        raise GateError(f"no {name} on the verification gates' PATH")
     try:
         probe = subprocess.run(
             [found, "-I", "-c", _VERSION_PROBE],
@@ -138,29 +146,47 @@ def gate_python_version(environment: dict[str, str], root: Path) -> tuple[str, s
 def check_gate_python(
     python_version: str | None, environment: dict[str, str], root: Path
 ) -> str | None:
-    """A warning (never a failure) when the `python3` the gates will run is not the policy's
-    `[ci] python_version` (major.minor) -- the interpreter the repository's own ci.yml installs
-    with setup-python (Codex 4243659485) -- or when it cannot be read, or the policy sets no
-    version. None when they match."""
-    try:
-        found, version = gate_python_version(environment, root)
-    except GateError as error:
+    """A warning (never a failure) when an interpreter the gates may run -- `python3` or
+    `python`, each the first on the gate PATH -- is not the policy's `[ci] python_version`
+    (major.minor), the interpreter the repository's own ci.yml installs with setup-python (Codex
+    4243659485, 4246082577); when the two names resolve to different versions; when neither
+    can be read; or when the policy sets no version. None when every one found matches.
+
+    A name absent from the PATH is not reported on its own: a gate that invokes it fails
+    outright, which needs no warning."""
+    found: list[tuple[str, str]] = []
+    errors: list[str] = []
+    for name in GATE_PYTHON_NAMES:
+        try:
+            found.append(gate_python_version(environment, root, name))
+        except GateError as error:
+            if shutil.which(name, path=environment.get("PATH", os.defpath)):
+                errors.append(str(error))  # present but unreadable: say so
+    if not found:
+        error = "; ".join(errors) or (
+            "no " + " or ".join(GATE_PYTHON_NAMES) + " on the verification gates' PATH"
+        )
         if python_version is None:
             return f"[ci] python_version is not set ({error})"
         return f"cannot confirm the gates run under Python {python_version}: {error}"
+    running = ", ".join(f"{path} (Python {version})" for path, version in found)
     if python_version is None:
         return (
-            f"[ci] python_version is not set; the gates run under {found} (Python {version}), "
-            "which nothing checks against the interpreter CI installs"
+            f"[ci] python_version is not set; the gates run under {running}, which nothing "
+            "checks against the interpreter CI installs"
         )
     wanted = python_version.split(".")[:2]
-    if version.split(".")[:2] != wanted:
+    off = [(path, version) for path, version in found if version.split(".")[:2] != wanted]
+    if off:
         return (
-            f"the verification gates run under {found} (Python {version}), but the "
-            f"policy's [ci] python_version is {python_version}: results may differ from CI; "
-            f"install Python {'.'.join(wanted)} (actions/setup-python) before run-gates, or "
-            "change [ci] python_version"
+            "the verification gates run under "
+            + ", ".join(f"{path} (Python {version})" for path, version in off)
+            + f", but the policy's [ci] python_version is {python_version}: results may differ "
+            f"from CI; install Python {'.'.join(wanted)} (actions/setup-python) before run-gates "
+            "so that both python3 and python resolve to it, or change [ci] python_version"
         )
+    if errors:
+        return f"cannot confirm the gates run under Python {python_version}: " + "; ".join(errors)
     return None
 
 

@@ -1021,7 +1021,11 @@ jobs:
     timeout-minutes: 5
     permissions: {}
     steps:
-      # prepare uploads both before it claims: without them, no claim was ever posted.
+      # prepare uploads both before claim-start, so for every run this job admits (a claim
+      # output of started, claimed, or empty from a lost runner) the material was uploaded or
+      # the claim was never posted. A failed restore is therefore NOT proof that nothing was
+      # claimed (Codex 4246082563): retry once, and if it still fails, fail this job -- red and
+      # re-runnable -- rather than succeed with the lease held until its TTL.
       - name: Restore pinned policy engine
         id: engine
         continue-on-error: true
@@ -1036,19 +1040,42 @@ jobs:
         with:
           name: lease-policy-${{ github.run_id }}
           path: ${{ runner.temp }}/lease/policy
-      - name: Nothing to release (prepare stopped before it could claim)
+      - name: Wait before retrying a failed restore
         if: steps.engine.outcome != 'success' || steps.lease-policy.outcome != 'success'
-        run: printf 'prepare uploaded no lease material, so it never claimed the issue.\n'
+        run: sleep 15
+      - name: Retry restoring pinned policy engine
+        id: engine-retry
+        if: steps.engine.outcome != 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: policy-engine-${{ github.run_id }}
+          path: ${{ runner.temp }}/lease/engine/agentic_sdlc
+      - name: Retry restoring lease policy
+        id: lease-policy-retry
+        if: steps.lease-policy.outcome != 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: lease-policy-${{ github.run_id }}
+          path: ${{ runner.temp }}/lease/policy
+      - name: Fail if the lease material could not be restored (the claim may be held)
+        if: >-
+          (steps.engine.outcome != 'success' && steps.engine-retry.outcome != 'success') ||
+          (steps.lease-policy.outcome != 'success' && steps.lease-policy-retry.outcome != 'success')
+        env:
+          CLAIM: ${{ needs.prepare.outputs.claim }}
+        run: |
+          printf '::error::Could not restore the lease material prepare uploaded (claim state: %s). The issue lease may still be held by this run; re-run this job to release it, or it expires at its TTL.\n' "${CLAIM:-unknown, runner lost}"
+          exit 1
       - name: Create short-lived issue-lease token (publisher App, issues only)
         id: lease-token
-        if: steps.engine.outcome == 'success' && steps.lease-policy.outcome == 'success'
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
           client-id: ${{ inputs.publisher_app_client_id }}
           private-key: ${{ secrets.PUBLISHER_APP_PRIVATE_KEY }}
           permission-issues: write
       - name: Release the issue lease so another agent can retry
-        if: steps.engine.outcome == 'success' && steps.lease-policy.outcome == 'success'
         env:
           GH_TOKEN: ${{ steps.lease-token.outputs.token }}
           ISSUE_NUMBER: ${{ inputs.issue_number }}

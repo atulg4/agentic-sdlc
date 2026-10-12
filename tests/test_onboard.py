@@ -322,6 +322,55 @@ def test_claude_implementer_has_no_routing_files_or_deepseek_preflight():
     assert "[routing]" not in files["agentic-sdlc.toml"]
 
 
+def test_routed_preflight_checks_no_provider_credential():
+    """Codex 4246082570: which providers the router can select depends on the INSTALLED registry
+    and routing policy, which the owner may trim; the caller's preflight cannot run the router,
+    so it checks only the Publisher App -- never a hard-coded provider."""
+    for name in ("agent-implement.yml", "agent-auto-implement.yml"):
+        doc = yaml.safe_load(render_onboarding(spec())[f".github/workflows/{name}"])
+        run = doc["jobs"]["preflight"]["steps"][0]["run"]
+        checked = re.findall(r'test -n "\$([A-Z0-9_]+)"', run)
+        assert checked == ["PUBLISHER_APP_CLIENT_ID", "PUBLISHER_APP_PRIVATE_KEY"], name
+
+
+def test_doctor_requires_only_the_credentials_a_trimmed_registry_can_select(tmp_path):
+    """Codex 4246082570: with DeepSeek trimmed from the registry and the routing policy, doctor
+    (which reads the preflight's `test -n` lines as requirements, and the router's selectable
+    executors) demands no DeepSeek credential -- and still demands the remaining providers'."""
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    registry_path = repo / ".forge/executors.json"
+    registry = json.loads(registry_path.read_text())
+    registry["executors"] = [e for e in registry["executors"] if e["provider"] != "deepseek"]
+    registry_path.write_text(json.dumps(registry, indent=2) + "\n")
+    policy_path = repo / ".forge/routing-policy.json"
+    policy = json.loads(policy_path.read_text())
+    policy["allowedProviders"] = [p for p in policy["allowedProviders"] if p != "deepseek"]
+    policy["preferredModelAliases"] = {
+        key: [alias for alias in aliases if not alias.startswith("deepseek")]
+        for key, aliases in policy["preferredModelAliases"].items()
+    }
+    policy_path.write_text(json.dumps(policy, indent=2) + "\n")
+    gh = _healthy_gh()
+    gh.answers["api repos/owner/comic/actions/variables"] = _var_pages(
+        "PUBLISHER_APP_CLIENT_ID", "ZAI_MODEL_GLM", "KIMI_MODEL_K3"
+    )
+    gh.answers["api repos/owner/comic/actions/secrets"] = _secret_pages(
+        "PUBLISHER_APP_PRIVATE_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ZAI_API_KEY", "KIMI_API_KEY"
+    )
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    assert report.ok, report.render()
+    rendered = report.render()
+    assert "DEEPSEEK" not in rendered
+    # the providers the trimmed registry still routes to remain required
+    gh.answers["api repos/owner/comic/actions/secrets"] = _secret_pages(
+        "PUBLISHER_APP_PRIVATE_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ZAI_API_KEY"
+    )
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", gh)
+    secrets = next(c for c in report.checks if c.name == "repo secrets set (by name)")
+    assert not secrets.ok and "KIMI_API_KEY" in secrets.detail
+
+
 def test_policy_loads_and_carries_commands_and_paths(tmp_path):
     files = render_onboarding(spec())
     path = tmp_path / "agentic-sdlc.toml"
@@ -2851,6 +2900,50 @@ def test_ruleset_update_merges_forge_rules_without_weakening_existing_ones():
     assert body["bypass_actors"] == []
     # a stricter Forge-free count on a fresh merge never drops below the existing one
     assert merged_ruleset(body, spec()) == body
+
+
+def test_ruleset_update_keeps_repeated_rules_of_one_type():
+    """GitHub permits repeated restrictions of one type (Codex 4246082551): two
+    `commit_message_pattern` rules are two patterns, and folding them by type kept the first
+    operator/pattern and silently deleted the second. Every existing rule survives as its own
+    entry, and a Forge-owned type that repeats gets Forge's floor merged into each one."""
+    from agentic_sdlc.onboard import merged_ruleset
+
+    pattern_a = {"operator": "starts_with", "pattern": "feat", "negate": False}
+    pattern_b = {"operator": "regex", "pattern": "JIRA-[0-9]+", "negate": False}
+    actual = json.loads(json.dumps(ruleset_payload(spec())))
+    actual["rules"] = [
+        {"type": "commit_message_pattern", "parameters": dict(pattern_a)},
+        {"type": "deletion"},
+        {"type": "commit_message_pattern", "parameters": dict(pattern_b)},
+        {"type": "file_path_restriction", "parameters": {"restricted_file_paths": ["a/**"]}},
+        {"type": "file_path_restriction", "parameters": {"restricted_file_paths": ["b/**"]}},
+        {"type": "pull_request", "parameters": {"required_approving_review_count": 2}},
+        {"type": "pull_request", "parameters": {"require_code_owner_review": True}},
+    ]
+    merged = merged_ruleset(actual, spec())
+    rules = merged["rules"]
+    assert [r["parameters"] for r in rules if r["type"] == "commit_message_pattern"] == [
+        pattern_a,
+        pattern_b,
+    ]
+    assert [
+        r["parameters"]["restricted_file_paths"]
+        for r in rules
+        if r["type"] == "file_path_restriction"
+    ] == [["a/**"], ["b/**"]]
+    prs = [r["parameters"] for r in rules if r["type"] == "pull_request"]
+    assert len(prs) == 2
+    assert prs[0]["required_approving_review_count"] == 2
+    assert prs[1]["require_code_owner_review"] is True
+    for pr in prs:  # Forge's floor reaches every rule of a type it owns
+        assert pr["required_review_thread_resolution"] is True
+        assert pr["dismiss_stale_reviews_on_push"] is True
+    # existing order kept, Forge's missing types appended once
+    assert [r["type"] for r in rules[:7]] == [r["type"] for r in actual["rules"]]
+    assert [r["type"] for r in rules[7:]] == ["non_fast_forward", "required_status_checks"]
+    assert ruleset_mismatches(merged, spec()) == []
+    assert merged_ruleset(merged, spec()) == merged  # idempotent: no growth on re-apply
 
 
 def test_ruleset_rejects_and_rebinds_a_foreign_integration_on_the_test_check():

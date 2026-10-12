@@ -1760,13 +1760,15 @@ def _render_workflow(name: str, spec: OnboardSpec, issue_expr: str | None = None
     text = _resource(f"github/forge/{name}")
     if "IMPLEMENT_JOBS" in text:
         jobs = _resource("github/forge/_implement-jobs.yml")
+        # Route mode checks no provider credential here (Codex 4246082570): which providers
+        # the router can select is a function of the INSTALLED `.forge/executors.json` and
+        # routing policy, which the owner may trim, and this caller cannot run the router. A
+        # hard-coded DeepSeek check failed every run of a registry without DeepSeek, and doctor
+        # (which reads these `test -n` lines as requirements) demanded its credentials. Doctor
+        # derives the routed requirements from the router itself; the adapter refuses a missing
+        # key of the executor it is handed.
         extra = ""
-        if spec.routed:
-            extra = (
-                '          test -n "$DEEPSEEK_API_KEY"\n          test -n "$DEEPSEEK_MODEL_FLASH"\n'
-                '          test -n "$DEEPSEEK_MODEL_PRO"\n'
-            )
-        elif spec.implementer == "claude":
+        if spec.implementer == "claude":
             extra = '          test -n "$CLAUDE_CODE_OAUTH_TOKEN"\n'
         elif spec.implementer == "codex":
             extra = '          test -n "$OPENAI_API_KEY"\n'
@@ -2559,9 +2561,10 @@ def merged_ruleset(actual: dict, spec: OnboardSpec) -> dict:
     """The PUT body that makes an existing `Protect main` ruleset enforce Forge's requirements
     while keeping every stronger control it already has.
 
-    Every existing rule is kept (required signatures, linear history, code scanning, ...); a rule
-    Forge also sets is merged parameter by parameter (`_merge_rule_parameters`); a Forge rule it
-    lacks is added. Forge's own requirements win where they are the stricter side: enforcement
+    Every existing rule is kept, repeated rules of one type included (required signatures, linear
+    history, several commit-message patterns, ...); a rule type Forge also sets is merged
+    parameter by parameter (`_merge_rule_parameters`) into each rule of that type; a Forge rule
+    it lacks is added. Forge's own requirements win where they are the stricter side: enforcement
     active, no bypass actors, the default branch included and nothing excluded.
     """
     want = ruleset_payload(spec)
@@ -2579,30 +2582,25 @@ def merged_ruleset(actual: dict, spec: OnboardSpec) -> dict:
         include.append("~DEFAULT_BRANCH")
     conditions["ref_name"] = {**ref_name, "include": include, "exclude": []}
     out["conditions"] = conditions
-    rules: list[dict] = []
-    index: dict[str, int] = {}
-    for rule in actual.get("rules") or []:
-        if not isinstance(rule, dict):
-            continue
-        kind = str(rule.get("type"))
-        if kind in index:  # a duplicate type: fold it into the first, keeping the stricter
-            first = rules[index[kind]]
-            first["parameters"] = _merge_rule_parameters(
-                first.get("parameters") or {}, rule.get("parameters") or {}
-            )
-            continue
-        index[kind] = len(rules)
-        rules.append(json.loads(json.dumps(rule)))
+    # Every existing rule is kept as its own entry, in order. GitHub permits repeated rules of
+    # one type (two `commit_message_pattern`s, two `file_path_restriction`s, ...), each its own
+    # restriction: folding them by type would keep one pattern/operator and silently delete the
+    # rest (Codex 4246082551). Only the rule types Forge's payload sets are touched: Forge's
+    # parameters are merged into EVERY existing rule of that type, so whichever one GitHub
+    # evaluates meets Forge's floor, and a type none of them has is appended.
+    rules = [
+        json.loads(json.dumps(rule)) for rule in actual.get("rules") or [] if isinstance(rule, dict)
+    ]
     for rule in want["rules"]:
         kind = rule["type"]
-        if kind not in index:
-            index[kind] = len(rules)
+        same = [r for r in rules if str(r.get("type")) == kind]
+        if not same:
             rules.append(json.loads(json.dumps(rule)))
         elif "parameters" in rule:
-            current = rules[index[kind]]
-            current["parameters"] = _merge_rule_parameters(
-                current.get("parameters") or {}, rule["parameters"]
-            )
+            for current in same:
+                current["parameters"] = _merge_rule_parameters(
+                    current.get("parameters") or {}, rule["parameters"]
+                )
     out["rules"] = rules
     return out
 

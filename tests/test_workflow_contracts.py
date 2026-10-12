@@ -432,13 +432,47 @@ def test_failure_cleanup_covers_every_claimed_run_on_an_independent_runner() -> 
     assert lease_input["default"] == '"ubuntu-latest"' and lease_input["required"] is False
     steps = cleanup["steps"]
     restores = [s for s in steps if str(s.get("uses", "")).startswith("actions/download-artifact")]
-    assert len(restores) == 2 and all(s["continue-on-error"] is True for s in restores)
-    gated = "steps.engine.outcome == 'success' && steps.lease-policy.outcome == 'success'"
+    assert len(restores) == 4 and all(s["continue-on-error"] is True for s in restores)
     token = next(s for s in steps if s.get("id") == "lease-token")
     release = next(s for s in steps if "agentic_sdlc release" in str(s.get("run")))
-    assert token["if"] == gated and release["if"] == gated
+    # the token and the release run unless an earlier step failed the job: no condition of
+    # their own that could turn a failed restore into a silent skip
+    assert "if" not in token and "if" not in release
     assert release["env"]["PR_URL"] == "${{ needs.publish_draft.outputs.pr_url }}"
     assert "|| true" not in release["run"] and "continue-on-error" not in release
+
+
+def test_failure_cleanup_fails_red_when_the_lease_material_cannot_be_restored() -> None:
+    """Codex 4246082563: the job only runs when prepare's claim may have been posted (started,
+    claimed, or empty from a lost runner), and prepare uploads both artifacts before that, so
+    a failed download is not proof that nothing was claimed. It retries each download once,
+    then FAILS the job (red, re-runnable) instead of succeeding with the lease held to TTL."""
+    cleanup = _workflow()["jobs"]["release_lease_on_failure"]
+    steps = cleanup["steps"]
+    assert not any("Nothing to release" in str(s.get("name")) for s in steps)
+    by_id = {s.get("id"): i for i, s in enumerate(steps) if s.get("id")}
+    for first, retry, artifact in (
+        ("engine", "engine-retry", "policy-engine-"),
+        ("lease-policy", "lease-policy-retry", "lease-policy-"),
+    ):
+        assert by_id[first] < by_id[retry]
+        assert steps[by_id[retry]]["if"] == f"steps.{first}.outcome != 'success'"
+        assert steps[by_id[retry]]["with"] == steps[by_id[first]]["with"]
+        assert artifact in steps[by_id[retry]]["with"]["name"]
+    fail = _named(steps, "Fail if the lease material could not be restored")
+    condition = " ".join(steps[fail]["if"].split())
+    assert condition == (
+        "(steps.engine.outcome != 'success' && steps.engine-retry.outcome != 'success') || "
+        "(steps.lease-policy.outcome != 'success' && "
+        "steps.lease-policy-retry.outcome != 'success')"
+    )
+    assert "continue-on-error" not in steps[fail]
+    assert steps[fail]["run"].rstrip().endswith("exit 1")
+    assert steps[fail]["env"]["CLAIM"] == "${{ needs.prepare.outputs.claim }}"
+    assert by_id["lease-policy-retry"] < fail < by_id["lease-token"]
+    # a genuinely pre-upload stop never reaches this job: the job condition excludes it
+    condition = " ".join(cleanup["if"].split())
+    assert "needs.prepare.outputs.claim != 'not-started'" in condition
 
 
 def test_verify_installs_the_policys_ci_python_before_the_gates() -> None:
