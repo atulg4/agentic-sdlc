@@ -2282,7 +2282,15 @@ def test_the_config_must_belong_to_the_exported_repository(tmp_path):
     gitlab = write_config(tmp_path / "gitlab.toml", project="acme/forge", provider="gitlab")
     assert run(gitlab) == 2
     matching = write_config(tmp_path / "match.toml", project="ACME/forge", provider="github")
+    issues.write_text(
+        json.dumps([{"number": 1, "title": "spelled", "state": "open", "labels": []}]),
+        encoding="utf-8",
+    )
     assert run(matching) == 0
+    # The policy's spelling is canonical: a case-differing --repository must
+    # not leak into references, or ledger joins by exact string would miss.
+    written = json.loads((tmp_path / "backlog.json").read_text(encoding="utf-8"))
+    assert written["items"][0]["itemId"] == "ACME/forge#1"
 
 
 def test_staged_replacement_preserves_destination_mode(tmp_path):
