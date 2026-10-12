@@ -6620,10 +6620,12 @@ _SHELL_EXPANSION_CHARS = set("$`{}*?[]")
 
 #: Builtins that change shell options themselves, or run a handler string that may.
 _SHELL_OPTION_COMMANDS = {"set", "shopt", "trap", "enable"}
-#: Whole words that name an option-changing builtin or one of the tracked options.
+#: Whole words that name an option-changing builtin, wherever they sit in a command.
 #: `trap` behind a redirection (Codex 4251826068); `enable` can disable the `command`/`builtin`
 #: wrappers a later `set` relies on (Codex 4251826084).
-_SHELL_OPTION_WORDS = {"set", "shopt", "trap", "enable", "pipefail", "errexit"}
+#: Option names themselves are NOT here: `pytest -k pipefail` names one inertly (Codex
+#: 4252316092); a `set`/`shopt` call that spells one is caught by its builtin's name.
+_SHELL_OPTION_WORDS = {"set", "shopt", "trap", "enable"}
 
 
 def _may_change_shell_options(argv: list[str]) -> bool:
@@ -6883,6 +6885,26 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                 elif argv[0] == "eval":
                     out.evals = True
                 invocation = _set_invocation(tuple(argv))
+                # Whether this command may run in the parent shell at all: not piped,
+                # backgrounded or in a subshell (Codex 4252316098: `set -n | cat` leaves the
+                # parent running).
+                may_run_in_parent = (
+                    not started_in_subshell
+                    and not any("(" in word or ")" in word for word in argv)
+                    and previous not in {"|", "|&"}
+                    and following not in {"|", "|&", "&"}
+                )
+                if (
+                    invocation is not None
+                    and may_run_in_parent
+                    and (
+                        _set_enables_noexec(invocation[0])
+                        # `set -$x` may expand to `-n` (Codex 4252316079).
+                        or any(set(w) & _SHELL_EXPANSION_CHARS for w in invocation[0])
+                    )
+                ):
+                    # `set -n` reads the rest without running it (Codex 4252099381).
+                    terminated = True
                 if invocation is not None and not invocation[1]:
                     invocation = None  # `command -v set ...`: not a call we can read
                 if invocation is not None and wrappers_untrusted and argv[0] in _BUILTIN_WRAPPERS:
@@ -6927,9 +6949,6 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                         and following not in {"|", "|&", "&", "||"}
                     )
                     changes, trusted = _set_options(arguments)
-                    if _set_enables_noexec(arguments):
-                        # `set -n` reads the rest without running it (Codex 4252099381).
-                        terminated = True
                     for option, on in changes.items():
                         if on and not (in_parent and trusted):
                             continue
@@ -6988,7 +7007,8 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
     for r in reversed(records):
         if r["following"] == "&":
             background = True
-        elif r["following"] not in {"|", "|&"}:
+        elif r["following"] not in {"|", "|&", "&&", "||"}:
+            # `a && b &` backgrounds the whole and-or list (Codex 4252316108).
             background = False
         r["background"] = background
     for index, r in enumerate(records):

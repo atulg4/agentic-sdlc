@@ -2384,6 +2384,12 @@ def test_doctor_rejects_a_ci_gate_whose_failure_is_ignored(tmp_path, mutate):
         # `set -n` reads the rest without running it (Codex 4252099381).
         ("set -n; pytest", "bash", False),
         ("set -o noexec; pytest", "bash", False),
+        # `set -$x` may expand to `-n` (Codex 4252316079); `set -n | cat` runs in a child and
+        # leaves the parent running (Codex 4252316098).
+        ("x=n; set -$x; pytest", "bash", False),
+        ("set -n | cat; pytest", "bash", True),
+        # `a && b &` backgrounds the whole and-or list (Codex 4252316108).
+        ("true; pytest && true &", "bash", False),
         ("set -o pipefail; echo ok; pytest | tee out", None, True),
         # `o` anywhere in a cluster takes the option name (Codex 4251046345).
         ("set +ou pipefail; pytest | tee out", "bash", False),
@@ -2474,6 +2480,14 @@ def test_doctor_accepts_a_piped_gate_naming_an_option_in_a_path(tmp_path):
     # Codex 4251422319: a word that merely CONTAINS `pipefail` changes no shell option.
     repo = _repo(tmp_path)
     write_onboarding(repo, spec(test_command="pytest tests/test_pipefail.py | tee out.txt"))
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    assert "ci.yml runs the policy gates as 'test'" not in _failed(report)
+
+
+def test_doctor_accepts_a_piped_gate_with_an_option_name_as_an_argument(tmp_path):
+    # Codex 4252316092: `-k pipefail` is pytest's selector, not a shell option change.
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(test_command="pytest -k pipefail | tee out.txt"))
     report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
     assert "ci.yml runs the policy gates as 'test'" not in _failed(report)
 
