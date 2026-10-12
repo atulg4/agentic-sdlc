@@ -414,7 +414,9 @@
         ? ""
         : "The snapshot's content does not match its snapshotSha256 digest; it was edited or truncated.";
     } catch {
-      return "";
+      // Fail closed: a digest this view cannot compute is a digest it cannot
+      // trust, exactly like a view with no SubtleCrypto at all.
+      return "This view cannot verify the snapshot's digest, so it will not adopt it.";
     }
   }
 

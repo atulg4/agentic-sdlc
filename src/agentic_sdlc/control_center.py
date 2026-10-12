@@ -439,6 +439,14 @@ REMEDIATION_CATALOGUE: Mapping[str, tuple[RemediationAction, ...]] = {
             _AGENT,
         ),
     ),
+    "branch-behind": (
+        _action(
+            "update-change-request-branch",
+            "Update the change request branch",
+            "Bring the base branch into the change request so checks run against the current base.",
+            _AGENT,
+        ),
+    ),
     "dependency-wait": (
         _action(
             "inspect-work-graph",
