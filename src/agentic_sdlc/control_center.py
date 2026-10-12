@@ -1143,9 +1143,16 @@ def _resolve_state(
     state apply, and with no evidence at all the state is *unknown*.
     """
 
-    if item.work_unit_id and item.work_unit_id in statuses:
-        status = statuses[item.work_unit_id]
-        return status.state.value, STATE_BASIS_LEDGER, status
+    if item.work_unit_id:
+        status = statuses.get(item.work_unit_id)
+        if status is not None:
+            return status.state.value, STATE_BASIS_LEDGER, status
+        # An explicit work-unit reference is authoritative: when it resolves
+        # to nothing, the item must NOT fall through to the issue-reference
+        # join, which could silently adopt a DIFFERENT unit's progress.
+        if item.declared_state:
+            return item.declared_state, STATE_BASIS_DECLARED, None
+        return "unknown", STATE_BASIS_UNKNOWN, None
     if item.issue_ref and item.issue_ref in by_issue_ref:
         status = by_issue_ref[item.issue_ref]
         return status.state.value, STATE_BASIS_LEDGER, status
@@ -1196,6 +1203,10 @@ def _build_backlog_tree(
     orphans: set[str] = set()
     warnings: list[str] = []
     for item in items:
+        if item.work_unit_id and item.work_unit_id not in statuses:
+            warnings.append(
+                f"backlog item {item.item_id} names an unknown work unit: {item.work_unit_id}"
+            )
         if item.parent_id and item.parent_id in present:
             children.setdefault(item.parent_id, []).append(item)
             continue

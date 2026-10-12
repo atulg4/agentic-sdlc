@@ -1923,6 +1923,56 @@ def test_adapter_outputs_must_not_overwrite_inputs(tmp_path):
     assert json.loads(issues.read_text(encoding="utf-8")) == []
 
 
+def test_an_unresolved_explicit_work_unit_never_joins_by_issue_ref():
+    # The item names wu-missing; its issueRef matches a DIFFERENT, dispatched
+    # unit. The explicit reference is authoritative: the item keeps its
+    # declared state, warns about the unknown unit, and an incident linked
+    # only through the item is not retired on the unrelated unit's progress.
+    ledger = _ledger(
+        *_chain(
+            TO_IMPLEMENTING,
+            workUnit={"projectId": "forge", "workUnitId": "wu-1", "issueRef": "acme/forge#7"},
+        )
+    )
+    stale = _incident(
+        incidentId="acme/forge#7:blocked",
+        kind="dispatch-blocked",
+        severity="blocker",
+        backlogItemId="acme/forge#7",
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        backlog=load_backlog_document(
+            _document(
+                _backlog(
+                    itemId="acme/forge#7",
+                    workUnitId="wu-missing",
+                    issueRef="acme/forge#7",
+                    declaredState="approved",
+                )
+            )
+        ),
+        incidents=load_incident_document(_incidents(stale)),
+    )
+    view = snapshot.get("forge")
+    assert view.backlog[0].state == "approved"
+    assert view.backlog[0].state_basis == STATE_BASIS_DECLARED
+    assert any("names an unknown work unit: wu-missing" in warning for warning in view.warnings)
+    assert [item.incident_id for item in view.incidents] == ["acme/forge#7:blocked"]
+
+
+def test_an_unrecognized_mergeability_verdict_is_a_controlled_error():
+    with pytest.raises(ControlCenterError, match="unrecognized mergeable_state"):
+        incidents_from_change_requests(
+            [{"number": 1, "title": "odd", "state": "open", "mergeable_state": "typo"}],
+            project_id="forge",
+            repository="acme/forge",
+            observed_at=NOW,
+        )
+
+
 def test_the_work_unit_id_contract_follows_the_ledger():
     # Version-1 ledgers accept any non-empty workUnitId with no length cap,
     # and existing ledgers already hold such ids, so the snapshot loaders
