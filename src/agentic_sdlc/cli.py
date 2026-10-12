@@ -54,6 +54,7 @@ from .git_diff import (
 from .github_backlog import (
     LifecycleLabels,
     backlog_document_from_issues,
+    canonical_repository,
     incident_document,
     incidents_from_change_requests,
     incidents_from_issues,
@@ -1179,6 +1180,9 @@ def _github_backlog(args: argparse.Namespace) -> int:
             implementation=policy.implementation_label,
         )
     issues = _record_array(_json_file(args.issues), "--issues", require_number=True)
+    # The payloads themselves carry the provider's canonical spelling: with or
+    # without a policy, the export must emit the strings ledger records join.
+    args.repository = canonical_repository(issues, args.repository)
     links = parent_links(
         *(_sub_issue_group(entry) for entry in args.sub_issues),
         repository=args.repository,

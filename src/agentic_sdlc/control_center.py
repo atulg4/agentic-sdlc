@@ -1381,7 +1381,11 @@ def build_control_center_snapshot(
             for item in items:
                 references.extend((item.item_id, item.issue_ref))
             for status in statuses.values():
-                references.extend((status.repository, status.issue_ref))
+                references.extend((status.repository, status.issue_ref, status.change_request_ref))
+            for incident in project_incidents:
+                references.extend(
+                    (incident.incident_id, incident.evidence_ref, incident.backlog_item_id)
+                )
             foreign: set[str] = set()
             for reference in references:
                 name = re.split(r"[#!]", reference, maxsplit=1)[0] if reference else ""
@@ -1417,13 +1421,33 @@ def build_control_center_snapshot(
                 # A state that does not imply the threshold (blocked,
                 # cancelled) retires nothing.
                 if incident.incident_id.endswith(":" + PLAN_EVIDENCE_RULE):
-                    proven_states = PLAN_PROVEN_STATES
-                    # planned/approval-pending retire only as CURRENT states:
-                    # a unit already past them (approved) still needs a fresh
-                    # label event, so from history only durable dispatch
-                    # evidence counts.
-                    history_states = DISPATCH_PROVEN_STATES
-                elif incident.incident_id.endswith(
+                    # Dispatch proof (current or historical) moots the plan
+                    # advisory entirely; proven approval replaces its guidance
+                    # with the implementation hold; otherwise planned or
+                    # approval-pending evidence, current or historical,
+                    # retires it (a plan provably ran even if the unit later
+                    # blocked).
+                    seen = proven.states_seen
+                    if proven.state in DISPATCH_PROVEN_STATES or seen & DISPATCH_PROVEN_STATES:
+                        continue
+                    if FactoryState.APPROVED in seen:
+                        retained.append(
+                            replace(
+                                incident,
+                                summary=(
+                                    "Plan and approval are proven by the ledger, but the "
+                                    "bundled implementation trigger fires only on the "
+                                    "implementation approval label event (implementation-"
+                                    "approved by default): apply it to dispatch"
+                                ),
+                            )
+                        )
+                        continue
+                    if proven.state in PLAN_PROVEN_STATES or seen & PLAN_PROVEN_STATES:
+                        continue
+                    retained.append(incident)
+                    continue
+                if incident.incident_id.endswith(
                     (":" + RELEASED_SPEC_RULE, ":" + SPEC_WITHOUT_APPROVAL_RULE)
                 ):
                     # These rules report missing dispatch labels, not only the
@@ -1439,26 +1463,6 @@ def build_control_center_snapshot(
                 # gate and later re-entered a pre-gate state (dispatched,
                 # then blocked) still proved the gate passed.
                 if proven.state in proven_states or proven.states_seen & history_states:
-                    continue
-                if (
-                    incident.incident_id.endswith(":" + PLAN_EVIDENCE_RULE)
-                    and FactoryState.APPROVED in proven.states_seen
-                ):
-                    # The advisory's plan instruction is stale once approval
-                    # is proven: planning completed, so the missing event is
-                    # the implementation approval label. Replace the guidance
-                    # rather than telling the operator to re-run planning.
-                    retained.append(
-                        replace(
-                            incident,
-                            summary=(
-                                "Plan and approval are proven by the ledger, but the "
-                                "bundled implementation trigger fires only on the "
-                                "implementation approval label event (implementation-"
-                                "approved by default): apply it to dispatch"
-                            ),
-                        )
-                    )
                     continue
             retained.append(incident)
         project_incidents = tuple(retained)
