@@ -321,7 +321,7 @@ jobs:
             exit 2
           fi
       - name: Store validated implementation request
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: implementation-input-${{ github.run_id }}
           path: |
@@ -335,7 +335,7 @@ jobs:
           include-hidden-files: true
           retention-days: 3
       - name: Store pinned policy engine for credential-free jobs
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: policy-engine-${{ github.run_id }}
           path: .agentic-platform/src/agentic_sdlc/
@@ -411,17 +411,17 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Restore validated request
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: implementation-input-${{ github.run_id }}
           path: .agentic-input
       - name: Restore pinned policy engine
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: policy-engine-${{ github.run_id }}
           path: .agentic-platform/src/agentic_sdlc
       - name: Restore route decision
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: implementation-input-${{ github.run_id }}
           path: .agentic-input
@@ -572,7 +572,7 @@ jobs:
             --output .agentic-output/manifest.json
           cp .agentic-input/agent-message.md .agentic-output/agent-message.md
       - name: Store untrusted generated patch
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: generated-patch-${{ github.run_id }}
           path: .agentic-output/
@@ -642,14 +642,14 @@ jobs:
           CONFIG_PATH: ${{ inputs.config_path }}
         run: cp -- "$CONFIG_PATH" "${RUNNER_TEMP}/trusted-policy.toml"
       - name: Restore pinned policy engine without repository credentials
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: policy-engine-${{ github.run_id }}
           path: .agentic-platform/src/agentic_sdlc
       - name: Exclude verifier material from diff
         run: printf '/.agentic-platform/\n' >> .git/info/exclude
       - name: Restore generated patch
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: generated-patch-${{ github.run_id }}
           path: ${{ runner.temp }}/generated-patch
@@ -788,14 +788,14 @@ jobs:
           CONFIG_PATH: ${{ inputs.config_path }}
         run: cp -- "$CONFIG_PATH" "${RUNNER_TEMP}/trusted-policy.toml"
       - name: Restore pinned policy engine without repository credentials
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: policy-engine-${{ github.run_id }}
           path: .agentic-platform/src/agentic_sdlc
       - name: Exclude attestation material from diff
         run: printf '/.agentic-platform/\n' >> .git/info/exclude
       - name: Restore original generated patch
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: generated-patch-${{ github.run_id }}
           path: ${{ runner.temp }}/generated-patch
@@ -836,7 +836,7 @@ jobs:
             --request-number "$ISSUE_NUMBER" \
             --output "${RUNNER_TEMP}/verified-patch/manifest.json"
       - name: Store patch from non-executing attestation job
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: verified-patch-${{ github.run_id }}
           path: ${{ runner.temp }}/verified-patch/
@@ -883,7 +883,7 @@ jobs:
           fetch-depth: 0
           token: ${{ github.token }}
       - name: Restore verified patch only
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: verified-patch-${{ github.run_id }}
           path: ${{ runner.temp }}/verified-patch
