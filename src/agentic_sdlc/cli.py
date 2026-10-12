@@ -21,6 +21,8 @@ from .capacity_metrics import (
 from .control_center import (
     ControlCenterError,
     build_control_center_snapshot,
+    load_backlog_document,
+    load_incident_document,
     read_control_center_inputs,
 )
 from .dashboard_efficiency import build_infrastructure_blocker_panel
@@ -602,18 +604,36 @@ def _github_backlog(args: argparse.Namespace) -> int:
         pulls = _json_file(args.pulls)
         if not isinstance(pulls, list):
             raise ControlCenterError("--pulls must hold a JSON array of change requests")
+        failing = _failing_checks(args.failing)
+        present = {
+            int(pull["number"])
+            for pull in pulls
+            if isinstance(pull, dict) and isinstance(pull.get("number"), int)
+        }
+        missing = sorted(set(failing) - present)
+        if missing:
+            raise ControlCenterError(
+                "--failing names change requests absent from --pulls: "
+                + ", ".join(str(number) for number in missing)
+            )
         groups.append(
             incidents_from_change_requests(
                 pulls,
                 project_id=args.project_id,
                 repository=args.repository,
                 observed_at=observed_at,
-                failing=_failing_checks(args.failing),
+                failing=failing,
             )
         )
+    # Round-trip the generated documents through their own loaders, so a bad
+    # input (e.g. a malformed --observed-at) fails the export here instead of
+    # the next command.
+    load_backlog_document(backlog)
     _write(backlog, args.backlog_output)
     if args.incidents_output:
-        _write(incident_document(*groups), args.incidents_output)
+        incidents_document = incident_document(*groups)
+        load_incident_document(incidents_document)
+        _write(incidents_document, args.incidents_output)
     return 0
 
 

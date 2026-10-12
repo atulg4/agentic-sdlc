@@ -407,18 +407,20 @@
         }
       }
       // Walk the backlog forest iteratively; depth stays bounded by the stack.
-      const stack = [...(project.backlog || [])];
+      const stack = (project.backlog || []).map((entry) => [entry, 1]);
       let visited = 0;
       while (stack.length) {
-        const node = stack.pop();
+        const [node, depth] = stack.pop();
+        if (depth > 32) return `${where} backlog nests deeper than 32 levels.`;
         if (!isObj(node) || typeof node.title !== "string") return `${where} has a malformed backlog node.`;
         for (const key of ["itemId", "kind", "state", "stateBasis", "url", "issueRef"]) {
           if (node[key] !== undefined && typeof node[key] !== "string") return `${where} backlog node field ${key} must be a string.`;
         }
+        if (node.url && !/^https:\/\//.test(node.url)) return `${where} backlog node ${node.itemId || ""} url must be https.`;
         if (node.children !== undefined && !Array.isArray(node.children)) return `${where} backlog node ${node.itemId || ""} children must be an array.`;
         visited += 1;
         if (visited > 10000) return `${where} backlog is too large or cyclic to render.`;
-        for (const child of node.children || []) stack.push(child);
+        for (const child of node.children || []) stack.push([child, depth + 1]);
       }
     }
     if (value.totals !== undefined && !isObj(value.totals)) return "totals must be an object.";
@@ -746,25 +748,18 @@
     return nodes;
   }
 
-  function noteIsStale(incident, note) {
-    // A note written before the incident's latest observation belongs to an
-    // earlier occurrence: a recurring incident reuses its stable id, and an
-    // old "resolved" must not dress up a blocker that is open again.
-    if (!note?.at || !incident.observedAt) return false;
-    const notedAt = Date.parse(note.at);
-    const observedAt = Date.parse(incident.observedAt);
-    return Number.isFinite(notedAt) && Number.isFinite(observedAt) && observedAt > notedAt;
-  }
-
   function incidentCard(incident, project) {
     const note = state.notes.get(incident.incidentId);
-    const stale = noteIsStale(incident, note);
+    // The incident being in the current snapshot already contradicts a
+    // "resolved" note, whatever the timestamps say: export times are not
+    // occurrence times, so no clock comparison decides this.
+    const contradicted = note?.status === "resolved";
     const card = el("div", { class: "inc " + (incident.severity || "advisory") },
       el("div", { class: "row" },
         chip(txt(incident.severity), SEVERITY[incident.severity] || "line"),
         chip(txt(project.displayName, project.projectId), "line"),
-        note?.status && !stale ? chip(note.status, note.status === "resolved" ? "ok" : "warn") : null,
-        note?.status && stale ? chip("recurred since note", "warn") : null,
+        note?.status && !contradicted ? chip(note.status, "warn") : null,
+        contradicted ? chip("noted resolved — still reported", "warn") : null,
       ),
       el("div", { style: "margin-top:7px; font-weight:560", text: txt(incident.summary) }),
       incident.detail ? el("div", { class: "small muted", style: "margin-top:3px", text: incident.detail }) : null,
@@ -775,7 +770,7 @@
       ),
     );
     for (const action of incident.remediations || []) card.append(remediationNode(action));
-    card.append(noteNode(incident, note, stale));
+    card.append(noteNode(incident, note, contradicted));
     return card;
   }
 
@@ -812,11 +807,11 @@
     );
   }
 
-  function noteNode(incident, note, stale) {
+  function noteNode(incident, note, contradicted) {
     const wrap = el("div", { style: "margin-top:9px" });
     if (note?.text) {
       wrap.append(el("div", { class: "small", text: note.text }));
-      wrap.append(el("div", { class: "tiny muted", style: "margin-top:3px", text: `noted ${txt(note.at, "")}${stale ? " — before this occurrence; record a fresh status" : ""}` }));
+      wrap.append(el("div", { class: "tiny muted", style: "margin-top:3px", text: `noted ${txt(note.at, "")}${contradicted ? " — the current snapshot still reports this; resolve it at the source or record a fresh status" : ""}` }));
     }
     if (!state.db) {
       wrap.append(el("div", { class: "tiny muted", text: "This view cannot record a remediation note." }));
