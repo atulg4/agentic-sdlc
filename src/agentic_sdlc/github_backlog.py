@@ -69,13 +69,13 @@ PULL_STATES = frozenset({"open", "closed"})
 ISSUE_STATES = PULL_STATES
 
 
-def _issue_state(issue: Mapping[str, Any]) -> str | None:
-    """The issue's state, or a controlled error for malformed provider data:
-    a non-string or unknown value must never silently classify as open."""
+def _issue_state(issue: Mapping[str, Any]) -> str:
+    """The issue's explicit state, or a controlled error: a record without
+    "open" or "closed" must never silently classify as open."""
 
     state = issue.get("state")
     _require(
-        state is None or (isinstance(state, str) and state in ISSUE_STATES),
+        isinstance(state, str) and state in ISSUE_STATES,
         f'issue {issue.get("number")}: state must be "open" or "closed"',
     )
     return state
@@ -248,6 +248,17 @@ def dispatch_rules(labels: LifecycleLabels = DEFAULT_LABELS) -> tuple[DispatchRu
             kind="dispatch-blocked",
             severity="degraded",
             summary=f"Labelled {ready} without {review}; both labels are required",
+        ),
+        # The symmetric loss: review-labelled work that lost (or never got)
+        # the ready label is just as stalled, because both bundled triggers
+        # require the pair. Spec-drafted items are the spec rules' concern.
+        DispatchRule(
+            rule_id="review-required-without-agent-ready",
+            required=frozenset({review}),
+            missing=frozenset({ready, approve, SPEC_DRAFTED_LABEL}),
+            kind="dispatch-blocked",
+            severity="degraded",
+            summary=f"Labelled {review} without {ready}; both bundled triggers require the pair",
         ),
         # With the ready label also present, the plan-ordering advisory below
         # is the actionable message, so this row yields to it.
@@ -493,11 +504,13 @@ def incidents_from_change_requests(
     incidents: list[dict[str, Any]] = []
     for pull in pulls:
         state_field = pull.get("state")
+        # The state must be explicit: without it the adapter has no evidence
+        # the change request is still open, so it never classifies one.
         _require(
-            state_field is None or (isinstance(state_field, str) and state_field in PULL_STATES),
+            isinstance(state_field, str) and state_field in PULL_STATES,
             f'change request {pull.get("number")}: state must be "open" or "closed"',
         )
-        if state_field is not None and state_field != "open":
+        if state_field != "open":
             # A merged or closed change request is not an open problem,
             # whatever its final mergeability read.
             continue
