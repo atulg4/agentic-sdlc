@@ -37,6 +37,7 @@ jobs:
       issues: write
     uses: atulg4/agentic-sdlc/.github/workflows/reusable-orchestrate.yml@PLATFORM_COMMIT_SHA
     with:
+      runs_on: ${{ toJSON(vars.FORGE_RUNNER || 'ubuntu-latest') }}
       unit_id: ${{ inputs.unit_id || github.event.issue.number }}
       action: ${{ inputs.action || (github.event.action == 'opened' && 'create' || 'transition') }}
       to_state: ${{ inputs.to_state || '' }}
