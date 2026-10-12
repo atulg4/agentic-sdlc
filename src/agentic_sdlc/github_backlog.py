@@ -374,7 +374,8 @@ def dispatch_rules(labels: LifecycleLabels = DEFAULT_LABELS) -> tuple[DispatchRu
             summary=(
                 "Both planning labels are present, but the bundled plan trigger fires "
                 f"only on the {ready} label event: confirm a plan run started, and "
-                f"re-apply {ready} to re-kick if none did"
+                f"re-apply {ready} to re-kick if none did; implementation dispatch "
+                f"then fires on the {approve} label event"
             ),
         ),
         DispatchRule(

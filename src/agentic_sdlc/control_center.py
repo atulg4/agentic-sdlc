@@ -65,9 +65,11 @@ MAX_INCIDENTS = 2000
 
 #: A tracker reference charset: ``owner/repo#123`` and ``owner/repo!123`` both
 #: fit, so a GitHub issue and a GitLab merge request need no re-encoding. The
+#: leading class matches the registry's repository grammar (GitLab allows
+#: ``_`` and ``.`` anywhere, so ``_group/repo#7`` is a real reference). The
 #: length budget covers GitHub's maxima (39-character owner, 100-character
 #: repository) plus an issue number and a rule suffix.
-_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/#!:-]{0,255}")
+_ID = re.compile(r"[A-Za-z0-9._-][A-Za-z0-9._/#!:-]{0,255}")
 #: A tracker reference that names a repository: an identifier of one or more
 #: slash-separated segments in the registry's own segment contract (GitLab
 #: nests groups and allows . and _ anywhere), followed by a MANDATORY #/! and
@@ -158,6 +160,34 @@ _LEDGER_RETIREMENT: Mapping[str, frozenset[FactoryState]] = {
     "awaiting-spec-review": DISPATCH_PROVEN_STATES,
     "awaiting-human-approval": APPROVAL_PROVEN_STATES,
 }
+
+#: States that prove a change request was merged: ``merged`` itself and every
+#: state only reachable after it. A rollback does not un-merge the change
+#: request, so the rollback states still carry the proof.
+MERGE_PROVEN_STATES = frozenset(
+    {
+        FactoryState.MERGED,
+        FactoryState.DEPLOYING,
+        FactoryState.DEPLOYMENT_VERIFYING,
+        FactoryState.LIVE,
+        FactoryState.ROLLING_BACK,
+        FactoryState.ROLLED_BACK,
+    }
+)
+
+#: Change-request-scoped incident kinds: each describes an obstacle to merging
+#: ONE change request (named by ``evidenceRef``), so durable ledger proof that
+#: the same change request merged moots the incident - a file exported before
+#: the merge, or racing it, must not tell the operator to merge again.
+_CHANGE_REQUEST_RETIREMENT = frozenset(
+    {
+        "awaiting-human-merge",
+        "merge-conflict",
+        "branch-behind",
+        "deterministic-ci-failed",
+        "unclassified",
+    }
+)
 
 #: States in which something is executing *right now*. Backlog-shaped states
 #: (intake through approved), queued ones (dispatched — a worker has not
@@ -1489,8 +1519,26 @@ def build_control_center_snapshot(
             _, basis, status = _resolve_state(item, statuses, by_issue_ref)
             if basis == STATE_BASIS_LEDGER and status is not None:
                 item_status[item.item_id] = status
+        # Change requests the ledger proves merged (scoped since the last
+        # lifecycle restart), keyed by the reference the adapter's incidents
+        # carry in evidenceRef.
+        merged_change_requests = {
+            status.change_request_ref
+            for status in statuses.values()
+            if status.change_request_ref
+            and (status.state in MERGE_PROVEN_STATES or status.states_seen & MERGE_PROVEN_STATES)
+        }
         retained: list[Incident] = []
         for incident in project_incidents:
+            # A change-request-scoped incident is moot once the ledger proves
+            # that same change request merged: an incident file exported
+            # before the merge (or racing it) must not tell the operator to
+            # merge, refresh, or fix what is already in the base branch.
+            if (
+                incident.kind in _CHANGE_REQUEST_RETIREMENT
+                and incident.evidence_ref in merged_change_requests
+            ):
+                continue
             # A named work unit is direct ledger evidence; the backlog-item
             # join applies ONLY when no unit is named, so an incident naming
             # an unknown unit is never retired on some other unit's proof.
@@ -1518,7 +1566,10 @@ def build_control_center_snapshot(
                     if FactoryState.APPROVED in seen:
                         # Not an advisory any more: approval is proven and
                         # dispatch cannot occur without the label event, so
-                        # the incident becomes a dispatch blocker.
+                        # the incident becomes a dispatch blocker. The hold's
+                        # own summary names the CONFIGURED labels (a policy
+                        # may rename them), so it is quoted rather than
+                        # replaced with default names.
                         retained.append(
                             replace(
                                 incident,
@@ -1526,9 +1577,10 @@ def build_control_center_snapshot(
                                 severity=IncidentSeverity.BLOCKER,
                                 summary=(
                                     "Plan and approval are proven by the ledger, but the "
-                                    "bundled implementation trigger fires only on the "
-                                    "implementation approval label event (implementation-"
-                                    "approved by default): apply it to dispatch"
+                                    "bundled implementation trigger fires only on its "
+                                    f"label event. The hold said: {incident.summary} - "
+                                    "re-apply the implementation approval label it names "
+                                    "to dispatch"
                                 ),
                             )
                         )
