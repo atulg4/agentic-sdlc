@@ -2085,6 +2085,63 @@ def test_an_absent_draft_verdict_is_a_controlled_error():
             )
 
 
+def test_a_hard_linked_output_alias_is_rejected(tmp_path):
+    # A different pathname hard-linked to an input shares its inode; writing
+    # through it would replace the input document itself.
+    import os
+
+    from agentic_sdlc.cli import main as cli_main
+
+    issues = tmp_path / "issues.json"
+    issues.write_text(json.dumps([]), encoding="utf-8")
+    alias = tmp_path / "innocent-output.json"
+    os.link(issues, alias)
+    assert (
+        cli_main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+                "--backlog-output",
+                str(alias),
+            ]
+        )
+        == 2
+    )
+    assert json.loads(issues.read_text(encoding="utf-8")) == []
+    backlog = tmp_path / "backlog.json"
+    backlog.write_text(
+        json.dumps({"schemaVersion": 1, "items": [], "source": "github-issues"}),
+        encoding="utf-8",
+    )
+    snapshot_alias = tmp_path / "snapshot.json"
+    os.link(backlog, snapshot_alias)
+    assert (
+        cli_main(
+            [
+                "control-center",
+                "--backlog",
+                str(backlog),
+                "--output",
+                str(snapshot_alias),
+            ]
+        )
+        == 2
+    )
+    assert json.loads(backlog.read_text(encoding="utf-8"))["items"] == []
+
+
+def test_a_boolean_sub_issue_number_is_a_controlled_error():
+    with pytest.raises(ControlCenterError, match="number must be a positive integer"):
+        parent_links(
+            [{"number": True, "parent_issue_url": "https://api.github.com/repos/a/b/issues/1"}]
+        )
+
+
 def test_a_dangling_symlink_scratch_name_is_never_followed(tmp_path):
     import os
 

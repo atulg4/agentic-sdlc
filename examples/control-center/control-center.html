@@ -358,7 +358,14 @@
           adoptSnapshot(body.document, body.loadedAt, body.loadedBy);
           render();
         },
-        () => { /* a dropped subscription leaves the last view in place */ },
+        (error) => {
+          // A terminated subscription must be visible: the last snapshot
+          // stays rendered, but operators are told updates stopped rather
+          // than left acting on stale data that still looks live.
+          state.error = "Live snapshot updates stopped (" + describe(error)
+            + "). Showing the last loaded snapshot; reload the page to reconnect.";
+          render();
+        },
       );
     } catch (error) { state.error = describe(error); }
     subscribe("notes", (docs) => {
@@ -1044,10 +1051,12 @@
     if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(projectId)) return "A project ID must start with a letter or digit and hold only lowercase letters, digits, dot, dash or underscore.";
     if (!displayName) return "A display name is required.";
     if (fields.provider.value === "github") {
-      // The bundled github-backlog adapter requires exactly OWNER/REPO, so a
-      // draft this form calls commit-ready must satisfy the same shape.
-      if (!/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(repository)) {
-        return "A GitHub repository is exactly owner/name - no nested paths.";
+      // The exact shape the bundled github-backlog adapter requires: an
+      // alphanumeric-bounded owner with inner hyphens only, one slash, then
+      // the repository name. A draft this form calls commit-ready must pass
+      // the same _require_repository check later.
+      if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\/[A-Za-z0-9._-]+$/.test(repository)) {
+        return "A GitHub repository is exactly owner/name (owner: letters, digits, inner dashes).";
       }
     } else if (!/^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)+$/.test(repository)) {
       return "A repository looks like group/name (nested groups are allowed).";
