@@ -31,7 +31,7 @@ import hashlib
 import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
@@ -964,10 +964,25 @@ def work_unit_status(projection: WorkUnitProjection) -> WorkUnitStatus:
         actor=projection.activity_actor,
         model=projection.activity_model,
         worker=projection.activity_worker,
-        states_seen=frozenset(
-            {projection.state} | {transition.to_state for transition in projection.transitions}
-        ),
+        states_seen=_states_seen(projection),
     )
+
+
+#: States that restart a unit's lifecycle: work sent back to triage must pass
+#: every gate again, so crossed-gate history from before the restart is void.
+_LIFECYCLE_RESTART_STATES = frozenset({FactoryState.INTAKE, FactoryState.TRIAGED})
+
+
+def _states_seen(projection: WorkUnitProjection) -> frozenset[FactoryState]:
+    """The states durably reached since the most recent lifecycle restart."""
+
+    seen: set[FactoryState] = set()
+    for transition in projection.transitions:
+        if transition.to_state in _LIFECYCLE_RESTART_STATES:
+            seen.clear()
+        seen.add(transition.to_state)
+    seen.add(projection.state)
+    return frozenset(seen)
 
 
 @dataclass(frozen=True)
@@ -1354,6 +1369,29 @@ def build_control_center_snapshot(
             warnings.append(
                 f"project {project_id} has factory data but is not declared in the registry"
             )
+        else:
+            # Registered data must belong to the registered repositories: a
+            # mistyped --project-id would otherwise file another project's
+            # issue tree and incidents under this profile without a trace.
+            declared_repositories = {
+                repository.identifier.lower()
+                for repository in registry.get(project_id).repositories
+            }
+            references: list[str] = []
+            for item in items:
+                references.extend((item.item_id, item.issue_ref))
+            for status in statuses.values():
+                references.extend((status.repository, status.issue_ref))
+            foreign: set[str] = set()
+            for reference in references:
+                name = re.split(r"[#!]", reference, maxsplit=1)[0] if reference else ""
+                if name and "/" in name and name.lower() not in declared_repositories:
+                    foreign.add(name)
+            for name in sorted(foreign):
+                view_warnings.append(
+                    f"project {project_id} data references repository {name}, "
+                    "which its registry profile does not declare"
+                )
 
         known_units = frozenset(statuses)
         known_items = frozenset(item.item_id for item in items)
@@ -1401,6 +1439,26 @@ def build_control_center_snapshot(
                 # gate and later re-entered a pre-gate state (dispatched,
                 # then blocked) still proved the gate passed.
                 if proven.state in proven_states or proven.states_seen & history_states:
+                    continue
+                if (
+                    incident.incident_id.endswith(":" + PLAN_EVIDENCE_RULE)
+                    and FactoryState.APPROVED in proven.states_seen
+                ):
+                    # The advisory's plan instruction is stale once approval
+                    # is proven: planning completed, so the missing event is
+                    # the implementation approval label. Replace the guidance
+                    # rather than telling the operator to re-run planning.
+                    retained.append(
+                        replace(
+                            incident,
+                            summary=(
+                                "Plan and approval are proven by the ledger, but the "
+                                "bundled implementation trigger fires only on the "
+                                "implementation approval label event (implementation-"
+                                "approved by default): apply it to dispatch"
+                            ),
+                        )
+                    )
                     continue
             retained.append(incident)
         project_incidents = tuple(retained)
