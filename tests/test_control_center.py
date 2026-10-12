@@ -1896,6 +1896,106 @@ def test_adapter_outputs_must_not_overwrite_inputs(tmp_path):
     assert json.loads(issues.read_text(encoding="utf-8")) == []
 
 
+def test_a_non_string_pull_state_is_a_controlled_error():
+    for bad in (False, 1, [], {}, "merged", ""):
+        with pytest.raises(ControlCenterError, match="state must be"):
+            incidents_from_change_requests(
+                [{"number": 1, "title": "odd state", "state": bad, "mergeable_state": "dirty"}],
+                project_id="forge",
+                repository="acme/forge",
+                observed_at=NOW,
+            )
+
+
+def test_a_bare_sub_issue_record_without_a_parent_is_rejected():
+    for record in (
+        {"number": 5},
+        {"number": 5, "parent_issue_url": "https://api.github.com/not-an-issue"},
+        {"number": 5, "parent_issue_url": None},
+    ):
+        with pytest.raises(ControlCenterError, match="no usable parent_issue_url"):
+            parent_links([record])
+
+
+def test_a_failed_replacement_restores_the_previous_pair(tmp_path, monkeypatch):
+    # Staging alone is not enough: when the SECOND os.replace fails, the
+    # first destination was already replaced and must be rolled back so the
+    # pair on disk still reads as one export, the previous one.
+    import os
+
+    from agentic_sdlc.cli import main as cli_main
+
+    issues = tmp_path / "issues.json"
+    issues.write_text(json.dumps([]), encoding="utf-8")
+    backlog_out = tmp_path / "backlog.json"
+    backlog_out.write_text("stale backlog", encoding="utf-8")
+    incidents_out = tmp_path / "incidents.json"
+    incidents_out.write_text("stale incidents", encoding="utf-8")
+    real_replace = os.replace
+    tripped = []
+
+    def flaky(source, destination):
+        if not tripped and str(destination) == str(incidents_out) and ".staged-" in str(source):
+            tripped.append(True)
+            raise OSError("simulated replace failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", flaky)
+    assert (
+        cli_main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+                "--backlog-output",
+                str(backlog_out),
+                "--incidents-output",
+                str(incidents_out),
+            ]
+        )
+        == 2
+    )
+    assert backlog_out.read_text(encoding="utf-8") == "stale backlog"
+    assert incidents_out.read_text(encoding="utf-8") == "stale incidents"
+    assert not list(tmp_path.glob("*.staged-*"))
+    assert not list(tmp_path.glob("*.backup-*"))
+
+
+def test_an_output_naming_an_existing_directory_is_rejected_before_any_write(tmp_path):
+    from agentic_sdlc.cli import main as cli_main
+
+    issues = tmp_path / "issues.json"
+    issues.write_text(json.dumps([]), encoding="utf-8")
+    backlog_out = tmp_path / "backlog.json"
+    backlog_out.write_text("stale backlog", encoding="utf-8")
+    incidents_out = tmp_path / "incidents-directory"
+    incidents_out.mkdir()
+    assert (
+        cli_main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+                "--backlog-output",
+                str(backlog_out),
+                "--incidents-output",
+                str(incidents_out),
+            ]
+        )
+        == 2
+    )
+    assert backlog_out.read_text(encoding="utf-8") == "stale backlog"
+    assert not list(tmp_path.glob("*.staged-*"))
+
+
 def test_adapter_outputs_are_staged_as_a_pair(tmp_path):
     # A failed incident write must not leave a freshly replaced backlog next
     # to a stale incident file: the pair would describe two different exports.

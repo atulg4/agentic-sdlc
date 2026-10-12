@@ -37,6 +37,9 @@ from .control_center import (
 
 _PARENT_URL = re.compile(r"/issues/(\d+)/?$")
 
+#: The only pull states GitHub emits; anything else is malformed provider data.
+PULL_STATES = frozenset({"open", "closed"})
+
 #: An epic is declared by title convention or by owning sub-issues.
 EPIC_TITLE = re.compile(r"^\s*(?:[A-Z][A-Za-z]*\s+)?EPIC\b", re.I)
 
@@ -381,6 +384,10 @@ def incidents_from_change_requests(
     incidents: list[dict[str, Any]] = []
     for pull in pulls:
         state_field = pull.get("state")
+        _require(
+            state_field is None or (isinstance(state_field, str) and state_field in PULL_STATES),
+            f'change request {pull.get("number")}: state must be "open" or "closed"',
+        )
         if state_field is not None and state_field != "open":
             # A merged or closed change request is not an open problem,
             # whatever its final mergeability read.
@@ -551,13 +558,22 @@ def parent_links(
             url = entry.get("parent_issue_url")
             if isinstance(url, str):
                 match = _PARENT_URL.search(url)
-                if match is not None:
+                if match is not None and int(match.group(1)) > 0:
                     referenced = int(match.group(1))
             if declared is not None and referenced is not None:
                 _require(
                     referenced == declared,
                     f"issue {number} references parent {referenced}, "
                     f"but the listing was declared for {declared}",
+                )
+            if declared is None:
+                # A bare listing was supplied *as* sub-issue data: a record
+                # that yields no usable parent would silently drop the edge
+                # and render the child as a root, so it is a controlled error.
+                _require(
+                    referenced is not None,
+                    f"sub-issue record {number} carries no usable parent_issue_url; "
+                    "pass the listing as a PARENT=path pair or fix the export",
                 )
             parent = declared if declared is not None else referenced
             if parent is not None:
