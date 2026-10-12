@@ -442,6 +442,36 @@
     };
   }
 
+  const backfilledNotes = new Set();
+  async function backfillNotes(document_) {
+    // The notes subscription is a bounded window, so a note outside it is
+    // fetched EXACTLY, by its deterministic per-incident document id, for
+    // every incident the adopted snapshot actually shows. A fetched absence
+    // is cached so each id is read at most once per page load.
+    if (!state.db) return;
+    const wanted = [];
+    for (const project of document_.projects || []) {
+      for (const incident of project.incidents || []) {
+        if (incident.incidentId && !state.notes.has(incident.incidentId) && !backfilledNotes.has(incident.incidentId)) {
+          wanted.push(incident.incidentId);
+          backfilledNotes.add(incident.incidentId);
+        }
+      }
+    }
+    let found = 0;
+    for (const incidentId of wanted) {
+      try {
+        const snap = await state.db.doc("notes/" + (await docId(incidentId))).get();
+        const entry = snap?.data?.();
+        if (entry?.incidentId && !state.notes.has(entry.incidentId)) {
+          state.notes.set(entry.incidentId, entry);
+          found += 1;
+        }
+      } catch { /* an unreadable note renders as unacknowledged */ }
+    }
+    if (found) render();
+  }
+
   function adoptSnapshot(document_, loadedAt, loadedBy) {
     const problem = validateSnapshot(document_);
     if (problem) { state.error = problem; return problem; }
@@ -459,6 +489,7 @@
     }
     document_.totals = totals;
     state.snapshot = document_;
+    backfillNotes(document_);
     state.snapshotMeta = { loadedAt: loadedAt || "", loadedBy: loadedBy || "" };
     state.error = "";
     if (!state.project && document_.projects?.length) state.project = document_.projects[0].projectId;
@@ -549,6 +580,13 @@
         const problem = arrayField(project, key, where, BUDGETS[key]);
         if (problem) return problem;
       }
+      // String collections hold strings: a null or object entry would throw
+      // inside a renderer (entry.toLowerCase()) and abort the whole view.
+      for (const key of ["warnings", "repositories", "capabilities", "environments"]) {
+        for (const entry of project[key]) {
+          if (typeof entry !== "string") return `${where}.${key} entries must be strings.`;
+        }
+      }
       // byState is the only complete unit representation the document
       // carries, and deriveProjectFacts sums it for the work-unit count, so
       // it is REQUIRED (the producer always serializes it) and its shape is
@@ -568,6 +606,11 @@
       // The producer's shared per-project budget: it rejects more than 5000
       // work units, so a byState summing past that is never producer output.
       if (stateTotal > 5000) return `${where}.counts.byState sums past the 5000-unit budget.`;
+      // active and attention are disjoint subsets of the same status map, so
+      // together they can never exceed the validated unit total.
+      if ((project.active || []).length + (project.attention || []).length > stateTotal) {
+        return `${where} lists more visible work units than its state counts hold.`;
+      }
       for (const list of [project.active || [], project.attention || []]) {
         for (const unit of list) {
           if (!isObj(unit)) return `${where} has a work unit that is not an object.`;
@@ -576,8 +619,9 @@
       for (const incident of project.incidents || []) {
         if (!isObj(incident)) return `${where} has an incident that is not an object.`;
         if (typeof incident.incidentId !== "string" || !incident.incidentId) return `${where} has an incident without a string incidentId.`;
-        if (seenIncidents.has(incident.incidentId)) return `Duplicate incidentId: ${incident.incidentId}.`;
-        seenIncidents.add(incident.incidentId);
+        const incidentKey = project.projectId + "\u0000" + incident.incidentId;
+        if (seenIncidents.has(incidentKey)) return `Duplicate incidentId in ${where}: ${incident.incidentId}.`;
+        seenIncidents.add(incidentKey);
         // Closed enums: kind and severity feed chip classes and the
         // plan-draft instruction block, so a store-rewritten snapshot must
         // not smuggle arbitrary text through them.
@@ -601,8 +645,9 @@
         if (depth > 32) return `${where} backlog nests deeper than 32 levels.`;
         if (!isObj(node) || typeof node.title !== "string") return `${where} has a malformed backlog node.`;
         if (typeof node.itemId !== "string" || !node.itemId) return `${where} has a backlog node without a string itemId.`;
-        if (seenItems.has(node.itemId)) return `Duplicate backlog itemId: ${node.itemId}.`;
-        seenItems.add(node.itemId);
+        const itemKey = project.projectId + "\u0000" + node.itemId;
+        if (seenItems.has(itemKey)) return `Duplicate backlog itemId in ${where}: ${node.itemId}.`;
+        seenItems.add(itemKey);
         for (const key of ["itemId", "kind", "state", "stateBasis", "url", "issueRef"]) {
           if (node[key] !== undefined && typeof node[key] !== "string") return `${where} backlog node field ${key} must be a string.`;
         }

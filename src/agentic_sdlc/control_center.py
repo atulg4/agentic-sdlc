@@ -794,6 +794,11 @@ def load_backlog_document(document: Any) -> tuple[BacklogItem, ...]:
         and version == BACKLOG_SCHEMA_VERSION,
         f"unsupported backlog schemaVersion: {version!r}",
     )
+    _require(
+        "items" in entry,
+        "backlog document requires an items array; an intentional empty export "
+        "carries an explicit []",
+    )
     raw_items = entry.get("items", [])
     _require(
         isinstance(raw_items, Sequence) and not isinstance(raw_items, (str, bytes)),
@@ -960,6 +965,11 @@ def load_incident_document(document: Any) -> tuple[Incident, ...]:
         and not isinstance(version, bool)
         and version == INCIDENT_SCHEMA_VERSION,
         f"unsupported incident schemaVersion: {version!r}",
+    )
+    _require(
+        "incidents" in entry,
+        "incident document requires an incidents array; an intentional empty "
+        "export carries an explicit []",
     )
     raw_items = entry.get("incidents", [])
     _require(
@@ -1434,7 +1444,6 @@ def build_control_center_snapshot(
     # naturally use acme/forge#1 item ids. Within one project the ids stay
     # unique, because its tree joins by them.
     seen_items: set[tuple[str, str]] = set()
-    item_owners: dict[str, set[str]] = {}
     for item in backlog:
         key = (item.project_id, item.item_id)
         _require(
@@ -1442,7 +1451,6 @@ def build_control_center_snapshot(
             f"duplicate backlog itemId in project {item.project_id}: {item.item_id}",
         )
         seen_items.add(key)
-        item_owners.setdefault(item.item_id, set()).add(item.project_id)
         by_project_backlog.setdefault(item.project_id, []).append(item)
 
     by_project_incidents: dict[str, list[Incident]] = {}
@@ -1495,15 +1503,12 @@ def build_control_center_snapshot(
             f"read model's {MAX_WORK_UNITS}-unit budget; narrow the ledger export",
         )
         _detect_backlog_cycles({item.item_id: item for item in items})
-        local_ids = {item.item_id for item in items}
-        for item in items:
-            if not item.parent_id or item.parent_id in local_ids:
-                continue
-            foreign_parents = item_owners.get(item.parent_id, set()) - {project_id}
-            _require(
-                not foreign_parents,
-                f"backlog item {item.item_id} has a parent in another project: {item.parent_id}",
-            )
+        # A parent id absent from this project is treated as a missing parent
+        # (the item roots itself and the view warns), never matched against
+        # other projects: identity is project-scoped, so a same-spelled item
+        # in another project is an unrelated record, not proof of a
+        # cross-project edge. Explicit cross-project parents are still
+        # rejected where a document declares both items.
         by_issue_ref, reference_warnings = _index_by_issue_ref(statuses)
         tree, tree_warnings = _build_backlog_tree(items, statuses, by_issue_ref)
         view_warnings = list(reference_warnings) + list(tree_warnings)
