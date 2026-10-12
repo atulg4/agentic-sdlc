@@ -2999,6 +2999,81 @@ def test_a_malformed_parents_map_is_a_controlled_error():
             )
 
 
+def test_a_lifecycle_restart_voids_crossed_gate_history():
+    # dispatched -> blocked -> triaged is a legal restart: the new lifecycle
+    # must pass every gate again, so the fresh label incident stays.
+    fresh = _incident(
+        incidentId="acme/forge#7:blocked-labels",
+        kind="dispatch-blocked",
+        severity="blocker",
+        backlogItemId="acme/forge#7",
+    )
+    ledger = _ledger(
+        *_chain(
+            TO_PLANNED + ("approved", "dispatched", "blocked", "triaged"),
+            workUnit={"projectId": "forge", "workUnitId": "wu-1", "issueRef": "acme/forge#7"},
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        backlog=load_backlog_document(
+            _document(_backlog(itemId="acme/forge#7", issueRef="acme/forge#7"))
+        ),
+        incidents=load_incident_document(_incidents(fresh)),
+    )
+    assert [item.incident_id for item in snapshot.get("forge").incidents] == [
+        "acme/forge#7:blocked-labels"
+    ]
+
+
+def test_proven_approval_replaces_the_plan_advisory_guidance():
+    from agentic_sdlc.control_center import PLAN_EVIDENCE_RULE
+
+    advisory = _incident(
+        incidentId=f"acme/forge#7:{PLAN_EVIDENCE_RULE}",
+        kind="awaiting-dispatch-evidence",
+        severity="advisory",
+        backlogItemId="acme/forge#7",
+        summary="Both planning labels are present; confirm a plan run started",
+    )
+    approved = _ledger(
+        *_chain(
+            TO_PLANNED + ("approved",),
+            workUnit={"projectId": "forge", "workUnitId": "wu-1", "issueRef": "acme/forge#7"},
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=approved.projections(),
+        backlog=load_backlog_document(
+            _document(_backlog(itemId="acme/forge#7", issueRef="acme/forge#7"))
+        ),
+        incidents=load_incident_document(_incidents(advisory)),
+    )
+    kept = snapshot.get("forge").incidents
+    assert [item.incident_id for item in kept] == [f"acme/forge#7:{PLAN_EVIDENCE_RULE}"]
+    assert "implementation approval label event" in kept[0].summary
+    assert "plan run" not in kept[0].summary
+
+
+def test_foreign_repository_data_under_a_registered_project_warns():
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        backlog=load_backlog_document(
+            _document(_backlog(itemId="acme/other#7", issueRef="acme/other#7"))
+        ),
+    )
+    view = snapshot.get("forge")
+    assert any(
+        "references repository acme/other" in warning and "does not declare" in warning
+        for warning in view.warnings
+    )
+
+
 def test_crossed_gate_evidence_survives_a_later_pre_gate_state():
     # approved -> dispatched -> blocked: the unit sits in a state reachable
     # before dispatch, but its durable transitions prove dispatch fired, so
