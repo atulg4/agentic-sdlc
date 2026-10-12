@@ -383,12 +383,15 @@
     if (!isObj(value)) return "That is not a snapshot document.";
     if (value.schemaVersion !== SCHEMA) return `Unsupported snapshot schemaVersion: ${value.schemaVersion}. This page renders version ${SCHEMA}.`;
     if (!Array.isArray(value.projects)) return "The snapshot has no projects array.";
+    const seenProjects = new Set();
     const arrayField = (owner, key, where) =>
       owner[key] === undefined || Array.isArray(owner[key]) ? "" : `${where}.${key} must be an array.`;
     for (const project of value.projects) {
       if (!isObj(project) || typeof project.projectId !== "string" || !project.projectId) {
         return "Every project needs a projectId.";
       }
+      if (seenProjects.has(project.projectId)) return `Duplicate projectId: ${project.projectId}.`;
+      seenProjects.add(project.projectId);
       const where = `project ${project.projectId}`;
       for (const key of ["backlog", "active", "attention", "incidents", "warnings", "repositories", "capabilities", "environments"]) {
         const problem = arrayField(project, key, where);

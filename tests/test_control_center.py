@@ -1788,3 +1788,65 @@ def test_the_snapshot_output_must_not_overwrite_an_input(tmp_path):
         == 2
     )
     assert "projects" in json.loads(registry.read_text(encoding="utf-8"))
+
+
+def test_approved_and_agent_ready_without_human_review_is_a_blocker():
+    incidents = incidents_from_issues(
+        [_issue(1, "stalled", ["implementation-approved", "agent-ready"])],
+        project_id="forge",
+        repository="acme/forge",
+        observed_at=NOW,
+    )
+    assert len(incidents) == 1
+    assert incidents[0]["severity"] == "blocker"
+    assert "human-review-required" in incidents[0]["summary"]
+
+
+def test_a_released_spec_without_dispatch_labels_is_surfaced():
+    incidents = incidents_from_issues(
+        [_issue(1, "released only", ["spec-drafted", "spec-approved"])],
+        project_id="forge",
+        repository="acme/forge",
+        observed_at=NOW,
+    )
+    assert len(incidents) == 1
+    assert incidents[0]["kind"] == "awaiting-human-approval"
+    assert "released" in incidents[0]["summary"]
+
+
+def test_a_self_parent_sub_issue_listing_is_rejected():
+    with pytest.raises(ControlCenterError, match="its own parent"):
+        parent_links(([{"number": 7}], 7))
+
+
+def test_malformed_labels_are_a_controlled_error():
+    with pytest.raises(ControlCenterError, match="labels must be an array"):
+        backlog_document_from_issues(
+            [{"number": 1, "title": "bad labels", "state": "open", "labels": 1}],
+            project_id="forge",
+            repository="acme/forge",
+        )
+
+
+def test_adapter_outputs_must_not_overwrite_inputs(tmp_path):
+    from agentic_sdlc.cli import main as cli_main
+
+    issues = tmp_path / "issues.json"
+    issues.write_text(json.dumps([]), encoding="utf-8")
+    assert (
+        cli_main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+                "--backlog-output",
+                str(issues),
+            ]
+        )
+        == 2
+    )
+    assert json.loads(issues.read_text(encoding="utf-8")) == []
