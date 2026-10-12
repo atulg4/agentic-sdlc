@@ -439,7 +439,7 @@
         el("div", { class: "stats" },
           stat(totals.projects, "projects"),
           stat(totals.active, "running now"),
-          stat(totals.attention, "waiting on a person"),
+          stat(totals.attention, "needs attention"),
           stat(totals.blockers, "blockers"),
           stat(totals.backlogItems, "backlog items"),
           stat(totals.workUnits, "work units"),
@@ -482,7 +482,7 @@
       el("div", { class: "row", style: "margin-top:10px" },
         chip(`${counts.backlogItems ?? 0} backlog`, "line"),
         counts.active ? chip(`${counts.active} running`, "ok") : null,
-        counts.attention ? chip(`${counts.attention} waiting`, "warn") : null,
+        counts.attention ? chip(`${counts.attention} need attention`, "warn") : null,
         counts.blockers ? chip(`${counts.blockers} blocker${counts.blockers === 1 ? "" : "s"}`, "bad") : null,
         !project.registered ? chip("not in registry", "warn") : null,
       ),
@@ -516,7 +516,7 @@
       el("div", { class: "stats" },
         stat(project.counts?.backlogItems, "backlog items"),
         stat(project.counts?.active, "running now"),
-        stat(project.counts?.attention, "waiting on a person"),
+        stat(project.counts?.attention, "needs attention"),
         stat(project.counts?.blockers, "blockers"),
       ),
       (project.capabilities || []).length ? el("div", { class: "tiny muted", style: "margin-top:10px", text: "capabilities: " + project.capabilities.join(", ") }) : null,
@@ -551,10 +551,11 @@
   function attentionCard(project) {
     const items = project.attention || [];
     if (!items.length) return el("div", { class: "card" },
-      el("h3", { text: "Waiting on a person" }),
-      el("p", { class: "small muted", text: "Nothing is parked at a human gate." }));
+      el("h3", { text: "Needs attention" }),
+      el("p", { class: "small muted", text: "Nothing is parked at a human gate, blocked, or failed." }));
     return el("div", { class: "card" },
-      el("h3", { text: `Waiting on a person (${items.length})` }),
+      el("h3", { text: `Needs attention (${items.length})` }),
+      el("p", { class: "tiny muted", style: "margin:0 0 4px", text: "Units marked with the human-gate chip wait on a person by design; the rest are blocked or failed and need an intervention." }),
       items.map((unit) => unitRow(unit)),
     );
   }
@@ -938,24 +939,26 @@
           catch (error) { result.append(el("div", { class: "banner bad", text: "That is not valid JSON: " + describe(error) })); return; }
           const problem = validateSnapshot(parsed);
           if (problem) { result.append(el("div", { class: "banner bad", text: problem })); return; }
-          const bytes = JSON.stringify(parsed).length;
-          if (bytes > 240000) {
-            result.append(el("div", { class: "banner bad", text: `That snapshot is ${Math.round(bytes / 1024)} KiB; the store holds 256 KiB per document. Narrow it with --project-id and load one project at a time.` }));
-            return;
-          }
           const button = event.currentTarget;
           button.disabled = true;
           const at = new Date().toISOString();
+          let saveProblem = "";
           if (state.db) {
-            try {
-              await state.db.doc("snapshots/current").set({ document: parsed, loadedAt: at, loadedBy: state.viewer?.id || "" });
-            } catch (error) {
-              result.append(el("div", { class: "banner bad", text: "Loaded here, but could not save it for everyone: " + describe(error) }));
+            const bytes = JSON.stringify(parsed).length;
+            if (bytes > 240000) {
+              saveProblem = `Loaded in this view only: at ${Math.round(bytes / 1024)} KiB the snapshot exceeds the shared store's 256 KiB document limit, so it was not saved for other viewers. Narrow it with --project-id to share it.`;
+            } else {
+              try {
+                await state.db.doc("snapshots/current").set({ document: parsed, loadedAt: at, loadedBy: state.viewer?.id || "" });
+              } catch (error) {
+                saveProblem = "Loaded in this view only — saving it for everyone failed: " + describe(error);
+              }
             }
           }
           adoptSnapshot(parsed, at, state.viewer?.id || "");
+          state.error = saveProblem;
           button.disabled = false;
-          state.tab = "portfolio";
+          if (!saveProblem) state.tab = "portfolio";
           render();
         } } }, "Load it"),
         state.snapshot ? copyButton(JSON.stringify(state.snapshot, null, 2), "Copy the current snapshot") : null,

@@ -1013,3 +1013,105 @@ def test_a_declared_parent_agreeing_with_the_reference_links_once():
         )
     )
     assert links == {2: 1}
+
+
+def test_only_ready_merge_states_wait_on_the_merge_authority():
+    pulls = [
+        {"number": 1, "title": "clean", "mergeable_state": "clean"},
+        {"number": 2, "title": "hooks", "mergeable_state": "has_hooks"},
+        {"number": 3, "title": "blocked", "mergeable_state": "blocked"},
+        {"number": 4, "title": "behind", "mergeable_state": "behind"},
+        {"number": 5, "title": "unstable", "mergeable_state": "unstable"},
+        {"number": 6, "title": "unknown", "mergeable_state": "unknown"},
+    ]
+    incidents = incidents_from_change_requests(
+        pulls, project_id="forge", repository="acme/forge", observed_at=NOW
+    )
+    assert [item["incidentId"] for item in incidents] == [
+        "acme/forge!1:awaiting-merge",
+        "acme/forge!2:awaiting-merge",
+    ]
+
+
+def test_a_missing_close_reason_declares_no_terminal_state():
+    document = _export(
+        _issue(1, "legacy close", state="closed", reason=None),
+        _issue(2, "odd reason", state="closed", reason="reopened"),
+    )
+    assert all("declaredState" not in item for item in document["items"])
+
+
+def test_a_spec_draft_is_held_for_spec_review_not_implementation_approval():
+    alone = incidents_from_issues(
+        [_issue(1, "draft only", ["spec-drafted"])],
+        project_id="forge",
+        repository="acme/forge",
+        observed_at=NOW,
+    )
+    with_review = incidents_from_issues(
+        [_issue(2, "draft held", ["spec-drafted", "human-review-required"])],
+        project_id="forge",
+        repository="acme/forge",
+        observed_at=NOW,
+    )
+    for incidents in (alone, with_review):
+        assert len(incidents) == 1
+        assert incidents[0]["kind"] == "awaiting-human-approval"
+        assert "spec review" in incidents[0]["summary"]
+
+
+def test_a_released_spec_waits_on_implementation_approval():
+    incidents = incidents_from_issues(
+        [_issue(1, "released", ["spec-drafted", "spec-approved", "human-review-required"])],
+        project_id="forge",
+        repository="acme/forge",
+        observed_at=NOW,
+    )
+    assert len(incidents) == 1
+    assert incidents[0]["summary"] == (
+        "Specification drafted and waiting on a human implementation approval"
+    )
+
+
+def test_full_length_github_names_fit_generated_identifiers():
+    owner = "o" * 39
+    repository = f"{owner}/{'r' * 100}"
+    document = backlog_document_from_issues(
+        [_issue(123456, "long names")],
+        project_id="forge",
+        repository=repository,
+    )
+    # itemId carries the repository verbatim; the loader must accept it.
+    items = load_backlog_document(
+        {**document, "items": [{**document["items"][0], "projectId": "forge"}]}
+    )
+    assert items[0].item_id == f"{repository}#123456"
+    incidents = incidents_from_issues(
+        [_issue(123456, "long names")],
+        project_id="forge",
+        repository=repository,
+        observed_at=NOW,
+    )
+    assert load_incident_document(_incidents(*incidents))
+
+
+def test_every_declared_remediation_command_parses_against_the_cli():
+    import shlex
+
+    from agentic_sdlc.cli import build_parser
+
+    parser = build_parser()
+    commands = [
+        action.command
+        for actions in REMEDIATION_CATALOGUE.values()
+        for action in actions
+        if action.command
+    ]
+    assert commands
+    for command in commands:
+        argv = shlex.split(command)
+        assert argv[0] == "sdlcctl"
+        try:
+            parser.parse_args(argv[1:])
+        except SystemExit as error:  # argparse rejects by exiting
+            raise AssertionError(f"catalogue command does not parse: {command}") from error
