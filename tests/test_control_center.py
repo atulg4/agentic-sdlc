@@ -36,7 +36,6 @@ from agentic_sdlc.control_center import (
 from agentic_sdlc.event_ledger import (
     EventLedger,
     FactoryState,
-    LedgerError,
     LifecycleStage,
     load_lifecycle_event,
 )
@@ -1924,17 +1923,30 @@ def test_adapter_outputs_must_not_overwrite_inputs(tmp_path):
     assert json.loads(issues.read_text(encoding="utf-8")) == []
 
 
-def test_the_work_unit_id_bound_is_shared_with_the_ledger():
-    # One contract on both sides: an id the ledger accepts (<= 512) loads in
-    # backlog items and incidents, and an id the ledger rejects is rejected
-    # here with the same bound, so no valid ledger unit becomes unaddressable.
-    longest = "w" * 512
-    load_backlog_document(_document(_backlog(itemId="acme/forge#7", workUnitId=longest)))
-    over = "w" * 513
-    with pytest.raises(ControlCenterError, match="at most 512"):
-        load_backlog_document(_document(_backlog(itemId="acme/forge#7", workUnitId=over)))
-    with pytest.raises(LedgerError, match="at most 512"):
-        _ledger(*_chain(("intake",), work_unit=over))
+def test_the_work_unit_id_contract_follows_the_ledger():
+    # Version-1 ledgers accept any non-empty workUnitId with no length cap,
+    # and existing ledgers already hold such ids, so the snapshot loaders
+    # apply the same contract: every unit the ledger accepted stays
+    # addressable from backlog items and incidents, and joins its status.
+    long_id = "w" * 600
+    ledger = _ledger(
+        *_chain(
+            TO_IMPLEMENTING,
+            work_unit=long_id,
+            workUnit={"projectId": "forge", "workUnitId": long_id, "issueRef": "acme/forge#7"},
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        backlog=load_backlog_document(
+            _document(_backlog(itemId="acme/forge#7", workUnitId=long_id))
+        ),
+    )
+    view = snapshot.get("forge")
+    assert view.backlog[0].state == "implementing"
+    assert not any("unknown work unit" in warning for warning in view.warnings)
 
 
 def test_the_retry_remediation_supplies_a_retry_state_input():
