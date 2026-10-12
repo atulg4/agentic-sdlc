@@ -792,6 +792,7 @@ def test_change_request_incidents_distinguish_conflict_ci_and_merge_wait():
                 "state": "open",
                 "mergeable_state": "dirty",
                 "draft": False,
+                "base": {"repo": {"full_name": "acme/forge"}},
             },
             {
                 "number": 2,
@@ -799,6 +800,7 @@ def test_change_request_incidents_distinguish_conflict_ci_and_merge_wait():
                 "state": "open",
                 "mergeable_state": "blocked",
                 "draft": False,
+                "base": {"repo": {"full_name": "acme/forge"}},
             },
             {
                 "number": 3,
@@ -806,6 +808,7 @@ def test_change_request_incidents_distinguish_conflict_ci_and_merge_wait():
                 "state": "open",
                 "mergeable_state": "clean",
                 "draft": False,
+                "base": {"repo": {"full_name": "acme/forge"}},
             },
             {
                 "number": 4,
@@ -856,6 +859,7 @@ def test_combining_incident_groups_produces_a_loadable_document():
                     "state": "open",
                     "mergeable_state": "clean",
                     "draft": False,
+                    "base": {"repo": {"full_name": "acme/forge"}},
                 }
             ],
             project_id="forge",
@@ -1030,7 +1034,15 @@ def test_a_draft_change_request_is_never_a_blocker():
 
 def test_a_change_request_without_a_mergeability_verdict_is_not_ready():
     incidents = incidents_from_change_requests(
-        [{"number": 1, "title": "list payload only", "state": "open", "draft": False}],
+        [
+            {
+                "number": 1,
+                "title": "list payload only",
+                "state": "open",
+                "draft": False,
+                "base": {"repo": {"full_name": "acme/forge"}},
+            }
+        ],
         project_id="forge",
         repository="acme/forge",
         observed_at=NOW,
@@ -1040,7 +1052,15 @@ def test_a_change_request_without_a_mergeability_verdict_is_not_ready():
 
 def test_a_failing_check_is_reported_even_without_a_mergeability_verdict():
     incidents = incidents_from_change_requests(
-        [{"number": 1, "title": "red", "state": "open", "draft": False}],
+        [
+            {
+                "number": 1,
+                "title": "red",
+                "state": "open",
+                "draft": False,
+                "base": {"repo": {"full_name": "acme/forge"}},
+            }
+        ],
         project_id="forge",
         repository="acme/forge",
         observed_at=NOW,
@@ -1082,6 +1102,7 @@ def test_only_ready_merge_states_wait_on_the_merge_authority():
             "state": "open",
             "mergeable_state": "clean",
             "draft": False,
+            "base": {"repo": {"full_name": "acme/forge"}},
         },
         {
             "number": 2,
@@ -1089,6 +1110,7 @@ def test_only_ready_merge_states_wait_on_the_merge_authority():
             "state": "open",
             "mergeable_state": "has_hooks",
             "draft": False,
+            "base": {"repo": {"full_name": "acme/forge"}},
         },
         {
             "number": 3,
@@ -1096,6 +1118,7 @@ def test_only_ready_merge_states_wait_on_the_merge_authority():
             "state": "open",
             "mergeable_state": "blocked",
             "draft": False,
+            "base": {"repo": {"full_name": "acme/forge"}},
         },
         {
             "number": 4,
@@ -1103,6 +1126,7 @@ def test_only_ready_merge_states_wait_on_the_merge_authority():
             "state": "open",
             "mergeable_state": "behind",
             "draft": False,
+            "base": {"repo": {"full_name": "acme/forge"}},
         },
         {
             "number": 5,
@@ -1110,6 +1134,7 @@ def test_only_ready_merge_states_wait_on_the_merge_authority():
             "state": "open",
             "mergeable_state": "unstable",
             "draft": False,
+            "base": {"repo": {"full_name": "acme/forge"}},
         },
         {
             "number": 6,
@@ -1117,6 +1142,7 @@ def test_only_ready_merge_states_wait_on_the_merge_authority():
             "state": "open",
             "mergeable_state": "unknown",
             "draft": False,
+            "base": {"repo": {"full_name": "acme/forge"}},
         },
     ]
     incidents = incidents_from_change_requests(
@@ -1604,7 +1630,18 @@ def test_failing_checks_must_name_change_requests_in_the_pull_payload(tmp_path):
     issues.write_text(json.dumps([]), encoding="utf-8")
     pulls = tmp_path / "pulls.json"
     pulls.write_text(
-        json.dumps([{"number": 7, "title": "x", "state": "open", "draft": False}]), encoding="utf-8"
+        json.dumps(
+            [
+                {
+                    "number": 7,
+                    "title": "x",
+                    "state": "open",
+                    "draft": False,
+                    "base": {"repo": {"full_name": "acme/forge"}},
+                }
+            ]
+        ),
+        encoding="utf-8",
     )
     assert (
         cli_main(
@@ -1694,6 +1731,7 @@ def test_closed_change_requests_raise_no_incident():
                 "state": "closed",
                 "mergeable_state": "dirty",
                 "draft": False,
+                "base": {"repo": {"full_name": "acme/forge"}},
             },
             {
                 "number": 2,
@@ -1701,6 +1739,7 @@ def test_closed_change_requests_raise_no_incident():
                 "state": "open",
                 "mergeable_state": "clean",
                 "draft": False,
+                "base": {"repo": {"full_name": "acme/forge"}},
             },
         ],
         project_id="forge",
@@ -2060,6 +2099,7 @@ def test_a_malformed_record_number_is_a_controlled_error():
                         "state": "open",
                         "draft": False,
                         "mergeable_state": "clean",
+                        "base": {"repo": {"full_name": "acme/forge"}},
                     }
                 ],
                 project_id="forge",
@@ -2185,6 +2225,7 @@ def test_an_unrecognized_mergeability_verdict_is_a_controlled_error():
                     "state": "open",
                     "mergeable_state": "typo",
                     "draft": False,
+                    "base": {"repo": {"full_name": "acme/forge"}},
                 }
             ],
             project_id="forge",
@@ -2268,13 +2309,20 @@ def test_an_absent_issue_or_pull_state_is_a_controlled_error():
         with pytest.raises(ControlCenterError, match="state must be"):
             backlog_document_from_issues([record], project_id="forge", repository="acme/forge")
     for pull in (
-        {"number": 1, "title": "no state", "mergeable_state": "clean", "draft": False},
+        {
+            "number": 1,
+            "title": "no state",
+            "mergeable_state": "clean",
+            "draft": False,
+            "base": {"repo": {"full_name": "acme/forge"}},
+        },
         {
             "number": 1,
             "title": "null state",
             "state": None,
             "mergeable_state": "clean",
             "draft": False,
+            "base": {"repo": {"full_name": "acme/forge"}},
         },
     ):
         with pytest.raises(ControlCenterError, match="state must be"):
@@ -2679,6 +2727,7 @@ def test_a_non_string_pull_state_is_a_controlled_error():
                         "state": bad,
                         "mergeable_state": "dirty",
                         "draft": False,
+                        "base": {"repo": {"full_name": "acme/forge"}},
                     }
                 ],
                 project_id="forge",
@@ -2818,6 +2867,7 @@ def test_a_conflicted_pull_with_a_failing_check_reports_both_blockers():
                 "state": "open",
                 "mergeable_state": "dirty",
                 "draft": False,
+                "base": {"repo": {"full_name": "acme/forge"}},
             }
         ],
         project_id="forge",
@@ -2834,7 +2884,16 @@ def test_a_conflicted_pull_with_a_failing_check_reports_both_blockers():
 def test_a_malformed_mergeability_value_is_a_controlled_error():
     with pytest.raises(ControlCenterError, match="mergeable_state must be a string"):
         incidents_from_change_requests(
-            [{"number": 1, "title": "bad", "state": "open", "mergeable_state": [], "draft": False}],
+            [
+                {
+                    "number": 1,
+                    "title": "bad",
+                    "state": "open",
+                    "mergeable_state": [],
+                    "draft": False,
+                    "base": {"repo": {"full_name": "acme/forge"}},
+                }
+            ],
             project_id="forge",
             repository="acme/forge",
             observed_at=NOW,
@@ -3178,6 +3237,9 @@ def test_proven_approval_replaces_the_plan_advisory_guidance():
     assert [item.incident_id for item in kept] == [f"acme/forge#7:{PLAN_EVIDENCE_RULE}"]
     assert "implementation approval label event" in kept[0].summary
     assert "plan run" not in kept[0].summary
+    # Not an advisory any more: dispatch provably cannot occur.
+    assert kept[0].kind == "dispatch-blocked"
+    assert kept[0].severity.value == "blocker"
 
 
 def test_foreign_repository_data_under_a_registered_project_warns():
@@ -3309,6 +3371,9 @@ def test_proven_approval_restates_the_spec_hold_as_dispatch_blocked():
     kept = snapshot.get("forge").incidents
     assert [item.kind for item in kept] == ["dispatch-blocked"]
     assert "Approval is proven" in kept[0].summary
+    # The released-spec rule matched with ALL THREE labels absent, so the
+    # guidance must name the review label too.
+    assert "human-review" in kept[0].summary
     document_incident = snapshot.get("forge").as_dict()["incidents"][0]
     assert any(
         action["actionId"] == "re-run-dispatch" for action in document_incident["remediations"]
@@ -3330,6 +3395,70 @@ def test_the_console_catalogue_matches_the_declared_catalogue():
         for kind, actions in REMEDIATION_CATALOGUE.items()
     }
     assert embedded == expected
+
+
+def test_a_prose_epic_mention_is_not_an_epic():
+    document = _export(_issue(1, "Fix epic timeout handling"))
+    assert document["items"][0]["kind"] == "task"
+
+
+def test_a_pull_without_its_target_repository_is_rejected():
+    for base in (None, "x", {}, {"repo": {}}, {"repo": {"full_name": "  "}}):
+        pull = {
+            "number": 1,
+            "title": "partial",
+            "state": "open",
+            "draft": False,
+            "mergeable_state": "clean",
+        }
+        if base is not None:
+            pull["base"] = base
+        with pytest.raises(ControlCenterError, match="base.repo.full_name is required"):
+            incidents_from_change_requests(
+                [pull], project_id="forge", repository="acme/forge", observed_at=NOW
+            )
+
+
+def test_underscore_and_dot_segments_participate_in_ownership_checks():
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        incidents=load_incident_document(
+            _incidents(
+                _incident(
+                    incidentId="foreign-underscore:untriaged",
+                    projectId="forge",
+                    kind="triage-needed",
+                    severity="advisory",
+                    evidenceRef="_other/repo#7",
+                )
+            )
+        ),
+    )
+    assert any(
+        "references repository _other/repo" in warning for warning in snapshot.get("forge").warnings
+    )
+
+
+def test_a_bare_slash_evidence_reference_never_warns():
+    # evidenceRef accepts arbitrary text: a bare "build/123" is not a
+    # repository reference, which needs the #/! number shape.
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        incidents=load_incident_document(
+            _incidents(
+                _incident(
+                    incidentId="run-7-infra",
+                    projectId="forge",
+                    kind="infrastructure-failure",
+                    severity="degraded",
+                    evidenceRef="build/123",
+                )
+            )
+        ),
+    )
+    assert not any("does not declare" in warning for warning in snapshot.get("forge").warnings)
 
 
 def test_non_repository_evidence_references_never_warn():
@@ -3363,6 +3492,7 @@ def test_a_malformed_failing_key_is_a_controlled_error():
                         "state": "open",
                         "draft": False,
                         "mergeable_state": "clean",
+                        "base": {"repo": {"full_name": "acme/forge"}},
                     }
                 ],
                 project_id="forge",
@@ -3486,6 +3616,7 @@ def test_a_failing_check_on_a_behind_branch_reports_both_requirements():
                 "state": "open",
                 "mergeable_state": "behind",
                 "draft": False,
+                "base": {"repo": {"full_name": "acme/forge"}},
             }
         ],
         project_id="forge",
@@ -3580,6 +3711,7 @@ def test_an_unstable_state_is_not_double_counted_with_its_failing_check():
                 "state": "open",
                 "mergeable_state": "unstable",
                 "draft": False,
+                "base": {"repo": {"full_name": "acme/forge"}},
             }
         ],
         project_id="forge",
@@ -3652,6 +3784,7 @@ def test_an_over_budget_failing_check_aggregate_is_rejected():
                     "state": "open",
                     "mergeable_state": "blocked",
                     "draft": False,
+                    "base": {"repo": {"full_name": "acme/forge"}},
                 }
             ],
             project_id="forge",

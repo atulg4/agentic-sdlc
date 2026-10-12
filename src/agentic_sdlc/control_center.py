@@ -68,12 +68,16 @@ MAX_INCIDENTS = 2000
 #: repository) plus an issue number and a rule suffix.
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/#!:-]{0,255}")
 #: A tracker reference that names a repository: an identifier of one or more
-#: slash-separated segments (GitLab nests groups, example/group/assets),
-#: optionally followed by #/! and a number (and a :suffix, as incident ids
-#: carry). Arbitrary text with a scheme (a CI URL) is NOT one.
+#: slash-separated segments in the registry's own segment contract (GitLab
+#: nests groups and allows . and _ anywhere), followed by a MANDATORY #/! and
+#: number (and an optional :suffix, as incident ids carry). Arbitrary
+#: slash-bearing evidence text ("build/123", a CI URL) is NOT one.
 _REPOSITORY_REFERENCE = re.compile(
-    r"(?P<name>[A-Za-z0-9][A-Za-z0-9-]*(?:/[A-Za-z0-9._-]+)+?)(?:[#!]\d+(?::.+)?)?"
+    r"(?P<name>[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+?)[#!]\d+(?::.+)?"
 )
+#: A bare repository identifier, for fields whose CONTRACT is a repository
+#: (a ledger status's repository field), never for free-form references.
+_REPOSITORY_IDENTIFIER = re.compile(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+")
 _TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})")
 _SECRET_KEY = re.compile(
     r"credential|secret|token|password|passphrase|api_?key|authorization|bearer|private_?key",
@@ -1384,27 +1388,31 @@ def build_control_center_snapshot(
                 repository.identifier.lower()
                 for repository in registry.get(project_id).repositories
             }
+            # Each field participates under ITS OWN contract: free-form
+            # references ("build/123", a CI URL) count only when they carry
+            # the full repo#number shape, while a status's repository field
+            # is a bare identifier by contract.
             references: list[str] = []
             for item in items:
                 references.extend((item.item_id, item.issue_ref))
             for status in statuses.values():
-                references.extend((status.repository, status.issue_ref, status.change_request_ref))
+                references.extend((status.issue_ref, status.change_request_ref))
             for incident in project_incidents:
                 references.extend(
                     (incident.incident_id, incident.evidence_ref, incident.backlog_item_id)
                 )
             foreign: set[str] = set()
             for reference in references:
-                if not reference:
-                    continue
-                # Only repository-SHAPED references participate: evidenceRef
-                # accepts arbitrary text (a CI URL, a run id), which must not
-                # read as a foreign repository just because it has a slash.
-                match = _REPOSITORY_REFERENCE.fullmatch(reference)
-                if match is None:
-                    continue
-                name = match.group("name")
-                if name.lower() not in declared_repositories:
+                match = _REPOSITORY_REFERENCE.fullmatch(reference) if reference else None
+                if match is not None and match.group("name").lower() not in declared_repositories:
+                    foreign.add(match.group("name"))
+            for status in statuses.values():
+                name = status.repository
+                if (
+                    name
+                    and _REPOSITORY_IDENTIFIER.fullmatch(name)
+                    and name.lower() not in declared_repositories
+                ):
                     foreign.add(name)
             for name in sorted(foreign):
                 view_warnings.append(
@@ -1446,9 +1454,14 @@ def build_control_center_snapshot(
                     if proven.state in DISPATCH_PROVEN_STATES or seen & DISPATCH_PROVEN_STATES:
                         continue
                     if FactoryState.APPROVED in seen:
+                        # Not an advisory any more: approval is proven and
+                        # dispatch cannot occur without the label event, so
+                        # the incident becomes a dispatch blocker.
                         retained.append(
                             replace(
                                 incident,
+                                kind="dispatch-blocked",
+                                severity=IncidentSeverity.BLOCKER,
                                 summary=(
                                     "Plan and approval are proven by the ledger, but the "
                                     "bundled implementation trigger fires only on the "
@@ -1475,14 +1488,22 @@ def build_control_center_snapshot(
                     if proven.state in DISPATCH_PROVEN_STATES or seen & DISPATCH_PROVEN_STATES:
                         continue
                     if FactoryState.APPROVED in seen:
+                        # Rule-specific label guidance: the released-spec rule
+                        # matched with ALL THREE dispatch labels absent, while
+                        # spec-without-approval still carries the review label.
+                        if incident.incident_id.endswith(":" + RELEASED_SPEC_RULE):
+                            missing_labels = (
+                                "apply the ready, human-review and implementation approval labels"
+                            )
+                        else:
+                            missing_labels = "apply the ready and implementation approval labels"
                         retained.append(
                             replace(
                                 incident,
                                 kind="dispatch-blocked",
                                 summary=(
                                     "Approval is proven by the ledger, but no dispatch label "
-                                    "follows it: apply the ready and implementation approval "
-                                    "labels so a trigger can fire"
+                                    f"follows it: {missing_labels} so a trigger can fire"
                                 ),
                             )
                         )
