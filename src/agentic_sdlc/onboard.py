@@ -716,9 +716,8 @@ def _safe_json(gh: GhRunner, args: Sequence[str]) -> object:
     try:
         out = gh(args)
     except OnboardError as exc:
-        return Unreadable(
-            f"{where}: {str(exc)[-160:]}", bool(re.search(r"\b404\b|Not Found", str(exc)))
-        )
+        # GitHub's answer, never "404" anywhere in the message (Codex 4244027557)
+        return Unreadable(f"{where}: {str(exc)[-160:]}", gh_http_status(exc) == 404)
     if not out or not out.strip():
         return Unreadable(f"{where}: empty answer")
     try:
@@ -2770,13 +2769,15 @@ class DoctorReport:
 
 
 def _remote_file_state(gh: GhRunner, args: Sequence[str]) -> str:
-    """The remote file's state: "absent" (the contents API answered 404), "present" (it served
-    the path) or "unknown"
-    (any other failure or answer: callers that need absence fail closed on it)."""
+    """The remote file's state: "absent" (the contents API answered 404, as `run_gh` parsed the
+    response: `gh_http_status`), "present" (it served the path) or "unknown" (any other failure
+    or answer: callers that need absence fail closed on it)."""
     try:
         data = json.loads(gh(args) or "null")
     except OnboardError as exc:
-        return "absent" if re.search(r"\b404\b|Not Found", str(exc)) else "unknown"
+        # The status GitHub answered, never a "404" in the echoed request: a repository or
+        # branch named `404` would read every 5xx or timeout as absent (Codex 4244027557).
+        return "absent" if gh_http_status(exc) == 404 else "unknown"
     except json.JSONDecodeError:
         return "unknown"
     return "present" if isinstance(data, (dict, list)) and data else "unknown"
@@ -9030,7 +9031,7 @@ def doctor(
         legacy_why = "" if isinstance(legacy, dict) else "unreadable answer"
     except OnboardError as exc:
         legacy = None
-        legacy_why = "absent" if re.search(r"\b404\b|Not Found", str(exc)) else str(exc)[:120]
+        legacy_why = "absent" if gh_http_status(exc) == 404 else str(exc)[:120]
     except json.JSONDecodeError:
         legacy, legacy_why = None, "unreadable answer"
     if legacy_why == "absent":

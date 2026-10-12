@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from agentic_sdlc import cli
-from agentic_sdlc.onboard import OnboardError
+from agentic_sdlc.onboard import GhCommandError, OnboardError
 
 PROJECT = "example/project"  # the `policy_file` fixture's project id
 LABELS = ["agent-ready", "human-review-required", "implementation-approved"]
@@ -291,7 +291,7 @@ class FakeGh:
         if isinstance(state, Exception):
             raise state
         if state is None:
-            raise OnboardError("gh api failed: Not Found (HTTP 404)")
+            raise GhCommandError("gh api failed: Not Found (HTTP 404)", http_status=404)
         assert args[2:] == []
         answer = json.dumps(
             {
