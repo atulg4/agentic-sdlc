@@ -799,6 +799,9 @@ def test_change_request_incidents_distinguish_conflict_ci_and_merge_wait():
     assert kinds == {
         "acme/forge!1:merge-conflict": "merge-conflict",
         "acme/forge!2:ci-failed": "deterministic-ci-failed",
+        # The branch-protection impediment survives the declared CI failure:
+        # both remediation requirements are real.
+        "acme/forge!2:merge-state-blocked": "unclassified",
         "acme/forge!3:awaiting-merge": "awaiting-human-merge",
     }
     assert load_incident_document(_incidents(*incidents))
@@ -1974,3 +1977,89 @@ def test_approval_proof_retires_a_stale_approval_wait():
         incidents=load_incident_document(_incidents(stale)),
     )
     assert snapshot.get("forge").incidents == ()
+
+
+def test_a_failing_check_on_a_behind_branch_reports_both_requirements():
+    incidents = incidents_from_change_requests(
+        [{"number": 7, "title": "both", "mergeable_state": "behind"}],
+        project_id="forge",
+        repository="acme/forge",
+        observed_at=NOW,
+        failing={7: "test"},
+    )
+    assert [item["kind"] for item in incidents] == [
+        "deterministic-ci-failed",
+        "unclassified",
+    ]
+
+
+def test_the_dispatch_evidence_advisory_carries_its_own_remediation():
+    incidents = incidents_from_issues(
+        [
+            _issue(
+                1,
+                "ready",
+                ["implementation-approved", "human-review-required", "agent-ready"],
+            )
+        ],
+        project_id="forge",
+        repository="acme/forge",
+        observed_at=NOW,
+    )
+    loaded = load_incident_document(_incidents(*incidents))
+    assert loaded[0].kind == "awaiting-dispatch-evidence"
+    actions = loaded[0].as_dict()["remediations"]
+    assert actions[0]["actionId"] == "confirm-the-run"
+
+
+def test_a_fresh_spec_hold_survives_planning_evidence():
+    hold = _incident(
+        incidentId="acme/forge#7:spec-hold",
+        kind="awaiting-spec-review",
+        severity="degraded",
+        backlogItemId="acme/forge#7",
+    )
+    planned = _ledger(
+        *_chain(
+            TO_PLANNED,
+            workUnit={"projectId": "forge", "workUnitId": "wu-1", "issueRef": "acme/forge#7"},
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=planned.projections(),
+        backlog=load_backlog_document(
+            _document(_backlog(itemId="acme/forge#7", issueRef="acme/forge#7"))
+        ),
+        incidents=load_incident_document(_incidents(hold)),
+    )
+    assert len(snapshot.get("forge").incidents) == 1
+
+
+def test_a_malformed_label_entry_is_a_controlled_error():
+    with pytest.raises(ControlCenterError, match="string name"):
+        backlog_document_from_issues(
+            [{"number": 1, "title": "bad entry", "state": "open", "labels": [{}]}],
+            project_id="forge",
+            repository="acme/forge",
+        )
+
+
+def test_combined_per_project_incidents_respect_the_budget():
+    half_one = load_incident_document(
+        {
+            "schemaVersion": 1,
+            "incidents": [dict(_incident(incidentId=f"a-{index}")) for index in range(1500)],
+        }
+    )
+    half_two = load_incident_document(
+        {
+            "schemaVersion": 1,
+            "incidents": [dict(_incident(incidentId=f"b-{index}")) for index in range(1500)],
+        }
+    )
+    with pytest.raises(ControlCenterError, match="more than 2000 incidents"):
+        build_control_center_snapshot(
+            generated_at=NOW, registry=REGISTRY, incidents=half_one + half_two
+        )

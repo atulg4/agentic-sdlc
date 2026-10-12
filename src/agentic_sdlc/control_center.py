@@ -130,8 +130,11 @@ APPROVAL_PROVEN_STATES = DISPATCH_PROVEN_STATES | frozenset({FactoryState.APPROV
 #: durable evidence that the gate the labels describe was already passed.
 _LEDGER_RETIREMENT: Mapping[str, frozenset[FactoryState]] = {
     "dispatch-blocked": DISPATCH_PROVEN_STATES,
+    "awaiting-dispatch-evidence": DISPATCH_PROVEN_STATES,
     "triage-needed": TRIAGE_PROVEN_STATES,
-    "awaiting-spec-review": PLAN_PROVEN_STATES,
+    # A fresh re-draft can hold work that already planned, so only dispatch
+    # evidence retires the spec-review hold.
+    "awaiting-spec-review": DISPATCH_PROVEN_STATES,
     "awaiting-human-approval": APPROVAL_PROVEN_STATES,
 }
 
@@ -483,6 +486,24 @@ REMEDIATION_CATALOGUE: Mapping[str, tuple[RemediationAction, ...]] = {
                 "--pull-request-number 123 --run-id 456 --head-sha <sha> "
                 "--current-head-sha <sha> --failure-class transient_infrastructure "
                 "--output decision.json"
+            ),
+        ),
+    ),
+    "awaiting-dispatch-evidence": (
+        _action(
+            "confirm-the-run",
+            "Confirm the run started",
+            "Every precondition label is present; check whether the trigger actually fired.",
+            _OPERATOR,
+        ),
+        _action(
+            "re-apply-the-trigger-label",
+            "Re-apply the trigger label",
+            "The bundled triggers fire only on their label event; re-apply it to re-kick.",
+            _HUMAN,
+            handoff=(
+                "Remove and re-add the trigger label (implementation-approved for the "
+                "implement trigger, agent-ready for the plan trigger) to fire the event again."
             ),
         ),
     ),
@@ -1247,6 +1268,11 @@ def build_control_center_snapshot(
         )
         seen_incidents.add(incident.incident_id)
         by_project_incidents.setdefault(incident.project_id, []).append(incident)
+    for project_id, project_incident_list in by_project_incidents.items():
+        _require(
+            len(project_incident_list) <= MAX_INCIDENTS,
+            f"project {project_id} combines more than {MAX_INCIDENTS} incidents",
+        )
 
     universe = set(registry.project_ids())
     observed = set(by_project_units) | set(by_project_backlog) | set(by_project_incidents)
