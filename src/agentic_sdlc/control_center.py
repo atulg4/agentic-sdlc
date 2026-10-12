@@ -62,14 +62,20 @@ MAX_TEXT_LENGTH = 512
 MAX_BACKLOG_ITEMS = 5000
 MAX_BACKLOG_DEPTH = 32
 MAX_INCIDENTS = 2000
+#: The snapshot's portfolio budget, shared with the console's validator: a
+#: snapshot either fits every declared and observed project in it or fails
+#: with a reason, so the producer and the viewer agree on what is renderable.
+MAX_PROJECTS = 500
 
 #: A tracker reference charset: ``owner/repo#123`` and ``owner/repo!123`` both
 #: fit, so a GitHub issue and a GitLab merge request need no re-encoding. The
 #: leading class matches the registry's repository grammar (GitLab allows
 #: ``_`` and ``.`` anywhere, so ``_group/repo#7`` is a real reference). The
-#: length budget is the read model's own text budget (``MAX_TEXT_LENGTH``),
-#: so any registry-valid repository identifier still leaves room for its
-#: tracker suffix (``#N``/``!N`` and a rule id).
+#: length budget is the read model's own text budget (``MAX_TEXT_LENGTH``).
+#: The registry caps repository identifiers at 255 characters
+#: (``project_registry.MAX_REPOSITORY_LENGTH``), so under the SHARED contract
+#: every registry-valid repository leaves room for its tracker suffix
+#: (``#N``/``!N`` and a rule id).
 _ID = re.compile(r"[A-Za-z0-9._-][A-Za-z0-9._/#!:-]{0,511}")
 #: A tracker reference that names a repository: an identifier of one or more
 #: slash-separated segments in the registry's own segment contract (GitLab
@@ -192,9 +198,24 @@ _CHANGE_REQUEST_RETIREMENT = frozenset(
         "merge-conflict",
         "branch-behind",
         "deterministic-ci-failed",
-        "unclassified",
     }
 )
+
+
+def _change_request_scoped(incident: Incident) -> bool:
+    """The incident describes an obstacle to MERGING its evidenceRef.
+
+    ``unclassified`` is provider-neutral and its evidenceRef is free text, so
+    only the adapter's own merge-state records (id ``<ref>:merge-state-<x>``)
+    count: any other unclassified incident citing a merged change request may
+    describe something else entirely (a post-merge regression) and must stay.
+    """
+    if incident.kind in _CHANGE_REQUEST_RETIREMENT:
+        return True
+    return incident.kind == "unclassified" and incident.incident_id.startswith(
+        incident.evidence_ref + ":merge-state-"
+    )
+
 
 #: States in which something is executing *right now*. Backlog-shaped states
 #: (intake through approved), queued ones (dispatched — a worker has not
@@ -1431,6 +1452,11 @@ def build_control_center_snapshot(
         missing = sorted(set(requested) - universe)
         _require(not missing, f"snapshot has no such project: {', '.join(missing)}")
         universe &= set(requested)
+    _require(
+        len(universe) <= MAX_PROJECTS,
+        f"snapshot would hold {len(universe)} projects, more than the read model's "
+        f"{MAX_PROJECTS}-project budget; narrow --project-id",
+    )
 
     warnings: list[str] = []
     views: list[ProjectView] = []
@@ -1543,7 +1569,7 @@ def build_control_center_snapshot(
             # history alone; otherwise reference-wide proof applies only when
             # every unit carrying the reference proves the merge, so one
             # unit's merge never hides another unit's real blocker.
-            if incident.kind in _CHANGE_REQUEST_RETIREMENT and incident.evidence_ref:
+            if incident.evidence_ref and _change_request_scoped(incident):
                 if incident.work_unit_id:
                     named = statuses.get(incident.work_unit_id)
                     merged = (

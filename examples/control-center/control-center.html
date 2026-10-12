@@ -397,9 +397,59 @@
     return error.message || error.code || "unknown error";
   }
 
+  function deriveProjectFacts(project) {
+    // health and the headline counts are documented as DERIVED fields, so
+    // the console recomputes them from the validated arrays rather than
+    // trusting the stored document: a writer who recomputes the digest must
+    // not be able to hide blockers behind a serialized "idle" project.
+    const incidents = project.incidents || [];
+    const active = project.active || [];
+    const attention = project.attention || [];
+    const blockers = incidents.filter((incident) => incident.severity === "blocker").length;
+    let backlogItems = 0;
+    const stack = [...(project.backlog || [])];
+    while (stack.length) {
+      const node = stack.pop();
+      backlogItems += 1;
+      for (const child of node.children || []) stack.push(child);
+    }
+    const registered = project.registered === true;
+    const serialized = project.counts || {};
+    const workUnits = Number.isInteger(serialized.workUnits) && serialized.workUnits >= 0 ? serialized.workUnits : 0;
+    project.health =
+      !registered ? "unregistered" :
+      blockers ? "blocked" :
+      attention.length ? "needs-attention" :
+      incidents.length ? "degraded" :
+      active.length ? "running" :
+      (workUnits || backlogItems) ? "idle" : "no-data";
+    project.counts = {
+      ...serialized,
+      workUnits,
+      backlogItems,
+      active: active.length,
+      attention: attention.length,
+      incidents: incidents.length,
+      blockers,
+    };
+  }
+
   function adoptSnapshot(document_, loadedAt, loadedBy) {
     const problem = validateSnapshot(document_);
     if (problem) { state.error = problem; return problem; }
+    for (const project of document_.projects) deriveProjectFacts(project);
+    // Portfolio totals are sums of the derived per-project facts.
+    const totals = { projects: document_.projects.length, workUnits: 0, backlogItems: 0, active: 0, attention: 0, incidents: 0, blockers: 0, unregistered: 0 };
+    for (const project of document_.projects) {
+      totals.workUnits += project.counts.workUnits;
+      totals.backlogItems += project.counts.backlogItems;
+      totals.active += project.counts.active;
+      totals.attention += project.counts.attention;
+      totals.incidents += project.counts.incidents;
+      totals.blockers += project.counts.blockers;
+      totals.unregistered += project.registered === true ? 0 : 1;
+    }
+    document_.totals = totals;
     state.snapshot = document_;
     state.snapshotMeta = { loadedAt: loadedAt || "", loadedBy: loadedBy || "" };
     state.error = "";
@@ -535,8 +585,8 @@
       }
     }
     if (value.totals !== undefined && !isObj(value.totals)) return "totals must be an object.";
-    if (value.warnings !== undefined && !Array.isArray(value.warnings)) return "warnings must be an array.";
-    if (value.sources !== undefined && !Array.isArray(value.sources)) return "sources must be an array.";
+    const topLevel = arrayField(value, "warnings", "snapshot", 5000) || arrayField(value, "sources", "snapshot", 100);
+    if (topLevel) return topLevel;
     if (value.generatedAt !== undefined && typeof value.generatedAt !== "string") return "generatedAt must be a string.";
     if (!/^[0-9a-f]{64}$/.test(value.snapshotSha256 || "")) return "The snapshot must carry its 64-character snapshotSha256 digest.";
     return "";

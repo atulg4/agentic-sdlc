@@ -1240,6 +1240,7 @@ def test_full_length_github_names_fit_generated_identifiers():
     long_issue = dict(
         _issue(123456, "long names"),
         repository_url=f"https://api.github.com/repos/{repository}",
+        html_url=f"https://github.com/{repository}/issues/123456",
     )
     document = backlog_document_from_issues(
         [long_issue],
@@ -4243,3 +4244,110 @@ def test_the_console_bounds_collections_before_validating():
     assert "const BUDGETS = { backlog: 5000" in html
     assert "holds more than ${budget} entries" in html
     assert "holds more than 5000 children" in html
+
+
+def test_issue_links_must_identify_the_declared_issue():
+    foreign = _issue(1, "lure")
+    foreign["html_url"] = "https://evil.example/acme/forge/issues/1"
+    with pytest.raises(ControlCenterError, match="not a recognized GitHub issue URL"):
+        _export(foreign)
+    wrong_number = _issue(1, "mismatch")
+    wrong_number["html_url"] = "https://github.com/acme/forge/issues/2"
+    with pytest.raises(ControlCenterError, match="does not identify acme/forge#1"):
+        _export(wrong_number)
+    wrong_repository = _issue(1, "mismatch")
+    wrong_repository["html_url"] = "https://github.com/other/repo/issues/1"
+    with pytest.raises(ControlCenterError, match="does not identify acme/forge#1"):
+        _export(wrong_repository)
+    absent = _issue(1, "no link")
+    del absent["html_url"]
+    assert "url" not in _export(absent)["items"][0]
+
+
+def test_the_snapshot_enforces_the_shared_project_budget():
+    items = [
+        _backlog(itemId=f"acme/forge#{index}", projectId=f"p{index}", issueRef="")
+        for index in range(501)
+    ]
+    with pytest.raises(ControlCenterError, match="more than the read model's 500-project budget"):
+        build_control_center_snapshot(
+            generated_at=NOW,
+            registry=EMPTY,
+            backlog=load_backlog_document(_document(*items)),
+        )
+
+
+def test_a_repository_identifier_beyond_the_registry_budget_is_rejected():
+    from agentic_sdlc.project_registry import ProjectRegistryError
+
+    document = {
+        "schemaVersion": 1,
+        "projects": [
+            {
+                "projectId": "forge",
+                "displayName": "Forge",
+                "group": "platform",
+                "defaultBranch": "main",
+                "repositories": [
+                    {
+                        "provider": "gitlab",
+                        "identifier": "g" * 300 + "/repo",
+                        "role": "primary",
+                    }
+                ],
+                "environments": [{"name": "production", "kind": "production"}],
+                "capabilities": ["planning"],
+            }
+        ],
+    }
+    with pytest.raises(ProjectRegistryError, match="at most 255 characters"):
+        load_project_registry(document)
+
+
+def test_merge_proof_spares_unclassified_incidents_that_are_not_merge_holds():
+    ledger = _ledger(
+        *_chain(
+            TO_MERGED,
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "changeRequestRef": "acme/forge!7",
+            },
+        )
+    )
+    merge_state = _incident(
+        incidentId="acme/forge!7:merge-state-blocked",
+        kind="unclassified",
+        severity="degraded",
+        evidenceRef="acme/forge!7",
+    )
+    regression = _incident(
+        incidentId="acme/forge!7:post-merge-regression",
+        kind="unclassified",
+        severity="degraded",
+        evidenceRef="acme/forge!7",
+        summary="Nightly data check regressed after this change request merged",
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        incidents=load_incident_document(_incidents(merge_state, regression)),
+    )
+    kept = [item.incident_id for item in snapshot.get("forge").incidents]
+    # The adapter's own merge-state record retires; an unclassified incident
+    # merely CITING the merged change request stays.
+    assert kept == ["acme/forge!7:post-merge-regression"]
+
+
+def test_the_console_derives_health_and_bounds_top_level_collections():
+    from pathlib import Path
+
+    html = Path("examples/control-center/control-center.html").read_text(encoding="utf-8")
+    assert "function deriveProjectFacts(project)" in html
+    assert "for (const project of document_.projects) deriveProjectFacts(project);" in html
+    # Top-level collections share the validator's budget enforcement.
+    assert (
+        'arrayField(value, "warnings", "snapshot", 5000) || '
+        'arrayField(value, "sources", "snapshot", 100)' in html
+    )
