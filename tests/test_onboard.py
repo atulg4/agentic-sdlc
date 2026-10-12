@@ -2417,6 +2417,12 @@ def test_doctor_rejects_a_ci_gate_whose_failure_is_ignored(tmp_path, mutate):
         # A quoted control word is a plain word to bash (Codex 4253116034).
         ('if ! true; then "fi"; pytest; fi; true', "bash", False),
         ('echo "if x"; pytest', "bash", True),
+        # A pipeline behind a skipped `||` branch never runs; a backgrounded brace group runs
+        # its contents in the background (Codex 4253230848/4253230837).
+        ("true || true | pytest; true", "bash", False),
+        ("true && pytest | tee out", "bash", True),
+        ("{ pytest; } & true", "bash", False),
+        ("{ pytest; }; true", "bash", True),
         ("set -o pipefail; echo ok; pytest | tee out", None, True),
         # `o` anywhere in a cluster takes the option name (Codex 4251046345).
         ("set +ou pipefail; pytest | tee out", "bash", False),
@@ -3795,6 +3801,8 @@ def _mutate_ci_test_step(repo, mutate):
         lambda doc, job, step: doc.update({"env": {"PYTEST_ADDOPTS": "--co"}}),
         lambda doc, job, step: step.update({"run": "PYTEST_ADDOPTS=--co " + step["run"]}),
         lambda doc, job, step: step.update({"run": "export PYTEST_ADDOPTS=--co\n" + step["run"]}),
+        # a name built by an expansion may be PYTEST_ADDOPTS (Codex 4253230817)
+        lambda doc, job, step: step.update({"run": "export $x=--co\n" + step["run"]}),
         lambda doc, job, step: step.update({"env": {"BASH_ENV": "./evil.sh"}}),
         lambda doc, job, step: job["steps"].insert(
             0, {"run": 'echo "PYTEST_ADDOPTS=--co" >> "$GITHUB_ENV"'}

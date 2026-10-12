@@ -6482,6 +6482,8 @@ def _gate_env_altering(name: str, tools: set[str]) -> bool:
     name = str(name)
     if name in GATE_ENV_BENIGN:
         return False
+    if set(name) & _SHELL_EXPANSION_CHARS:
+        return True  # a name built by an expansion may be any of the ones below
     return (
         "ADDOPTS" in name.upper()
         or name in GATE_ENV_ALWAYS
@@ -6850,6 +6852,8 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
     # After any `enable` the `builtin`/`command` wrappers may be disabled (Codex 4251826084): a
     # wrapped `set` is no longer proven to run.
     wrappers_untrusted = False
+    group_starts: list[int] = []  # index in `records` where each open `{` group began
+    closed_group_start: int | None = None
     for line in script.replace("\\\n", " ").splitlines():
         lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
         lexer.whitespace_split = True
@@ -6907,9 +6911,11 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                     pending_function = True
                 elif head == "{":
                     braces.append("function" if pending_function else "group")
+                    group_starts.append(len(records))
                     pending_function = False
                 elif head == "}" and braces:
                     braces.pop()
+                    closed_group_start = group_starts.pop() if group_starts else 0
                 condition = condition or head in _SHELL_CONDITIONS
                 if head in _SHELL_OPENERS:
                     depth += 1
@@ -6921,6 +6927,12 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                 depth += 1
                 argv = []
             following = ";" if token is None else token
+            if closed_group_start is not None:
+                if following == "&":
+                    # `{ a; } &` backgrounds the whole group (Codex 4253230837).
+                    for record in records[closed_group_start:]:
+                        record["forced_background"] = True
+                closed_group_start = None
             if argv:
                 # Judged on the command bash runs: `command eval ...` evaluates too (Codex
                 # 4252987831).
@@ -6930,6 +6942,10 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                         found = _ASSIGNMENT_WORD.match(word) or _NAME_WORD.match(word)
                         if found:
                             out.assigned.add(found.group(1) if found.groups() else word)
+                        elif set(word) & _SHELL_EXPANSION_CHARS:
+                            # `export $x=--collect-only` sets a name only bash knows (Codex
+                            # 4253230848): recorded as-is, it reads as gate-altering.
+                            out.assigned.add(word.split("=", 1)[0])
                 elif effective[0] == "alias":
                     out.aliases |= {w.split("=", 1)[0] for w in effective[1:] if "=" in w}
                 elif effective[0] in {"source", "."}:
@@ -7065,12 +7081,16 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
     # `! a | b` and `if a | b` make the WHOLE pipeline the condition, not only its first member
     # (Codex 4251826079).
     in_condition = False
+    pipeline_reached = True
     for r in records:
         if r["previous"] in {"|", "|&"}:
-            if in_condition:
+            # A pipeline a short circuit skips (`true || a | b`) skips every member, not
+            # only the first (Codex 4253230817).
+            if in_condition or not pipeline_reached:
                 r["reached"] = False
         else:
             in_condition = r["condition"]
+            pipeline_reached = r["reached"]
     background = False
     for r in reversed(records):
         if r["following"] == "&":
@@ -7078,7 +7098,7 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
         elif r["following"] not in {"|", "|&", "&&", "||"}:
             # `a && b &` backgrounds the whole and-or list (Codex 4252316108).
             background = False
-        r["background"] = background
+        r["background"] = background or r.get("forced_background", False)
     # A failure before a later `||` in the same and-or list can be recovered by it -- `pytest &&
     # true || true` exits 0 -- so no member before the list's last `||` is enforced (Codex
     # 4252760398).
