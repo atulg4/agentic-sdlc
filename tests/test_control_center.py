@@ -3224,9 +3224,41 @@ def test_crossed_gate_evidence_survives_a_later_pre_gate_state():
 
 
 def test_a_malformed_declared_parent_is_a_controlled_error():
-    for bad in (True, 0, -2):
+    for bad in (True, 0, -2, 1.0, "1"):
         with pytest.raises(ControlCenterError, match="declared parent number"):
             parent_links(([{"number": 2}], bad))
+    with pytest.raises(ControlCenterError, match="must be an object"):
+        parent_links(([1, 2], 1))
+
+
+def test_a_foreign_payload_behind_a_valid_record_is_still_rejected():
+    from agentic_sdlc.github_backlog import canonical_repository
+
+    records = [
+        {"number": 1, "repository_url": "https://api.github.com/repos/acme/forge"},
+        {"number": 2, "repository_url": "https://api.github.com/repos/other/repo"},
+    ]
+    with pytest.raises(ControlCenterError, match="belong to other/repo"):
+        canonical_repository(records, "acme/forge")
+
+
+def test_non_repository_evidence_references_never_warn():
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        incidents=load_incident_document(
+            _incidents(
+                _incident(
+                    incidentId="run-7-infra",
+                    projectId="forge",
+                    kind="infrastructure-failure",
+                    severity="degraded",
+                    evidenceRef="https://ci.example/runs/7",
+                )
+            )
+        ),
+    )
+    assert not any("does not declare" in warning for warning in snapshot.get("forge").warnings)
 
 
 def test_a_malformed_failing_key_is_a_controlled_error():
