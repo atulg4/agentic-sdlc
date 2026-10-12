@@ -342,6 +342,15 @@ def trusted_marker_author(
     return granted is not None and login_key(granted) in WRITE_PERMISSIONS
 
 
+def _answered_404(exc: BaseException) -> bool:
+    """True only when GitHub ANSWERED 404 -- the status `run_gh` parsed from the response
+    (`gh_http_status`), never a "404" anywhere in the message (Codex 4244027557): a timeout or
+    5xx on a path that echoes `404` must not read as "no access"."""
+    from .onboard import gh_http_status  # onboard imports this module
+
+    return gh_http_status(exc) == 404
+
+
 class PermissionCache:
     """Repository permission per login, read once per run (`GET .../collaborators/{u}/permission`).
     Keyed by `login_key`: `Alice` and `alice` are one read.
@@ -374,7 +383,7 @@ class PermissionCache:
         try:
             raw = self.gh(["api", path])
         except Exception as exc:  # noqa: BLE001 -- only a 404 is an answer
-            if "HTTP 404" in str(exc):
+            if _answered_404(exc):
                 return None  # GitHub: the account has no access to the repository
             raise LeaseError(
                 f"cannot read the repository permission of marker author {login!r} "
@@ -2123,7 +2132,7 @@ def labeler_permission(project: str, login: str, gh: GhRunner) -> str | None:
     try:
         raw = gh(["api", path])
     except Exception as exc:  # noqa: BLE001 -- only a 404 is an answer
-        if "HTTP 404" in str(exc):
+        if _answered_404(exc):
             return None
         raise LeaseError(
             f"cannot read the repository permission of {login!r} "

@@ -136,7 +136,7 @@ class FakeGh:
             login = args[1].split("/")[4]
             known = {k.casefold(): v for k, v in self.permissions.items()}  # GitHub: any case
             if login.casefold() not in known:
-                raise RuntimeError("gh: Not Found (HTTP 404)")
+                raise GhCommandError("gh: Not Found (HTTP 404)", http_status=404)
             level = known[login.casefold()]
             legacy = {"maintain": "write", "triage": "read"}.get(level, level)
             return json.dumps({"permission": legacy, "role_name": level})
@@ -2506,7 +2506,6 @@ APPROVAL = "implementation-approved"
 
 def test_authorize_labeler_requires_write_authority_from_the_latest_approver():
     from agentic_sdlc.leases import authorize_labeler
-    from agentic_sdlc.onboard import OnboardError
 
     write = json.dumps({"permission": "write", "role_name": "write"})
     maintain = json.dumps({"permission": "write", "role_name": "maintain"})
@@ -2517,7 +2516,7 @@ def test_authorize_labeler_requires_write_authority_from_the_latest_approver():
         "keeper": maintain,
         "boss": admin,
         "triager": triage,
-        "stranger": OnboardError("gh: Not Found (HTTP 404)"),
+        "stranger": GhCommandError("gh: Not Found (HTTP 404)", http_status=404),
     }
     other = _label_event("labeled", "agent-ready", "writer", 1)
     for login, ok in (
@@ -3979,3 +3978,55 @@ def test_committed_policy_fails_closed_unless_github_answered_404(failure, monke
 
     monkeypatch.setattr(cli, "run_gh", absent)
     assert cli._committed_lease_policy("o/404") is None
+
+
+# Codex 4244027557: a permission read is "no access" only when GitHub ANSWERED 404 -- the status
+# run_gh parsed (`gh_http_status`), never "404"/"HTTP 404" anywhere in the message.
+@pytest.mark.parametrize(
+    "failure",
+    [
+        GhCommandError(
+            "gh api repos/o/404/collaborators/x/permission failed: gh: Server Error (HTTP 500)",
+            http_status=500,
+        ),
+        GhCommandError("gh: x (HTTP 404) then gh: Server Error (HTTP 500)", http_status=None),
+        OnboardError(
+            "gh api repos/o/404/collaborators/x/permission did not answer within 60s (HTTP 404)"
+        ),
+        RuntimeError("gh: Not Found (HTTP 404)"),
+    ],
+)
+def test_permission_reads_fail_closed_unless_github_answered_404(failure):
+    from agentic_sdlc.leases import PermissionCache, labeler_permission
+
+    def failing(args, input=None):
+        raise failure
+
+    def absent(args, input=None):
+        raise GhCommandError("gh: Not Found (HTTP 404)", http_status=404)
+
+    with pytest.raises(LeaseError):
+        labeler_permission("o/404", "x", failing)
+    with pytest.raises(LeaseError):
+        PermissionCache("o/404", failing)("x")
+    assert labeler_permission("o/404", "x", absent) is None
+    assert PermissionCache("o/404", absent)("x") is None
+
+
+@pytest.mark.parametrize(
+    ("stderr", "stdout"),
+    [
+        ("gh: Not Found (HTTP 404)", '{"message":"Not Found","status":"404"}'),
+        ("gh: Not Found (HTTP 404)\n", ""),
+        ("gh: Server Error (HTTP 502)", ""),
+        ("gh: Not Found (HTTP 404)", '{"message":"x","status":"500"}'),
+        ("gh: repos/o/404 (HTTP 404) proxy said no", ""),
+        ("error connecting to api.github.com (repos/o/404)", ""),
+        ("gh: Bad (HTTP 404)\ngh: Server Error (HTTP 500)", ""),
+        ("", ""),
+    ],
+)
+def test_the_commit_guard_reads_the_404_answer_like_run_gh(stderr, stdout):
+    from agentic_sdlc.onboard import gh_error_http_status
+
+    assert _guard()._gh_http_status(stderr, stdout) == gh_error_http_status(stderr, stdout)

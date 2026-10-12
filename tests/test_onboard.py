@@ -21,6 +21,7 @@ from agentic_sdlc.onboard import (
     REUSABLE_IMPLEMENT_AGENTS,
     REUSABLE_IMPLEMENT_DEFAULT_AGENT,
     RULESET_NAME,
+    GhCommandError,
     OnboardError,
     OnboardSpec,
     ProducedContexts,
@@ -146,7 +147,7 @@ class FakeGh:
             return json.dumps({"sha": "c" * 40, "commit": {"tree": {"sha": tree_sha(ref, "")}}})
         sha = unquote(key[len(CONSUMER_TREES) :])
         if sha not in trees:
-            raise OnboardError("gh: Not Found (HTTP 404)")
+            raise GhCommandError("gh: Not Found (HTTP 404)", http_status=404)
         ref, rel = trees[sha]
         raw = self._answer(CONSUMER_CONTENTS + f"{rel}?ref={quote(ref, safe='')}")
         try:
@@ -193,7 +194,7 @@ class FakeGh:
                     ]
                 )
             if not path.is_file():
-                raise OnboardError("gh: Not Found (HTTP 404)")
+                raise GhCommandError("gh: Not Found (HTTP 404)", http_status=404)
             return _blob(path.read_bytes())
         if key.startswith(PLATFORM_CONTENTS):
             for prefix, value in self.answers.items():
@@ -202,11 +203,11 @@ class FakeGh:
                         raise value
                     return value
             if any(key.startswith(prefix) for prefix in self.fail):
-                raise OnboardError("gh: Not Found (HTTP 404)")
+                raise GhCommandError("gh: Not Found (HTTP 404)", http_status=404)
             name = key[len(PLATFORM_CONTENTS) :].split("?")[0].removeprefix(".github/workflows/")
             path = PLATFORM_WORKFLOWS / name
             if "/" in name or not path.is_file():
-                raise OnboardError("gh: Not Found (HTTP 404)")
+                raise GhCommandError("gh: Not Found (HTTP 404)", http_status=404)
             return _blob(path.read_bytes())
         if key == "api repos/owner/agentic-sdlc --jq .private" and not any(
             key.startswith(prefix) for prefix in self.answers
@@ -530,8 +531,8 @@ def _healthy_gh() -> FakeGh:
     return FakeGh(
         {
             # before "api repos/owner/comic": answers match by prefix, in this order
-            "api repos/owner/comic/branches/main/protection": OnboardError(
-                "gh: Branch not protected (HTTP 404)"
+            "api repos/owner/comic/branches/main/protection": GhCommandError(
+                "gh: Branch not protected (HTTP 404)", http_status=404
             ),
             "api repos/owner/comic/rules/branches/main": _effective_rules(),
             # the publisher's agent/... branches: no ruleset targets them
@@ -2268,7 +2269,9 @@ def test_doctor_requires_the_managed_files_on_the_remote_default_branch(tmp_path
     repo = _repo(tmp_path)
     write_onboarding(repo, spec())
     gh = _healthy_gh()
-    gh.answers[CONSUMER_CONTENTS] = OnboardError("gh: Not Found (HTTP 404)")  # nothing pushed
+    gh.answers[CONSUMER_CONTENTS] = GhCommandError(
+        "gh: Not Found (HTTP 404)", http_status=404
+    )  # nothing pushed
     failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))
     # with no workflows on the default branch, its required `test` context is unverifiable too
     rules = "effective default-branch rules (org/enterprise rulesets too) fit Forge"
@@ -2418,7 +2421,7 @@ def _repo_gh(repo: dict, fork_policy: str | None = None):
         key = " ".join(args)
         if key == FORK_POLICY:
             if fork_policy is None:
-                raise OnboardError("gh: Not Found (HTTP 404)")
+                raise GhCommandError("gh: Not Found (HTTP 404)", http_status=404)
             return fork_policy
         assert key == "api repos/o/r", key
         return json.dumps(repo)
@@ -6977,7 +6980,9 @@ def test_paged_items_distinguishes_unreadable_from_empty():
         assert isinstance(found, Unreadable), text
         with pytest.raises(TypeError):
             bool(found)  # an unhandled Unreadable fails loudly, never reads as empty
-    not_found = _paged_items(FakeGh({"api x": OnboardError("gh: Not Found (HTTP 404)")}), "x")
+    not_found = _paged_items(
+        FakeGh({"api x": GhCommandError("gh: Not Found (HTTP 404)", http_status=404)}), "x"
+    )
     assert isinstance(not_found, Unreadable) and not_found.not_found
 
 
@@ -13477,3 +13482,54 @@ def test_doctor_reads_no_organization_inventory_for_a_user_repository(tmp_path):
     failed = _failed(doctor(repo, "owner/comic", "owner/agentic-sdlc", gh))
     assert "PUBLISHER_APP_PRIVATE_KEY" in failed["repo secrets set (by name)"].detail
     assert not any("organization-" in c[1] for c, _ in gh.calls if len(c) > 1)
+
+
+# Codex 4244027557: "absent" is GitHub's 404 ANSWER (`gh_http_status`), never "404" in the
+# message -- a repository or branch named `404` echoes it in every failed request.
+_FAILURES_ON_A_404_PATH = [
+    GhCommandError(
+        "gh api repos/o/404/contents/x?ref=404 failed: gh: Server Error (HTTP 500)",
+        http_status=500,
+    ),
+    GhCommandError(
+        "gh api repos/o/404/contents/x?ref=404 failed: gh: Forbidden (HTTP 403)", http_status=403
+    ),
+    GhCommandError("gh api repos/o/404/contents/x?ref=404 failed: Not Found", http_status=None),
+    OnboardError("gh api repos/o/404/contents/x?ref=404 did not answer within 60s; not concluding"),
+    # an OnboardError that is not run_gh's: no parsed status, whatever the text says
+    OnboardError("gh: Not Found (HTTP 404)"),
+]
+
+
+def _raising(failure):
+    def gh(args, input=None):
+        raise failure
+
+    return gh
+
+
+@pytest.mark.parametrize(
+    "failure", [f for f in _FAILURES_ON_A_404_PATH if isinstance(f, OnboardError)]
+)
+def test_remote_file_state_is_unknown_unless_github_answered_404(failure):
+    from agentic_sdlc.onboard import _remote_file_state
+
+    args = ["api", "repos/o/404/contents/x?ref=404"]
+    assert _remote_file_state(_raising(failure), args) == "unknown"
+    genuine = GhCommandError("gh: Not Found (HTTP 404)", http_status=404)
+    assert _remote_file_state(_raising(genuine), args) == "absent"
+
+
+@pytest.mark.parametrize(
+    "failure", [f for f in _FAILURES_ON_A_404_PATH if isinstance(f, OnboardError)]
+)
+def test_safe_json_not_found_only_on_a_404_answer(failure):
+    from agentic_sdlc.onboard import Unreadable, _safe_json
+
+    args = ["api", "repos/o/404/branches/404"]
+    answer = _safe_json(_raising(failure), args)
+    assert isinstance(answer, Unreadable) and not answer.not_found
+    genuine = _safe_json(
+        _raising(GhCommandError("gh: Not Found (HTTP 404)", http_status=404)), args
+    )
+    assert isinstance(genuine, Unreadable) and genuine.not_found

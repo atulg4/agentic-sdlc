@@ -3286,6 +3286,27 @@ def trusted_marker_author(comment: dict, permission, configured: str | None = No
     return granted is not None and login_key(granted) in WRITE_PERMISSIONS
 
 
+_GH_HTTP_ERROR_LINE = re.compile(r"^gh: .*\(HTTP ([1-5][0-9]{2})\)$")
+
+
+def _gh_http_status(stderr: str | None, stdout: str | None = "") -> int | None:
+    """The HTTP status GitHub answered (onboard.gh_error_http_status): the `gh: ... (HTTP nnn)`
+    last line of stderr, agreeing with the error body's own `status` when it carries one. Never
+    a "404" elsewhere in the output (Codex 4244027557); None = unknown, fail closed."""
+    lines = [line.strip() for line in (stderr or "").strip().splitlines() if line.strip()]
+    match = _GH_HTTP_ERROR_LINE.match(lines[-1]) if lines else None
+    if match is None:
+        return None
+    status = int(match.group(1))
+    try:
+        body = json.loads(stdout) if (stdout or "").strip() else None
+    except ValueError:
+        body = None
+    if isinstance(body, dict) and "status" in body and str(body["status"]) != str(status):
+        return None
+    return status
+
+
 _PERMISSIONS: dict[str, str | None] = {}  # one read per login (login_key) per hook run
 
 
@@ -3303,7 +3324,7 @@ def repo_permission(login: str) -> str | None:
     except OSError as exc:
         raise LeaseUnavailable(f"gh unavailable: {exc}") from exc
     if proc.returncode != 0:
-        if "HTTP 404" not in (proc.stderr or ""):
+        if _gh_http_status(proc.stderr, proc.stdout) != 404:
             raise LeaseUnavailable((proc.stderr or "").strip() or "permission read failed")
         data = None
     else:
