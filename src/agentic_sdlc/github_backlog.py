@@ -47,12 +47,19 @@ LABEL_STATES: tuple[tuple[frozenset[str], frozenset[str], str], ...] = (
     (frozenset({"human-review-required"}), frozenset({"spec-drafted"}), "triaged"),
 )
 
-#: GitHub's close reason, mapped to the terminal state it actually means.
+#: GitHub's close reason, mapped to the terminal state it actually means. A
+#: missing or unrecognised reason maps to nothing: the API permits a null
+#: ``state_reason``, and a snapshot never fabricates terminal evidence.
 CLOSED_STATES: Mapping[str, str] = {
     "completed": "merged",
     "not_planned": "cancelled",
     "duplicate": "superseded",
 }
+
+#: Mergeability verdicts in which a change request is actually waiting on the
+#: human merge authority. ``blocked``, ``behind``, ``unstable`` and ``unknown``
+#: mean something else is owed first, so they raise no "ready" incident.
+READY_MERGE_STATES = frozenset({"clean", "has_hooks"})
 
 
 @dataclass(frozen=True)
@@ -74,6 +81,18 @@ class DispatchRule:
 #: ``agent-auto-implement`` triggers enforce. Each unmet row is why an approved
 #: item is sitting still, which is precisely what an operator needs told.
 DISPATCH_RULES: tuple[DispatchRule, ...] = (
+    DispatchRule(
+        rule_id="spec-awaiting-human-review",
+        required=frozenset({"spec-drafted"}),
+        missing=frozenset({"spec-approved"}),
+        kind="awaiting-human-approval",
+        severity="degraded",
+        summary=(
+            "Specification draft held for human spec review: planning and "
+            "implementation stay blocked until spec-drafted is removed or "
+            "spec-approved is added"
+        ),
+    ),
     DispatchRule(
         rule_id="approved-without-dispatch-labels",
         required=frozenset({"implementation-approved"}),
@@ -141,8 +160,10 @@ def _declared_state(issue: Mapping[str, Any], labels: frozenset[str]) -> str:
     """Resolve a declared state, or return "" so the console reports unknown."""
 
     if issue.get("state") == "closed":
-        reason = issue.get("state_reason") or "completed"
-        return CLOSED_STATES.get(str(reason), "")
+        reason = issue.get("state_reason")
+        if not isinstance(reason, str):
+            return ""
+        return CLOSED_STATES.get(reason, "")
     for required, absent, state in LABEL_STATES:
         if required <= labels and not (absent & labels):
             return state
@@ -262,9 +283,10 @@ def incidents_from_change_requests(
     comes from the change request's own detail payload (GitHub's *list*
     endpoint omits ``mergeable_state``, so the caller fetches each one — the
     documented recipe does). Drafts are skipped before any classification: a
-    work in progress is not a blocker. A payload with no mergeability verdict
-    is never reported as ready — unknown is not "waiting on the merge
-    authority".
+    work in progress is not a blocker. Only a verdict in
+    :data:`READY_MERGE_STATES` reports "waiting on the merge authority":
+    ``blocked``, ``behind``, ``unstable``, ``unknown`` and an absent field all
+    mean something else is owed first, and unknown is never fabricated.
     """
 
     checks = dict(failing or {})
@@ -304,7 +326,7 @@ def incidents_from_change_requests(
                 }
             )
             continue
-        if not isinstance(state, str) or not state:
+        if state not in READY_MERGE_STATES:
             continue
         incidents.append(
             {

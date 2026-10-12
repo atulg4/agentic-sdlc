@@ -60,8 +60,10 @@ MAX_BACKLOG_ITEMS = 5000
 MAX_INCIDENTS = 2000
 
 #: A tracker reference charset: ``owner/repo#123`` and ``owner/repo!123`` both
-#: fit, so a GitHub issue and a GitLab merge request need no re-encoding.
-_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/#!:-]{0,127}")
+#: fit, so a GitHub issue and a GitLab merge request need no re-encoding. The
+#: length budget covers GitHub's maxima (39-character owner, 100-character
+#: repository) plus an issue number and a rule suffix.
+_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/#!:-]{0,255}")
 _TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})")
 _SECRET_KEY = re.compile(
     r"credential|secret|token|password|passphrase|api_?key|authorization|bearer|private_?key",
@@ -280,7 +282,10 @@ REMEDIATION_CATALOGUE: Mapping[str, tuple[RemediationAction, ...]] = {
             "Inspect the runner pool",
             "Read current runner capacity and the queue depth that is waiting on it.",
             _OPERATOR,
-            command="sdlcctl capacity-report --ledger usage-ledger.json --output capacity.json",
+            command=(
+                "sdlcctl capacity-report --usage usage-ledger.json "
+                "--window-start <start> --window-end <end> --output capacity.json"
+            ),
         ),
         _action(
             "scale-runner-pool",
@@ -298,7 +303,11 @@ REMEDIATION_CATALOGUE: Mapping[str, tuple[RemediationAction, ...]] = {
             "Route to a fallback executor",
             "Re-run routing so the work unit lands on an executor that still has quota.",
             _OPERATOR,
-            command="sdlcctl route-executor --registry executors.json --policy routing.json",
+            command=(
+                "sdlcctl route-executor --config agentic-sdlc.toml --mission-id <mission> "
+                "--executors executors.json --repository <owner/repo> "
+                "--task-class implementation --budget-usd 5"
+            ),
         ),
         _action(
             "wait-for-quota-reset",
@@ -320,7 +329,10 @@ REMEDIATION_CATALOGUE: Mapping[str, tuple[RemediationAction, ...]] = {
             "Re-run mission dispatch",
             "Once preconditions hold, re-dispatch the mission for this work unit.",
             _OPERATOR,
-            command="sdlcctl dispatch-mission --registry missions.json --task task.json",
+            command=(
+                "sdlcctl dispatch-mission --config agentic-sdlc.toml --mission-id <mission> "
+                "--agents agents.json --work-ref <work-ref> --prompt prompt.md"
+            ),
         ),
     ),
     "deterministic-ci-failed": (
@@ -329,7 +341,10 @@ REMEDIATION_CATALOGUE: Mapping[str, tuple[RemediationAction, ...]] = {
             "Reproduce the failure locally",
             "Run the same deterministic gates the pipeline ran, before changing anything.",
             _OPERATOR,
-            command="sdlcctl run-gates --task task.json --diff diff.json",
+            command=(
+                "sdlcctl run-gates --config agentic-sdlc.toml --repository . "
+                "--output gates-report.json"
+            ),
         ),
         _action(
             "route-to-bounded-repair",
@@ -392,14 +407,19 @@ REMEDIATION_CATALOGUE: Mapping[str, tuple[RemediationAction, ...]] = {
             "Classify the failure",
             "Decide whether the failure is infrastructure or the change itself before retrying.",
             _OPERATOR,
-            command="sdlcctl classify-failure --log run.log",
+            command="sdlcctl classify-failure --log run.log --output classification.json",
         ),
         _action(
             "decide-infrastructure-retry",
             "Decide the retry",
             "Apply the declared retry budget instead of retrying by hand.",
             _OPERATOR,
-            command="sdlcctl decide-infra-retry --classification classification.json",
+            command=(
+                "sdlcctl decide-infra-retry --repository <owner/repo> "
+                "--pull-request-number 123 --run-id 456 --head-sha <sha> "
+                "--current-head-sha <sha> --failure-class transient_infrastructure "
+                "--output decision.json"
+            ),
         ),
     ),
     "unclassified": (
