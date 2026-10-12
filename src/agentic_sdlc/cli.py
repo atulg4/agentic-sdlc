@@ -1132,7 +1132,17 @@ def _github_backlog(args: argparse.Namespace) -> int:
     if args.config:
         # The policy can rename the automation labels; the generated workflows
         # then fire on those names, so the adapter must evaluate the same ones.
+        # The policy must also BE this export's: another repository's labels
+        # (or a non-GitHub policy) would silently misread every issue.
         policy = load_policy(args.config)
+        if policy.provider != "github":
+            raise ControlCenterError(
+                f"--config names a {policy.provider} policy; this adapter exports GitHub"
+            )
+        if policy.project_id.lower() != args.repository.lower():
+            raise ControlCenterError(
+                f"--config belongs to {policy.project_id}, not --repository {args.repository}"
+            )
         labels = LifecycleLabels(
             ready=policy.ready_label,
             human_review=policy.human_review_label,
