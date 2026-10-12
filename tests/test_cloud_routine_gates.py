@@ -465,14 +465,66 @@ def test_check_diff_fails_closed_without_a_trusted_git(tmp_path, policy_file, mo
     assert not marker.exists()
 
 
-def test_an_explicit_git_override_is_vetted_too(tmp_path, policy_file, monkeypatch, capsys):
+def test_check_diff_ignores_an_explicit_git_override(tmp_path, policy_file, monkeypatch, capsys):
     repository = _repo(tmp_path, policy_file)
     _commit(repository, {".github/workflows/x.yml": "on: push\n"})
     marker = _plant_git(tmp_path, monkeypatch)
     monkeypatch.setenv("AGENTIC_SDLC_GIT", str(tmp_path / "bin" / "git"))
     assert _check_diff(repository, policy_file) == 2
-    assert "AGENTIC_SDLC_GIT" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "AGENTIC_SDLC_GIT is ignored by `sdlcctl check-diff`" in err
+    assert "forbidden paths changed: .github/workflows/x.yml" in err  # the real git's diff
     assert not marker.exists()
+
+
+def test_publication_gates_are_strict_whatever_the_policy_and_environment_say(
+    tmp_path, policy_file, monkeypatch, capsys
+):
+    """Codex 4244027559: `trust_mode = "local"` in the policy (committed AND in the working
+    tree the agent can edit), CLAUDE_CODE_REMOTE / GITHUB_ACTIONS unset or "false", and an
+    AGENTIC_SDLC_GIT naming a planted git: check-diff still resolves git in strict trust, so the
+    planted one never runs. A developer-facing command (inspect-diff) does honour local."""
+    from agentic_sdlc import trusted_exec
+
+    text = policy_file.read_text().replace("[automation]\n", '[automation]\ntrust_mode = "local"\n')
+    policy_file.write_text(text)
+    repository = _repo(tmp_path, policy_file)
+    _commit(repository, {".github/workflows/x.yml": "on: push\n"})
+    monkeypatch.chdir(repository)  # ./agentic-sdlc.toml: the working-tree policy says local
+    marker = _plant_git(tmp_path, monkeypatch)
+    monkeypatch.setenv("AGENTIC_SDLC_GIT", str(tmp_path / "bin" / "git"))
+    monkeypatch.setenv("CLAUDE_CODE_REMOTE", "false")
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    assert _check_diff(repository, policy_file) == 2
+    assert "forbidden paths changed: .github/workflows/x.yml" in capsys.readouterr().err
+    assert not marker.exists()  # never executed
+    assert trusted_exec.trust_mode() == trusted_exec.STRICT
+    # every gate command runs under gate trust, whatever the policy says
+    for argv in (
+        ["check-request", "--project", PROJECT, "--issue", "7", "--config", str(policy_file)],
+        ["authorize-labeler", "--project", PROJECT, "--issue", "7"],
+        ["claim", "--project", PROJECT, "--issue", "7", "--session", "s", "--agent", "a",
+         "--branch", "forge/issue-7"],
+        ["renew", "--project", PROJECT, "--issue", "7", "--session", "s"],
+        ["release", "--project", PROJECT, "--issue", "7", "--session", "s"],
+    ):  # fmt: skip
+        seen = []
+        monkeypatch.setattr(cli, "use_gate_trust", seen.append)
+        monkeypatch.setattr(cli, "use_trust_mode", seen.append)
+        args = cli.build_parser().parse_args(argv)
+        cli._use_trust_for(args)
+        assert seen == [True, trusted_exec.STRICT], argv
+    monkeypatch.setattr(cli, "use_gate_trust", trusted_exec.use_gate_trust)
+    monkeypatch.setattr(cli, "use_trust_mode", trusted_exec.use_trust_mode)
+    # the developer-facing inspect-diff keeps the policy's local mode and the override
+    inspect = [
+        "inspect-diff", "--config", "agentic-sdlc.toml", "--repository", str(repository),
+        "--base", "main", "--patch-output", str(tmp_path / "p"),
+        "--paths-output", str(tmp_path / "n"), "--decision-output", str(tmp_path / "d"),
+    ]  # fmt: skip
+    cli.main(inspect)
+    assert trusted_exec.trust_mode() == trusted_exec.LOCAL
+    assert marker.exists()
 
 
 def test_trusted_git_vets_the_file_and_every_directory_above_it(tmp_path):

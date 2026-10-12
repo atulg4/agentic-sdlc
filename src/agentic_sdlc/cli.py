@@ -7,6 +7,7 @@ import base64
 import hashlib
 import json
 import math
+import os
 import re
 import shlex
 import sys
@@ -118,7 +119,14 @@ from .project_registry import (
 from .scaffold import ScaffoldError, scaffold_project
 from .spec_stage import merge_spec, parse_draft
 from .task_spec import TaskSpecError, check_task_spec, draft_request, parse_task, render_prompt
-from .trusted_exec import STRICT, TRUST_MODES, use_trust_mode
+from .trusted_exec import GH_OVERRIDE_ENV as _GH_OVERRIDE_ENV
+from .trusted_exec import (
+    STRICT,
+    TRUST_MODES,
+    use_gate_trust,
+    use_trust_mode,
+)
+from .trusted_git import OVERRIDE_ENV as _GIT_OVERRIDE_ENV
 from .usage_ledger import (
     EstimatorCalibration,
     TokenCounts,
@@ -2016,8 +2024,10 @@ def build_parser() -> argparse.ArgumentParser:
         choices=TRUST_MODES,
         help="strict (default): git, gh and the hook python must be files only root can "
         "replace; local: a developer's own machine (first on PATH, owned by root or you). "
-        "GitHub Actions and Claude Code cloud sessions are strict regardless. Default: the "
-        "installed policy's on --force, else strict",
+        "GitHub Actions, Claude Code cloud sessions and the publication-decision commands "
+        "(check-diff, check-request, authorize-labeler, claim, renew, release, "
+        "confirm-cloud-routine) are strict regardless. Default: the installed policy's on "
+        "--force, else strict",
     )
     onboard.add_argument(
         "--required-approvals",
@@ -2188,10 +2198,46 @@ def _policy_trust_mode(args: argparse.Namespace) -> str | None:
     return None
 
 
+#: The publication-decision commands: what the cloud routine and the Actions workflows run as
+#: gates. They always resolve git and gh in STRICT trust and ignore the override variables
+#: (`use_gate_trust`, Codex 4244027559) -- neither the policy's `trust_mode` (possibly a
+#: working-tree file the agent edited) nor the environment (the agent's own shell can unset
+#: CLAUDE_CODE_REMOTE) may loosen how they pick the programs whose output they decide on.
+GATE_COMMANDS = frozenset(
+    {
+        "check-diff",
+        "check-request",
+        "authorize-labeler",
+        "claim",
+        "renew",
+        "release",
+        "confirm-cloud-routine",
+    }
+)
+
+
+def _use_trust_for(args: argparse.Namespace) -> None:
+    """Record the trust mode this command runs under: STRICT with no overrides for a
+    `GATE_COMMANDS` one (an ignored override is reported on stderr), else the policy's."""
+    gate = getattr(args, "command", None) in GATE_COMMANDS
+    use_gate_trust(gate)
+    if not gate:
+        use_trust_mode(_policy_trust_mode(args))
+        return
+    use_trust_mode(STRICT)
+    for name in (_GIT_OVERRIDE_ENV, _GH_OVERRIDE_ENV):
+        if os.environ.get(name):
+            print(
+                f"WARNING: {name} is ignored by `sdlcctl {args.command}`: a publication "
+                "decision always resolves git and gh in strict trust mode",
+                file=sys.stderr,
+            )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        use_trust_mode(_policy_trust_mode(args))
+        _use_trust_for(args)
         return int(args.handler(args))
     except (
         TaskSpecError,

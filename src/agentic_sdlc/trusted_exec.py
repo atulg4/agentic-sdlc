@@ -34,7 +34,17 @@ The mode in force (`trust_mode()`) is STRICT whenever this runs in an agent cont
 GitHub Actions (`GITHUB_ACTIONS=true`) or in a Claude Code cloud session
 (`CLAUDE_CODE_REMOTE=true`, the variable Claude Code sets in its cloud environments) -- whatever
 the policy says. Elsewhere it is the policy's (`use_trust_mode`, which the CLI calls with the
-policy it reads), and strict when no policy chose one."""
+policy it reads), and strict when no policy chose one.
+
+The publication-decision commands are stricter still (Codex 4244027559): `check-diff`,
+`check-request`, `authorize-labeler`, `claim`, `renew`, `release` and `confirm-cloud-routine`
+-- what the cloud routine and the Actions workflows run as gates -- call `use_gate_trust()`,
+which makes the mode STRICT whatever the policy or the environment says and IGNORES the
+override variables. The agent-context markers are environment variables the agent's own shell
+can unset, and the policy it reads may be a working-tree file the agent edited, so neither may
+decide how these commands pick their git and gh. `trust_mode = "local"` therefore only shapes
+the developer-facing commands (onboard, doctor, inspect-diff, run-gates, claims, ...) and the
+hooks."""
 
 from __future__ import annotations
 
@@ -50,6 +60,8 @@ AGENT_CONTEXT_MARKERS = (("GITHUB_ACTIONS", "true"), ("CLAUDE_CODE_REMOTE", "tru
 
 #: The mode the policy chose (`use_trust_mode`); None = no policy said, i.e. STRICT.
 _POLICY_MODE: str | None = None
+#: Set by `use_gate_trust`: a publication-decision command runs; STRICT, overrides ignored.
+_GATE = False
 
 
 def trust_mode_problem(value: object) -> str:
@@ -65,6 +77,19 @@ def use_trust_mode(mode: str | None) -> None:
     _POLICY_MODE = mode
 
 
+def use_gate_trust(on: bool = True) -> None:
+    """Mark this process as running a publication-decision command (see the module docstring):
+    the trust mode is STRICT whatever the policy and environment say, and `AGENTIC_SDLC_GIT` /
+    `AGENTIC_SDLC_GH` are not consulted at all."""
+    global _GATE
+    _GATE = bool(on)
+
+
+def gate_trust() -> bool:
+    """True while a publication-decision command runs (`use_gate_trust`)."""
+    return _GATE
+
+
 def agent_context(environ: Mapping[str, str] | None = None) -> str | None:
     """The marker (`NAME=value`) saying this runs in an agent context, or None."""
     env = os.environ if environ is None else environ
@@ -75,8 +100,9 @@ def agent_context(environ: Mapping[str, str] | None = None) -> str | None:
 
 
 def trust_mode(environ: Mapping[str, str] | None = None) -> str:
-    """The trust mode in force: STRICT in an agent context, else the policy's, else STRICT."""
-    if agent_context(environ):
+    """The trust mode in force: STRICT for a publication-decision command (`use_gate_trust`)
+    and in an agent context, else the policy's, else STRICT."""
+    if _GATE or agent_context(environ):
         return STRICT
     return _POLICY_MODE or STRICT
 
@@ -204,14 +230,15 @@ def resolve_trusted(
     error: type[UntrustedExecutableError] = UntrustedExecutableError,
 ) -> str:
     """The resolved path of a trusted `name` executable. STRICT mode (`trust_mode`):
-    `override_env` when set (vetted; refused as root), else the first trusted one of
-    `system_paths` and then -- for a non-root user only -- the absolute PATH entries. LOCAL mode:
-    `_resolve_local`. `error` (an UntrustedExecutableError) when there is none."""
+    `override_env` when set (vetted; refused as root; never consulted under `use_gate_trust`),
+    else the first trusted one of `system_paths` and then -- for a non-root user only -- the
+    absolute PATH entries. LOCAL mode: `_resolve_local`. `error` (an UntrustedExecutableError)
+    when there is none."""
     env = os.environ if environ is None else environ
     if trust_mode(env) == LOCAL:
         return _resolve_local(name, tuple(system_paths), override_env, env, error)
     euid = _euid()
-    override = env.get(override_env, "")
+    override = "" if _GATE else env.get(override_env, "")
     if override:
         if euid == 0:
             raise error(

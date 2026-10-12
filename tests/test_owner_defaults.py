@@ -268,9 +268,16 @@ def test_the_cli_reads_the_policy_trust_mode(tmp_path, monkeypatch, no_agent_con
     policy.write_text('[automation]\ntrust_mode = "local"\n')
     seen = []
     monkeypatch.setattr(cli, "use_trust_mode", seen.append)
-    cli.main(["check-request", "--project", "o/r", "--issue", "1", "--config", str(policy)])
+    argv = ["inspect-diff", "--config", str(policy), "--repository", str(tmp_path)]
+    argv += ["--base", "main", "--patch-output", str(tmp_path / "p")]
+    argv += ["--paths-output", str(tmp_path / "n"), "--decision-output", str(tmp_path / "d")]
+    cli.main(argv)
     assert seen == [LOCAL]
     policy.write_text('[automation]\ntrust_mode = "anything-else"\n')
+    cli.main(argv)
+    assert seen[-1] == STRICT
+    # a publication-decision command never takes the policy's mode (Codex 4244027559)
+    policy.write_text('[automation]\ntrust_mode = "local"\n')
     cli.main(["check-request", "--project", "o/r", "--issue", "1", "--config", str(policy)])
     assert seen[-1] == STRICT
 
