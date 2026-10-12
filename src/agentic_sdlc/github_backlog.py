@@ -468,7 +468,14 @@ def parent_links(
     for group in groups:
         declared: int | None = None
         payload = group
-        if isinstance(group, tuple):
+        if (
+            isinstance(group, tuple)
+            and len(group) == 2
+            and (group[1] is None or isinstance(group[1], int))
+            and not isinstance(group[1], Mapping)
+        ):
+            # The explicit (payload, parent_number) pair; any other tuple is an
+            # ordinary payload of child records.
             payload, declared = group
         for entry in payload:
             number = entry.get("number")

@@ -1440,3 +1440,78 @@ def test_failing_checks_require_the_pull_payload(tmp_path):
         )
         == 2
     )
+
+
+def test_a_plain_tuple_payload_is_not_mistaken_for_an_explicit_pair():
+    children = (
+        {"number": 2, "parent_issue_url": "https://api.github.com/repos/a/b/issues/1"},
+        {"number": 3, "parent_issue_url": "https://api.github.com/repos/a/b/issues/1"},
+        {"number": 4, "parent_issue_url": "https://api.github.com/repos/a/b/issues/1"},
+    )
+    assert parent_links(children) == {2: 1, 3: 1, 4: 1}
+
+
+def test_failing_checks_must_name_change_requests_in_the_pull_payload(tmp_path):
+    from agentic_sdlc.cli import main as cli_main
+
+    issues = tmp_path / "issues.json"
+    issues.write_text(json.dumps([]), encoding="utf-8")
+    pulls = tmp_path / "pulls.json"
+    pulls.write_text(json.dumps([{"number": 7, "title": "x"}]), encoding="utf-8")
+    assert (
+        cli_main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--pulls",
+                str(pulls),
+                "--failing",
+                "148=test",
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+            ]
+        )
+        == 2
+    )
+
+
+def test_a_malformed_observed_at_fails_the_export_not_the_next_command(tmp_path):
+    from agentic_sdlc.cli import main as cli_main
+
+    issues = tmp_path / "issues.json"
+    issues.write_text(
+        json.dumps(
+            [
+                {
+                    "number": 1,
+                    "title": "bare",
+                    "state": "open",
+                    "labels": [],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    incidents = tmp_path / "incidents.json"
+    assert (
+        cli_main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--observed-at",
+                "not-a-time",
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+                "--incidents-output",
+                str(incidents),
+            ]
+        )
+        == 2
+    )
+    assert not incidents.exists()
