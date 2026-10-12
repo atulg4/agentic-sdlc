@@ -3280,7 +3280,15 @@ def test_proven_approval_replaces_the_plan_advisory_guidance():
         kind="awaiting-dispatch-evidence",
         severity="advisory",
         backlogItemId="acme/forge#7",
-        summary="Both planning labels are present; confirm a plan run started",
+        # The adapter's hold names the CONFIGURED labels; here the policy
+        # renamed the implementation label, and the replacement must keep
+        # that literal spelling so the operator applies a label that fires.
+        summary=(
+            "Both planning labels are present, but the bundled plan trigger fires "
+            "only on the claude-ready label event: confirm a plan run started, and "
+            "re-apply claude-ready to re-kick if none did; implementation dispatch "
+            "then fires on the go-implement label event"
+        ),
     )
     approved = _ledger(
         *_chain(
@@ -3299,8 +3307,11 @@ def test_proven_approval_replaces_the_plan_advisory_guidance():
     )
     kept = snapshot.get("forge").incidents
     assert [item.incident_id for item in kept] == [f"acme/forge#7:{PLAN_EVIDENCE_RULE}"]
-    assert "implementation approval label event" in kept[0].summary
-    assert "plan run" not in kept[0].summary
+    # The replacement leads with the proven approval and quotes the hold, so
+    # the configured implementation label survives into the guidance.
+    assert kept[0].summary.startswith("Plan and approval are proven by the ledger")
+    assert "go-implement" in kept[0].summary
+    assert "re-apply the implementation approval label it names" in kept[0].summary
     # Not an advisory any more: dispatch provably cannot occur.
     assert kept[0].kind == "dispatch-blocked"
     assert kept[0].severity.value == "blocker"
@@ -4056,3 +4067,101 @@ def test_ownership_checks_are_provider_qualified():
     assert not any(
         "references repository" in warning for warning in unqualified.get("forge").warnings
     )
+
+
+def test_registry_valid_prefixes_are_accepted_in_tracker_identifiers():
+    # GitLab allows _ and . anywhere in a repository path, and the registry
+    # accepts them, so the tracker-reference grammar must too: a project on
+    # _group/repo could otherwise never supply tracker-linked backlog state.
+    items = load_backlog_document(
+        _document(_backlog(itemId="_group/repo#7", issueRef="_group/repo#7"))
+    )
+    assert items[0].item_id == "_group/repo#7"
+    loaded = load_incident_document(
+        _incidents(
+            _incident(
+                incidentId="_group/repo#7:untriaged",
+                kind="triage-needed",
+                severity="advisory",
+                backlogItemId="_group/repo#7",
+            )
+        )
+    )
+    assert loaded[0].incident_id == "_group/repo#7:untriaged"
+    # The reference still participates in ownership checks.
+    snapshot = build_control_center_snapshot(generated_at=NOW, registry=REGISTRY, backlog=items)
+    assert any(
+        "references repository _group/repo" in warning for warning in snapshot.get("forge").warnings
+    )
+
+
+TO_MERGED = TO_IMPLEMENTING + ("verifying", "reviewing", "ready-for-human-merge", "merged")
+
+
+def test_a_merged_change_request_retires_its_incidents():
+    merged = _ledger(
+        *_chain(
+            TO_MERGED,
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "issueRef": "acme/forge#4",
+                "changeRequestRef": "acme/forge!7",
+            },
+        )
+    )
+    stale = _incident(
+        incidentId="acme/forge!7:awaiting-merge",
+        kind="awaiting-human-merge",
+        severity="advisory",
+        evidenceRef="acme/forge!7",
+    )
+    conflict = _incident(
+        incidentId="acme/forge!7:merge-conflict",
+        kind="merge-conflict",
+        severity="blocker",
+        evidenceRef="acme/forge!7",
+    )
+    other = _incident(
+        incidentId="acme/forge!8:awaiting-merge",
+        kind="awaiting-human-merge",
+        severity="advisory",
+        evidenceRef="acme/forge!8",
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=merged.projections(),
+        incidents=load_incident_document(_incidents(stale, conflict, other)),
+    )
+    kept = snapshot.get("forge").incidents
+    # Both incidents naming the provably merged change request retire; the
+    # one naming a different change request stays.
+    assert [item.incident_id for item in kept] == ["acme/forge!8:awaiting-merge"]
+
+
+def test_an_unmerged_change_request_keeps_its_incidents():
+    running = _ledger(
+        *_chain(
+            TO_IMPLEMENTING,
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "changeRequestRef": "acme/forge!7",
+            },
+        )
+    )
+    waiting = _incident(
+        incidentId="acme/forge!7:awaiting-merge",
+        kind="awaiting-human-merge",
+        severity="advisory",
+        evidenceRef="acme/forge!7",
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=running.projections(),
+        incidents=load_incident_document(_incidents(waiting)),
+    )
+    kept = snapshot.get("forge").incidents
+    assert [item.incident_id for item in kept] == ["acme/forge!7:awaiting-merge"]
