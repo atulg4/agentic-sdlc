@@ -2331,13 +2331,47 @@ def test_doctor_rejects_a_ci_gate_whose_failure_is_ignored(tmp_path, mutate):
         ("set -o pipefail\nset +o pipefail\npytest | tee out", None, False),
         ("set -o errexit\npytest | tee out", None, False),
         ("pytest", None, True),
+        # Only a `set` the parent shell runs turns pipefail ON (Codex 4250527925/-28/-32).
+        ("set +o pipefail; set -o pipefail | cat; pytest | tee out", "bash", False),
+        ("set -o pipefail & pytest | tee out", None, False),
+        ("(set -o pipefail); pytest | tee out", None, False),
+        ("( set -o pipefail ) ; pytest | tee out", None, False),
+        ("if true; then set -o pipefail; fi; pytest | tee out", None, False),
+        ("set +o pipefail; set -- -o pipefail; pytest | tee out", "bash", False),
+        ("set -e -- -o pipefail; pytest | tee out", None, False),
+        ("builtin set +o pipefail; pytest | tee out", "bash", False),
+        ("command set +o pipefail; pytest | tee out", "bash", False),
+        ("command -v set -o pipefail; pytest | tee out", None, False),
+        ("builtin set -o pipefail; pytest | tee out", None, True),
+        ("command set -euo pipefail; pytest | tee out", None, True),
     ],
 )
 def test_shell_parse_enforces_a_piped_command_only_with_pipefail(script, shell, enforced):
     from agentic_sdlc.onboard import _shell_parse
 
-    commands = dict(_shell_parse(script, shell).commands)
-    assert commands[("pytest",)] is enforced, commands
+    commands = _shell_parse(script, shell).commands
+    pytest_runs = [flag for argv, flag in commands if argv == ("pytest",)]
+    # A command the parser cannot isolate (`); pytest`) is never enforced: that fails closed too.
+    assert any(pytest_runs) is enforced, commands
+
+
+@pytest.mark.parametrize(
+    ("script", "enforced"),
+    [
+        ("set -e\nfalse\npytest", True),
+        ("builtin set -e\nfalse\npytest", True),
+        ("set -o errexit\nfalse\npytest", True),
+        ("set -- -e\nfalse\npytest", False),  # positional parameters, not an option
+        ("set -e | cat\nfalse\npytest", False),  # runs in a child of the pipe
+        ("set -e\nbuiltin set +e\nfalse\npytest", False),
+    ],
+)
+def test_shell_parse_reads_errexit_from_set_like_bash(script, enforced):
+    from agentic_sdlc.onboard import _shell_parse
+
+    # A shell Forge does not know starts without errexit: only the script's own `set` turns it on.
+    commands = dict(_shell_parse(script, "zsh").commands)
+    assert commands[("false",)] is enforced, commands
 
 
 @pytest.mark.parametrize(

@@ -6614,20 +6614,56 @@ _ERREXIT_SHELLS = {None, "bash", "sh"}
 _PIPEFAIL_SHELLS = {"bash"}
 
 
-def _set_pipefail(arguments: list[str]) -> bool | None:
-    """What a `set` command does to pipefail: True for `set -o pipefail` (also clustered, as in
-    `set -euo pipefail`), False for `set +o pipefail`, None when it does not name it."""
-    result = None
-    for index, word in enumerate(arguments[:-1]):
-        if (
-            len(word) > 1
-            and word[0] in "-+"
-            and word[-1] == "o"
-            and word[1:].isalpha()
-            and arguments[index + 1] == "pipefail"
-        ):
-            result = word[0] == "-"
-    return result
+#: Prefixes that run the next word as the shell builtin itself, in the current shell.
+_BUILTIN_WRAPPERS = {"builtin", "command"}
+
+
+def _subshell_depth(depth: int, token: str) -> int:
+    """`depth` after `token`: a punctuation token opens (`(`) or closes (`)`, also merged into
+    `);` or `)|`) subshells. `()` is a function header and opens nothing."""
+    if token == "()" or not token or set(token) - set("();<>|&"):
+        return depth
+    return max(0, depth + token.count("(") - token.count(")"))
+
+
+def _set_invocation(argv: tuple[str, ...]) -> tuple[list[str], bool] | None:
+    """The arguments of a `set` builtin call (`set ...`, `builtin set ...`, `command set ...`),
+    and whether it is a plain call: False when a wrapper carried options (`command -v set` only
+    prints). None when the command is not `set`."""
+    words = list(argv)
+    plain = True
+    while words and words[0] in _BUILTIN_WRAPPERS:
+        words.pop(0)
+        while words and words[0].startswith("-") and words[0] != "--":
+            words.pop(0)
+            plain = False
+        if words and words[0] == "--":
+            words.pop(0)
+    if not words or words[0] != "set":
+        return None
+    return words[1:], plain
+
+
+def _set_options(arguments: list[str]) -> dict[str, bool]:
+    """The `errexit`/`pipefail` changes a `set` call's arguments make, parsed as bash does: options
+    (`-e`, `+e`, `-o NAME`, `+o NAME`, clustered as in `-euo pipefail`) until `--`, `-` or the first
+    operand; everything after that is positional parameters (Codex 4250527928)."""
+    changes: dict[str, bool] = {}
+    index = 0
+    while index < len(arguments):
+        word = arguments[index]
+        if word in {"--", "-"} or len(word) < 2 or word[0] not in "-+" or not word[1:].isalpha():
+            break
+        on = word[0] == "-"
+        for position, flag in enumerate(word[1:]):
+            if flag == "e":
+                changes["errexit"] = on
+            elif flag == "o" and position == len(word) - 2 and index + 1 < len(arguments):
+                index += 1
+                if arguments[index] in {"errexit", "pipefail"}:
+                    changes[arguments[index]] = on
+        index += 1
+    return changes
 
 
 def _job_key_set(node: dict, key: str) -> bool:
@@ -6691,6 +6727,8 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
     braces: list[str] = []  # "function" / "group" per open `{`
     pending_function = False
     previous = ";"
+    subshell = 0  # open `(` ... `)`: a command inside runs in a child shell
+    started_in_subshell = False
     for line in script.replace("\\\n", " ").splitlines():
         lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
         lexer.whitespace_split = True
@@ -6710,7 +6748,10 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                 argv = []
                 continue
             if token is not None and token not in _SHELL_SEPARATORS:
+                if not argv:
+                    started_in_subshell = subshell > 0
                 argv.append(token)
+                subshell = _subshell_depth(subshell, token)  # shlex merges `)` into `);`
                 continue
             condition = False
             while argv and (
@@ -6755,16 +6796,30 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                     out.sourced.append(argv[1] if len(argv) > 1 else "")
                 elif argv[0] == "eval":
                     out.evals = True
-                if argv[0] == "set" and "+e" in argv[1:]:
-                    errexit = False
-                elif argv[0] == "set" and any(
-                    a.startswith("-") and "e" in a.lstrip("-") for a in argv[1:]
-                ):
-                    errexit = True
-                if argv[0] == "set":
-                    turned = _set_pipefail(list(argv[1:]))
-                    if turned is not None:
-                        pipefail = turned
+                invocation = _set_invocation(tuple(argv))
+                if invocation is not None:
+                    arguments, plain = invocation
+                    # Turning an option ON counts only when the parent shell surely runs this
+                    # `set`: not piped, backgrounded or in a subshell (each runs in a child),
+                    # not conditional, not a wrapper with options (Codex 4250527925/4250527932).
+                    # Turning one OFF counts wherever it is: an unproven OFF fails closed.
+                    in_parent = (
+                        plain
+                        and not condition
+                        and not nested
+                        and not in_function
+                        and not started_in_subshell
+                        and not any("(" in word or ")" in word for word in argv)
+                        and previous not in {"|", "|&"}
+                        and following not in {"|", "|&", "&"}
+                    )
+                    for option, on in _set_options(arguments).items():
+                        if on and not in_parent:
+                            continue
+                        if option == "errexit":
+                            errexit = on
+                        else:
+                            pipefail = on
                 records.append(
                     {
                         "argv": tuple(argv),
@@ -6787,6 +6842,9 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                     # subshell), it may end the script, so later commands are not proven to run.
                     terminated = True
             argv = []
+            started_in_subshell = False
+            if token is not None:
+                subshell = _subshell_depth(subshell, token)
             if token is None:  # a line ending in an operator continues the list
                 previous = previous if tokens[-1] in {"&&", "||", "|"} else ";"
             else:
