@@ -6482,6 +6482,8 @@ def _gate_env_altering(name: str, tools: set[str]) -> bool:
     name = str(name)
     if name in GATE_ENV_BENIGN:
         return False
+    if set(name) & _SHELL_EXPANSION_CHARS:
+        return True  # a name built by an expansion may be any of the ones below
     return (
         "ADDOPTS" in name.upper()
         or name in GATE_ENV_ALWAYS
@@ -6555,9 +6557,13 @@ def _gate_environment_problems(
             problems.append(f"{label} defines {', '.join(shadow)} as a function/alias")
         foreign = [s for s in parsed.sourced if not s.endswith("/bin/activate")]
         if foreign or parsed.evals:
+            what = (
+                "eval or a command named by an expansion"
+                if parsed.evals
+                else "source " + repr(foreign[0])
+            )
             problems.append(
-                f"{label} runs {'eval' if parsed.evals else 'source ' + foreign[0]!r}: "
-                "what it defines cannot be verified (fails closed)"
+                f"{label} runs {what}: what it defines cannot be verified (fails closed)"
             )
     return problems
 
@@ -6606,9 +6612,192 @@ _SHELL_TERMINATORS = {"exit", "exec", "return"}
 _SHELL_DECLARERS = {"export", "declare", "typeset", "readonly", "local"}
 _ASSIGNMENT_WORD = re.compile(r"^([A-Za-z_]\w*)=")
 _NAME_WORD = re.compile(r"^[A-Za-z_]\w*$")
-#: Shells whose run steps abort on a failing command: GitHub runs an unspecified or `bash` shell
-#: as `bash -eo pipefail`, and `sh` as `sh -e` (no pipefail).
+#: Shells whose run steps abort on a failing command. On Linux and macOS GitHub runs an
+#: unspecified shell as `bash -e {0}`, `shell: bash` as `bash --noprofile --norc -eo pipefail
+#: {0}` and `shell: sh` as `sh -e {0}`: only an explicit `bash` has pipefail (#153).
 _ERREXIT_SHELLS = {None, "bash", "sh"}
+#: The one shell GitHub starts with pipefail; any other starts without it.
+_PIPEFAIL_SHELLS = {"bash"}
+
+
+#: Characters that make bash expand a word before `set` sees it: parameter/command
+#: substitution, brace expansion, pathname globs and tilde expansion (`set ~` with HOME=-n:
+#: Codex 4252987836).
+_SHELL_EXPANSION_CHARS = set("$`{}*?[]~")
+
+#: Builtins that change shell options themselves, run a handler string that may (`trap`, also
+#: behind a redirection: Codex 4251826068), or can disable `set` and its wrappers (`enable`).
+_SHELL_OPTION_COMMANDS = {"set", "shopt", "trap", "enable"}
+
+
+def _effective_command(argv: list[str]) -> list[str]:
+    """`argv` from the word bash runs as the command: past leading redirections (`>/x`,
+    `2>/dev/null`), `time`'s options (`time -p`) and the `builtin`/`command` wrappers with
+    theirs."""
+    words = list(argv)
+    while words:
+        head = words[0]
+        if head and set(head) <= set("<>&|") and ("<" in head or ">" in head):
+            del words[:2]  # the operator and its target
+        elif head.isdigit() and len(words) > 1 and set(words[1]) <= set("<>&|"):
+            words.pop(0)  # `2` of `2>/dev/null`
+        elif head.startswith("-") or head in _BUILTIN_WRAPPERS:
+            words.pop(0)
+        else:
+            break
+    return words
+
+
+def _may_change_shell_options(argv: list[str]) -> bool:
+    """Whether a command that `_set_invocation` cannot read may still change errexit or
+    pipefail, judged on the command bash actually runs (`_effective_command`): it is `set`,
+    `shopt`, `trap` (a handler runs in the parent: Codex 4251422330) or `enable` (it can disable
+    `set` or its wrappers: Codex 4251826084), or its name is an expansion (`s$x`, `command $x`:
+    Codex 4251246556/4251422308). The same words as ARGUMENTS -- `pytest -k set`,
+    `pytest -k pipefail` -- change nothing (Codex 4252463247/4252316092)."""
+    words = _effective_command(argv)
+    if not words:
+        return False
+    if words[0] == "shopt":
+        # Only `shopt -o` reaches the `set -o` options (`help shopt`); `shopt -s nullglob`
+        # changes neither errexit nor pipefail (Codex 4252615579). Without `-s`/`-u` it only
+        # lists or queries (`shopt -q -o pipefail`: Codex 4253363488).
+        if any(set(word) & _SHELL_EXPANSION_CHARS for word in words[1:]):
+            return True
+        flags = {c for word in words[1:] if word.startswith("-") for c in word[1:]}
+        return "o" in flags and bool(flags & {"s", "u"})
+    return bool(set(words[0]) & _SHELL_EXPANSION_CHARS or words[0] in _SHELL_OPTION_COMMANDS)
+
+
+#: Prefixes that run the next word as the shell builtin itself, in the current shell.
+_BUILTIN_WRAPPERS = {"builtin", "command"}
+
+
+def _subshell_depth(depth: int, token: str) -> int:
+    """`depth` after `token`: a punctuation token opens (`(`) or closes (`)`, also merged into
+    `);` or `)|`) subshells. `()` is a function header and opens nothing."""
+    if token == "()" or not token or set(token) - set("();<>|&"):
+        return depth
+    return max(0, depth + token.count("(") - token.count(")"))
+
+
+def _set_invocation(argv: tuple[str, ...]) -> tuple[list[str], bool] | None:
+    """The arguments of a `set` builtin call (`set ...`, `builtin set ...`, `command set ...`),
+    and whether it is a plain call: False when a wrapper carried options (`command -v set` only
+    prints). None when the command is not `set`."""
+    words = list(argv)
+    plain = True
+    while words and words[0] in _BUILTIN_WRAPPERS:
+        words.pop(0)
+        while words and words[0].startswith("-") and words[0] != "--":
+            words.pop(0)
+            plain = False
+        if words and words[0] == "--":
+            words.pop(0)
+    if not words or words[0] != "set":
+        return None
+    return words[1:], plain
+
+
+#: The single-letter flags bash's `set` accepts (`help set`); any other aborts the call.
+_SET_FLAGS = set("abefhkmnoptuvxBCEHPT")
+#: The `-o` option names bash's `set` accepts; any other aborts the call.
+_SET_OPTION_NAMES = {
+    "allexport", "braceexpand", "emacs", "errexit", "errtrace", "functrace", "hashall",
+    "histexpand", "history", "ignoreeof", "interactive-comments", "keyword", "monitor",
+    "noclobber", "noexec", "noglob", "nolog", "notify", "nounset", "onecmd", "physical",
+    "pipefail", "posix", "privileged", "verbose", "vi", "xtrace",
+}  # fmt: skip
+
+
+#: Words that open, close or continue a compound command; quoted, they are plain words.
+_SHELL_CONTROL_WORDS = {
+    "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac",
+    "select", "function", "{", "}", "!",
+}  # fmt: skip
+
+
+def _quotes_a_control_word(line: str) -> bool:
+    """Whether `line` quotes or escapes a control word (`"fi"`, `'done'`, `\\fi`): the POSIX
+    tokenizing the parser uses drops that quoting and would read it as the keyword."""
+    lexer = shlex.shlex(line, posix=False, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return True
+    # Only where the parser reads a keyword: the head of a command, past keywords and `VAR=x`
+    # prefixes. `pytest -k "if"` passes `if` as an argument (Codex 4253363470).
+    command_position = True
+    for token in tokens:
+        bare = token.replace("\\", "").replace('"', "").replace("'", "")
+        if bare != token:
+            if command_position and bare in _SHELL_CONTROL_WORDS:
+                return True
+            command_position = False
+        elif not set(token) - set("();<>|&"):
+            command_position = bool(set(token) & set(";|&()"))
+        elif not (
+            command_position
+            and (token in _SHELL_CONTROL_WORDS or token == "time" or _ASSIGNMENT_WORD.match(token))
+        ):
+            command_position = False
+    return False
+
+
+def _set_enables_noexec(arguments: list[str]) -> bool:
+    """Whether a `set` call may turn on `noexec` (`-n`, `-o noexec`): bash then reads every later
+    command without running it. Judged on any option-looking word, so an unreadable call fails
+    closed."""
+    index = 0
+    while index < len(arguments):
+        word = arguments[index]
+        if word in {"--", "-"} or len(word) < 2 or word[0] not in "-+":
+            # `set -- -n` assigns positional parameters (Codex 4252615565).
+            return False
+        if word[0] == "-" and "n" in word[1:]:
+            return True
+        if "o" in word[1:]:
+            # `-o NAME` takes the next word as its option name, so `set -eo pipefail -n` still
+            # reaches `-n` (Codex 4253116041).
+            index += 1
+            if word[0] == "-" and index < len(arguments) and arguments[index] == "noexec":
+                return True
+        index += 1
+    return False
+
+
+def _set_options(arguments: list[str]) -> tuple[dict[str, bool], bool]:
+    """The `errexit`/`pipefail` changes a `set` call's arguments make, parsed as bash does: options
+    (`-e`, `+e`, `-o NAME`, `+o NAME`, clustered as in `-euo pipefail`) until `--`, `-` or the first
+    operand; everything after that is positional parameters (Codex 4250527928).
+
+    Also whether the call surely runs and applies them: False when it carries a redirection (a
+    failing one skips the builtin: Codex 4251593338) or an invalid flag or option name (bash
+    stops there: Codex 4251593332). An untrusted call may only turn options OFF."""
+    changes: dict[str, bool] = {}
+    trusted = not any("<" in word or ">" in word for word in arguments)
+    index = 0
+    while index < len(arguments):
+        word = arguments[index]
+        if word in {"--", "-"} or len(word) < 2 or word[0] not in "-+" or not word[1:].isalpha():
+            break
+        on = word[0] == "-"
+        flags = word[1:]
+        if set(flags) - _SET_FLAGS:
+            trusted = False
+        if "e" in flags:
+            changes["errexit"] = on
+        if "o" in flags and index + 1 < len(arguments):
+            # Wherever `o` sits in the cluster (`+ou pipefail`), it takes the next word as its
+            # option name (Codex 4251046345).
+            index += 1
+            if arguments[index] not in _SET_OPTION_NAMES:
+                trusted = False
+            if arguments[index] in {"errexit", "pipefail"}:
+                changes[arguments[index]] = on
+        index += 1
+    return changes, trusted
 
 
 def _job_key_set(node: dict, key: str) -> bool:
@@ -6646,11 +6835,14 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
     """The simple commands a `run:` script executes, each with whether its failure fails the
     step, plus what the script sets up for later commands (`ShellScript`).
 
-    With errexit (GitHub's default `bash -eo pipefail`, or `sh -e`) a command is enforced unless it
-    is a condition (`if`/`while`/`until`/`!`) or inside a conditional/loop body, backgrounded with
-    `&`, part of an `&&`/`||` list other than its last member (errexit ignores those), after `||`
-    (it may never run), piped onward without pipefail, or after `set +e`. Whatever the shell, the
-    script's LAST and-or list is the step's exit status: its `&&` members are enforced too.
+    With errexit (GitHub's default `bash -e`, `shell: bash`'s `bash -eo pipefail`, or `sh -e`) a
+    command is enforced unless it is a condition (`if`/`while`/`until`/`!`) or inside a
+    conditional/loop body, backgrounded with `&`, part of an `&&`/`||` list other than its last
+    member (errexit ignores those), after `||` (it may never run), piped onward without pipefail,
+    or after `set +e`. Pipefail is on only under an explicit `shell: bash` or after the script's
+    own `set -o pipefail` (#153): with no `shell:` key, `pytest | tee out` exits with tee's status.
+    Whatever the shell, the script's LAST and-or list is the step's exit status: its `&&` members
+    are enforced too.
 
     Commands inside a shell function body (`name() { ... }`, `function name { ... }`) are NEVER
     enforced: defining a function runs nothing, and whether a later call reaches the body (and
@@ -6659,6 +6851,7 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
     """
     shell_name = None if shell is None else str(shell).strip()
     errexit = shell_name in _ERREXIT_SHELLS
+    pipefail = shell_name in _PIPEFAIL_SHELLS
     out = ShellScript(
         [], set(), set(), set(), [], False, "GITHUB_ENV" in script, "GITHUB_PATH" in script
     )
@@ -6668,13 +6861,32 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
     braces: list[str] = []  # "function" / "group" per open `{`
     pending_function = False
     previous = ";"
+    subshell = 0  # open `(` ... `)`: a command inside runs in a child shell
+    started_in_subshell = False
+    # A heredoc body or a quoted string spanning lines is text the line-by-line parse would read
+    # as commands: from the first one on, no `set` can be trusted to turn an option ON.
+    opaque = False
+    # After any `enable` the `builtin`/`command` wrappers may be disabled (Codex 4251826084): a
+    # wrapped `set` is no longer proven to run.
+    wrappers_untrusted = False
+    group_starts: list[int] = []  # index in `records` where each open `{` group began
+    closed_group_start: int | None = None
     for line in script.replace("\\\n", " ").splitlines():
         lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
         lexer.whitespace_split = True
         try:
             tokens = list(lexer)
         except ValueError:  # unbalanced quotes: no command we can vouch for
+            opaque = True
             continue
+        if _quotes_a_control_word(line):
+            # shlex drops quoting, so a quoted `"fi"` would close an `if` the shell keeps open:
+            # nothing from this line on is proven to run (Codex 4253116034).
+            terminated = True
+        if "'" in line or '"' in line:
+            # shlex drops quoting, so a quoted `"fi"` would read as the `if` closer: from the
+            # first quoted line on, no `set` is trusted to turn an option ON (Codex 4251422334).
+            opaque = True
         if not tokens:
             continue
         argv: list[str] = []
@@ -6687,7 +6899,17 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                 argv = []
                 continue
             if token is not None and token not in _SHELL_SEPARATORS:
+                if not argv:
+                    started_in_subshell = subshell > 0
+                if token.startswith("<<"):
+                    opaque = True
                 argv.append(token)
+                subshell = _subshell_depth(subshell, token)  # shlex merges `)` into `);`
+                if "(" in token or ")" in token:
+                    # shlex drops quoting, so `echo ')'` would close a subshell early: from the
+                    # first parenthesis on, no `set` is trusted to run in the parent (Codex
+                    # 4251246570).
+                    opaque = True
                 continue
             condition = False
             while argv and (
@@ -6706,9 +6928,11 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                     pending_function = True
                 elif head == "{":
                     braces.append("function" if pending_function else "group")
+                    group_starts.append(len(records))
                     pending_function = False
                 elif head == "}" and braces:
                     braces.pop()
+                    closed_group_start = group_starts.pop() if group_starts else 0
                 condition = condition or head in _SHELL_CONDITIONS
                 if head in _SHELL_OPENERS:
                     depth += 1
@@ -6720,27 +6944,137 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                 depth += 1
                 argv = []
             following = ";" if token is None else token
+            if closed_group_start is not None:
+                if following == "&":
+                    # `{ a; } &` backgrounds the whole group (Codex 4253230837).
+                    for record in records[closed_group_start:]:
+                        record["forced_background"] = True
+                closed_group_start = None
             if argv:
-                if argv[0] in _SHELL_DECLARERS:
-                    for word in argv[1:]:
+                # Judged on the command bash runs: `command eval ...` evaluates too (Codex
+                # 4252987831).
+                effective = _effective_command(argv) or [""]
+                if effective[0] in _SHELL_DECLARERS:
+                    for word in effective[1:]:
                         found = _ASSIGNMENT_WORD.match(word) or _NAME_WORD.match(word)
                         if found:
                             out.assigned.add(found.group(1) if found.groups() else word)
-                elif argv[0] == "alias":
-                    out.aliases |= {w.split("=", 1)[0] for w in argv[1:] if "=" in w}
-                elif argv[0] in {"source", "."}:
-                    out.sourced.append(argv[1] if len(argv) > 1 else "")
-                elif argv[0] == "eval":
-                    out.evals = True
-                if argv[0] == "set" and "+e" in argv[1:]:
-                    errexit = False
-                elif argv[0] == "set" and any(
-                    a.startswith("-") and "e" in a.lstrip("-") for a in argv[1:]
+                        elif set(word) & _SHELL_EXPANSION_CHARS:
+                            # `export $x=--collect-only` sets a name only bash knows (Codex
+                            # 4253230848): recorded as-is, it reads as gate-altering.
+                            out.assigned.add(word.split("=", 1)[0])
+                elif effective[0] == "alias":
+                    out.aliases |= {w.split("=", 1)[0] for w in effective[1:] if "=" in w}
+                elif effective[0] in {"source", "."}:
+                    out.sourced.append(effective[1] if len(effective) > 1 else "")
+                elif effective[0] == "eval" or (
+                    set(effective[0]) & _SHELL_EXPANSION_CHARS and set(effective[0]) != {"`"}
                 ):
-                    errexit = True
+                    # `x=eval; $x '...'` evaluates too (Codex 4253363494). A bare run of
+                    # backticks is an empty substitution, not a name: a policy command may
+                    # start with one (`test_every_template_round_trips_hostile_values`).
+                    out.evals = True
+                invocation = _set_invocation(tuple(argv))
+                ends_script = False  # applied after this command is recorded, as `exit` is
+                # Whether this command may run in the parent shell at all: not piped,
+                # backgrounded or in a subshell (Codex 4252316098: `set -n | cat` leaves the
+                # parent running).
+                may_run_in_parent = (
+                    not started_in_subshell
+                    and not any("(" in word or ")" in word for word in argv)
+                    and previous not in {"|", "|&"}
+                    and following not in {"|", "|&", "&"}
+                )
+                # Judged past redirections too: `>/x set -n` (Codex 4253363484).
+                noexec_arguments = (
+                    invocation[0]
+                    if invocation is not None
+                    else effective[1:]
+                    if effective[0] == "set"
+                    else None
+                )
+                if (
+                    noexec_arguments is not None
+                    and may_run_in_parent
+                    and (
+                        _set_enables_noexec(noexec_arguments)
+                        # `set -$x` may expand to `-n` (Codex 4252316079).
+                        or any(set(w) & _SHELL_EXPANSION_CHARS for w in noexec_arguments)
+                    )
+                ):
+                    # `set -n` reads the rest without running it (Codex 4252099381).
+                    ends_script = True
+                if invocation is not None and not invocation[1]:
+                    invocation = None  # `command -v set ...`: not a call we can read
+                if invocation is not None and wrappers_untrusted and argv[0] in _BUILTIN_WRAPPERS:
+                    invocation = None
+                if invocation is not None and any(
+                    set(word) & _SHELL_EXPANSION_CHARS for word in invocation[0]
+                ):
+                    # `set -o pipefail $x`: $x may expand to `+o pipefail`; so may a brace or a
+                    # pathname expansion, `+o {pipefail,pipefail}` (Codex 4251046343).
+                    invocation = None
+                if _effective_command(argv)[:1] == ["enable"]:
+                    wrappers_untrusted = True
+                if (_effective_command(argv) or [""])[0] == "trap":
+                    # An ERR/EXIT/DEBUG handler can turn a later failure into success (`trap
+                    # 'exit 0' ERR`): no command after a trap is proven enforced (Codex
+                    # 4253116046).
+                    ends_script = True
+                if (
+                    invocation is None
+                    and may_run_in_parent
+                    and _may_change_shell_options(argv)
+                    and (
+                        "noexec" in argv or any(set(word) & _SHELL_EXPANSION_CHARS for word in argv)
+                    )
+                ):
+                    # `shopt -s -o noexec` (or an expansion that may spell it) reads the rest
+                    # without running it (Codex 4252760388).
+                    ends_script = True
+                if invocation is None and _may_change_shell_options(argv):
+                    # Anything else that could touch errexit or pipefail -- a redirected or
+                    # timed `set`, `shopt`, a `trap` string, a command run through a variable
+                    # (Codex 4250836628/4250836632) -- is read as turning both OFF. Recognising
+                    # every way to spell `set +o pipefail` cannot be done; failing closed can.
+                    errexit = False
+                    pipefail = False
+                    # A DEBUG trap re-runs before every later command, and `enable -n set`
+                    # disables `set` itself (Codex 4252099401/4252099389): after any option
+                    # change the parser cannot read, no later `set` proves an option ON.
+                    opaque = True
+                if invocation is not None:
+                    arguments, plain = invocation
+                    # Turning an option ON counts only when the parent shell surely runs this
+                    # `set`: not piped, backgrounded or in a subshell (each runs in a child),
+                    # not in a `{ ...; }` group (piped or backgrounded as a whole, it runs in a
+                    # child too: Codex 4250684144), not conditional, not a wrapper with options
+                    # (Codex 4250527925/4250527932), and not after a heredoc or a multi-line
+                    # string. Turning one OFF counts wherever it is: an unproven OFF fails closed.
+                    in_parent = (
+                        plain
+                        and not opaque
+                        and not braces
+                        and not condition
+                        and not nested
+                        and not in_function
+                        and not started_in_subshell
+                        and not any("(" in word or ")" in word for word in argv)
+                        and previous not in {"|", "|&", "&&", "||"}
+                        and following not in {"|", "|&", "&", "||"}
+                    )
+                    changes, trusted = _set_options(arguments)
+                    for option, on in changes.items():
+                        if on and not (in_parent and trusted):
+                            continue
+                        if option == "errexit":
+                            errexit = on
+                        else:
+                            pipefail = on
                 records.append(
                     {
                         "argv": tuple(argv),
+                        "condition": condition,
                         "reached": not terminated
                         and not condition
                         and not nested
@@ -6749,19 +7083,21 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                         "previous": previous,
                         "following": following,
                         "errexit": errexit,
-                        "piped": following in {"|", "|&"}
-                        and shell_name != "bash"
-                        and shell_name is not None,
+                        "piped": following in {"|", "|&"} and not pipefail,
                     }
                 )
-                program = (
-                    argv[1] if argv[0] in {"builtin", "command"} and len(argv) > 1 else argv[0]
-                )
-                if program in _SHELL_TERMINATORS:
+                # `command -p exit 0` exits too (Codex 4252760408).
+                program = (_effective_command(argv) or [""])[0]
+                if ends_script or program in _SHELL_TERMINATORS:
                     # Fails closed: wherever it sits (a condition, a branch, a function body, a
                     # subshell), it may end the script, so later commands are not proven to run.
                     terminated = True
             argv = []
+            started_in_subshell = False
+            if token is not None:
+                subshell = _subshell_depth(subshell, token)
+                if "(" in token or ")" in token:
+                    opaque = True
             if token is None:  # a line ending in an operator continues the list
                 previous = previous if tokens[-1] in {"&&", "||", "|"} else ";"
             else:
@@ -6770,8 +7106,41 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
     last = len(records) - 1
     while last > 0 and records[last]["previous"] in {"&&", "||", "|", "|&"}:
         last -= 1
+    # `a | b &` backgrounds the WHOLE pipeline and reports 0 for it: every member, not only the
+    # last, is unenforced (Codex 4251046354).
+    # `! a | b` and `if a | b` make the WHOLE pipeline the condition, not only its first member
+    # (Codex 4251826079).
+    in_condition = False
+    pipeline_reached = True
+    for r in records:
+        if r["previous"] in {"|", "|&"}:
+            # A pipeline a short circuit skips (`true || a | b`) skips every member, not
+            # only the first (Codex 4253230817).
+            if in_condition or not pipeline_reached:
+                r["reached"] = False
+        else:
+            in_condition = r["condition"]
+            pipeline_reached = r["reached"]
+    background = False
+    for r in reversed(records):
+        if r["following"] == "&":
+            background = True
+        elif r["following"] not in {"|", "|&", "&&", "||"}:
+            # `a && b &` backgrounds the whole and-or list (Codex 4252316108).
+            background = False
+        r["background"] = background or r.get("forced_background", False)
+    # A failure before a later `||` in the same and-or list can be recovered by it -- `pytest &&
+    # true || true` exits 0 -- so no member before the list's last `||` is enforced (Codex
+    # 4252760398).
+    recoverable = False
+    for r in reversed(records):
+        if r["following"] == "||":
+            recoverable = True
+        elif r["following"] not in {"&&", "|", "|&"}:
+            recoverable = False
+        r["recoverable"] = recoverable
     for index, r in enumerate(records):
-        base = r["reached"] and r["following"] != "&" and not r["piped"]
+        base = r["reached"] and not r["background"] and not r["piped"] and not r["recoverable"]
         if index >= last and (index == len(records) - 1 or r["following"] in {"&&", "|", "|&"}):
             enforced = base
         else:
