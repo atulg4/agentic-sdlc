@@ -6557,9 +6557,13 @@ def _gate_environment_problems(
             problems.append(f"{label} defines {', '.join(shadow)} as a function/alias")
         foreign = [s for s in parsed.sourced if not s.endswith("/bin/activate")]
         if foreign or parsed.evals:
+            what = (
+                "eval or a command named by an expansion"
+                if parsed.evals
+                else "source " + repr(foreign[0])
+            )
             problems.append(
-                f"{label} runs {'eval' if parsed.evals else 'source ' + foreign[0]!r}: "
-                "what it defines cannot be verified (fails closed)"
+                f"{label} runs {what}: what it defines cannot be verified (fails closed)"
             )
     return problems
 
@@ -6656,11 +6660,12 @@ def _may_change_shell_options(argv: list[str]) -> bool:
         return False
     if words[0] == "shopt":
         # Only `shopt -o` reaches the `set -o` options (`help shopt`); `shopt -s nullglob`
-        # changes neither errexit nor pipefail (Codex 4252615579).
-        return any(
-            set(word) & _SHELL_EXPANSION_CHARS or (word.startswith("-") and "o" in word[1:])
-            for word in words[1:]
-        )
+        # changes neither errexit nor pipefail (Codex 4252615579). Without `-s`/`-u` it only
+        # lists or queries (`shopt -q -o pipefail`: Codex 4253363488).
+        if any(set(word) & _SHELL_EXPANSION_CHARS for word in words[1:]):
+            return True
+        flags = {c for word in words[1:] if word.startswith("-") for c in word[1:]}
+        return "o" in flags and bool(flags & {"s", "u"})
     return bool(set(words[0]) & _SHELL_EXPANSION_CHARS or words[0] in _SHELL_OPTION_COMMANDS)
 
 
@@ -6721,10 +6726,22 @@ def _quotes_a_control_word(line: str) -> bool:
         tokens = list(lexer)
     except ValueError:
         return True
+    # Only where the parser reads a keyword: the head of a command, past keywords and `VAR=x`
+    # prefixes. `pytest -k "if"` passes `if` as an argument (Codex 4253363470).
+    command_position = True
     for token in tokens:
         bare = token.replace("\\", "").replace('"', "").replace("'", "")
-        if bare != token and bare in _SHELL_CONTROL_WORDS:
-            return True
+        if bare != token:
+            if command_position and bare in _SHELL_CONTROL_WORDS:
+                return True
+            command_position = False
+        elif not set(token) - set("();<>|&"):
+            command_position = bool(set(token) & set(";|&()"))
+        elif not (
+            command_position
+            and (token in _SHELL_CONTROL_WORDS or token == "time" or _ASSIGNMENT_WORD.match(token))
+        ):
+            command_position = False
     return False
 
 
@@ -6950,7 +6967,12 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                     out.aliases |= {w.split("=", 1)[0] for w in effective[1:] if "=" in w}
                 elif effective[0] in {"source", "."}:
                     out.sourced.append(effective[1] if len(effective) > 1 else "")
-                elif effective[0] == "eval":
+                elif effective[0] == "eval" or (
+                    set(effective[0]) & _SHELL_EXPANSION_CHARS and set(effective[0]) != {"`"}
+                ):
+                    # `x=eval; $x '...'` evaluates too (Codex 4253363494). A bare run of
+                    # backticks is an empty substitution, not a name: a policy command may
+                    # start with one (`test_every_template_round_trips_hostile_values`).
                     out.evals = True
                 invocation = _set_invocation(tuple(argv))
                 ends_script = False  # applied after this command is recorded, as `exit` is
@@ -6963,13 +6985,21 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                     and previous not in {"|", "|&"}
                     and following not in {"|", "|&", "&"}
                 )
+                # Judged past redirections too: `>/x set -n` (Codex 4253363484).
+                noexec_arguments = (
+                    invocation[0]
+                    if invocation is not None
+                    else effective[1:]
+                    if effective[0] == "set"
+                    else None
+                )
                 if (
-                    invocation is not None
+                    noexec_arguments is not None
                     and may_run_in_parent
                     and (
-                        _set_enables_noexec(invocation[0])
+                        _set_enables_noexec(noexec_arguments)
                         # `set -$x` may expand to `-n` (Codex 4252316079).
-                        or any(set(w) & _SHELL_EXPANSION_CHARS for w in invocation[0])
+                        or any(set(w) & _SHELL_EXPANSION_CHARS for w in noexec_arguments)
                     )
                 ):
                     # `set -n` reads the rest without running it (Codex 4252099381).

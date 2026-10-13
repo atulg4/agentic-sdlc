@@ -2390,6 +2390,13 @@ def test_doctor_rejects_a_ci_gate_whose_failure_is_ignored(tmp_path, mutate):
         ("set -n | cat; pytest", "bash", True),
         # `a && b &` backgrounds the whole and-or list (Codex 4252316108).
         ("true; pytest && true &", "bash", False),
+        # `set -n` behind a redirection; `shopt -q` only queries; a quoted control word as an
+        # argument is a plain word (Codex 4253363484/4253363488/4253363470).
+        (">/tmp/x set -n; pytest", "bash", False),
+        ("shopt -q -o pipefail; pytest | tee out", "bash", True),
+        ("shopt -s -o pipefail; pytest | tee out", "bash", False),
+        ('echo "if"; pytest', "bash", True),
+        ('x=1 "fi"; pytest', "bash", False),
         # Only the command bash runs counts, past redirections, `time -p` and wrappers; the same
         # words as arguments are inert (Codex 4252463247).
         ("2>/dev/null set +e +o pipefail; pytest | tee out", "bash", False),
@@ -3803,6 +3810,11 @@ def _mutate_ci_test_step(repo, mutate):
         lambda doc, job, step: step.update({"run": "export PYTEST_ADDOPTS=--co\n" + step["run"]}),
         # a name built by an expansion may be PYTEST_ADDOPTS (Codex 4253230817)
         lambda doc, job, step: step.update({"run": "export $x=--co\n" + step["run"]}),
+        # an expanded command name may be eval (Codex 4253363494)
+        lambda doc, job, step: step.update({"run": "x=eval; $x 'pytest() { :; }'\n" + step["run"]}),
+        lambda doc, job, step: step.update(
+            {"run": "`echo eval` 'pytest() { :; }'\n" + step["run"]}
+        ),
         lambda doc, job, step: step.update({"env": {"BASH_ENV": "./evil.sh"}}),
         lambda doc, job, step: job["steps"].insert(
             0, {"run": 'echo "PYTEST_ADDOPTS=--co" >> "$GITHUB_ENV"'}
