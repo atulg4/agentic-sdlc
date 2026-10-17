@@ -474,7 +474,7 @@ jobs:
       - name: Generate patch with Claude Code using Max/Pro OAuth
         id: claude-oauth
         if: needs.prepare.outputs.selected_provider == 'anthropic' && needs.prepare.outputs.selected_auth_mode == 'oauth'
-        uses: anthropics/claude-code-action@6fed3ca145920b639991cb756090506e1bcaf515 # v1
+        uses: anthropics/claude-code-action@a26b07d8c778b0c43f64618e5fd29fd0f8af72e8 # v1
         env:
           CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
         with:
@@ -491,7 +491,7 @@ jobs:
       - name: Generate patch with Claude Code using direct API billing
         id: claude-api
         if: needs.prepare.outputs.selected_provider == 'anthropic' && needs.prepare.outputs.selected_auth_mode == 'api-key'
-        uses: anthropics/claude-code-action@6fed3ca145920b639991cb756090506e1bcaf515 # v1
+        uses: anthropics/claude-code-action@a26b07d8c778b0c43f64618e5fd29fd0f8af72e8 # v1
         env:
           CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
         with:
