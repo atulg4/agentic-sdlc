@@ -117,6 +117,9 @@ _REPOSITORY_REFERENCE = re.compile(
 #: A bare repository identifier, for fields whose CONTRACT is a repository
 #: (a ledger status's repository field), never for free-form references.
 _REPOSITORY_IDENTIFIER = re.compile(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+")
+#: URL userinfo (https://user:secret@host/...): a reference embedding it
+#: carries a credential the snapshot must never republish.
+_CREDENTIAL_REFERENCE = re.compile(r"://[^/\s@]+:[^/\s@]+@")
 _TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})")
 _SECRET_KEY = re.compile(
     r"credential|secret|token|password|passphrase|api_?key|authorization|bearer|private_?key",
@@ -1577,14 +1580,25 @@ def build_control_center_snapshot(
         # A malformed repository value is withheld EVERYWHERE, not only from
         # the warning: it is often a clone URL, and URLs can embed credentials
         # that must never reach the serialized statuses or the shared store.
-        # Redaction happens BEFORE the backlog tree is built, because its
-        # nodes capture the status objects they join.
+        # The free-text references get the same treatment when they embed URL
+        # userinfo. Redaction happens BEFORE the backlog tree is built,
+        # because its nodes capture the status objects they join.
         malformed_repositories: set[str] = set()
+        credential_references = 0
         for unit_id, status in list(statuses.items()):
             name = status.repository
             if name and not _REPOSITORY_IDENTIFIER.fullmatch(name):
                 malformed_repositories.add(name)
-                statuses[unit_id] = replace(status, repository="")
+                status = replace(status, repository="")
+            redactions: dict[str, str] = {}
+            for field_name in ("issue_ref", "change_request_ref", "run_ref"):
+                value = getattr(status, field_name)
+                if value and _CREDENTIAL_REFERENCE.search(value):
+                    redactions[field_name] = ""
+                    credential_references += 1
+            if redactions:
+                status = replace(status, **redactions)
+            statuses[unit_id] = status
 
         by_issue_ref, reference_warnings = _index_by_issue_ref(statuses)
         tree, tree_warnings = _build_backlog_tree(items, statuses, by_issue_ref)
@@ -1595,6 +1609,12 @@ def build_control_center_snapshot(
                 "repository identifier(s) that are not owner/name shaped; the values "
                 "are withheld because malformed identifiers can embed credentials - "
                 "fix the ledger entries so ownership checks can cover them"
+            )
+        if credential_references:
+            view_warnings.append(
+                f"project {project_id} ledger data carries {credential_references} "
+                "reference(s) embedding URL credentials; the values are withheld - "
+                "strip the userinfo from the ledger references"
             )
 
         if not registered:
