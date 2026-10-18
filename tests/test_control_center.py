@@ -4390,7 +4390,7 @@ def test_the_console_derives_health_and_bounds_top_level_collections():
     )
 
 
-def test_pull_references_carry_the_validated_provider_spelling():
+def test_pull_references_carry_the_callers_canonical_spelling():
     pull = {
         "number": 7,
         "state": "open",
@@ -4402,11 +4402,12 @@ def test_pull_references_carry_the_validated_provider_spelling():
     incidents = incidents_from_change_requests(
         [pull], project_id="forge", repository="acme/forge", observed_at=NOW
     )
-    # The ledger carries the provider's own spelling, and change-request
-    # retirement joins by exact string equality, so the caller's casing must
-    # never leak into the exported reference.
-    assert [item["evidenceRef"] for item in incidents] == ["Acme/Forge!7"]
-    assert incidents[0]["incidentId"].startswith("Acme/Forge!7:")
+    # Every id the adapter emits — issue item ids, label incident ids — uses
+    # the caller's canonical spelling, and change-request retirement joins by
+    # exact string equality, so the detail payload's own casing must never
+    # leak into the exported reference and split the join.
+    assert [item["evidenceRef"] for item in incidents] == ["acme/forge!7"]
+    assert incidents[0]["incidentId"].startswith("acme/forge!7:")
 
 
 def test_a_web_shaped_parent_url_cannot_reparent_a_child():
@@ -4857,12 +4858,15 @@ def test_a_malformed_ledger_repository_is_warned_not_skipped():
     snapshot = build_control_center_snapshot(
         generated_at=NOW, registry=REGISTRY, projections=ledger.projections()
     )
-    warnings = snapshot.get("forge").warnings
+    view = snapshot.get("forge")
     # The warning reports the problem WITHOUT the raw value: a malformed
     # identifier is often a clone URL, and URLs can embed credentials the
     # snapshot must never republish.
-    assert any("not owner/name shaped" in warning for warning in warnings)
-    assert not any("https://github.com/acme/forge" in warning for warning in warnings)
+    assert any("not owner/name shaped" in warning for warning in view.warnings)
+    assert "https://github.com/acme/forge" not in json.dumps(snapshot.as_dict())
+    # The value is withheld from the serialized statuses too, not only the
+    # warning: the unit still renders, with its repository redacted.
+    assert [unit.repository for unit in view.active] == [""]
 
 
 def test_the_adapter_rejects_a_duplicated_change_request_number():
@@ -5001,8 +5005,17 @@ def test_the_console_keeps_the_verified_document_and_exact_memberships():
     from pathlib import Path
 
     html = Path("examples/control-center/control-center.html").read_text(encoding="utf-8")
-    # The attention list must hold exactly the attention-state unit count.
-    assert "attention must list exactly the ${attentionTotal} unit(s)" in html
+    # Both lists are reconciled per state against the validated counts.
+    assert "active must list every unit its ${key} count holds." in html
+    assert "attention must list every unit its ${key} count holds." in html
+    assert "active lists more ${key} units than its state counts hold." in html
+    assert (
+        '"implementing", "verifying", "repairing", "deploying", '
+        '"deployment-verifying", "rolling-back"' in html
+    )
+    # A stale async notes delivery never overwrites a newer one.
+    assert "const delivery = ++notesDelivery;" in html
+    assert "if (delivery !== notesDelivery) return;" in html
     # generatedAt components are validated; Date.parse normalization is out.
     assert "generatedAt must be a real calendar instant." in html
     assert "leap ? 29 : 28" in html

@@ -377,7 +377,12 @@
         },
       );
     } catch (error) { state.error = describe(error); }
+    let notesDelivery = 0;
     subscribe("notes", async (docs) => {
+      // Adoption yields at each docId await, so an older delivery could
+      // otherwise finish after a newer one and overwrite the map with stale
+      // acknowledgements; only the latest delivery may assign it.
+      const delivery = ++notesDelivery;
       // A migrated incident can carry both its legacy document and the
       // project-scoped one; document identity decides, so the scoped record
       // deterministically wins whatever order the window delivers them in.
@@ -396,6 +401,7 @@
       // always scoped) stay visible over a legacy duplicate; an in-window
       // scoped document is live data and wins over the cached overlay.
       for (const [key, entry] of backfilledEntries) if (!scopedKeys.has(key)) next.set(key, entry);
+      if (delivery !== notesDelivery) return;
       state.notes = next;
     }, 1000);
     // Recency-ordered window: a newly saved draft is always retrievable.
@@ -677,14 +683,11 @@
       // needsAttention derives from the state alone (human gates, blocked,
       // failed), so the flag is validated against the state, never trusted.
       const attentionStates = ["approval-pending", "ready-for-human-merge", "blocked", "failed"];
-      // The producer lists EVERY attention-state unit, so the list length
-      // must equal the byState sum exactly: a rewrite that drops a blocked
-      // unit from attention cannot report the project as idle.
-      let attentionTotal = 0;
-      for (const key of attentionStates) attentionTotal += project.counts.byState[key] || 0;
-      if ((project.attention || []).length !== attentionTotal) {
-        return `${where} attention must list exactly the ${attentionTotal} unit(s) its state counts hold.`;
-      }
+      // Both lists are reconciled per state against byState below, so a
+      // rewrite can neither drop a blocked unit from attention nor hide an
+      // implementing unit from active while the counts declare running work.
+      const activeByState = {};
+      const attentionByState = {};
       for (const [membership, list] of [["active", project.active || []], ["attention", project.attention || []]]) {
         for (const unit of list) {
           if (!isObj(unit)) return `${where} has a work unit that is not an object.`;
@@ -707,6 +710,27 @@
               return `${where} active lists review-gate work unit ${unit.workUnitId} without recorded activity.`;
             }
           }
+          const tally = membership === "active" ? activeByState : attentionByState;
+          tally[unit.state] = (tally[unit.state] || 0) + 1;
+        }
+      }
+      // Reconcile both lists against the validated state counts: every unit
+      // in an always-active executing state must appear in active, review
+      // gates may be fewer (activity-less ones are excluded), and every
+      // attention-state unit must appear in attention.
+      for (const key of ["implementing", "verifying", "repairing", "deploying", "deployment-verifying", "rolling-back"]) {
+        if ((activeByState[key] || 0) !== (project.counts.byState[key] || 0)) {
+          return `${where} active must list every unit its ${key} count holds.`;
+        }
+      }
+      for (const key of ["reviewing", "re-reviewing"]) {
+        if ((activeByState[key] || 0) > (project.counts.byState[key] || 0)) {
+          return `${where} active lists more ${key} units than its state counts hold.`;
+        }
+      }
+      for (const key of attentionStates) {
+        if ((attentionByState[key] || 0) !== (project.counts.byState[key] || 0)) {
+          return `${where} attention must list every unit its ${key} count holds.`;
         }
       }
       for (const incident of project.incidents || []) {

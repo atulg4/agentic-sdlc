@@ -1578,6 +1578,23 @@ def build_control_center_snapshot(
         tree, tree_warnings = _build_backlog_tree(items, statuses, by_issue_ref)
         view_warnings = list(reference_warnings) + list(tree_warnings)
 
+        # A malformed repository value is withheld EVERYWHERE, not only from
+        # the warning: it is often a clone URL, and URLs can embed credentials
+        # that must never reach the serialized statuses or the shared store.
+        malformed_repositories: set[str] = set()
+        for unit_id, status in list(statuses.items()):
+            name = status.repository
+            if name and not _REPOSITORY_IDENTIFIER.fullmatch(name):
+                malformed_repositories.add(name)
+                statuses[unit_id] = replace(status, repository="")
+        if malformed_repositories:
+            view_warnings.append(
+                f"project {project_id} ledger data names {len(malformed_repositories)} "
+                "repository identifier(s) that are not owner/name shaped; the values "
+                "are withheld because malformed identifiers can embed credentials - "
+                "fix the ledger entries so ownership checks can cover them"
+            )
+
         if not registered:
             view_warnings.append(
                 f"project {project_id} has factory data but is not declared in the registry"
@@ -1636,29 +1653,12 @@ def build_control_center_snapshot(
                 match = _REPOSITORY_REFERENCE.fullmatch(reference) if reference else None
                 if match is not None and not owned(match.group("name"), provider):
                     foreign.add((match.group("name"), provider))
-            malformed: set[str] = set()
+            # Statuses were already redacted above, so every nonempty name
+            # here is owner/name shaped.
             for status in statuses.values():
                 name = status.repository
-                if not name:
-                    continue
-                if _REPOSITORY_IDENTIFIER.fullmatch(name):
-                    if not owned(name, ""):
-                        foreign.add((name, ""))
-                else:
-                    # The ledger accepts free-form repository text, so a typo
-                    # or URL would otherwise dodge the ownership check
-                    # entirely; it is flagged rather than silently skipped.
-                    malformed.add(name)
-            if malformed:
-                # The values are withheld: a malformed identifier is often a
-                # clone URL, and URLs can embed credentials the snapshot (and
-                # any store it lands in) must never republish.
-                view_warnings.append(
-                    f"project {project_id} ledger data names {len(malformed)} repository "
-                    "identifier(s) that are not owner/name shaped; the values are "
-                    "withheld because malformed identifiers can embed credentials - "
-                    "fix the ledger entries so ownership checks can cover them"
-                )
+                if name and not owned(name, ""):
+                    foreign.add((name, ""))
             for name, provider in sorted(foreign):
                 declared_for = declared_providers.get(name.lower())
                 if provider and declared_for:

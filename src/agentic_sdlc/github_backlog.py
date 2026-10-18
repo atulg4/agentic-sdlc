@@ -709,10 +709,13 @@ def incidents_from_change_requests(
             full_name.lower() == repository.lower(),
             f"change request {number} belongs to {full_name}, not repository {repository}",
         )
-        # The provider's own spelling, validated above: ledger events carry
-        # it, and the read model joins change-request references by exact
-        # string equality, so the caller's casing must never leak into refs.
-        ref = f"{full_name.strip()}!{number}"
+        # The caller's canonical spelling, which every other emitted id uses
+        # (issue item ids, label incident ids): the read model joins
+        # change-request references by EXACT string equality, so one export
+        # must never mix the detail payload's casing into refs the backlog
+        # and ledger spell canonically. The payload's own full_name was
+        # validated against it case-insensitively above.
+        ref = f"{repository}!{number}"
         title = str(pull.get("title") or "")[:512]
         state = pull.get("mergeable_state")
         _require(
