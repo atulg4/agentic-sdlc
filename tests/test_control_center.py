@@ -4789,6 +4789,100 @@ def test_rule_retirement_requires_github_provenance():
     assert kept[0].summary == "A provider-neutral record that matches the adapter spelling"
 
 
+def test_merge_state_retirement_requires_github_provenance():
+    # The id uses the adapter's merge-state spelling, but the document never
+    # declared a GitHub source: only the GitHub adapter defines that
+    # spelling, so the record survives merge proof.
+    record = _incident(
+        incidentId="acme/forge!5:merge-state-blocked",
+        kind="unclassified",
+        severity="degraded",
+        evidenceRef="acme/forge!5",
+        summary="An unclassified record using the adapter's merge-state spelling",
+    )
+    merged = _ledger(
+        *_chain(
+            TO_MERGED,
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "changeRequestRef": "acme/forge!5",
+            },
+        )
+    )
+    kept = (
+        build_control_center_snapshot(
+            generated_at=NOW,
+            registry=REGISTRY,
+            projections=merged.projections(),
+            incidents=load_incident_document(
+                {"schemaVersion": INCIDENT_SCHEMA_VERSION, "incidents": [record]}
+            ),
+        )
+        .get("forge")
+        .incidents
+    )
+    assert [item.incident_id for item in kept] == ["acme/forge!5:merge-state-blocked"]
+    # With the GitHub source declared, the same record retires on merge proof.
+    retired = (
+        build_control_center_snapshot(
+            generated_at=NOW,
+            registry=REGISTRY,
+            projections=merged.projections(),
+            incidents=load_incident_document(_incidents(record)),
+        )
+        .get("forge")
+        .incidents
+    )
+    assert retired == ()
+
+
+def test_generated_at_is_normalized_before_serialization():
+    snapshot = build_control_center_snapshot(generated_at=f"  {NOW} ", registry=EMPTY)
+    assert snapshot.generated_at == NOW
+    assert snapshot.as_dict()["generatedAt"] == NOW
+
+
+def test_a_malformed_ledger_repository_is_warned_not_skipped():
+    ledger = _ledger(
+        *_chain(
+            TO_IMPLEMENTING,
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "repository": "https://github.com/acme/forge",
+            },
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW, registry=REGISTRY, projections=ledger.projections()
+    )
+    warnings = snapshot.get("forge").warnings
+    assert any(
+        "malformed repository identifier: https://github.com/acme/forge" in warning
+        for warning in warnings
+    )
+
+
+def test_the_adapter_rejects_a_duplicated_change_request_number():
+    base = {
+        "title": "same change request twice",
+        "state": "open",
+        "draft": False,
+        "base": {"repo": {"full_name": "acme/forge"}},
+    }
+    with pytest.raises(ControlCenterError, match="appears more than once"):
+        incidents_from_change_requests(
+            [
+                {**base, "number": 5, "mergeable_state": "dirty"},
+                {**base, "number": 5, "mergeable_state": "clean"},
+            ],
+            project_id="forge",
+            repository="acme/forge",
+            observed_at=NOW,
+        )
+
+
 def test_rule_retirement_requires_the_adapter_identity():
     from agentic_sdlc.control_center import PLAN_EVIDENCE_RULE
 
@@ -4856,8 +4950,25 @@ def test_the_console_checks_membership_and_mirrors_its_writes():
     # Every backlog node carries its children array.
     assert "if (!Array.isArray(node.children)) return" in html
     # active/attention membership mirrors the producer's split exactly.
-    assert "that does not need attention" in html
+    assert "outside the attention states" in html
     assert "outside the executing, no-attention states" in html
     assert '"deployment-verifying", "rolling-back"' in html
     # Draft saves clamp their timestamp past the newest visible draft.
     assert "newest >= now ? newest + 1000 : now" in html
+
+
+def test_the_console_binds_incidents_and_enforces_full_membership():
+    from pathlib import Path
+
+    html = Path("examples/control-center/control-center.html").read_text(encoding="utf-8")
+    # Every incident binds to its containing project.
+    assert "declares a different projectId" in html
+    # Membership mirrors the producer's derivations, not the serialized flag
+    # alone: attention states are closed, review gates need activity.
+    assert '"approval-pending", "ready-for-human-merge", "blocked", "failed"' in html
+    assert "outside the attention states" in html
+    assert "without recorded activity" in html
+    # The producer-owned top-level collections are required, not optional.
+    assert "The snapshot requires its ${key} array" in html
+    # Note backfill sweeps every incident in passes, each key attempted once.
+    assert "if (!wanted.length) break;" in html

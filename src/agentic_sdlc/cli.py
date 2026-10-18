@@ -1049,7 +1049,29 @@ def _project_state(args: argparse.Namespace) -> int:
     return 0
 
 
+def _require_path_not_blank(option: str, supplied: str | None) -> None:
+    """An explicitly supplied empty path is a bad invocation, never "omitted".
+
+    ``--ledger "$LEDGER"`` with an unset shell variable expands to an empty
+    string; silently reading it as an absent option would publish an
+    incomplete or wholly unregistered snapshot instead of surfacing the
+    deployment bug.
+    """
+
+    if supplied is not None and not supplied.strip():
+        raise ControlCenterError(
+            f"{option} was given an empty path; pass a real file or omit the option"
+        )
+
+
 def _control_center(args: argparse.Namespace) -> int:
+    _require_path_not_blank("--registry", args.registry)
+    _require_path_not_blank("--ledger", args.ledger)
+    _require_path_not_blank("--output", args.output)
+    for supplied in args.backlog:
+        _require_path_not_blank("--backlog", supplied)
+    for supplied in args.incidents:
+        _require_path_not_blank("--incidents", supplied)
     registry, backlog, incidents = read_control_center_inputs(
         registry_path=args.registry,
         backlog_paths=tuple(args.backlog),
