@@ -377,12 +377,26 @@
         },
       );
     } catch (error) { state.error = describe(error); }
-    subscribe("notes", (docs) => {
-      state.notes = new Map();
-      for (const entry of docs) if (entry?.incidentId) state.notes.set(noteKey(entry.projectId, entry.incidentId), entry);
-      // Out-of-window notes fetched exactly stay visible: every delivery
-      // replaces the map, so the backfilled overlay is re-applied.
-      for (const [key, entry] of backfilledEntries) if (!state.notes.has(key)) state.notes.set(key, entry);
+    subscribe("notes", async (docs) => {
+      // A migrated incident can carry both its legacy document and the
+      // project-scoped one; document identity decides, so the scoped record
+      // deterministically wins whatever order the window delivers them in.
+      const next = new Map();
+      const scopedKeys = new Set();
+      for (const entry of docs) {
+        if (!entry?.incidentId) continue;
+        const key = noteKey(entry.projectId, entry.incidentId);
+        if (scopedKeys.has(key)) continue;
+        const scoped = entry.docId === (await docId(key));
+        if (scoped) scopedKeys.add(key);
+        else if (next.has(key)) continue;
+        next.set(key, entry);
+      }
+      // Out-of-window notes fetched exactly (and local saveNote mirrors,
+      // always scoped) stay visible over a legacy duplicate; an in-window
+      // scoped document is live data and wins over the cached overlay.
+      for (const [key, entry] of backfilledEntries) if (!scopedKeys.has(key)) next.set(key, entry);
+      state.notes = next;
     }, 1000);
     // Recency-ordered window: a newly saved draft is always retrievable.
     subscribe("projectDrafts", (docs) => { state.drafts = docs; }, 500, "at");
@@ -397,8 +411,13 @@
       let query = state.db.collection(collection);
       if (recencyField) query = query.orderBy(recencyField, "desc");
       query.limit(bound).onSnapshot(
-        (snapshot) => {
-          adopt(snapshot.docs.map((entry) => entry.data()).filter(Boolean));
+        async (snapshot) => {
+          // Each entry carries its document id, so adopters can tell a
+          // legacy-id document from a scoped one.
+          await adopt(snapshot.docs.map((entry) => {
+            const data = entry.data();
+            return data ? { ...data, docId: entry.id } : null;
+          }).filter(Boolean));
           render();
         },
         () => { /* a dropped subscription leaves the last view in place */ },
@@ -506,6 +525,11 @@
   function adoptSnapshot(document_, loadedAt, loadedBy) {
     const problem = validateSnapshot(document_);
     if (problem) { state.error = problem; return problem; }
+    // The verified document stays byte-faithful for "Copy the current
+    // snapshot": facts are derived on a clone, so a copied document still
+    // matches its own snapshotSha256 when loaded back.
+    state.snapshotPristine = document_;
+    document_ = structuredClone(document_);
     for (const project of document_.projects) deriveProjectFacts(project);
     // Portfolio totals are sums of the derived per-project facts.
     const totals = { projects: document_.projects.length, workUnits: 0, backlogItems: 0, active: 0, attention: 0, incidents: 0, blockers: 0, unregistered: 0 };
@@ -653,6 +677,14 @@
       // needsAttention derives from the state alone (human gates, blocked,
       // failed), so the flag is validated against the state, never trusted.
       const attentionStates = ["approval-pending", "ready-for-human-merge", "blocked", "failed"];
+      // The producer lists EVERY attention-state unit, so the list length
+      // must equal the byState sum exactly: a rewrite that drops a blocked
+      // unit from attention cannot report the project as idle.
+      let attentionTotal = 0;
+      for (const key of attentionStates) attentionTotal += project.counts.byState[key] || 0;
+      if ((project.attention || []).length !== attentionTotal) {
+        return `${where} attention must list exactly the ${attentionTotal} unit(s) its state counts hold.`;
+      }
       for (const [membership, list] of [["active", project.active || []], ["attention", project.attention || []]]) {
         for (const unit of list) {
           if (!isObj(unit)) return `${where} has a work unit that is not an object.`;
@@ -744,11 +776,23 @@
     if (topLevel) return topLevel;
     // The producer always stamps generatedAt, and the subtitle and snapshot
     // views display it verbatim, so a rewritten snapshot cannot smuggle
-    // arbitrary text (or drop the field) through it.
-    if (typeof value.generatedAt !== "string"
-      || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value.generatedAt)
-      || Number.isNaN(Date.parse(value.generatedAt))) {
-      return "generatedAt must be an RFC 3339 timestamp.";
+    // arbitrary text (or drop the field) through it. Components are checked
+    // directly: Date.parse silently normalizes impossible dates (Feb 30
+    // becomes Mar 2), so it cannot establish a real calendar instant.
+    const stamp = typeof value.generatedAt === "string"
+      ? /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/.exec(value.generatedAt)
+      : null;
+    if (!stamp) return "generatedAt must be an RFC 3339 timestamp.";
+    {
+      const [year, month, day, hour, minute, second] = stamp.slice(1, 7).map(Number);
+      const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+      const monthDays = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+      const offset = stamp[7];
+      const offsetBad = offset !== "Z" && (Number(offset.slice(1, 3)) > 23 || Number(offset.slice(4, 6)) > 59);
+      if (month < 1 || month > 12 || day < 1 || day > monthDays[month - 1]
+        || hour > 23 || minute > 59 || second > 59 || offsetBad) {
+        return "generatedAt must be a real calendar instant.";
+      }
     }
     if (!/^[0-9a-f]{64}$/.test(value.snapshotSha256 || "")) return "The snapshot must carry its 64-character snapshotSha256 digest.";
     return "";
@@ -1610,7 +1654,7 @@
           if (!saveProblem) state.tab = "portfolio";
           render();
         } } }, "Load it"),
-        state.snapshot ? copyButton(JSON.stringify(state.snapshot, null, 2), "Copy the current snapshot") : null,
+        state.snapshotPristine ? copyButton(JSON.stringify(state.snapshotPristine, null, 2), "Copy the current snapshot") : null,
       ),
       result,
     ));
