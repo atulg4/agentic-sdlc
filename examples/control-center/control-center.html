@@ -395,10 +395,12 @@
       for (const entry of docs) {
         if (!entry?.incidentId) continue;
         const key = noteKey(entry.projectId, entry.incidentId);
-        live.add(key);
         if (scopedKeys.has(key)) continue;
         const scoped = entry.docId === (await docId(key));
-        if (scoped) scopedKeys.add(key);
+        // Only a SCOPED live document makes the key live: a window that
+        // carries just the legacy twin must not stop the exact scoped read,
+        // or the stale legacy note could win indefinitely.
+        if (scoped) { scopedKeys.add(key); live.add(key); }
         else if (next.has(key)) continue;
         next.set(key, entry);
       }
@@ -806,20 +808,45 @@
         }
       }
       // Walk the backlog forest iteratively; depth stays bounded by the stack.
-      const stack = (project.backlog || []).map((entry) => [entry, 1]);
+      const stack = (project.backlog || []).map((entry) => [entry, 1, null]);
       let visited = 0;
       while (stack.length) {
-        const [node, depth] = stack.pop();
+        const [node, depth, placedUnder] = stack.pop();
         if (depth > 32) return `${where} backlog nests deeper than 32 levels.`;
         if (!isObj(node) || typeof node.title !== "string") return `${where} has a malformed backlog node.`;
         if (typeof node.itemId !== "string" || !node.itemId) return `${where} has a backlog node without a string itemId.`;
         const itemKey = project.projectId + "\u0000" + node.itemId;
         if (seenItems.has(itemKey)) return `Duplicate backlog itemId in ${where}: ${node.itemId}.`;
         seenItems.add(itemKey);
-        for (const key of ["itemId", "kind", "state", "stateBasis", "url", "issueRef"]) {
+        for (const key of ["itemId", "kind", "state", "stateBasis", "url", "issueRef", "parentId", "declaredState"]) {
           if (node[key] !== undefined && typeof node[key] !== "string") return `${where} backlog node field ${key} must be a string.`;
         }
         if (node.url && !/^https:\/\//.test(node.url)) return `${where} backlog node ${node.itemId || ""} url must be https.`;
+        // Placement must agree with the serialized parent link: the renderer
+        // follows the nested arrays, so a child moved under another parent
+        // would display a hierarchy no producer could build.
+        if (placedUnder === null) {
+          if (node.parentId && node.parentMissing !== true) return `${where} backlog root ${node.itemId} names a parent without a parent-missing flag.`;
+          if (!node.parentId && node.parentMissing === true) return `${where} backlog root ${node.itemId} is flagged parent-missing without a parent.`;
+        } else {
+          if (node.parentId !== placedUnder) return `${where} backlog node ${node.itemId} sits under ${placedUnder} but names another parent.`;
+          if (node.parentMissing === true) return `${where} backlog node ${node.itemId} is flagged parent-missing while placed under its parent.`;
+        }
+        // State provenance is a closed contract: the kind vocabulary, the
+        // three bases, and the basis-specific agreement (a ledger state must
+        // match the embedded status; a declared state its declaredState).
+        if (!["epic", "story", "task"].includes(node.kind)) return `${where} backlog node ${node.itemId} kind is unknown.`;
+        if (node.stateBasis === "state projected from the lifecycle ledger") {
+          if (!isObj(node.status) || node.status.state !== node.state) return `${where} backlog node ${node.itemId} state disagrees with its ledger status.`;
+          if (!factoryStates.includes(node.state)) return `${where} backlog node ${node.itemId} names an unknown ledger state.`;
+        } else if (node.stateBasis === "state declared by the backlog source") {
+          if (!node.state || node.state !== node.declaredState) return `${where} backlog node ${node.itemId} state disagrees with its declared state.`;
+          if (node.status) return `${where} backlog node ${node.itemId} carries a status without ledger provenance.`;
+        } else if (node.stateBasis === "state unknown: no ledger events and no declared state") {
+          if (node.state !== "unknown" || node.status) return `${where} backlog node ${node.itemId} claims an unknown basis with state data.`;
+        } else {
+          return `${where} backlog node ${node.itemId} names an unknown state basis.`;
+        }
         // The producer serializes children on every node, so a node without
         // the array is never producer output.
         if (!Array.isArray(node.children)) return `${where} backlog node ${node.itemId || ""} children must be an array.`;
@@ -828,7 +855,7 @@
         // The producer's combined per-project budget counts EVERY node, so
         // the traversal holds nested nodes to the same 5000-item limit.
         if (visited > 5000) return `${where} backlog holds more than 5000 nodes or is cyclic.`;
-        for (const child of node.children || []) stack.push([child, depth + 1]);
+        for (const child of node.children || []) stack.push([child, depth + 1, node.itemId]);
       }
       totalItems += visited;
       totalIncidents += project.incidents.length;

@@ -4877,6 +4877,22 @@ def test_a_malformed_ledger_repository_is_warned_not_skipped():
     assert [unit.repository for unit in view.active] == [""]
 
 
+def test_credential_bearing_inputs_are_rejected_at_load():
+    # A backlog url or incident evidenceRef with URL userinfo would be
+    # republished by the snapshot and rendered as a clickable link.
+    with pytest.raises(ControlCenterError, match="url must not embed credentials"):
+        load_backlog_document(
+            _document(
+                _backlog(
+                    itemId="acme/forge#7",
+                    url="https://user:secret@github.com/acme/forge/issues/7",
+                )
+            )
+        )
+    with pytest.raises(ControlCenterError, match="evidenceRef must not embed credentials"):
+        load_incident_document(_incidents(_incident(evidenceRef="https://token@ci.example/run/9")))
+
+
 def test_a_malformed_pull_request_marker_is_rejected():
     # GitHub's real marker is an object; a null or string value is a
     # transformed payload, and skipping on it would silently drop records.
@@ -4914,6 +4930,21 @@ def test_credential_bearing_references_are_redacted():
     view = snapshot.get("forge")
     assert "user:secret" not in json.dumps(snapshot.as_dict())
     assert [unit.run_ref for unit in view.active] == [""]
+    # Username-only userinfo is a credential too (tokens travel that way).
+    tokened = _ledger(
+        *_chain(
+            TO_IMPLEMENTING,
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "runRef": "https://ghp-token-here@ci.example/run/7",
+            },
+        )
+    )
+    redacted = build_control_center_snapshot(
+        generated_at=NOW, registry=REGISTRY, projections=tokened.projections()
+    )
+    assert "ghp-token-here" not in json.dumps(redacted.as_dict())
     # The untouched reference survives; only the credential-bearing one is
     # withheld, with a warning naming the count.
     assert [unit.issue_ref for unit in view.active] == ["acme/forge#7"]
@@ -5135,3 +5166,19 @@ def test_the_console_pins_state_vocabulary_and_note_freshness():
     )
     # Exact reads attach only records naming this project and incident.
     assert "entry.incidentId !== incidentId || entry.projectId !== projectId" in html
+
+
+def test_the_console_validates_backlog_provenance_and_scoped_liveness():
+    from pathlib import Path
+
+    html = Path("examples/control-center/control-center.html").read_text(encoding="utf-8")
+    # Only a scoped live document stops the exact backfill read.
+    assert "if (scoped) { scopedKeys.add(key); live.add(key); }" in html
+    # Placement must agree with the serialized parent link.
+    assert "sits under ${placedUnder} but names another parent" in html
+    assert "names a parent without a parent-missing flag" in html
+    # State provenance is a closed, reconciled contract.
+    assert "state disagrees with its ledger status" in html
+    assert "state disagrees with its declared state" in html
+    assert "names an unknown state basis" in html
+    assert "carries a status without ledger provenance" in html

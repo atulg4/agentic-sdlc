@@ -117,9 +117,10 @@ _REPOSITORY_REFERENCE = re.compile(
 #: A bare repository identifier, for fields whose CONTRACT is a repository
 #: (a ledger status's repository field), never for free-form references.
 _REPOSITORY_IDENTIFIER = re.compile(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+")
-#: URL userinfo (https://user:secret@host/...): a reference embedding it
-#: carries a credential the snapshot must never republish.
-_CREDENTIAL_REFERENCE = re.compile(r"://[^/\s@]+:[^/\s@]+@")
+#: URL userinfo (https://user:secret@host/..., https://token@host/...): ANY
+#: userinfo before the host carries a credential the snapshot must never
+#: republish - tokens are commonly supplied username-only.
+_CREDENTIAL_REFERENCE = re.compile(r"://[^/?#\s]*@")
 _TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})")
 _SECRET_KEY = re.compile(
     r"credential|secret|token|password|passphrase|api_?key|authorization|bearer|private_?key",
@@ -783,6 +784,12 @@ def _load_backlog_item(raw: Any, index: int) -> BacklogItem:
             url.startswith("https://"),
             f"{label}.url must be an https URL: {url}",
         )
+        # The console renders the URL as a clickable link and the snapshot
+        # republishes it; userinfo would leak the embedded credential.
+        _require(
+            not _CREDENTIAL_REFERENCE.search(url),
+            f"{label}.url must not embed credentials; strip the URL userinfo",
+        )
     return BacklogItem(
         item_id=_identifier(entry, "itemId", label),
         kind=BacklogKind(kind),
@@ -966,6 +973,13 @@ def _load_incident(raw: Any, index: int) -> Incident:
     label = f"incidents[{index}]"
     entry = _mapping(raw, label)
     _known_keys(entry, _INCIDENT_KEYS, label)
+    evidence_ref = _text(entry, "evidenceRef", label)
+    # The reference is serialized into the snapshot and the shared store;
+    # URL userinfo would republish the embedded credential.
+    _require(
+        not _CREDENTIAL_REFERENCE.search(evidence_ref),
+        f"{label}.evidenceRef must not embed credentials; strip the URL userinfo",
+    )
     kind = _text(entry, "kind", label, required=True)
     _require(
         kind in INCIDENT_KINDS,
@@ -986,7 +1000,7 @@ def _load_incident(raw: Any, index: int) -> Incident:
         work_unit_id=_unit_text(entry, "workUnitId", label),
         backlog_item_id=_identifier(entry, "backlogItemId", label, required=False),
         observed_at=_timestamp(entry, "observedAt", label),
-        evidence_ref=_text(entry, "evidenceRef", label),
+        evidence_ref=evidence_ref,
     )
 
 

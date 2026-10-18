@@ -1487,6 +1487,10 @@ def test_control_center_rejects_an_explicitly_empty_input_path():
     assert main([*base, "--issues", "x.json", "--pulls", ""]) == 2
     assert main([*base, "--issues", "x.json", "--backlog-output", ""]) == 2
     assert main([*base, "--issues", "x.json", "--incidents-output", " "]) == 2
+    # Blank timestamps must not silently become "now": that would fabricate
+    # temporal provenance instead of surfacing the bad invocation.
+    assert main(["control-center", "--generated-at", ""]) == 2
+    assert main([*base, "--issues", "x.json", "--observed-at", " "]) == 2
 
 
 def test_control_center_rejects_a_malformed_failing_check_pair(tmp_path):
