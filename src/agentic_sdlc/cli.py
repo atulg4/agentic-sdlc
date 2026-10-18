@@ -1177,6 +1177,14 @@ def _sub_issue_group(entry: str) -> tuple[Any, int | None]:
 
 
 def _github_backlog(args: argparse.Namespace) -> int:
+    # An unset shell variable expands to an empty string; reading it as an
+    # omitted option would silently use default labels, drop the pulls
+    # classification, discard an output, or redirect it to stdout.
+    _require_path_not_blank("--config", args.config)
+    _require_path_not_blank("--issues", args.issues)
+    _require_path_not_blank("--pulls", args.pulls)
+    _require_path_not_blank("--backlog-output", args.backlog_output)
+    _require_path_not_blank("--incidents-output", args.incidents_output)
     labels = None
     if args.config:
         # The policy can rename the automation labels; the generated workflows

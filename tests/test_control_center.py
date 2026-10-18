@@ -4851,22 +4851,57 @@ def test_a_malformed_ledger_repository_is_warned_not_skipped():
             workUnit={
                 "projectId": "forge",
                 "workUnitId": "wu-1",
-                "repository": "https://github.com/acme/forge",
+                "repository": "https://user:secret@github.com/acme/forge",
+                "issueRef": "acme/forge#7",
             },
         )
     )
     snapshot = build_control_center_snapshot(
-        generated_at=NOW, registry=REGISTRY, projections=ledger.projections()
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        # The unit joins a backlog item, so the backlog tree captures its
+        # status too: redaction must happen before the tree is built.
+        backlog=load_backlog_document(
+            _document(_backlog(itemId="acme/forge#7", issueRef="acme/forge#7"))
+        ),
     )
     view = snapshot.get("forge")
     # The warning reports the problem WITHOUT the raw value: a malformed
     # identifier is often a clone URL, and URLs can embed credentials the
     # snapshot must never republish.
     assert any("not owner/name shaped" in warning for warning in view.warnings)
-    assert "https://github.com/acme/forge" not in json.dumps(snapshot.as_dict())
-    # The value is withheld from the serialized statuses too, not only the
-    # warning: the unit still renders, with its repository redacted.
+    # The value is withheld EVERYWHERE in the serialized snapshot - the
+    # active/attention statuses and the backlog nodes' captured statuses.
+    assert "user:secret" not in json.dumps(snapshot.as_dict())
     assert [unit.repository for unit in view.active] == [""]
+
+
+def test_the_adapter_rejects_a_non_string_title():
+    # str() on an object would serialize nested provider fields - potentially
+    # credential-bearing - into the snapshot, bypassing the loaders' checks.
+    with pytest.raises(ControlCenterError, match="title must be a string"):
+        backlog_document_from_issues(
+            [_issue(1, "ok") | {"title": {"token": "secret"}}],
+            project_id="forge",
+            repository="acme/forge",
+        )
+    with pytest.raises(ControlCenterError, match="title must be a string"):
+        incidents_from_change_requests(
+            [
+                {
+                    "number": 5,
+                    "title": ["not", "a", "string"],
+                    "state": "open",
+                    "mergeable_state": "dirty",
+                    "draft": False,
+                    "base": {"repo": {"full_name": "acme/forge"}},
+                }
+            ],
+            project_id="forge",
+            repository="acme/forge",
+            observed_at=NOW,
+        )
 
 
 def test_the_adapter_rejects_a_duplicated_change_request_number():
@@ -5027,3 +5062,23 @@ def test_the_console_keeps_the_verified_document_and_exact_memberships():
     assert "state.snapshotPristine = document_;" in html
     assert "document_ = structuredClone(document_);" in html
     assert "JSON.stringify(state.snapshotPristine, null, 2)" in html
+
+
+def test_the_console_pins_state_vocabulary_and_note_freshness():
+    from pathlib import Path
+
+    html = Path("examples/control-center/control-center.html").read_text(encoding="utf-8")
+    # byState keys belong to the producer's closed FactoryState vocabulary.
+    assert "names an unknown state: ${key}" in html
+    assert '"rolled-back", "blocked", "failed", "cancelled", "superseded"' in html
+    # awaitsHuman is validated against the state, never trusted.
+    assert "awaitsHuman disagrees with its state" in html
+    # A present incident observedAt must be a real instant.
+    assert "observedAt must be a real RFC 3339 instant." in html
+    # Deleting the store document clears the pristine copy too.
+    assert "state.snapshotPristine = null;" in html
+    # Out-of-window notes are re-read on every adoption, and a deleted note
+    # drops its stale overlay entry.
+    assert "backfilledNotes.clear();" in html
+    assert "liveNoteKeys = live;" in html
+    assert "} else if (backfilledEntries.delete(key)) {" in html

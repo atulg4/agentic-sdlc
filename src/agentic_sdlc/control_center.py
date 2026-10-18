@@ -1574,19 +1574,21 @@ def build_control_center_snapshot(
         # in another project is an unrelated record, not proof of a
         # cross-project edge. Explicit cross-project parents are still
         # rejected where a document declares both items.
-        by_issue_ref, reference_warnings = _index_by_issue_ref(statuses)
-        tree, tree_warnings = _build_backlog_tree(items, statuses, by_issue_ref)
-        view_warnings = list(reference_warnings) + list(tree_warnings)
-
         # A malformed repository value is withheld EVERYWHERE, not only from
         # the warning: it is often a clone URL, and URLs can embed credentials
         # that must never reach the serialized statuses or the shared store.
+        # Redaction happens BEFORE the backlog tree is built, because its
+        # nodes capture the status objects they join.
         malformed_repositories: set[str] = set()
         for unit_id, status in list(statuses.items()):
             name = status.repository
             if name and not _REPOSITORY_IDENTIFIER.fullmatch(name):
                 malformed_repositories.add(name)
                 statuses[unit_id] = replace(status, repository="")
+
+        by_issue_ref, reference_warnings = _index_by_issue_ref(statuses)
+        tree, tree_warnings = _build_backlog_tree(items, statuses, by_issue_ref)
+        view_warnings = list(reference_warnings) + list(tree_warnings)
         if malformed_repositories:
             view_warnings.append(
                 f"project {project_id} ledger data names {len(malformed_repositories)} "

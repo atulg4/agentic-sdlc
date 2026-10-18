@@ -350,8 +350,11 @@
           const delivery = ++deliveries;
           if (!snap?.exists) {
             // A deleted snapshot is a delivery too: it clears the view and
-            // supersedes any older digest verification still in flight.
+            // supersedes any older digest verification still in flight. The
+            // pristine copy clears with it, so the copy action never offers
+            // a document the live store explicitly removed.
             state.snapshot = null;
+            state.snapshotPristine = null;
             state.snapshotMeta = null;
             state.error = "";
             render();
@@ -388,9 +391,11 @@
       // deterministically wins whatever order the window delivers them in.
       const next = new Map();
       const scopedKeys = new Set();
+      const live = new Set();
       for (const entry of docs) {
         if (!entry?.incidentId) continue;
         const key = noteKey(entry.projectId, entry.incidentId);
+        live.add(key);
         if (scopedKeys.has(key)) continue;
         const scoped = entry.docId === (await docId(key));
         if (scoped) scopedKeys.add(key);
@@ -402,6 +407,9 @@
       // scoped document is live data and wins over the cached overlay.
       for (const [key, entry] of backfilledEntries) if (!scopedKeys.has(key)) next.set(key, entry);
       if (delivery !== notesDelivery) return;
+      // The keys the window itself delivered: backfill needs no exact read
+      // for these, and refreshes everything else on each adoption.
+      liveNoteKeys = live;
       state.notes = next;
     }, 1000);
     // Recency-ordered window: a newly saved draft is always retrievable.
@@ -481,22 +489,26 @@
 
   const backfilledNotes = new Set();
   const backfilledEntries = new Map();
+  let liveNoteKeys = new Set();
   async function backfillNotes(document_) {
     // The notes subscription is a bounded window, so a note outside it is
     // fetched EXACTLY, by its deterministic per-incident document id. The
     // work is bounded: keys are gathered in passes of at most 200, read in
     // small parallel batches, and each attempted key is read at most once
-    // per page load. The passes repeat until every incident in the adopted
-    // snapshot was attempted, so finishing the sweep never waits on a later
-    // adoption that may not come.
+    // PER ADOPTION — not once per page load, so an out-of-window note that
+    // was edited, created, or deleted after the last sweep refreshes on the
+    // next snapshot adoption instead of staying stale until reload. The
+    // passes repeat until every incident in the adopted snapshot was
+    // attempted, so finishing the sweep never waits on a later adoption.
     if (!state.db) return;
+    backfilledNotes.clear();
     let found = 0;
     for (;;) {
     const wanted = [];
     outer: for (const project of document_.projects || []) {
       for (const incident of project.incidents || []) {
         const key = noteKey(project.projectId, incident.incidentId);
-        if (!incident.incidentId || state.notes.has(key) || backfilledNotes.has(key)) continue;
+        if (!incident.incidentId || liveNoteKeys.has(key) || backfilledNotes.has(key)) continue;
         wanted.push([key, project.projectId, incident.incidentId]);
         if (wanted.length >= 200) break outer;
       }
@@ -519,7 +531,12 @@
           }
           if (entry?.incidentId) {
             backfilledEntries.set(key, entry);
-            if (!state.notes.has(key)) { state.notes.set(key, entry); found += 1; }
+            state.notes.set(key, entry);
+            found += 1;
+          } else if (backfilledEntries.delete(key)) {
+            // The note was deleted at the store; drop the stale overlay.
+            state.notes.delete(key);
+            found += 1;
           }
         } catch { /* an unreadable note renders as unacknowledged */ }
       }));
@@ -658,8 +675,12 @@
       if (!isObj(project.counts.byState)) return `${where}.counts.byState must be an object.`;
       const states = Object.keys(project.counts.byState);
       if (states.length > 64) return `${where}.counts.byState holds more than 64 states.`;
+      // The producer's FactoryState enum is closed: an unknown key would sit
+      // outside every reconciliation loop below, hiding the unit it counts.
+      const factoryStates = ["intake", "triaged", "specified", "planned", "approval-pending", "approved", "dispatched", "implementing", "verifying", "reviewing", "repair-needed", "repairing", "re-reviewing", "ready-for-human-merge", "merged", "deploying", "deployment-verifying", "live", "rolling-back", "rolled-back", "blocked", "failed", "cancelled", "superseded"];
       let stateTotal = 0;
       for (const key of states) {
+        if (!factoryStates.includes(key)) return `${where}.counts.byState names an unknown state: ${key}.`;
         const count = project.counts.byState[key];
         if (!Number.isInteger(count) || count < 0) {
           return `${where}.counts.byState.${key} must be a non-negative integer.`;
@@ -696,6 +717,13 @@
           if (typeof unit.workUnitId !== "string" || !unit.workUnitId) return `${where} has a work unit without a string workUnitId.`;
           if (unitIds.has(unit.workUnitId)) return `${where} lists work unit ${unit.workUnitId} more than once.`;
           unitIds.add(unit.workUnitId);
+          // awaitsHuman is state-derived like needsAttention, and unitRow
+          // renders a "human gate" chip from it, so the flag is validated
+          // against the state rather than trusted.
+          const humanGate = unit.state === "approval-pending" || unit.state === "ready-for-human-merge";
+          if (unit.awaitsHuman !== humanGate) {
+            return `${where} work unit ${unit.workUnitId} awaitsHuman disagrees with its state.`;
+          }
           if (membership === "attention" && (unit.needsAttention !== true || !attentionStates.includes(unit.state))) {
             return `${where} attention lists work unit ${unit.workUnitId} outside the attention states.`;
           }
@@ -752,6 +780,12 @@
         if (!["blocker", "degraded", "advisory"].includes(incident.severity)) {
           return `${where} has an incident with an unknown severity.`;
         }
+        // observedAt is excluded from the digest and displayed verbatim, so
+        // a present value must be a real instant, like generatedAt.
+        if (incident.observedAt !== undefined && incident.observedAt !== ""
+          && !realInstant(incident.observedAt)) {
+          return `${where} incident ${incident.incidentId} observedAt must be a real RFC 3339 instant.`;
+        }
         const problem = arrayField(incident, "remediations", `${where} incident`, 16);
         if (problem) return problem;
         for (const action of incident.remediations || []) {
@@ -800,26 +834,31 @@
     if (topLevel) return topLevel;
     // The producer always stamps generatedAt, and the subtitle and snapshot
     // views display it verbatim, so a rewritten snapshot cannot smuggle
-    // arbitrary text (or drop the field) through it. Components are checked
-    // directly: Date.parse silently normalizes impossible dates (Feb 30
-    // becomes Mar 2), so it cannot establish a real calendar instant.
-    const stamp = typeof value.generatedAt === "string"
-      ? /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/.exec(value.generatedAt)
-      : null;
-    if (!stamp) return "generatedAt must be an RFC 3339 timestamp.";
-    {
-      const [year, month, day, hour, minute, second] = stamp.slice(1, 7).map(Number);
-      const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
-      const monthDays = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-      const offset = stamp[7];
-      const offsetBad = offset !== "Z" && (Number(offset.slice(1, 3)) > 23 || Number(offset.slice(4, 6)) > 59);
-      if (month < 1 || month > 12 || day < 1 || day > monthDays[month - 1]
-        || hour > 23 || minute > 59 || second > 59 || offsetBad) {
-        return "generatedAt must be a real calendar instant.";
-      }
+    // arbitrary text (or drop the field) through it.
+    if (typeof value.generatedAt !== "string"
+      || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value.generatedAt)) {
+      return "generatedAt must be an RFC 3339 timestamp.";
     }
+    if (!realInstant(value.generatedAt)) return "generatedAt must be a real calendar instant.";
     if (!/^[0-9a-f]{64}$/.test(value.snapshotSha256 || "")) return "The snapshot must carry its 64-character snapshotSha256 digest.";
     return "";
+  }
+
+  // Components are checked directly: Date.parse silently normalizes
+  // impossible dates (Feb 30 becomes Mar 2), so it cannot establish a real
+  // calendar instant.
+  function realInstant(value) {
+    const stamp = typeof value === "string"
+      ? /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/.exec(value)
+      : null;
+    if (!stamp) return false;
+    const [year, month, day, hour, minute, second] = stamp.slice(1, 7).map(Number);
+    const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+    const monthDays = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    const offset = stamp[7];
+    const offsetBad = offset !== "Z" && (Number(offset.slice(1, 3)) > 23 || Number(offset.slice(4, 6)) > 59);
+    return !(month < 1 || month > 12 || day < 1 || day > monthDays[month - 1]
+      || hour > 23 || minute > 59 || second > 59 || offsetBad);
   }
 
   /* ---------- render ---------- */
