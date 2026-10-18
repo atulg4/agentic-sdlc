@@ -52,9 +52,14 @@ selection notes.
 ## Fail-closed exclusions and dispatch blocking
 
 Evidence never enters a packet when its repository path matches the policy's
-or the mission's forbidden paths, or when its payload carries a secret-like
-value (key blocks, provider token shapes, quoted credential assignments).
-Each exclusion is recorded on the packet.
+or the mission's forbidden paths or falls outside the mission's `read_paths`,
+or when its rendered block — the payload and its citation metadata (locator,
+revision) alike — carries a secret-like value (key blocks, provider token
+shapes, quoted credential assignments). A record whose `sourceType` disagrees
+with its declared source is rejected outright, and duplicate records are
+counted once, matching the knowledge layer. Each exclusion is recorded on the
+packet, and the pack's own qualifications (stale retentions, detected
+contradictions) are rendered into the prompt with the evidence they qualify.
 
 `build_context_packet` raises `ContextBuilderError` with an actionable
 reason — naming the source or evidence and the remedy — when:
@@ -68,6 +73,10 @@ reason — naming the source or evidence and the remedy — when:
 - the task specification is not dispatchable (route it through the spec
   stage first).
 
+A required source the mission may not read — its `permitted_missions` or the
+mission's explicit `knowledge_sources` exclude it — is not demanded of that
+mission, since supplying it would be rejected by the same access policy.
+
 High- and critical-risk missions additionally keep the knowledge layer's
 stricter rule: any stale or missing evidence, required or not, refuses the
 pack outright.
@@ -75,8 +84,10 @@ pack outright.
 ## Digest and the agent run record
 
 `ContextPacket.packet_sha256` is deterministic over content-stable fields
-(retrieval times never change it) and embeds the underlying knowledge pack's
-`packSha256`. `dispatch_envelope_for_packet` pins it into the dispatch
+(retrieval times never change it), embeds the underlying knowledge pack's
+`packSha256`, and binds the SHA-256 of the fully rendered prompt, so two
+packets never share a digest while sending the model different text (a
+changed citation locator changes the digest). `dispatch_envelope_for_packet` pins it into the dispatch
 envelope as `contextPackDigest` and adds `sha256:<packSha256>` to
 `inputRefs`, so the orchestrator's agent run record carries the exact packet
 content every run received.
