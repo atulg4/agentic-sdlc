@@ -1480,6 +1480,13 @@ def test_control_center_rejects_an_explicitly_empty_input_path():
     assert main(["control-center", "--backlog", ""]) == 2
     assert main(["control-center", "--incidents", ""]) == 2
     assert main(["control-center", "--output", ""]) == 2
+    # The GitHub adapter command applies the same rule to its path options.
+    base = ["github-backlog", "--project-id", "forge", "--repository", "acme/forge"]
+    assert main([*base, "--issues", ""]) == 2
+    assert main([*base, "--issues", "x.json", "--config", " "]) == 2
+    assert main([*base, "--issues", "x.json", "--pulls", ""]) == 2
+    assert main([*base, "--issues", "x.json", "--backlog-output", ""]) == 2
+    assert main([*base, "--issues", "x.json", "--incidents-output", " "]) == 2
 
 
 def test_control_center_rejects_a_malformed_failing_check_pair(tmp_path):

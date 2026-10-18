@@ -454,8 +454,20 @@ def _declared_state(
     return ""
 
 
+def _title(record: Mapping[str, Any], label: str) -> str:
+    """The record's title: a string or absent, never coerced from another type.
+
+    ``str()`` on an object would serialize nested provider fields -
+    potentially credential-bearing - into the snapshot and the shared store,
+    bypassing the document loaders' key checks.
+    """
+    value = record.get("title")
+    _require(value is None or isinstance(value, str), f"{label}: title must be a string")
+    return value or ""
+
+
 def _kind(issue: Mapping[str, Any], labels: frozenset[str], has_children: bool) -> str:
-    title = str(issue.get("title") or "")
+    title = _title(issue, f"issue {issue.get('number')}")
     summary = issue.get("sub_issues_summary")
     total = 0
     if summary is not None:
@@ -538,7 +550,7 @@ def backlog_document_from_issues(
         item: dict[str, Any] = {
             "itemId": f"{repository}#{number}",
             "kind": _kind(issue, labels, number in parent_of_children),
-            "title": str(issue.get("title") or f"issue {number}")[:512],
+            "title": (_title(issue, f"issue {number}") or f"issue {number}")[:512],
             "projectId": project_id,
             "issueRef": f"{repository}#{number}",
             "labels": sorted(labels),
@@ -616,7 +628,7 @@ def incidents_from_issues(
                     "kind": rule.kind,
                     "severity": rule.severity,
                     "summary": rule.summary,
-                    "detail": str(issue.get("title") or "")[:512],
+                    "detail": _title(issue, f"issue {number}")[:512],
                     "backlogItemId": f"{repository}#{number}",
                     "observedAt": observed_at,
                     "evidenceRef": f"{repository}#{number}",
@@ -716,7 +728,7 @@ def incidents_from_change_requests(
         # and ledger spell canonically. The payload's own full_name was
         # validated against it case-insensitively above.
         ref = f"{repository}!{number}"
-        title = str(pull.get("title") or "")[:512]
+        title = _title(pull, f"change request {number}")[:512]
         state = pull.get("mergeable_state")
         _require(
             state is None or isinstance(state, str),
