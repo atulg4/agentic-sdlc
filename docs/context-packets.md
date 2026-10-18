@@ -38,11 +38,14 @@ never review its own writes. Missions with neither capability set
   retrieval-controlled text, so metadata never holds a privileged prompt
   position.
 - **Reviewer verification** (`VerificationEvidence`): the candidate's exact
-  40-hex head SHA, the changed paths and line counts, the patch digest, the
-  complete `run_gates` report (a nonempty gates array whose entries each
+  40- or 64-hex head SHA, the changed paths and line counts, the patch
+  digest, the complete `run_gates` report (exactly the keys `run_gates`
+  emits, top level and per entry — a nonempty gates array whose entries each
   carry name, command, exitCode, durationSeconds and a boolean verdict, with
-  an agreeing aggregate), and prior findings. Builders and testers must not
-  receive it; reviews start from fresh context.
+  an agreeing aggregate), and prior findings, which fail closed when they
+  carry secret-like content. Changed paths render inside an untrusted
+  boundary — filenames are patch data the patch author controls. Builders
+  and testers must not receive it; reviews start from fresh context.
 
 ## Budgeting and ordering
 
@@ -55,6 +58,11 @@ records that do not fit are recorded as `omitted by budget` in the packet's
 selection notes. The pack's qualification notices count against the budget
 too: `renderedBytes` reports the real rendered prompt size, and a packet
 whose notices push it past the budget blocks rather than under-reporting.
+The knowledge layer's record cap is a second selection budget: mandatory
+records past it block the build, and excess optional records are recorded
+as `omitted by record limit`. For high- and critical-risk missions,
+staleness is judged over everything admitted — before budget selection —
+so a stale record cannot slip out of sight by being omitted for size.
 
 ## Fail-closed exclusions and dispatch blocking
 
@@ -71,7 +79,11 @@ pack's own qualifications (stale retentions, detected contradictions) are
 rendered into the prompt with the evidence they qualify — each notice
 single-lined, secret-scanned (a credential-bearing retrieval-failure detail
 is withheld), and wrapped inside an untrusted boundary, since failure details
-quote retrieval-controlled text. Retrieval failures naming a source the mission may not read
+quote retrieval-controlled text. A secret-like retrieval-failure detail is
+redacted before the pack handoff, so neither the serialized packet nor a
+blocking error can echo it. A repository record whose path is not the
+canonical relative form Git stores (traversal segments, absolute prefixes,
+backslashes) fails closed before any pattern is matched. Retrieval failures naming a source the mission may not read
 are filtered from the knowledge-pack handoff for the same reason the source
 itself is.
 
@@ -104,7 +116,10 @@ packets never share a digest while sending the model different text (a
 changed citation locator changes the digest). `dispatch_envelope_for_packet` pins it into the dispatch
 envelope as `contextPackDigest` and adds `sha256:<packSha256>` to
 `inputRefs`, so the orchestrator's agent run record carries the exact packet
-content every run received.
+content every run received. The envelope also verifies the full mission
+contract — role, write/read/forbidden paths, token and runtime limits —
+against the packet's bound limits, so a mission edited without a version
+bump cannot dispatch a prompt that still encodes the old policy.
 
 ## CLI
 
