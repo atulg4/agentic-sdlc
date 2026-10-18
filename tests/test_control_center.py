@@ -2057,27 +2057,41 @@ def test_malformed_labels_are_a_controlled_error():
             )
 
 
-def test_a_null_or_absent_labels_field_defaults_to_no_labels():
+def test_a_null_or_absent_labels_field_fails_closed():
+    # The GitHub export contract always supplies the array ([] when genuinely
+    # unlabeled); absence or null is a partial payload, and reading it as
+    # "unlabeled" would fabricate a triage diagnosis.
+    for broken in (
+        {
+            "number": 1,
+            "title": "null labels",
+            "state": "open",
+            "labels": None,
+            "repository_url": "https://api.github.com/repos/acme/forge",
+        },
+        {
+            "number": 2,
+            "title": "no labels",
+            "state": "open",
+            "repository_url": "https://api.github.com/repos/acme/forge",
+        },
+    ):
+        with pytest.raises(ControlCenterError, match=r"labels must be an array"):
+            backlog_document_from_issues([broken], project_id="forge", repository="acme/forge")
     document = backlog_document_from_issues(
         [
             {
-                "number": 1,
-                "title": "null labels",
+                "number": 3,
+                "title": "explicitly unlabeled",
                 "state": "open",
-                "labels": None,
+                "labels": [],
                 "repository_url": "https://api.github.com/repos/acme/forge",
-            },
-            {
-                "number": 2,
-                "title": "no labels",
-                "state": "open",
-                "repository_url": "https://api.github.com/repos/acme/forge",
-            },
+            }
         ],
         project_id="forge",
         repository="acme/forge",
     )
-    assert [item["labels"] for item in document["items"]] == [[], []]
+    assert [item["labels"] for item in document["items"]] == [[]]
 
 
 def test_adapter_outputs_must_not_overwrite_inputs(tmp_path):
@@ -4877,6 +4891,48 @@ def test_a_malformed_ledger_repository_is_warned_not_skipped():
     assert [unit.repository for unit in view.active] == [""]
 
 
+def test_merge_proof_binds_to_the_referenced_change_request():
+    # The unit merged change request !1; a later event re-points it at !2.
+    # Historical merge states must not read as proof that !2 merged.
+    ledger = _ledger(
+        *_chain(
+            TO_MERGED,
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "changeRequestRef": "acme/forge!1",
+            },
+        ),
+        _event(
+            eventId="e-swap",
+            idempotencyKey="k-swap",
+            state="merged",
+            stage="merge",
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "changeRequestRef": "acme/forge!2",
+            },
+            activity="re-pointed at a follow-up change request",
+        ),
+    )
+    blocked = _incident(
+        incidentId="acme/forge!2:merge-state-blocked",
+        kind="unclassified",
+        severity="degraded",
+        evidenceRef="acme/forge!2",
+        summary="The follow-up change request is blocked",
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        incidents=load_incident_document(_incidents(blocked)),
+    )
+    kept = [item.incident_id for item in snapshot.get("forge").incidents]
+    assert kept == ["acme/forge!2:merge-state-blocked"]
+
+
 def test_credential_bearing_inputs_are_rejected_at_load():
     # A backlog url or incident evidenceRef with URL userinfo would be
     # republished by the snapshot and rendered as a clickable link.
@@ -5160,10 +5216,10 @@ def test_the_console_pins_state_vocabulary_and_note_freshness():
     # sweep's late reads never overwrite a newer adoption's view.
     assert "const generation = ++backfillGeneration;" in html
     assert "if (generation !== backfillGeneration) return;" in html
-    # A key that vanished from the live window drops its cached copy.
-    assert (
-        "for (const key of liveNoteKeys) if (!live.has(key)) backfilledEntries.delete(key);" in html
-    )
+    # A key that vanished from the live window is exact-read VERIFIED before
+    # any drop, since eviction from the bounded query is not deletion.
+    assert "deleted or merely EVICTED" in html
+    assert "entry.incidentId === keyIncident && entry.projectId === keyProject" in html
     # Exact reads attach only records naming this project and incident.
     assert "entry.incidentId !== incidentId || entry.projectId !== projectId" in html
 
@@ -5177,6 +5233,10 @@ def test_the_console_validates_backlog_provenance_and_scoped_liveness():
     # Placement must agree with the serialized parent link.
     assert "sits under ${placedUnder} but names another parent" in html
     assert "names a parent without a parent-missing flag" in html
+    # Rendered backlog URLs must not embed credentials.
+    assert "url must not embed credentials" in html
+    # Declared-basis states belong to the closed vocabulary too.
+    assert "names an unknown declared state" in html
     # State provenance is a closed, reconciled contract.
     assert "state disagrees with its ledger status" in html
     assert "state disagrees with its declared state" in html
