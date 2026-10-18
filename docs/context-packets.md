@@ -33,10 +33,15 @@ never review its own writes. Missions with neither capability set
 - **Policy limits**: changed-file/diff-line/patch-byte caps, forbidden and
   protected paths, and the mission's write paths and token/runtime limits.
 - **Selected repository evidence**: knowledge-layer evidence records, each
-  rendered with its citation inside an `<untrusted-evidence>` boundary.
+  rendered with its citation collapsed to one line INSIDE the
+  `<untrusted-evidence>` boundary — locator and revision are
+  retrieval-controlled text, so metadata never holds a privileged prompt
+  position.
 - **Reviewer verification** (`VerificationEvidence`): the candidate's exact
   40-hex head SHA, the changed paths and line counts, the patch digest, the
-  trusted gate report, and prior findings. Builders and testers must not
+  complete `run_gates` report (a nonempty gates array whose entries each
+  carry name, command, exitCode, durationSeconds and a boolean verdict, with
+  an agreeing aggregate), and prior findings. Builders and testers must not
   receive it; reviews start from fresh context.
 
 ## Budgeting and ordering
@@ -47,7 +52,9 @@ when it cannot fit `budget_bytes` (default 256 KiB), the build blocks with a
 reason instead. Optional evidence fills the remaining budget in deterministic
 relevance order (keyword overlap with the task, ties broken by evidence ID);
 records that do not fit are recorded as `omitted by budget` in the packet's
-selection notes.
+selection notes. The pack's qualification notices count against the budget
+too: `renderedBytes` reports the real rendered prompt size, and a packet
+whose notices push it past the budget blocks rather than under-reporting.
 
 ## Fail-closed exclusions and dispatch blocking
 
@@ -56,10 +63,16 @@ or the mission's forbidden paths or falls outside the mission's `read_paths`,
 or when its rendered block — the payload and its citation metadata (locator,
 revision) alike — carries a secret-like value (key blocks, provider token
 shapes, quoted credential assignments). A record whose `sourceType` disagrees
-with its declared source is rejected outright, and duplicate records are
-counted once, matching the knowledge layer. Each exclusion is recorded on the
-packet, and the pack's own qualifications (stale retentions, detected
-contradictions) are rendered into the prompt with the evidence they qualify.
+with its declared source is rejected outright; identical duplicate records
+are counted once, matching the knowledge layer, while records that share an
+evidence ID but differ in other fields fail closed, so the prompt never
+depends on input order. Each exclusion is recorded on the packet, and the
+pack's own qualifications (stale retentions, detected contradictions) are
+rendered into the prompt with the evidence they qualify — each notice
+single-lined and secret-scanned, with a credential-bearing retrieval-failure
+detail withheld. Retrieval failures naming a source the mission may not read
+are filtered from the knowledge-pack handoff for the same reason the source
+itself is.
 
 `build_context_packet` raises `ContextBuilderError` with an actionable
 reason — naming the source or evidence and the remedy — when:
