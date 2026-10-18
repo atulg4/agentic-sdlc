@@ -69,8 +69,9 @@ evidence ID but differ in other fields fail closed, so the prompt never
 depends on input order. Each exclusion is recorded on the packet, and the
 pack's own qualifications (stale retentions, detected contradictions) are
 rendered into the prompt with the evidence they qualify — each notice
-single-lined and secret-scanned, with a credential-bearing retrieval-failure
-detail withheld. Retrieval failures naming a source the mission may not read
+single-lined, secret-scanned (a credential-bearing retrieval-failure detail
+is withheld), and wrapped inside an untrusted boundary, since failure details
+quote retrieval-controlled text. Retrieval failures naming a source the mission may not read
 are filtered from the knowledge-pack handoff for the same reason the source
 itself is.
 
