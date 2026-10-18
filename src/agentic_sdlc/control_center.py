@@ -234,12 +234,17 @@ _CHANGE_REQUEST_RETIREMENT = frozenset(
 def _adapter_rule_incident(incident: Incident, rule: str) -> bool:
     """The incident IS the adapter's label-derived record for ``rule``.
 
-    Its id is exactly the named backlog item plus the rule suffix - the shape
-    the GitHub adapter emits - so a provider-neutral incident whose id merely
-    ends in the rule spelling is never silently rewritten or retired.
+    The adapter's complete identity relationship must hold - the document
+    declared a GitHub source, the id is exactly the named backlog item plus
+    the rule suffix, and the evidenceRef repeats that same item, the shape
+    the GitHub adapter emits - so a provider-neutral incident that merely
+    matches the adapter's id spelling is never silently rewritten or retired.
     """
-    return bool(incident.backlog_item_id) and (
-        incident.incident_id == f"{incident.backlog_item_id}:{rule}"
+    return (
+        incident.source_provider == "github"
+        and bool(incident.backlog_item_id)
+        and incident.evidence_ref == incident.backlog_item_id
+        and incident.incident_id == f"{incident.backlog_item_id}:{rule}"
     )
 
 
@@ -813,6 +818,10 @@ def load_backlog_document(document: Any) -> tuple[BacklogItem, ...]:
         f"unsupported backlog schemaVersion: {version!r}",
     )
     if "source" in entry:
+        _require(
+            isinstance(entry.get("source"), str),
+            "backlog document.source must be a string",
+        )
         _text(entry, "source", "backlog document")
     _require(
         "items" in entry,
@@ -987,6 +996,10 @@ def load_incident_document(document: Any) -> tuple[Incident, ...]:
         f"unsupported incident schemaVersion: {version!r}",
     )
     if "source" in entry:
+        _require(
+            isinstance(entry.get("source"), str),
+            "incident document.source must be a string",
+        )
         _text(entry, "source", "incident document")
     _require(
         "incidents" in entry,
