@@ -1472,6 +1472,16 @@ def test_control_center_joins_registry_backlog_and_incidents(tmp_path):
     ]
 
 
+def test_control_center_rejects_an_explicitly_empty_input_path():
+    # An unset shell variable ("--ledger \"$LEDGER\"") expands to an empty
+    # string; that is a bad invocation, never an omitted option.
+    assert main(["control-center", "--ledger", ""]) == 2
+    assert main(["control-center", "--registry", "  "]) == 2
+    assert main(["control-center", "--backlog", ""]) == 2
+    assert main(["control-center", "--incidents", ""]) == 2
+    assert main(["control-center", "--output", ""]) == 2
+
+
 def test_control_center_rejects_a_malformed_failing_check_pair(tmp_path):
     issues = tmp_path / "issues.json"
     issues.write_text(json.dumps([]), encoding="utf-8")

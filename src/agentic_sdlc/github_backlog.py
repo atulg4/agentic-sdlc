@@ -657,6 +657,11 @@ def incidents_from_change_requests(
             f"failing-check key must be a positive integer: {key!r}",
         )
     incidents: list[dict[str, Any]] = []
+    # One record per change request: a concatenated export carrying the same
+    # number twice (say once dirty, once clean) would otherwise emit
+    # contradictory incidents under distinct ids, which the later
+    # duplicate-id check cannot catch.
+    seen_numbers: set[int] = set()
     for pull in pulls:
         state_field = pull.get("state")
         # The state must be explicit: without it the adapter has no evidence
@@ -697,6 +702,11 @@ def incidents_from_change_requests(
             full_name.lower() == repository.lower(),
             f"change request {number} belongs to {full_name}, not repository {repository}",
         )
+        _require(
+            number not in seen_numbers,
+            f"change request {number} appears more than once in the pulls export",
+        )
+        seen_numbers.add(number)
         # The provider's own spelling, validated above: ledger events carry
         # it, and the read model joins change-request references by exact
         # string equality, so the caller's casing must never leak into refs.

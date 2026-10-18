@@ -252,14 +252,18 @@ def _change_request_scoped(incident: Incident) -> bool:
     """The incident describes an obstacle to MERGING its evidenceRef.
 
     ``unclassified`` is provider-neutral and its evidenceRef is free text, so
-    only the adapter's own merge-state records (id ``<ref>:merge-state-<x>``)
-    count: any other unclassified incident citing a merged change request may
-    describe something else entirely (a post-merge regression) and must stay.
+    only the adapter's own merge-state records count: the id spelling
+    (``<ref>:merge-state-<x>``) AND the document's declared GitHub source,
+    since only the GitHub adapter defines that spelling. Any other
+    unclassified incident citing a merged change request may describe
+    something else entirely (a post-merge regression) and must stay.
     """
     if incident.kind in _CHANGE_REQUEST_RETIREMENT:
         return True
-    return incident.kind == "unclassified" and incident.incident_id.startswith(
-        incident.evidence_ref + ":merge-state-"
+    return (
+        incident.source_provider == "github"
+        and incident.kind == "unclassified"
+        and incident.incident_id.startswith(incident.evidence_ref + ":merge-state-")
     )
 
 
@@ -1462,7 +1466,12 @@ def build_control_center_snapshot(
     than dropped: an operator cannot remediate what the console hides.
     """
 
-    _timestamp({"generatedAt": generated_at}, "generatedAt", "snapshot", required=True)
+    # The validator returns the normalized (stripped) instant; serializing the
+    # raw input instead would let surrounding whitespace survive into a
+    # document whose consumers anchor their own RFC 3339 checks.
+    generated_at = _timestamp(
+        {"generatedAt": generated_at}, "generatedAt", "snapshot", required=True
+    )
 
     by_project_units: dict[str, dict[str, WorkUnitStatus]] = {}
     for projection in projections:
@@ -1627,10 +1636,25 @@ def build_control_center_snapshot(
                 match = _REPOSITORY_REFERENCE.fullmatch(reference) if reference else None
                 if match is not None and not owned(match.group("name"), provider):
                     foreign.add((match.group("name"), provider))
+            malformed: set[str] = set()
             for status in statuses.values():
                 name = status.repository
-                if name and _REPOSITORY_IDENTIFIER.fullmatch(name) and not owned(name, ""):
-                    foreign.add((name, ""))
+                if not name:
+                    continue
+                if _REPOSITORY_IDENTIFIER.fullmatch(name):
+                    if not owned(name, ""):
+                        foreign.add((name, ""))
+                else:
+                    # The ledger accepts free-form repository text, so a typo
+                    # or URL would otherwise dodge the ownership check
+                    # entirely; it is flagged rather than silently skipped.
+                    malformed.add(name)
+            for name in sorted(malformed):
+                view_warnings.append(
+                    f"project {project_id} ledger data names a malformed repository "
+                    f"identifier: {name[:512]}; expected owner/name, so ownership "
+                    "checks cannot cover it"
+                )
             for name, provider in sorted(foreign):
                 declared_for = declared_providers.get(name.lower())
                 if provider and declared_for:

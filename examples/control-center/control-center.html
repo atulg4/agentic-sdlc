@@ -459,10 +459,14 @@
   async function backfillNotes(document_) {
     // The notes subscription is a bounded window, so a note outside it is
     // fetched EXACTLY, by its deterministic per-incident document id. The
-    // work is bounded: at most 200 incidents per adoption (later adoptions
-    // continue where this one capped out), read in small parallel batches,
-    // and each attempted key is read at most once per page load.
+    // work is bounded: keys are gathered in passes of at most 200, read in
+    // small parallel batches, and each attempted key is read at most once
+    // per page load. The passes repeat until every incident in the adopted
+    // snapshot was attempted, so finishing the sweep never waits on a later
+    // adoption that may not come.
     if (!state.db) return;
+    let found = 0;
+    for (;;) {
     const wanted = [];
     outer: for (const project of document_.projects || []) {
       for (const incident of project.incidents || []) {
@@ -472,7 +476,7 @@
         if (wanted.length >= 200) break outer;
       }
     }
-    let found = 0;
+    if (!wanted.length) break;
     for (let start = 0; start < wanted.length; start += 10) {
       await Promise.all(wanted.slice(start, start + 10).map(async ([key, projectId, incidentId]) => {
         backfilledNotes.add(key);
@@ -494,6 +498,7 @@
           }
         } catch { /* an unreadable note renders as unacknowledged */ }
       }));
+    }
     }
     if (found) render();
   }
@@ -645,6 +650,9 @@
       // units that do, so a store-rewritten snapshot cannot park a blocked
       // unit under "Running" or hide one from the attention rail.
       const executing = ["implementing", "verifying", "reviewing", "repairing", "re-reviewing", "deploying", "deployment-verifying", "rolling-back"];
+      // needsAttention derives from the state alone (human gates, blocked,
+      // failed), so the flag is validated against the state, never trusted.
+      const attentionStates = ["approval-pending", "ready-for-human-merge", "blocked", "failed"];
       for (const [membership, list] of [["active", project.active || []], ["attention", project.attention || []]]) {
         for (const unit of list) {
           if (!isObj(unit)) return `${where} has a work unit that is not an object.`;
@@ -653,17 +661,29 @@
           if (typeof unit.workUnitId !== "string" || !unit.workUnitId) return `${where} has a work unit without a string workUnitId.`;
           if (unitIds.has(unit.workUnitId)) return `${where} lists work unit ${unit.workUnitId} more than once.`;
           unitIds.add(unit.workUnitId);
-          if (membership === "attention" && unit.needsAttention !== true) {
-            return `${where} attention lists work unit ${unit.workUnitId} that does not need attention.`;
+          if (membership === "attention" && (unit.needsAttention !== true || !attentionStates.includes(unit.state))) {
+            return `${where} attention lists work unit ${unit.workUnitId} outside the attention states.`;
           }
-          if (membership === "active" && (unit.needsAttention === true || !executing.includes(unit.state))) {
-            return `${where} active lists work unit ${unit.workUnitId} outside the executing, no-attention states.`;
+          if (membership === "active") {
+            if (unit.needsAttention === true || !executing.includes(unit.state)) {
+              return `${where} active lists work unit ${unit.workUnitId} outside the executing, no-attention states.`;
+            }
+            // The producer excludes review gates without recorded activity,
+            // so an activity-less reviewing unit is never producer output.
+            if ((unit.state === "reviewing" || unit.state === "re-reviewing")
+              && !(typeof unit.activity === "string" && unit.activity)) {
+              return `${where} active lists review-gate work unit ${unit.workUnitId} without recorded activity.`;
+            }
           }
         }
       }
       for (const incident of project.incidents || []) {
         if (!isObj(incident)) return `${where} has an incident that is not an object.`;
         if (typeof incident.incidentId !== "string" || !incident.incidentId) return `${where} has an incident without a string incidentId.`;
+        // The note key and card actions read incident.projectId, so an
+        // incident filed under one project while declaring another would
+        // read or overwrite the other project's remediation notes.
+        if (incident.projectId !== project.projectId) return `${where} incident ${incident.incidentId} declares a different projectId.`;
         const incidentKey = project.projectId + "\u0000" + incident.incidentId;
         if (seenIncidents.has(incidentKey)) return `Duplicate incidentId in ${where}: ${incident.incidentId}.`;
         seenIncidents.add(incidentKey);
@@ -715,6 +735,11 @@
       if (totalUnits > 50000) return "The snapshot holds more than 50000 work units in all.";
     }
     if (value.totals !== undefined && !isObj(value.totals)) return "totals must be an object.";
+    // The producer always emits both portfolio collections, so an absent one
+    // means a writer deleted the warnings or the input provenance.
+    for (const key of ["warnings", "sources"]) {
+      if (value[key] === undefined) return `The snapshot requires its ${key} array; the producer always emits it.`;
+    }
     const topLevel = arrayField(value, "warnings", "snapshot", 5000) || arrayField(value, "sources", "snapshot", 1200);
     if (topLevel) return topLevel;
     // The producer always stamps generatedAt, and the subtitle and snapshot
