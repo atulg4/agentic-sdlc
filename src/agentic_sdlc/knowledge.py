@@ -266,6 +266,12 @@ def record_from_dict(document: Mapping[str, Any]) -> EvidenceRecord:
         links=tuple(links),
     )
     _validate_record(record)
+    # Every declared anchor must resolve against the reconstructed payload:
+    # a persisted record with a malformed or out-of-range anchor would
+    # otherwise ship inside a "fully validated" packet only to fail when a
+    # consumer resolves the citation.
+    for anchor in record.anchors:
+        resolve_anchor(record, anchor)
     return record
 
 

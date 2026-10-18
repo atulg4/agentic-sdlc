@@ -242,9 +242,13 @@ class VerificationEvidence:
                 "regenerate the report with run_gates"
             )
         try:
-            _canonical(dict(self.gate_report))
+            canonical_report = _canonical(dict(self.gate_report))
         except (TypeError, ValueError) as error:
             raise ContextBuilderError("verification gate_report must be JSON data") from error
+        # The validated report is detached from the caller's object: a shallow
+        # dict() would leave the nested gates list and command arrays aliased
+        # to mutable input, which could change after validation.
+        object.__setattr__(self, "gate_report", json.loads(canonical_report))
         if not all(isinstance(finding, str) for finding in self.prior_findings):
             raise ContextBuilderError("verification prior_findings must be strings")
         for finding in self.prior_findings:
@@ -265,7 +269,9 @@ class VerificationEvidence:
             "addedLines": self.added_lines,
             "deletedLines": self.deleted_lines,
             "patchSha256": self.patch_sha256,
-            "gateReport": dict(self.gate_report),
+            # Detached nested structures: a caller mutating the returned
+            # report must never reach the validated original.
+            "gateReport": json.loads(_canonical(dict(self.gate_report))),
             "priorFindings": list(self.prior_findings),
         }
 
@@ -629,7 +635,10 @@ def _verification_section(verification: VerificationEvidence) -> str:
             f"- lines added {verification.added_lines}, deleted "
             f"{verification.deleted_lines}; patch sha256 {verification.patch_sha256}"
         ),
-        f"- gate report: {_single_line(_canonical(dict(verification.gate_report)))}",
+        # Canonical JSON is already one physical line (string content is
+        # escaped), so only boundary markers are stripped: collapsing
+        # whitespace would misreport a command containing significant spaces.
+        f"- gate report: {sanitize_payload(_canonical(dict(verification.gate_report)))}",
     ]
     if verification.base_sha:
         lines.insert(1, f"- diff base: {verification.base_sha}")
@@ -811,13 +820,14 @@ def build_context_packet(
             # filesystem read scope would deny it.
             exclusions.append(f"outside mission read paths excluded: {record.evidence_id} ({path})")
             continue
-        if _secret_like(_render_evidence(record)):
-            # The whole rendered block, not just the payload: the locator and
-            # revision are emitted outside the untrusted boundary and can
-            # carry a token-bearing URL just as easily.
+        if _secret_like(_render_evidence(record)) or _secret_like(_canonical(record.as_dict())):
+            # BOTH sinks are scanned: the rendered block (raw payload and
+            # citation, where quoted-assignment shapes survive) and the whole
+            # serialized record (author, scope, anchors, link targets - the
+            # packet artifact carries every field, JSON-escaped).
             exclusions.append(
                 f"secret-like content excluded: {record.evidence_id}; "
-                "redact the payload or citation metadata at the source before packing"
+                "redact the payload or record metadata at the source before packing"
             )
             continue
         admitted.append(record)

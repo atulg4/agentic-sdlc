@@ -79,7 +79,10 @@ pack's own qualifications (stale retentions, detected contradictions) are
 rendered into the prompt with the evidence they qualify — each notice
 single-lined, secret-scanned (a credential-bearing retrieval-failure detail
 is withheld), and wrapped inside an untrusted boundary, since failure details
-quote retrieval-controlled text. A secret-like retrieval-failure detail is
+quote retrieval-controlled text. The secret scan covers every serialized
+record field — the packet artifact carries the whole record, author, scope,
+anchors and link targets included — alongside the rendered block. A
+secret-like retrieval-failure detail is
 redacted before the pack handoff, so neither the serialized packet nor a
 blocking error can echo it. A repository record whose path is not the
 canonical relative form Git stores (traversal segments, absolute prefixes,

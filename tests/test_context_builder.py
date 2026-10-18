@@ -763,7 +763,7 @@ def test_secret_like_citation_metadata_is_excluded(registry, policy):
     packet = _packet(registry, policy, records=(tainted, _record()))
     kept = [record.external_id for record in packet.pack.records]
     assert kept == ["src/scheduler.py@abc123"]
-    assert any("redact the payload or citation metadata" in note for note in packet.exclusions)
+    assert any("redact the payload or record metadata" in note for note in packet.exclusions)
     assert "ghp_" not in render_packet_for_prompt(packet)
 
 
@@ -1017,6 +1017,57 @@ def test_dispatch_binds_the_full_mission_contract(registry, policy):
     )
     with pytest.raises(ContextBuilderError, match="mission contract does not match"):
         dispatch_envelope_for_packet(packet, drifted, agent)
+
+
+def test_secret_like_record_metadata_is_excluded(registry, policy):
+    tainted = _record(
+        external_id="src/config.py@abc123",
+        author="bot ghp_0123456789abcdefghij0123456789abcdef",
+    )
+    packet = _packet(registry, policy, records=(tainted, _record()))
+    kept = [record.external_id for record in packet.pack.records]
+    # The rendered block never shows the author, but the serialized packet
+    # carries every record field, so the record is excluded anyway.
+    assert kept == ["src/scheduler.py@abc123"]
+    assert "ghp_" not in json.dumps(packet.as_dict())
+
+
+def test_persisted_anchors_must_resolve():
+    valid = _record()
+    assert record_from_dict(valid.as_dict()) == valid
+    broken = {**valid.as_dict(), "anchors": ["L9-L9"]}
+    with pytest.raises(ValueError, match="out of range"):
+        record_from_dict(broken)
+    malformed = {**valid.as_dict(), "anchors": ["lines 1-2"]}
+    with pytest.raises(ValueError, match="L<start>-L<end>"):
+        record_from_dict(malformed)
+
+
+def test_gate_commands_render_without_whitespace_collapse(registry, policy):
+    verification = _verification(
+        gate_report={
+            "passed": True,
+            "gates": [_gate(command=["bash", "-c", "pytest -k 'two  words'"])],
+        }
+    )
+    packet = _packet(registry, policy, mission_id="code-reviewer", verification=verification)
+    prompt = render_packet_for_prompt(packet)
+    # Canonical JSON is one line; the command's significant double space
+    # survives into the reviewer prompt.
+    assert "pytest -k 'two  words'" in prompt
+
+
+def test_gate_reports_are_detached_from_mutable_input():
+    document = _verification().as_dict()
+    rebuilt = verification_from_dict(document)
+    document["gateReport"]["gates"][0]["passed"] = False
+    document["gateReport"]["gates"][0]["command"].append("injected")
+    assert rebuilt.gate_report["gates"][0]["passed"] is True
+    assert "injected" not in rebuilt.gate_report["gates"][0]["command"]
+    # The serialized copy is detached too.
+    emitted = rebuilt.as_dict()
+    emitted["gateReport"]["passed"] = False
+    assert rebuilt.gate_report["passed"] is True
 
 
 def test_default_budget_is_compact():
