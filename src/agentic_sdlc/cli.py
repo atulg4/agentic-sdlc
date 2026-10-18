@@ -1064,6 +1064,20 @@ def _require_path_not_blank(option: str, supplied: str | None) -> None:
         )
 
 
+def _require_timestamp_not_blank(option: str, supplied: str | None) -> None:
+    """An explicitly blank timestamp must not silently become "now".
+
+    ``--generated-at "$STAMP"`` with an unset shell variable expands to an
+    empty string; substituting the current time would fabricate temporal
+    provenance instead of surfacing the bad invocation.
+    """
+
+    if supplied is not None and not supplied.strip():
+        raise ControlCenterError(
+            f"{option} was given an empty value; pass a timestamp or omit the option"
+        )
+
+
 def _control_center(args: argparse.Namespace) -> int:
     _require_path_not_blank("--registry", args.registry)
     _require_path_not_blank("--ledger", args.ledger)
@@ -1093,6 +1107,7 @@ def _control_center(args: argparse.Namespace) -> int:
         _require_not_an_input(
             args.output, [args.registry, args.ledger, *args.backlog, *args.incidents], "--output"
         )
+    _require_timestamp_not_blank("--generated-at", args.generated_at)
     generated_at = args.generated_at or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     snapshot = build_control_center_snapshot(
         generated_at=generated_at,
@@ -1224,6 +1239,7 @@ def _github_backlog(args: argparse.Namespace) -> int:
         parents=links,
         labels=labels,
     )
+    _require_timestamp_not_blank("--observed-at", args.observed_at)
     observed_at = args.observed_at or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     groups = [
         incidents_from_issues(
