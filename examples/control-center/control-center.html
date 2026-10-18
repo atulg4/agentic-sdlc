@@ -468,22 +468,25 @@
       for (const incident of project.incidents || []) {
         const key = noteKey(project.projectId, incident.incidentId);
         if (!incident.incidentId || state.notes.has(key) || backfilledNotes.has(key)) continue;
-        wanted.push([key, incident.incidentId]);
+        wanted.push([key, project.projectId, incident.incidentId]);
         if (wanted.length >= 200) break outer;
       }
     }
     let found = 0;
     for (let start = 0; start < wanted.length; start += 10) {
-      await Promise.all(wanted.slice(start, start + 10).map(async ([key, incidentId]) => {
+      await Promise.all(wanted.slice(start, start + 10).map(async ([key, projectId, incidentId]) => {
         backfilledNotes.add(key);
         try {
           let snap = await state.db.doc("notes/" + (await docId(key))).get();
           let entry = snap?.data?.();
           if (!entry) {
             // Notes recorded before keys were project-scoped live at the
-            // legacy id derived from the incident id alone.
+            // legacy id derived from the incident id alone. Legacy writes
+            // always stored their projectId, so a record that names another
+            // project never crosses over through a same-named incident.
             snap = await state.db.doc("notes/" + (await docId(incidentId))).get();
             entry = snap?.data?.();
+            if (entry && entry.projectId !== projectId) entry = undefined;
           }
           if (entry?.incidentId) {
             backfilledEntries.set(key, entry);
@@ -637,7 +640,12 @@
         return `${where} lists more visible work units than its state counts hold.`;
       }
       const unitIds = new Set();
-      for (const list of [project.active || [], project.attention || []]) {
+      // Mirror the producer's EXECUTING_STATES: active holds exactly the
+      // executing units that do not need attention, attention exactly the
+      // units that do, so a store-rewritten snapshot cannot park a blocked
+      // unit under "Running" or hide one from the attention rail.
+      const executing = ["implementing", "verifying", "reviewing", "repairing", "re-reviewing", "deploying", "deployment-verifying", "rolling-back"];
+      for (const [membership, list] of [["active", project.active || []], ["attention", project.attention || []]]) {
         for (const unit of list) {
           if (!isObj(unit)) return `${where} has a work unit that is not an object.`;
           // active and attention are disjoint views of one status map, so a
@@ -645,6 +653,12 @@
           if (typeof unit.workUnitId !== "string" || !unit.workUnitId) return `${where} has a work unit without a string workUnitId.`;
           if (unitIds.has(unit.workUnitId)) return `${where} lists work unit ${unit.workUnitId} more than once.`;
           unitIds.add(unit.workUnitId);
+          if (membership === "attention" && unit.needsAttention !== true) {
+            return `${where} attention lists work unit ${unit.workUnitId} that does not need attention.`;
+          }
+          if (membership === "active" && (unit.needsAttention === true || !executing.includes(unit.state))) {
+            return `${where} active lists work unit ${unit.workUnitId} outside the executing, no-attention states.`;
+          }
         }
       }
       for (const incident of project.incidents || []) {
@@ -683,8 +697,10 @@
           if (node[key] !== undefined && typeof node[key] !== "string") return `${where} backlog node field ${key} must be a string.`;
         }
         if (node.url && !/^https:\/\//.test(node.url)) return `${where} backlog node ${node.itemId || ""} url must be https.`;
-        if (node.children !== undefined && !Array.isArray(node.children)) return `${where} backlog node ${node.itemId || ""} children must be an array.`;
-        if (node.children && node.children.length > 5000) return `${where} backlog node ${node.itemId || ""} holds more than 5000 children.`;
+        // The producer serializes children on every node, so a node without
+        // the array is never producer output.
+        if (!Array.isArray(node.children)) return `${where} backlog node ${node.itemId || ""} children must be an array.`;
+        if (node.children.length > 5000) return `${where} backlog node ${node.itemId || ""} holds more than 5000 children.`;
         visited += 1;
         // The producer's combined per-project budget counts EVERY node, so
         // the traversal holds nested nodes to the same 5000-item limit.
@@ -701,7 +717,14 @@
     if (value.totals !== undefined && !isObj(value.totals)) return "totals must be an object.";
     const topLevel = arrayField(value, "warnings", "snapshot", 5000) || arrayField(value, "sources", "snapshot", 1200);
     if (topLevel) return topLevel;
-    if (value.generatedAt !== undefined && typeof value.generatedAt !== "string") return "generatedAt must be a string.";
+    // The producer always stamps generatedAt, and the subtitle and snapshot
+    // views display it verbatim, so a rewritten snapshot cannot smuggle
+    // arbitrary text (or drop the field) through it.
+    if (typeof value.generatedAt !== "string"
+      || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value.generatedAt)
+      || Number.isNaN(Date.parse(value.generatedAt))) {
+      return "generatedAt must be an RFC 3339 timestamp.";
+    }
     if (!/^[0-9a-f]{64}$/.test(value.snapshotSha256 || "")) return "The snapshot must carry its 64-character snapshotSha256 digest.";
     return "";
   }
@@ -1339,16 +1362,23 @@
   }
 
   async function saveNote(incident, status, text) {
+    const entry = {
+      incidentId: incident.incidentId,
+      projectId: incident.projectId || "",
+      kind: incident.kind || "",
+      status,
+      text,
+      byId: state.viewer?.id || "",
+      at: new Date().toISOString(),
+    };
     try {
-      await state.db.doc("notes/" + (await docId(noteKey(incident.projectId, incident.incidentId)))).set({
-        incidentId: incident.incidentId,
-        projectId: incident.projectId || "",
-        kind: incident.kind || "",
-        status,
-        text,
-        byId: state.viewer?.id || "",
-        at: new Date().toISOString(),
-      });
+      const key = noteKey(incident.projectId, incident.incidentId);
+      await state.db.doc("notes/" + (await docId(key))).set(entry);
+      // The notes subscription is a bounded recency window, so the write is
+      // mirrored into the local overlay too: the saved note stays visible
+      // even when it falls outside that window, across later deliveries.
+      backfilledEntries.set(key, entry);
+      state.notes.set(key, entry);
       return "Recorded";
     } catch (error) {
       const code = error?.code || "";
@@ -1423,8 +1453,19 @@
           const button = event.currentTarget;
           button.disabled = true;
           try {
+            // The store offers no server-owned ordering, so the writer clamps
+            // its own clock one second past the newest visible draft: the
+            // "at"-ordered subscription window can never drop a fresh draft
+            // behind a peer's forward-skewed timestamp.
+            let newest = 0;
+            for (const draft of state.drafts) {
+              const parsed = Date.parse(draft.at || "");
+              if (!Number.isNaN(parsed) && parsed > newest) newest = parsed;
+            }
+            const now = Date.now();
+            const at = new Date(newest >= now ? newest + 1000 : now).toISOString();
             await state.db.doc("projectDrafts/" + (await docId(entry.projectId))).set({
-              projectId: entry.projectId, entry, byId: state.viewer?.id || "", at: new Date().toISOString(),
+              projectId: entry.projectId, entry, byId: state.viewer?.id || "", at,
             });
             output.append(el("div", { class: "banner ok", text: "Saved as a draft in the Control Center store. Commit the JSON above to the project registry to make it real." }));
           } catch (error) {

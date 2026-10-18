@@ -102,7 +102,13 @@ def _incident(**overrides):
 
 
 def _incidents(*entries):
-    return {"schemaVersion": INCIDENT_SCHEMA_VERSION, "incidents": list(entries)}
+    # The adapter's own exports always declare their GitHub source; rule
+    # rewriting and retirement require that provenance.
+    return {
+        "schemaVersion": INCIDENT_SCHEMA_VERSION,
+        "source": "github",
+        "incidents": list(entries),
+    }
 
 
 def _event(**overrides):
@@ -1512,12 +1518,14 @@ def test_planning_evidence_retires_the_plan_advisory_but_not_the_implement_one()
         kind="dispatch-blocked",
         severity="advisory",
         backlogItemId="acme/forge#7",
+        evidenceRef="acme/forge#7",
     )
     implement_advisory = _incident(
         incidentId="acme/forge#7:eligible-awaiting-dispatch-evidence",
         kind="dispatch-blocked",
         severity="advisory",
         backlogItemId="acme/forge#7",
+        evidenceRef="acme/forge#7",
     )
     ledger = _ledger(
         *_chain(
@@ -3098,6 +3106,7 @@ def test_approval_proof_does_not_retire_a_released_spec_label_loss():
         kind="awaiting-human-approval",
         severity="degraded",
         backlogItemId="acme/forge#7",
+        evidenceRef="acme/forge#7",
     )
     backlog = load_backlog_document(
         _document(_backlog(itemId="acme/forge#7", issueRef="acme/forge#7"))
@@ -3187,6 +3196,7 @@ def test_planning_history_retires_the_plan_advisory_after_a_block():
         kind="awaiting-dispatch-evidence",
         severity="advisory",
         backlogItemId="acme/forge#7",
+        evidenceRef="acme/forge#7",
     )
     ledger = _ledger(
         *_chain(
@@ -3305,6 +3315,7 @@ def test_proven_approval_replaces_the_plan_advisory_guidance():
         kind="awaiting-dispatch-evidence",
         severity="advisory",
         backlogItemId="acme/forge#7",
+        evidenceRef="acme/forge#7",
         # The adapter's hold names the CONFIGURED labels; here the policy
         # renamed the implementation label, and the replacement must keep
         # that literal spelling so the operator applies a label that fires.
@@ -3475,6 +3486,7 @@ def test_proven_approval_restates_the_spec_hold_as_dispatch_blocked():
         kind="awaiting-human-approval",
         severity="degraded",
         backlogItemId="acme/forge#7",
+        evidenceRef="acme/forge#7",
         # The adapter's hold names the project's CONFIGURED labels; here the
         # policy renamed the ready label, so the replacement must keep that
         # literal spelling rather than substitute default conventions.
@@ -3645,6 +3657,7 @@ def test_approval_proof_does_not_retire_the_spec_approval_hold():
         kind="awaiting-human-approval",
         severity="degraded",
         backlogItemId="acme/forge#7",
+        evidenceRef="acme/forge#7",
     )
     backlog = load_backlog_document(
         _document(_backlog(itemId="acme/forge#7", issueRef="acme/forge#7"))
@@ -4727,6 +4740,55 @@ def test_a_malformed_document_source_is_rejected():
         )
 
 
+def test_a_null_document_source_is_rejected():
+    # None is not "source absent": text normalization would silently read it
+    # as "", so the loaders reject it before normalizing.
+    with pytest.raises(ControlCenterError, match="source must be a string"):
+        load_backlog_document(
+            {"schemaVersion": BACKLOG_SCHEMA_VERSION, "source": None, "items": []}
+        )
+    with pytest.raises(ControlCenterError, match="source must be a string"):
+        load_incident_document(
+            {"schemaVersion": INCIDENT_SCHEMA_VERSION, "source": None, "incidents": []}
+        )
+
+
+def test_rule_retirement_requires_github_provenance():
+    from agentic_sdlc.control_center import PLAN_EVIDENCE_RULE
+
+    # The id matches the adapter's exact spelling, but the document never
+    # declared a GitHub source, so the record is some other system's and is
+    # neither rewritten nor retired by ledger evidence.
+    neutral = _incident(
+        incidentId=f"acme/forge#7:{PLAN_EVIDENCE_RULE}",
+        kind="dispatch-blocked",
+        severity="advisory",
+        backlogItemId="acme/forge#7",
+        evidenceRef="acme/forge#7",
+        summary="A provider-neutral record that matches the adapter spelling",
+    )
+    ledger = _ledger(
+        *_chain(
+            TO_PLANNED,
+            workUnit={"projectId": "forge", "workUnitId": "wu-1", "issueRef": "acme/forge#7"},
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        backlog=load_backlog_document(
+            _document(_backlog(itemId="acme/forge#7", issueRef="acme/forge#7"))
+        ),
+        incidents=load_incident_document(
+            {"schemaVersion": INCIDENT_SCHEMA_VERSION, "incidents": [neutral]}
+        ),
+    )
+    kept = snapshot.get("forge").incidents
+    assert [item.incident_id for item in kept] == [f"acme/forge#7:{PLAN_EVIDENCE_RULE}"]
+    assert kept[0].summary == "A provider-neutral record that matches the adapter spelling"
+
+
 def test_rule_retirement_requires_the_adapter_identity():
     from agentic_sdlc.control_center import PLAN_EVIDENCE_RULE
 
@@ -4777,3 +4839,25 @@ def test_the_console_scopes_notes_and_bounds_its_work():
     assert "more than 50000 backlog items in all" in html
     assert "more than 10000 incidents in all" in html
     assert "more than 50000 work units in all" in html
+
+
+def test_the_console_checks_membership_and_mirrors_its_writes():
+    from pathlib import Path
+
+    html = Path("examples/control-center/control-center.html").read_text(encoding="utf-8")
+    # A saved note lands in the local overlay too, so it stays visible when
+    # it falls outside the bounded subscription window.
+    assert "backfilledEntries.set(key, entry);" in html
+    assert "state.notes.set(key, entry);" in html
+    # The legacy note fallback only accepts a record naming the same project.
+    assert "if (entry && entry.projectId !== projectId) entry = undefined;" in html
+    # generatedAt is required and must parse as a timestamp.
+    assert "generatedAt must be an RFC 3339 timestamp." in html
+    # Every backlog node carries its children array.
+    assert "if (!Array.isArray(node.children)) return" in html
+    # active/attention membership mirrors the producer's split exactly.
+    assert "that does not need attention" in html
+    assert "outside the executing, no-attention states" in html
+    assert '"deployment-verifying", "rolling-back"' in html
+    # Draft saves clamp their timestamp past the newest visible draft.
+    assert "newest >= now ? newest + 1000 : now" in html
