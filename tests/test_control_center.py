@@ -4858,10 +4858,11 @@ def test_a_malformed_ledger_repository_is_warned_not_skipped():
         generated_at=NOW, registry=REGISTRY, projections=ledger.projections()
     )
     warnings = snapshot.get("forge").warnings
-    assert any(
-        "malformed repository identifier: https://github.com/acme/forge" in warning
-        for warning in warnings
-    )
+    # The warning reports the problem WITHOUT the raw value: a malformed
+    # identifier is often a clone URL, and URLs can embed credentials the
+    # snapshot must never republish.
+    assert any("not owner/name shaped" in warning for warning in warnings)
+    assert not any("https://github.com/acme/forge" in warning for warning in warnings)
 
 
 def test_the_adapter_rejects_a_duplicated_change_request_number():
@@ -4875,6 +4876,28 @@ def test_the_adapter_rejects_a_duplicated_change_request_number():
         incidents_from_change_requests(
             [
                 {**base, "number": 5, "mergeable_state": "dirty"},
+                {**base, "number": 5, "mergeable_state": "clean"},
+            ],
+            project_id="forge",
+            repository="acme/forge",
+            observed_at=NOW,
+        )
+    # Numbers are recorded before the closed/draft skips, so a duplicate
+    # cannot hide behind a skipped record either.
+    with pytest.raises(ControlCenterError, match="appears more than once"):
+        incidents_from_change_requests(
+            [
+                {**base, "number": 5, "state": "closed", "mergeable_state": "dirty"},
+                {**base, "number": 5, "mergeable_state": "clean"},
+            ],
+            project_id="forge",
+            repository="acme/forge",
+            observed_at=NOW,
+        )
+    with pytest.raises(ControlCenterError, match="appears more than once"):
+        incidents_from_change_requests(
+            [
+                {**base, "number": 5, "draft": True, "mergeable_state": "dirty"},
                 {**base, "number": 5, "mergeable_state": "clean"},
             ],
             project_id="forge",
@@ -4972,3 +4995,22 @@ def test_the_console_binds_incidents_and_enforces_full_membership():
     assert "The snapshot requires its ${key} array" in html
     # Note backfill sweeps every incident in passes, each key attempted once.
     assert "if (!wanted.length) break;" in html
+
+
+def test_the_console_keeps_the_verified_document_and_exact_memberships():
+    from pathlib import Path
+
+    html = Path("examples/control-center/control-center.html").read_text(encoding="utf-8")
+    # The attention list must hold exactly the attention-state unit count.
+    assert "attention must list exactly the ${attentionTotal} unit(s)" in html
+    # generatedAt components are validated; Date.parse normalization is out.
+    assert "generatedAt must be a real calendar instant." in html
+    assert "leap ? 29 : 28" in html
+    # The scoped note document deterministically wins over a legacy twin.
+    assert "const scoped = entry.docId === (await docId(key));" in html
+    assert "if (!scopedKeys.has(key)) next.set(key, entry);" in html
+    # Derivation happens on a clone; the copy action serializes the verified
+    # document so it still matches its own digest when loaded back.
+    assert "state.snapshotPristine = document_;" in html
+    assert "document_ = structuredClone(document_);" in html
+    assert "JSON.stringify(state.snapshotPristine, null, 2)" in html

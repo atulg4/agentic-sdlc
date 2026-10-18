@@ -1649,11 +1649,15 @@ def build_control_center_snapshot(
                     # or URL would otherwise dodge the ownership check
                     # entirely; it is flagged rather than silently skipped.
                     malformed.add(name)
-            for name in sorted(malformed):
+            if malformed:
+                # The values are withheld: a malformed identifier is often a
+                # clone URL, and URLs can embed credentials the snapshot (and
+                # any store it lands in) must never republish.
                 view_warnings.append(
-                    f"project {project_id} ledger data names a malformed repository "
-                    f"identifier: {name[:512]}; expected owner/name, so ownership "
-                    "checks cannot cover it"
+                    f"project {project_id} ledger data names {len(malformed)} repository "
+                    "identifier(s) that are not owner/name shaped; the values are "
+                    "withheld because malformed identifiers can embed credentials - "
+                    "fix the ledger entries so ownership checks can cover them"
                 )
             for name, provider in sorted(foreign):
                 declared_for = declared_providers.get(name.lower())

@@ -670,6 +670,14 @@ def incidents_from_change_requests(
             isinstance(state_field, str) and state_field in PULL_STATES,
             f'change request {pull.get("number")}: state must be "open" or "closed"',
         )
+        # Numbers are validated and recorded BEFORE the closed/draft skips, so
+        # a contradictory duplicate cannot hide behind a skipped record.
+        number = _record_number(pull, "change request")
+        _require(
+            number not in seen_numbers,
+            f"change request {number} appears more than once in the pulls export",
+        )
+        seen_numbers.add(number)
         if state_field != "open":
             # A merged or closed change request is not an open problem,
             # whatever its final mergeability read.
@@ -684,7 +692,6 @@ def incidents_from_change_requests(
         )
         if draft:
             continue
-        number = _record_number(pull, "change request")
         # A detail payload names its own target repository, and the adapter
         # REQUIRES it: without base.repo.full_name there is no evidence the
         # record belongs to this repository at all, and one naming another
@@ -702,11 +709,6 @@ def incidents_from_change_requests(
             full_name.lower() == repository.lower(),
             f"change request {number} belongs to {full_name}, not repository {repository}",
         )
-        _require(
-            number not in seen_numbers,
-            f"change request {number} appears more than once in the pulls export",
-        )
-        seen_numbers.add(number)
         # The provider's own spelling, validated above: ledger events carry
         # it, and the read model joins change-request references by exact
         # string equality, so the caller's casing must never leak into refs.
