@@ -1070,6 +1070,98 @@ def test_gate_reports_are_detached_from_mutable_input():
     assert rebuilt.gate_report["passed"] is True
 
 
+def test_read_scopes_match_case_sensitively(policy):
+    narrow = _mission(read_paths=("docs/**",))
+    packet = build_context_packet(
+        narrow,
+        TASK,
+        policy,
+        work_ref=WORK_REF,
+        records=(
+            _record(external_id="Docs/private.md@abc123", payload="SALARY = 1\n"),
+            _record(external_id="docs/notes.md@abc123", payload="# notes\n"),
+        ),
+        sources={"repo-main": _source()},
+    )
+    # Casefolding an allowlist would widen it: "Docs/private.md" is a
+    # DIFFERENT path on a case-sensitive repository and stays out.
+    assert [record.external_id for record in packet.pack.records] == ["docs/notes.md@abc123"]
+    assert "SALARY" not in render_packet_for_prompt(packet)
+
+
+def test_secret_like_failure_prefixes_are_not_preserved(registry, policy):
+    leak = "ghp_0123456789abcdefghij0123456789abcdef: timeout"
+    packet = _packet(
+        registry,
+        policy,
+        sources={"repo-main": _source(), "flaky-docs": _source("flaky-docs")},
+        retrieval_failures=(leak,),
+    )
+    # The prefix is not a declared source id, so the WHOLE string is
+    # replaced rather than keeping the token as a "source name".
+    assert "ghp_" not in json.dumps(packet.as_dict())
+    assert "ghp_" not in render_packet_for_prompt(packet)
+
+
+def test_raw_metadata_strings_are_scanned_before_encoding(registry, policy):
+    tainted = _record(
+        external_id="src/config.py@abc123",
+        author='ops password = "hunter2hunter2"',
+    )
+    packet = _packet(registry, policy, records=(tainted, _record()))
+    # JSON encoding escapes the quotes and would defeat the quoted-assignment
+    # pattern; the raw field value is scanned instead.
+    assert [record.external_id for record in packet.pack.records] == ["src/scheduler.py@abc123"]
+    assert "hunter2hunter2" not in json.dumps(packet.as_dict())
+
+
+def test_dispatch_binds_the_mission_risk(registry, policy):
+    from dataclasses import replace as dc_replace
+
+    from agentic_sdlc.models import RiskLevel
+
+    packet = _packet(registry, policy)
+    mission = registry.get("implementation-worker")
+    drifted = dc_replace(mission, risk=RiskLevel.CRITICAL)
+    agent = AgentProfile(
+        agent_id="claude-worker",
+        adapter="claude-code",
+        adapter_version="1.0.0",
+        provider="anthropic",
+        model="claude-sonnet-5-5",
+        capabilities=mission.capabilities,
+    )
+    with pytest.raises(ContextBuilderError, match="mission contract does not match"):
+        dispatch_envelope_for_packet(packet, drifted, agent)
+
+
+def test_serialized_policy_limits_are_detached(registry, policy):
+    packet = _packet(registry, policy)
+    digest = packet.packet_sha256
+    document = packet.as_dict()
+    document["policyLimits"]["forbiddenPaths"].clear()
+    assert packet.policy_limits["forbiddenPaths"]
+    assert packet.packet_sha256 == digest
+
+
+def test_non_finite_gate_durations_fail_closed():
+    with pytest.raises(ContextBuilderError, match="complete run_gates entry"):
+        _verification(gate_report={"passed": True, "gates": [_gate(durationSeconds=float("inf"))]})
+
+
+def test_non_utf8_diff_paths_fail_closed():
+    with pytest.raises(ContextBuilderError, match="non-UTF-8 path"):
+        _verification(diff_paths=("bad\udce9.py",))
+
+
+def test_changed_paths_render_exactly(registry, policy):
+    verification = _verification(diff_paths=("src/two  spaces.py",))
+    packet = _packet(registry, policy, mission_id="code-reviewer", verification=verification)
+    prompt = render_packet_for_prompt(packet)
+    # Escaped rendering preserves the exact filename, double space included.
+    assert '"src/two  spaces.py"' in prompt
+
+
 def test_default_budget_is_compact():
     assert DEFAULT_PACKET_BYTES <= 1_000_000
     assert ROLE_BUILDER in {"builder"} and ROLE_TESTER in {"tester"}

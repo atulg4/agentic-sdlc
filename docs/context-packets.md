@@ -67,7 +67,7 @@ so a stale record cannot slip out of sight by being omitted for size.
 ## Fail-closed exclusions and dispatch blocking
 
 Evidence never enters a packet when its repository path matches the policy's
-or the mission's forbidden paths or falls outside the mission's `read_paths`,
+or the mission's forbidden paths or falls outside the mission's `read_paths` (matched case-sensitively — casefolding an allowlist would widen it, while the deny patterns stay casefolded),
 or when its rendered block — the payload and its citation metadata (locator,
 revision) alike — carries a secret-like value (key blocks, provider token
 shapes, quoted credential assignments). A record whose `sourceType` disagrees
@@ -79,12 +79,14 @@ pack's own qualifications (stale retentions, detected contradictions) are
 rendered into the prompt with the evidence they qualify — each notice
 single-lined, secret-scanned (a credential-bearing retrieval-failure detail
 is withheld), and wrapped inside an untrusted boundary, since failure details
-quote retrieval-controlled text. The secret scan covers every serialized
+quote retrieval-controlled text. The secret scan walks every RAW serialized
 record field — the packet artifact carries the whole record, author, scope,
-anchors and link targets included — alongside the rendered block. A
+anchors and link targets included — alongside the rendered block, so JSON
+escaping cannot defeat the patterns. A
 secret-like retrieval-failure detail is
-redacted before the pack handoff, so neither the serialized packet nor a
-blocking error can echo it. A repository record whose path is not the
+redacted before the pack handoff — keeping its prefix only when it names a
+declared source — so neither the serialized packet nor a blocking error can
+echo it. A repository record whose path is not the
 canonical relative form Git stores (traversal segments, absolute prefixes,
 backslashes) fails closed before any pattern is matched. Retrieval failures naming a source the mission may not read
 are filtered from the knowledge-pack handoff for the same reason the source
@@ -120,7 +122,8 @@ changed citation locator changes the digest). `dispatch_envelope_for_packet` pin
 envelope as `contextPackDigest` and adds `sha256:<packSha256>` to
 `inputRefs`, so the orchestrator's agent run record carries the exact packet
 content every run received. The envelope also verifies the full mission
-contract — role, write/read/forbidden paths, token and runtime limits —
+contract — role, risk level, write/read/forbidden paths, token and runtime
+limits —
 against the packet's bound limits, so a mission edited without a version
 bump cannot dispatch a prompt that still encodes the old policy.
 
