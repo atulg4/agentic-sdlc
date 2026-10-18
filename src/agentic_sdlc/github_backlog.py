@@ -454,6 +454,24 @@ def _declared_state(
     return ""
 
 
+def _is_pull_marker(issue: Mapping[str, Any]) -> bool:
+    """Whether the record carries GitHub's real pull-request marker.
+
+    The provider emits the key only on pull requests, as an object. A null or
+    string value is a transformed payload, and treating it as the marker
+    would silently drop the record from the backlog - a no-drop violation -
+    so a malformed marker is a controlled error.
+    """
+    if "pull_request" not in issue:
+        return False
+    marker = issue.get("pull_request")
+    _require(
+        isinstance(marker, Mapping),
+        f"issue {issue.get('number')}: pull_request must be an object when present",
+    )
+    return True
+
+
 def _title(record: Mapping[str, Any], label: str) -> str:
     """The record's title: a string or absent, never coerced from another type.
 
@@ -528,7 +546,7 @@ def backlog_document_from_issues(
     issues = list(issues)
     for issue in issues:
         _issue_repository(issue, repository)
-    rows = [issue for issue in issues if "pull_request" not in issue]
+    rows = [issue for issue in issues if not _is_pull_marker(issue)]
     numbers = {_record_number(issue, "issue") for issue in rows}
     # No-drop: a sub-issue listing naming a child the issues payload does not
     # carry would silently vanish from the export, concealing a partial
@@ -614,7 +632,7 @@ def incidents_from_issues(
     incidents: list[dict[str, Any]] = []
     for issue in issues:
         _issue_repository(issue, repository)
-        if "pull_request" in issue or _issue_state(issue) == "closed":
+        if _is_pull_marker(issue) or _issue_state(issue) == "closed":
             continue
         number = _record_number(issue, "issue")
         issue_labels = _issue_labels(issue)

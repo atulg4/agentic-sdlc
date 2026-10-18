@@ -4877,6 +4877,49 @@ def test_a_malformed_ledger_repository_is_warned_not_skipped():
     assert [unit.repository for unit in view.active] == [""]
 
 
+def test_a_malformed_pull_request_marker_is_rejected():
+    # GitHub's real marker is an object; a null or string value is a
+    # transformed payload, and skipping on it would silently drop records.
+    for marker in (None, "yes"):
+        with pytest.raises(ControlCenterError, match="pull_request must be an object"):
+            backlog_document_from_issues(
+                [_issue(1, "ok") | {"pull_request": marker}],
+                project_id="forge",
+                repository="acme/forge",
+            )
+    with pytest.raises(ControlCenterError, match="pull_request must be an object"):
+        incidents_from_issues(
+            [_issue(1, "ok", labels=("implementation-approved",)) | {"pull_request": None}],
+            project_id="forge",
+            repository="acme/forge",
+            observed_at=NOW,
+        )
+
+
+def test_credential_bearing_references_are_redacted():
+    ledger = _ledger(
+        *_chain(
+            TO_IMPLEMENTING,
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "runRef": "https://user:secret@ci.example/run/7",
+                "issueRef": "acme/forge#7",
+            },
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW, registry=REGISTRY, projections=ledger.projections()
+    )
+    view = snapshot.get("forge")
+    assert "user:secret" not in json.dumps(snapshot.as_dict())
+    assert [unit.run_ref for unit in view.active] == [""]
+    # The untouched reference survives; only the credential-bearing one is
+    # withheld, with a warning naming the count.
+    assert [unit.issue_ref for unit in view.active] == ["acme/forge#7"]
+    assert any("embedding URL credentials" in warning for warning in view.warnings)
+
+
 def test_the_adapter_rejects_a_non_string_title():
     # str() on an object would serialize nested provider fields - potentially
     # credential-bearing - into the snapshot, bypassing the loaders' checks.
@@ -5005,8 +5048,9 @@ def test_the_console_checks_membership_and_mirrors_its_writes():
     # it falls outside the bounded subscription window.
     assert "backfilledEntries.set(key, entry);" in html
     assert "state.notes.set(key, entry);" in html
-    # The legacy note fallback only accepts a record naming the same project.
-    assert "if (entry && entry.projectId !== projectId) entry = undefined;" in html
+    # Exact reads (legacy fallback included) only accept a record naming the
+    # requested project and incident.
+    assert "entry.incidentId !== incidentId || entry.projectId !== projectId" in html
     # generatedAt is required and must parse as a timestamp.
     assert "generatedAt must be an RFC 3339 timestamp." in html
     # Every backlog node carries its children array.
@@ -5079,6 +5123,15 @@ def test_the_console_pins_state_vocabulary_and_note_freshness():
     assert "state.snapshotPristine = null;" in html
     # Out-of-window notes are re-read on every adoption, and a deleted note
     # drops its stale overlay entry.
-    assert "backfilledNotes.clear();" in html
     assert "liveNoteKeys = live;" in html
     assert "} else if (backfilledEntries.delete(key)) {" in html
+    # Each sweep carries its own generation and attempted set, so an older
+    # sweep's late reads never overwrite a newer adoption's view.
+    assert "const generation = ++backfillGeneration;" in html
+    assert "if (generation !== backfillGeneration) return;" in html
+    # A key that vanished from the live window drops its cached copy.
+    assert (
+        "for (const key of liveNoteKeys) if (!live.has(key)) backfilledEntries.delete(key);" in html
+    )
+    # Exact reads attach only records naming this project and incident.
+    assert "entry.incidentId !== incidentId || entry.projectId !== projectId" in html

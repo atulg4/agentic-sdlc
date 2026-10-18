@@ -402,11 +402,15 @@
         else if (next.has(key)) continue;
         next.set(key, entry);
       }
+      if (delivery !== notesDelivery) return;
+      // A key the previous delivery carried but this one does not names a
+      // document deleted from the window: its cached copy is dropped rather
+      // than overlaid, and the next adoption's exact read re-verifies it.
+      for (const key of liveNoteKeys) if (!live.has(key)) backfilledEntries.delete(key);
       // Out-of-window notes fetched exactly (and local saveNote mirrors,
       // always scoped) stay visible over a legacy duplicate; an in-window
       // scoped document is live data and wins over the cached overlay.
       for (const [key, entry] of backfilledEntries) if (!scopedKeys.has(key)) next.set(key, entry);
-      if (delivery !== notesDelivery) return;
       // The keys the window itself delivered: backfill needs no exact read
       // for these, and refreshes everything else on each adoption.
       liveNoteKeys = live;
@@ -487,9 +491,9 @@
     };
   }
 
-  const backfilledNotes = new Set();
   const backfilledEntries = new Map();
   let liveNoteKeys = new Set();
+  let backfillGeneration = 0;
   async function backfillNotes(document_) {
     // The notes subscription is a bounded window, so a note outside it is
     // fetched EXACTLY, by its deterministic per-incident document id. The
@@ -501,14 +505,19 @@
     // passes repeat until every incident in the adopted snapshot was
     // attempted, so finishing the sweep never waits on a later adoption.
     if (!state.db) return;
-    backfilledNotes.clear();
+    // Each adoption's sweep carries its own generation and attempted set, so
+    // an older sweep's late reads can never restore a value a newer sweep
+    // observed as edited or deleted.
+    const generation = ++backfillGeneration;
+    const attempted = new Set();
     let found = 0;
     for (;;) {
+    if (generation !== backfillGeneration) return;
     const wanted = [];
     outer: for (const project of document_.projects || []) {
       for (const incident of project.incidents || []) {
         const key = noteKey(project.projectId, incident.incidentId);
-        if (!incident.incidentId || liveNoteKeys.has(key) || backfilledNotes.has(key)) continue;
+        if (!incident.incidentId || liveNoteKeys.has(key) || attempted.has(key)) continue;
         wanted.push([key, project.projectId, incident.incidentId]);
         if (wanted.length >= 200) break outer;
       }
@@ -516,19 +525,23 @@
     if (!wanted.length) break;
     for (let start = 0; start < wanted.length; start += 10) {
       await Promise.all(wanted.slice(start, start + 10).map(async ([key, projectId, incidentId]) => {
-        backfilledNotes.add(key);
+        attempted.add(key);
         try {
           let snap = await state.db.doc("notes/" + (await docId(key))).get();
           let entry = snap?.data?.();
           if (!entry) {
             // Notes recorded before keys were project-scoped live at the
-            // legacy id derived from the incident id alone. Legacy writes
-            // always stored their projectId, so a record that names another
-            // project never crosses over through a same-named incident.
+            // legacy id derived from the incident id alone.
             snap = await state.db.doc("notes/" + (await docId(incidentId))).get();
             entry = snap?.data?.();
-            if (entry && entry.projectId !== projectId) entry = undefined;
           }
+          // The store is viewer-writable: a record attaches only when it
+          // names exactly this project and incident, so an overwritten or
+          // mismatched document never displays another incident's note.
+          if (entry && (entry.incidentId !== incidentId || entry.projectId !== projectId)) {
+            entry = undefined;
+          }
+          if (generation !== backfillGeneration) return;
           if (entry?.incidentId) {
             backfilledEntries.set(key, entry);
             state.notes.set(key, entry);
