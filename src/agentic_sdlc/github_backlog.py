@@ -419,11 +419,12 @@ def _issue_labels(issue: Mapping[str, Any]) -> frozenset[str]:
     ``agent-ready`` and must evaluate the same here."""
 
     raw = issue.get("labels")
-    if raw is None:
-        raw = []
+    # The GitHub export contract always supplies the array - [] for a
+    # genuinely unlabeled issue - so absence or null is a partial payload,
+    # and reading it as "unlabeled" would fabricate a triage diagnosis.
     _require(
         isinstance(raw, list),
-        f"issue {issue.get('number')}: labels must be an array",
+        f"issue {issue.get('number')}: labels must be an array ([] when unlabeled)",
     )
     names: set[str] = set()
     for entry in raw:

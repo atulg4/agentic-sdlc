@@ -617,6 +617,7 @@ class WorkUnitProjection:
     stage: LifecycleStage
     references: WorkUnitRef
     transitions: tuple[ProjectionTransition, ...] = ()
+    merged_change_request_refs: tuple[str, ...] = ()
     repair_cycles: int = 0
     blocked_reason: str = ""
     depends_on: tuple[str, ...] = ()
@@ -649,6 +650,7 @@ class WorkUnitProjection:
                 "dependsOn": list(self.depends_on),
                 "references": self.references.as_dict(),
                 "transitions": [item.as_dict() for item in self.transitions],
+                "mergedChangeRequestRefs": list(self.merged_change_request_refs),
                 "eventCount": self.event_count,
                 "lastEventId": self.last_event_id,
                 "lastEventAt": self.last_event_at,
@@ -664,6 +666,21 @@ class WorkUnitProjection:
         }
 
 
+#: Post-merge states: entering one proves the unit's change request merged.
+#: The reference in effect at that moment is recorded, so merge proof binds
+#: to the change request it actually covered.
+_MERGE_EVIDENT_STATES = frozenset(
+    {
+        FactoryState.MERGED,
+        FactoryState.DEPLOYING,
+        FactoryState.DEPLOYMENT_VERIFYING,
+        FactoryState.LIVE,
+        FactoryState.ROLLING_BACK,
+        FactoryState.ROLLED_BACK,
+    }
+)
+
+
 @dataclass
 class _Fold:
     """Mutable accumulator used while folding one work unit's events."""
@@ -674,6 +691,7 @@ class _Fold:
     stage: LifecycleStage = LifecycleStage.INTAKE
     references: WorkUnitRef = field(init=False)
     transitions: list[ProjectionTransition] = field(default_factory=list)
+    merged_change_request_refs: set[str] = field(default_factory=set)
     repair_cycles: int = 0
     blocked_reason: str = ""
     depends_on: tuple[str, ...] = ()
@@ -752,6 +770,10 @@ def _fold(events: Sequence[LifecycleEvent]) -> WorkUnitProjection:
                 accumulator.repair_cycles += 1
             accumulator.blocked_reason = event.reason if event.state is FactoryState.BLOCKED else ""
             accumulator.state = event.state
+            if event.state in _MERGE_EVIDENT_STATES and accumulator.references.change_request_ref:
+                accumulator.merged_change_request_refs.add(
+                    accumulator.references.change_request_ref
+                )
             # A durable state change retires the previous ephemeral activity.
             accumulator.activity = ""
             accumulator.activity_at = ""
@@ -775,6 +797,7 @@ def _fold(events: Sequence[LifecycleEvent]) -> WorkUnitProjection:
         stage=accumulator.stage,
         references=accumulator.references,
         transitions=tuple(accumulator.transitions),
+        merged_change_request_refs=tuple(sorted(accumulator.merged_change_request_refs)),
         repair_cycles=accumulator.repair_cycles,
         blocked_reason=accumulator.blocked_reason,
         depends_on=accumulator.depends_on,

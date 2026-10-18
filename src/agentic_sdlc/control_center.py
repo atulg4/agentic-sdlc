@@ -216,9 +216,17 @@ MERGE_PROVEN_STATES = frozenset(
 )
 
 
-def _merge_proven(status: WorkUnitStatus) -> bool:
-    """The unit's own durable history proves its change request merged."""
-    return status.state in MERGE_PROVEN_STATES or bool(status.states_seen & MERGE_PROVEN_STATES)
+def _merge_proven(status: WorkUnitStatus, reference: str) -> bool:
+    """Whether the ledger proves THIS change request merged.
+
+    A later event can replace the unit's changeRequestRef, so historical
+    merge states alone are not proof: the reference must have been in effect
+    when a merge-proven state was entered.
+    """
+
+    if not (status.state in MERGE_PROVEN_STATES or status.states_seen & MERGE_PROVEN_STATES):
+        return False
+    return reference in status.merged_change_request_refs
 
 
 #: Change-request-scoped incident kinds: each describes an obstacle to merging
@@ -1096,6 +1104,9 @@ class WorkUnitStatus:
     #: gate and later re-entered a pre-gate state (dispatched, then blocked)
     #: still proved the gate passed.
     states_seen: frozenset[FactoryState] = frozenset()
+    #: Change-request references in effect when a merge-proven state was
+    #: entered; never serialized - merge retirement binds proof to them.
+    merged_change_request_refs: frozenset[str] = frozenset()
 
     @property
     def awaits_human(self) -> bool:
@@ -1156,6 +1167,7 @@ def work_unit_status(projection: WorkUnitProjection) -> WorkUnitStatus:
         model=projection.activity_model,
         worker=projection.activity_worker,
         states_seen=_states_seen(projection),
+        merged_change_request_refs=frozenset(projection.merged_change_request_refs),
     )
 
 
@@ -1739,11 +1751,13 @@ def build_control_center_snapshot(
                     merged = (
                         named is not None
                         and named.change_request_ref == incident.evidence_ref
-                        and _merge_proven(named)
+                        and _merge_proven(named, incident.evidence_ref)
                     )
                 else:
                     carriers = by_change_request.get(incident.evidence_ref, [])
-                    merged = bool(carriers) and all(_merge_proven(s) for s in carriers)
+                    merged = bool(carriers) and all(
+                        _merge_proven(s, incident.evidence_ref) for s in carriers
+                    )
                 if merged:
                     continue
             # A named work unit is direct ledger evidence; the backlog-item
