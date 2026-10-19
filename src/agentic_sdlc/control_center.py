@@ -1038,10 +1038,13 @@ def _load_incident(raw: Any, index: int) -> Incident:
     _known_keys(entry, _INCIDENT_KEYS, label)
     evidence_ref = _text(entry, "evidenceRef", label)
     # The reference is serialized into the snapshot and the shared store;
-    # URL userinfo would republish the embedded credential.
+    # URL userinfo — or a token-shaped credential in a query string or
+    # fragment, percent-encoded or not — would republish the secret, and
+    # the console refuses exactly these shapes on every rendered document.
     _require(
-        not _CREDENTIAL_REFERENCE.search(evidence_ref),
-        f"{label}.evidenceRef must not embed credentials; strip the URL userinfo",
+        not _CREDENTIAL_REFERENCE.search(evidence_ref)
+        and not _carries_credential_token(evidence_ref),
+        f"{label}.evidenceRef must not embed credentials; strip the credential from the reference",
     )
     kind = _text(entry, "kind", label, required=True)
     _require(
@@ -1053,6 +1056,13 @@ def _load_incident(raw: Any, index: int) -> Incident:
         severity in frozenset(item.value for item in IncidentSeverity),
         f"{label}.severity must be blocker, degraded or advisory: {severity}",
     )
+    backlog_item_id = _identifier(entry, "backlogItemId", label, required=False)
+    # The identifier grammar permits underscores, so a token-shaped value
+    # fits it; the console refuses the shape on render, so the loader does.
+    _require(
+        not _carries_credential_token(backlog_item_id),
+        f"{label}.backlogItemId carries a token-shaped credential (value withheld)",
+    )
     return Incident(
         incident_id=_identifier(entry, "incidentId", label),
         project_id=_identifier(entry, "projectId", label),
@@ -1061,7 +1071,7 @@ def _load_incident(raw: Any, index: int) -> Incident:
         summary=_text(entry, "summary", label, required=True),
         detail=_text(entry, "detail", label),
         work_unit_id=_unit_text(entry, "workUnitId", label),
-        backlog_item_id=_identifier(entry, "backlogItemId", label, required=False),
+        backlog_item_id=backlog_item_id,
         observed_at=_timestamp(entry, "observedAt", label),
         evidence_ref=evidence_ref,
     )
@@ -1698,6 +1708,14 @@ def build_control_center_snapshot(
             not _CREDENTIAL_REFERENCE.search(projection.project_id),
             "a ledger project identifier embeds URL userinfo (value withheld); "
             "rename the project in the lifecycle ledger",
+        )
+        # NUL delimits the console's identity keys: a ledger-permitted
+        # project id carrying it would produce a validly digested snapshot
+        # the bundled viewer refuses outright.
+        _require(
+            "\x00" not in projection.project_id,
+            "a ledger project identifier carries a NUL delimiter (value "
+            "withheld); rename the project in the lifecycle ledger",
         )
         units = by_project_units.setdefault(projection.project_id, {})
         _require(

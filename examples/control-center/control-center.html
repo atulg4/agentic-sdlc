@@ -807,11 +807,16 @@
     // scan: bounded peeling decodes each layer before scanning, mirroring
     // the producer's _carries_credential_token.
     const tokenShaped = (raw) => {
+      // Valid escapes are peeled INDIVIDUALLY, like the producer's
+      // urllib.parse.unquote: decodeURIComponent throws on a malformed
+      // escape elsewhere in the value (%ZZ%67hp_...), which would stop the
+      // scan before the valid escapes beside it ever decoded.
+      const peel = (text) => text.replace(/%([0-9a-fA-F]{2})/g,
+        (match, hex) => String.fromCharCode(parseInt(hex, 16)));
       let decoded = String(raw);
       for (let pass = 0; pass < 3; pass += 1) {
         if (/gh[pousr]_|github_pat_|glpat-/i.test(decoded)) return true;
-        let peeled;
-        try { peeled = decodeURIComponent(decoded); } catch { break; }
+        const peeled = peel(decoded);
         if (peeled === decoded) break;
         decoded = peeled;
       }
@@ -2152,33 +2157,42 @@
       el("label", { class: "field" }, el("span", { text: "Snapshot JSON" }), area),
       el("div", { class: "row" },
         el("button", { class: "btn primary", type: "button", on: { click: async (event) => {
-          result.replaceChildren();
-          let parsed;
-          try { parsed = JSON.parse(area.value); }
-          catch (error) { result.append(el("div", { class: "banner bad", text: "That is not valid JSON: " + describe(error) })); return; }
-          const problem = validateSnapshot(parsed) || await digestMismatch(parsed);
-          if (problem) { result.append(el("div", { class: "banner bad", text: problem })); return; }
+          // Disabled BEFORE the first await, re-enabled in finally: two
+          // overlapping loads could otherwise adopt out of order — the
+          // older, slower document writing the store and the view LAST —
+          // since this path has no delivery-generation check like the live
+          // subscription's.
           const button = event.currentTarget;
+          if (button.disabled) return;
           button.disabled = true;
-          const at = new Date().toISOString();
-          let saveProblem = "";
-          if (state.db) {
-            const bytes = JSON.stringify(parsed).length;
-            if (bytes > 240000) {
-              saveProblem = `Loaded in this view only: at ${Math.round(bytes / 1024)} KiB the snapshot exceeds the shared store's 256 KiB document limit, so it was not saved for other viewers. Narrow it with --project-id to share it.`;
-            } else {
-              try {
-                await state.db.doc("snapshots/current").set({ document: parsed, loadedAt: at, loadedBy: state.viewer?.id || "" });
-              } catch (error) {
-                saveProblem = "Loaded in this view only — saving it for everyone failed: " + describe(error);
+          try {
+            result.replaceChildren();
+            let parsed;
+            try { parsed = JSON.parse(area.value); }
+            catch (error) { result.append(el("div", { class: "banner bad", text: "That is not valid JSON: " + describe(error) })); return; }
+            const problem = validateSnapshot(parsed) || await digestMismatch(parsed);
+            if (problem) { result.append(el("div", { class: "banner bad", text: problem })); return; }
+            const at = new Date().toISOString();
+            let saveProblem = "";
+            if (state.db) {
+              const bytes = JSON.stringify(parsed).length;
+              if (bytes > 240000) {
+                saveProblem = `Loaded in this view only: at ${Math.round(bytes / 1024)} KiB the snapshot exceeds the shared store's 256 KiB document limit, so it was not saved for other viewers. Narrow it with --project-id to share it.`;
+              } else {
+                try {
+                  await state.db.doc("snapshots/current").set({ document: parsed, loadedAt: at, loadedBy: state.viewer?.id || "" });
+                } catch (error) {
+                  saveProblem = "Loaded in this view only — saving it for everyone failed: " + describe(error);
+                }
               }
             }
+            adoptSnapshot(parsed, at, state.viewer?.id || "");
+            state.error = saveProblem;
+            if (!saveProblem) state.tab = "portfolio";
+            render();
+          } finally {
+            button.disabled = false;
           }
-          adoptSnapshot(parsed, at, state.viewer?.id || "");
-          state.error = saveProblem;
-          button.disabled = false;
-          if (!saveProblem) state.tab = "portfolio";
-          render();
         } } }, "Load it"),
         state.snapshotPristine ? copyButton(JSON.stringify(state.snapshotPristine, null, 2), "Copy the current snapshot") : null,
       ),
