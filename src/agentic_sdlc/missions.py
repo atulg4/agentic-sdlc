@@ -153,6 +153,9 @@ class AgentProfile:
     capabilities: tuple[str, ...]
     available: bool = True
     max_risk: RiskLevel = RiskLevel.HIGH
+    #: The model's declared context window; 0 means undeclared, and dispatch
+    #: then relies on the mission token budget alone.
+    context_window_tokens: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -164,6 +167,7 @@ class AgentProfile:
             "capabilities": list(self.capabilities),
             "available": self.available,
             "maxRisk": self.max_risk.value,
+            "contextWindowTokens": self.context_window_tokens,
         }
 
 
@@ -727,6 +731,7 @@ def load_agents(document: object) -> tuple[AgentProfile, ...]:
                 "capabilities",
                 "available",
                 "maxRisk",
+                "contextWindowTokens",
             }
         )
         if unknown:
@@ -754,6 +759,11 @@ def load_agents(document: object) -> tuple[AgentProfile, ...]:
             max_risk = RiskLevel(str(entry.get("maxRisk", "high")))
         except ValueError as error:
             raise MissionError(f"agent {agent_id}: invalid maxRisk") from error
+        context_window = entry.get("contextWindowTokens", 0)
+        if type(context_window) is not int or context_window < 0:
+            raise MissionError(
+                f"agent {agent_id}: contextWindowTokens must be a non-negative integer"
+            )
         strings = {}
         for key in ("adapter", "adapterVersion", "provider", "model"):
             value = entry.get(key)
@@ -770,6 +780,7 @@ def load_agents(document: object) -> tuple[AgentProfile, ...]:
                 capabilities=tuple(capabilities),
                 available=available,
                 max_risk=max_risk,
+                context_window_tokens=context_window,
             )
         )
     return tuple(agents)

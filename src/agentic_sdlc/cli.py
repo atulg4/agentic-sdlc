@@ -26,6 +26,7 @@ from .capacity_metrics import (
 from .context_builder import (
     DEFAULT_PACKET_BYTES,
     ContextBuilderError,
+    VerificationEvidence,
     build_context_packet,
     dispatch_envelope_for_packet,
     verification_from_dict,
@@ -813,7 +814,40 @@ def _dispatch_mission(args: argparse.Namespace) -> int:
     return 0
 
 
-def _build_packet_from_request(args: argparse.Namespace):
+def _derived_verification(args: argparse.Namespace, request: dict) -> VerificationEvidence:
+    """Reviewer verification DERIVED from the candidate repository itself.
+
+    The diff summary comes from ``collect_commit_diff`` over the resolved
+    base and head commits and the gate report from ``run_gates`` run here,
+    in the trusted caller — request JSON never impersonates pipeline
+    evidence, and the base is bound to the actual review target.
+    """
+    if not args.candidate_base or not args.candidate_head:
+        raise ContextBuilderError(
+            "--candidate-base and --candidate-head are required with --candidate-repository"
+        )
+    base = resolve_commit(args.candidate_repository, args.candidate_base)
+    head = resolve_commit(args.candidate_repository, args.candidate_head)
+    snapshot = collect_commit_diff(args.candidate_repository, base, head)
+    report = run_gates(args.config, args.candidate_repository)
+    findings = request.get("priorFindings", [])
+    if not isinstance(findings, list) or not all(isinstance(item, str) for item in findings):
+        raise ContextBuilderError("packet request priorFindings must be an array of strings")
+    return VerificationEvidence(
+        head_sha=head,
+        base_sha=base,
+        diff_paths=snapshot.paths,
+        added_lines=snapshot.added_lines,
+        deleted_lines=snapshot.deleted_lines,
+        patch_sha256=hashlib.sha256(snapshot.patch).hexdigest(),
+        gate_report=report,
+        prior_findings=tuple(findings),
+    )
+
+
+def _build_packet_from_request(
+    args: argparse.Namespace, *, trusted_verification_only: bool = False
+):
     """Rebuild and validate a packet from its request inputs.
 
     Shared by ``context-packet`` and ``dispatch-packet``, so dispatching runs
@@ -853,7 +887,23 @@ def _build_packet_from_request(args: argparse.Namespace):
     if not isinstance(failures, list) or not all(isinstance(item, str) for item in failures):
         raise ContextBuilderError("packet request retrievalFailures must be an array of strings")
     verification = None
-    if request.get("verification") is not None:
+    if getattr(args, "candidate_repository", None):
+        if request.get("verification") is not None:
+            raise ContextBuilderError(
+                "the packet request must not carry verification when the CLI "
+                "derives it from the candidate repository"
+            )
+        verification = _derived_verification(args, request)
+    elif request.get("verification") is not None:
+        if trusted_verification_only:
+            # Schema-valid request JSON is not pipeline evidence: a dispatch
+            # could otherwise render a fabricated gate report or diff summary
+            # beneath the trusted-pipeline heading.
+            raise ContextBuilderError(
+                "dispatch derives reviewer verification from the candidate "
+                "repository; pass --candidate-repository, --candidate-base and "
+                "--candidate-head instead of request verification"
+            )
         verification = verification_from_dict(request["verification"])
     repository_revision = request.get("repositoryRevision", "")
     if not isinstance(repository_revision, str):
@@ -890,7 +940,7 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
     envelope carries the packet digest as ``contextPackDigest`` and the
     rendered packet as its prompt.
     """
-    registry, mission, packet = _build_packet_from_request(args)
+    registry, mission, packet = _build_packet_from_request(args, trusted_verification_only=True)
     if args.packet:
         artifact = json.loads(Path(args.packet).read_text(encoding="utf-8"))
 
@@ -1923,6 +1973,9 @@ def build_parser() -> argparse.ArgumentParser:
     packet.add_argument("--missions")
     packet.add_argument("--knowledge", required=True)
     packet.add_argument("--request", required=True)
+    packet.add_argument("--candidate-repository")
+    packet.add_argument("--candidate-base")
+    packet.add_argument("--candidate-head")
     packet.add_argument("--output")
     packet.set_defaults(handler=_context_packet)
 
@@ -1931,6 +1984,9 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch_packet.add_argument("--missions")
     dispatch_packet.add_argument("--knowledge", required=True)
     dispatch_packet.add_argument("--request", required=True)
+    dispatch_packet.add_argument("--candidate-repository")
+    dispatch_packet.add_argument("--candidate-base")
+    dispatch_packet.add_argument("--candidate-head")
     dispatch_packet.add_argument("--agents", required=True)
     dispatch_packet.add_argument("--history")
     dispatch_packet.add_argument("--packet")

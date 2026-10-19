@@ -230,7 +230,17 @@ class VerificationEvidence:
         # The runtime checks below accept any sequence, but a frozen record
         # must not retain the caller's mutable lists: a post-construction
         # append could insert a credential or replace the verified changed
-        # paths without rerunning any validation.
+        # paths without rerunning any validation. A plain string is rejected
+        # first — tuple() would silently shred it into one-character entries
+        # that each pass the later string checks.
+        for label, value in (
+            ("diff_paths", self.diff_paths),
+            ("prior_findings", self.prior_findings),
+        ):
+            if isinstance(value, (str, bytes)):
+                raise ContextBuilderError(
+                    f"verification {label} must be a sequence of strings, not a single string"
+                )
         if not isinstance(self.diff_paths, tuple):
             object.__setattr__(self, "diff_paths", tuple(self.diff_paths))
         if not isinstance(self.prior_findings, tuple):
@@ -948,6 +958,27 @@ def build_context_packet(
             f"a {role} packet must not carry review verification evidence; "
             "reviews start from fresh context"
         )
+    # Python dataclasses accept lists at runtime, and the packet RETAINS the
+    # task: its sequences are detached as tuples before any validation, so a
+    # caller's retained list cannot be mutated past the secret and budget
+    # checks — and a plain string is rejected rather than shredded.
+    for label, value in (
+        ("acceptance_criteria", task.acceptance_criteria),
+        ("required_tests", task.required_tests),
+        ("non_goals", task.non_goals),
+        ("dependencies", task.dependencies),
+        ("labels", task.labels),
+    ):
+        if isinstance(value, (str, bytes)):
+            raise ContextBuilderError(f"task {label} must be a sequence, not a single string")
+    task = replace(
+        task,
+        acceptance_criteria=tuple(task.acceptance_criteria),
+        required_tests=tuple(task.required_tests),
+        non_goals=tuple(task.non_goals),
+        dependencies=tuple(task.dependencies),
+        labels=tuple(task.labels),
+    )
     _require_usable_task(task)
     if _contains_secret(_task_dict(task)):
         # The task fields reach both the rendered prompt and the serialized
@@ -959,6 +990,15 @@ def build_context_packet(
         )
     if not isinstance(repository_revision, str):
         raise ContextBuilderError("repository_revision must be a string")
+    if repository_revision and (
+        len(repository_revision) > 512 or _secret_like_text(repository_revision)
+    ):
+        # The pin is echoed by later mismatch errors (stderr, CI logs), so a
+        # credential-shaped or unbounded value is withheld here instead.
+        raise ContextBuilderError(
+            "repository_revision is overlong or secret-like; pass the trusted "
+            "checkout revision (the value is withheld)"
+        )
     if (
         verification is not None
         and repository_revision
@@ -1331,11 +1371,24 @@ def dispatch_envelope_for_packet(
             "dispatch envelope mission contract does not match the packet's bound "
             "role and limits; rebuild the packet against the current mission"
         )
+    prompt = render_packet_for_prompt(packet)
+    if agent.context_window_tokens:
+        # The mission budget alone cannot guarantee the SELECTED model can
+        # consume the packet: a 500k-token mission dispatched to a smaller-
+        # window agent would be rejected or truncated by the model itself.
+        needed = -(-len(prompt.encode("utf-8")) // PROMPT_BYTES_PER_TOKEN) + OUTPUT_TOKEN_RESERVE
+        if needed > agent.context_window_tokens:
+            raise ContextBuilderError(
+                f"agent {agent.agent_id} declares a {agent.context_window_tokens}-token "
+                f"context window but the packet needs up to {needed} tokens including "
+                f"the {OUTPUT_TOKEN_RESERVE}-token output reserve; route a larger-window "
+                "agent or split the task"
+            )
     return create_dispatch_envelope(
         mission,
         agent,
         work_ref=packet.work_ref,
-        prompt=render_packet_for_prompt(packet),
+        prompt=prompt,
         input_refs=(*input_refs, f"sha256:{packet.pack.pack_sha256}"),
         context_pack_digest=packet.packet_sha256,
     )

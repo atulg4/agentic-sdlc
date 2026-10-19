@@ -204,7 +204,17 @@ inputs — evidence authorization, the reviewer-verification requirement, and
 the budget checks all run again — selects the agent (`--history` works as in
 `dispatch-mission`), and emits the envelope via `dispatch_envelope_for_packet`
 with `contextPackDigest` bound to the packet digest and the rendered packet
-as the dispatched prompt. With `--packet`, the previously written packet
+as the dispatched prompt. Reviewer verification on the dispatch path is
+DERIVED, never declared: with `--candidate-repository`, `--candidate-base`
+and `--candidate-head`, the CLI resolves both commits in that repository,
+computes the diff summary with `collect_commit_diff`, and runs the gates
+itself (`run_gates`), so request JSON can never impersonate pipeline
+evidence — `dispatch-packet` refuses a request-supplied `verification`
+object outright, and `context-packet` accepts the same flags (request
+`priorFindings` carries prior review findings on the derived path). An
+agent that declares `contextWindowTokens` is also checked at dispatch: the
+rendered prompt plus the output reserve must fit its window, not only the
+mission budget. With `--packet`, the previously written packet
 artifact must equal the rebuilt packet's whole document — never just its
 digest field, and compared through canonical JSON encodings so booleans and
 numbers never conflate — so a stale or tampered artifact never dispatches. The plain `dispatch-mission` command remains for
