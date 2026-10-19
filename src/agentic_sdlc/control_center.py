@@ -1279,6 +1279,11 @@ class ProjectView:
             return "degraded"
         if self.active:
             return "running"
+        if self.waiting:
+            # Dependency-held units are in flight, just not executing: the
+            # serialized health must say so like the console does, or every
+            # non-browser consumer reads the project as idle.
+            return "waiting"
         if self.work_unit_count or self.backlog_count:
             return "idle"
         return "no-data"
@@ -1403,9 +1408,7 @@ def _provider_agrees(
 
     if not provider:
         return True
-    repository = status.repository
-    if not repository and reference:
-        repository = re.split(r"[#!]", reference, maxsplit=1)[0].strip()
+    repository = status.repository or _reference_repository(reference)
     if not repository:
         return True
     declared = repository_providers.get(repository.lower())
@@ -1420,15 +1423,34 @@ def _provider_agrees(
     return provider in declared
 
 
+def _reference_repository(reference: str) -> str:
+    """The repository a CANONICAL tracker reference names, or empty.
+
+    Only the numeric ``repo#N``/``repo!N`` shape supplies registry evidence:
+    a loader-permitted free-form identifier like ``acme/forge#ticket`` proves
+    nothing about the repository and must neither join nor refuse a match.
+    """
+    match = _REPOSITORY_REFERENCE.fullmatch(reference) if reference else None
+    return match.group("name") if match else ""
+
+
 def _positively_identified(
     item: BacklogItem,
     status: WorkUnitStatus,
     repository_providers: Mapping[str, set[str]],
 ) -> bool:
-    """Whether registry evidence proves the status belongs to ITEM's provider."""
-    if not item.source_provider or not status.repository:
+    """Whether registry evidence proves the status belongs to ITEM's provider.
+
+    A status without its own repository is still judged through the joined
+    reference's repository, exactly like ``_provider_agrees``: the registry
+    declaring that repository for exactly the item's provider is positive
+    identification, so contested joins do not reject the one provider the
+    registry vouches for.
+    """
+    repository = status.repository or _reference_repository(item.issue_ref)
+    if not item.source_provider or not repository:
         return False
-    declared = repository_providers.get(status.repository.lower())
+    declared = repository_providers.get(repository.lower())
     return declared == {item.source_provider}
 
 
