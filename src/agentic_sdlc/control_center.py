@@ -1793,12 +1793,13 @@ def build_control_center_snapshot(
             # unit's merge never hides another unit's real blocker.
             if incident.evidence_ref and _change_request_scoped(incident):
                 if incident.work_unit_id:
+                    # _merge_proven binds the proof to the reference in
+                    # effect when a merge-evident state was entered, so the
+                    # reference need not still be CURRENT: a unit that merged
+                    # this request and was later re-pointed retires the
+                    # incident exactly as the unnamed join would.
                     named = statuses.get(incident.work_unit_id)
-                    merged = (
-                        named is not None
-                        and named.change_request_ref == incident.evidence_ref
-                        and _merge_proven(named, incident.evidence_ref)
-                    )
+                    merged = named is not None and _merge_proven(named, incident.evidence_ref)
                 else:
                     carriers = by_change_request.get(incident.evidence_ref, [])
                     merged = bool(carriers) and all(

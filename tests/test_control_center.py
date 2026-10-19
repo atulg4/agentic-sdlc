@@ -5165,6 +5165,14 @@ def test_the_console_binds_incidents_and_enforces_full_membership():
     assert "The snapshot requires its ${key} array" in html
     # Note backfill sweeps every incident in passes, each key attempted once.
     assert "if (!wanted.length) break;" in html
+    # Unit references render as chips, so a digest-consistent snapshot must
+    # not carry a credential-bearing or unbounded reference value.
+    assert 'for (const field of ["issueRef", "changeRequestRef", "runRef"])' in html
+    assert "${field} must be a bounded string." in html
+    assert "${field} must not embed credentials." in html
+    # A backfill read that resumes after a notes delivery made the key live
+    # leaves the subscription's newer data alone.
+    assert "if (liveNoteKeys.has(key)) return;" in html
 
 
 def test_the_console_keeps_the_verified_document_and_exact_memberships():
@@ -5434,3 +5442,69 @@ def test_failing_check_names_must_be_nonempty_bounded_strings():
             observed_at=NOW,
             failing={7: "x" * 513},
         )
+
+
+def test_named_incidents_retire_on_historical_merge_proof():
+    # wu-1 merged !1 and was later re-pointed at !2: an incident NAMING wu-1
+    # about !1 retires on the recorded historical proof, exactly as the same
+    # incident does when it names no unit — the proof binds the reference in
+    # effect at the merge, so the reference need not still be current.
+    swap = _event(
+        eventId="e-swap",
+        idempotencyKey="k-swap",
+        state="merged",
+        stage="merge",
+        workUnit={
+            "projectId": "forge",
+            "workUnitId": "wu-1",
+            "changeRequestRef": "acme/forge!2",
+        },
+        activity="re-pointed at a follow-up change request",
+    )
+    ledger = _ledger(
+        *_chain(
+            TO_MERGED,
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "changeRequestRef": "acme/forge!1",
+            },
+        ),
+        swap,
+        *_chain(
+            TO_IMPLEMENTING,
+            work_unit="wu-2",
+            prefix="b",
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-2",
+                "changeRequestRef": "acme/forge!3",
+            },
+        ),
+    )
+    retired = _incident(
+        incidentId="acme/forge!1:merge-state-blocked",
+        kind="unclassified",
+        severity="degraded",
+        evidenceRef="acme/forge!1",
+        workUnitId="wu-1",
+        summary="The merged change request still reports blocked",
+    )
+    # A named unit WITHOUT proof for the reference keeps its incident.
+    kept = _incident(
+        incidentId="acme/forge!3:merge-state-blocked",
+        kind="unclassified",
+        severity="degraded",
+        evidenceRef="acme/forge!3",
+        workUnitId="wu-2",
+        summary="The in-flight change request is blocked",
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        incidents=load_incident_document(_incidents(retired, kept)),
+    )
+    assert [item.incident_id for item in snapshot.get("forge").incidents] == [
+        "acme/forge!3:merge-state-blocked"
+    ]
