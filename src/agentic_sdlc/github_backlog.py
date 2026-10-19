@@ -752,21 +752,14 @@ def incidents_from_change_requests(
             # A merged or closed change request is not an open problem,
             # whatever its final mergeability read.
             continue
-        draft = pull.get("draft")
-        # GitHub's pull-detail schema defines draft as a boolean; a partial
-        # payload without it carries no evidence the pull is ready for
-        # review, so it must not classify as non-draft.
-        _require(
-            isinstance(draft, bool),
-            f"change request {pull.get('number')}: draft must be a boolean",
-        )
-        if draft:
-            continue
         # A detail payload names its own target repository, and the adapter
         # REQUIRES it: without base.repo.full_name there is no evidence the
         # record belongs to this repository at all, and one naming another
         # repository must not attribute its blockers to a same-numbered
-        # local change request.
+        # local change request. Validated BEFORE the draft skip, so a
+        # mistargeted or partial export fails closed instead of silently
+        # dropping its drafts (an all-draft foreign export would otherwise
+        # emit an apparently valid empty document).
         base = pull.get("base")
         base_repo = base.get("repo") if isinstance(base, Mapping) else None
         full_name = base_repo.get("full_name") if isinstance(base_repo, Mapping) else None
@@ -779,6 +772,16 @@ def incidents_from_change_requests(
             full_name.lower() == repository.lower(),
             f"change request {number} belongs to {full_name}, not repository {repository}",
         )
+        draft = pull.get("draft")
+        # GitHub's pull-detail schema defines draft as a boolean; a partial
+        # payload without it carries no evidence the pull is ready for
+        # review, so it must not classify as non-draft.
+        _require(
+            isinstance(draft, bool),
+            f"change request {pull.get('number')}: draft must be a boolean",
+        )
+        if draft:
+            continue
         # The caller's canonical spelling, which every other emitted id uses
         # (issue item ids, label incident ids): the read model joins
         # change-request references by EXACT string equality, so one export
