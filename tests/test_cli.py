@@ -1003,6 +1003,31 @@ def test_orchestrate_attests_only_runs_a_trusted_dispatch_produced(tmp_path: Pat
         )
         == 0
     )
+    # The verdict EDGES belong to those actions too: a generic transition
+    # taking verifying -> reviewing under the key would bypass the outcome
+    # gating and still receive a genuine state attestation.
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                *base,
+                "--action",
+                "transition",
+                "--event-key",
+                "evt-skip",
+                "--to",
+                "reviewing",
+                "--timestamp",
+                stamp,
+                "--actor",
+                "operator",
+                "--actor-kind",
+                "human",
+            ]
+        )
+        == 2
+    )
+    assert "verification or review verdict" in capsys.readouterr().err
     verify = [
         *base,
         "--action",
@@ -1126,19 +1151,72 @@ def test_orchestrate_attests_only_runs_a_trusted_dispatch_produced(tmp_path: Pat
         path.write_text(json.dumps(document), encoding="utf-8")
         return str(path)
 
+    # The reviewing -> ready-for-human-merge edge is verdict-owned too.
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                *base,
+                "--action",
+                "transition",
+                "--event-key",
+                "evt-skip-2",
+                "--to",
+                "ready-for-human-merge",
+                "--timestamp",
+                stamp,
+                "--actor",
+                "operator",
+                "--actor-kind",
+                "human",
+            ]
+        )
+        == 2
+    )
+    assert "verification or review verdict" in capsys.readouterr().err
     # A review signed for another run, another findings count, or another
     # envelope must not advance this unit; a verification outcome cannot be
-    # replayed as a review either.
+    # replayed as a review, and a genuinely signed FAILED review (a crashed
+    # reviewer) proves nothing and must not pass as a zero-finding verdict.
     for bogus in (
         _review_reissued("review-run.json", runId="42:run-001"),
         _review_reissued("review-count.json", findings=3),
         _review_reissued("review-env.json", envelopeSha256=signed["envelopeSha256"]),
+        _review_reissued("review-failed.json", result="failed"),
         str(outcome),
     ):
         assert main([*review, "--outcome", bogus]) == 2
     assert main([*review, "--outcome", str(review_outcome)]) == 0
     document = json.loads(state.read_text(encoding="utf-8"))
     assert document["units"]["42"]["state"] == "ready-for-human-merge"
+
+
+def test_the_harness_trust_anchor_pins_the_attestation_key(tmp_path: Path, monkeypatch, capsys):
+    # The artifacts and the key that verifies them must not both be caller
+    # inputs: under the anchor, attestation cannot be switched off by
+    # omitting the flag, and a caller-minted substitute key is refused.
+    from agentic_sdlc.cli import _attest_document
+
+    secret = b"an-attestation-secret-of-at-least-32-bytes"
+    anchor_file = tmp_path / "anchor.key"
+    anchor_file.write_bytes(secret)
+    minted = tmp_path / "minted.key"
+    minted.write_bytes(b"a-caller-minted-key-of-32-bytes-or-more!")
+    monkeypatch.setenv("AGENTIC_SDLC_ATTESTATION_KEY_FILE", str(anchor_file))
+    state = tmp_path / "state.json"
+    stamp = "2026-08-06T12:00:00Z"
+    base = ["orchestrate", "--state", str(state), "--unit", "42", "--timestamp", stamp]
+    # No flag at all: the anchor still signs the written state.
+    assert main([*base, "--action", "create", "--event-key", "evt-1"]) == 0
+    document = json.loads(state.read_text(encoding="utf-8"))
+    assert document["attestation"] == _attest_document(document, secret)
+    # A caller-minted key is refused outright, not trusted for verification.
+    capsys.readouterr()
+    transition = [*base, "--action", "transition", "--to", "triaged", "--event-key", "evt-2"]
+    assert main([*transition, "--attestation-key", str(minted)]) == 2
+    assert "trust anchor" in capsys.readouterr().err
+    # The same key material passed explicitly still works.
+    assert main([*transition, "--attestation-key", str(anchor_file)]) == 0
 
 
 def test_orchestrate_attests_state_under_a_key(tmp_path: Path) -> None:

@@ -200,6 +200,35 @@ def test_series_patch_disables_signature_helpers(tmp_path: Path) -> None:
     assert not marker.exists()
 
 
+def test_series_patch_forces_textual_rendering(tmp_path: Path) -> None:
+    # The candidate's committed .gitattributes is honored by a default diff:
+    # a `*.py -diff` rule renders source changes as an opaque "GIT binary
+    # patch" the reviewer cannot read, while the packet still labels the
+    # evidence ordinary text. The series patch forces text rendering.
+    from agentic_sdlc.git_diff import collect_series_patch
+
+    repo = tmp_path / "attrs"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    (repo / ".gitattributes").write_text("*.py -diff\n", encoding="utf-8")
+    (repo / "a.py").write_text("x = 1\n", encoding="utf-8")
+    _git(repo, "add", "--", ".")
+    _git(repo, "commit", "-qm", "base")
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    (repo / "a.py").write_text("x = 1\ny = evil()\n", encoding="utf-8")
+    _git(repo, "commit", "-qam", "head")
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    patch = collect_series_patch(repo, base, head)
+    assert b"GIT binary patch" not in patch
+    assert b"+y = evil()" in patch
+
+
 def test_derivation_tree_pins_caller_supplied_refs(tmp_path: Path) -> None:
     # The source's remote-tracking refs are source-mutable: a caller that
     # authenticated a commit elsewhere pins the tree's ref to that exact

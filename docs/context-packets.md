@@ -281,9 +281,12 @@ worktree sharing its store, or a repository nested inside the candidate's
 tree all refuse — and containment refuses in BOTH directions, since a
 candidate checkout nested inside the target's worktree could reach the
 parent's `.git` and move its refs. The evidence patch carries the
-PER-COMMIT SERIES (`git log --no-show-signature --patch` over `base..head`,
-so a candidate-configured `log.showSignature`/`gpg.program` pair can never
-execute a verifier before the sandbox): a commit that adds
+PER-COMMIT SERIES (`git log --no-show-signature --text --patch` over
+`base..head`, so a candidate-configured `log.showSignature`/`gpg.program`
+pair can never execute a verifier before the sandbox, and a committed
+`.gitattributes` rule such as `*.py -diff` cannot render source changes as
+an opaque binary patch — every file is forced to render as text, with
+genuinely non-UTF-8 bytes still travelling losslessly as base64): a commit that adds
 content a later commit removes leaves the endpoint tree diff empty while a
 push of the head still publishes the blob, so the reviewer reads every
 intermediate change, the endpoint and whole-series line counters both
@@ -344,7 +347,14 @@ caller-selected label. Both trust artifacts are ATTESTED, because structure
 proves nothing about provenance — an invoker could author either as plain
 JSON: `dispatch-packet` requires `--attestation-key` (a secret key file of
 at least 32 bytes) and verifies an HMAC-SHA256 `attestation` field over
-each document's canonical JSON. `check-request --attestation-key` signs
+each document's canonical JSON. The artifacts and the key that verifies
+them must not BOTH be caller inputs — an invoker could mint a fresh key
+and sign fabricated artifacts under it — so the execution harness sets the
+TRUST ANCHOR `AGENTIC_SDLC_ATTESTATION_KEY_FILE`: under the anchor the
+named file IS the key for every attested command, attestation cannot be
+switched off by omitting the flag, and a `--attestation-key` carrying
+different key material is refused rather than trusted; without the anchor
+the caller is the operator and the flag stands alone. `check-request --attestation-key` signs
 its result and `orchestrate --attestation-key` signs the state it writes
 (verifying existing state on read, so an out-of-band edit is refused at
 the next step); the secret never travels in the artifacts, so reading one
@@ -378,7 +388,16 @@ run and the judged envelope's digest, signed by the verifier or reviewer
 harness that observed the outcome) must match the transition's arguments
 and bind the judged run's recorded `envelopeSha256` — the latest producing
 run's for a verification, the named review run's for a review — so a
-verdict always attaches to the exact dispatched code it judged. The agent roster is repository-owned configuration exactly
+verdict always attaches to the exact dispatched code it judged. A signed
+review whose own `result` is not `succeeded` is refused outright: a
+crashed or failed reviewer proves nothing about the patch, so its genuine
+record cannot pass as a zero-finding verdict. And the verdict EDGES
+themselves are owned by these actions: under a key, a generic
+`orchestrate --action transition` refuses to take `verifying` or
+`reviewing`/`re-reviewing` into their verdict targets (`reviewing`,
+`ready-for-human-merge`, `repair-needed`, `blocked`), which would
+otherwise bypass the outcome gating and still receive a genuine state
+attestation; operator aborts (`cancelled`, `failed`) stay generic. The agent roster is repository-owned configuration exactly
 like the policy: `dispatch-packet` reads `--agents` from the committed
 candidate tree at the packet's pinned revision — and for REVIEWER
 dispatches, whose pin is the untrusted candidate head, from the

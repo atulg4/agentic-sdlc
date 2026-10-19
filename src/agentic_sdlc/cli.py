@@ -725,13 +725,12 @@ def _check_request(args: argparse.Namespace) -> int:
     # authorization: labels, dependencies, and pull requests all move after
     # a check, so the result's age is part of what it attests.
     result["checkedAt"] = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
-    if getattr(args, "attestation_key", None):
+    signing_key = _resolve_attestation_key(args)
+    if signing_key is not None:
         # Dispatch consumes this result as its authorization gate: the mark
         # binds every field, checkedAt included, to the shared secret, so a
         # caller cannot author an acceptable result by hand.
-        result[_ATTESTATION_FIELD] = _attest_document(
-            result, _attestation_key_bytes(args.attestation_key)
-        )
+        result[_ATTESTATION_FIELD] = _attest_document(result, signing_key)
     _write(result, args.output)
     _status(message)
     return code
@@ -1102,17 +1101,65 @@ def _derived_verification(
 _ATTESTATION_FIELD = "attestation"
 
 
+#: The harness TRUST ANCHOR: when the execution harness sets this variable,
+#: the file it names is the attestation key for every attested command the
+#: harness runs — non-overridable from the command line.
+_ATTESTATION_ANCHOR_ENV = "AGENTIC_SDLC_ATTESTATION_KEY_FILE"
+
+
 def _attestation_key_bytes(path: str) -> bytes:
-    """The shared attestation secret: at least 32 bytes of key material."""
-    try:
-        key = Path(path).read_bytes().strip()
-    except OSError as error:
-        raise ContextBuilderError(f"the attestation key could not be read: {error}") from None
-    if len(key) < 32:
+    """The shared attestation secret: at least 32 bytes of key material.
+
+    The artifacts and the key that verifies them must not BOTH be caller
+    inputs: an invoker could mint a fresh 32-byte key, sign a fabricated
+    authorization result or run history under it, and pass both. A harness
+    that sets the trust anchor pins the key — the anchor file is the key,
+    attestation cannot be switched off by omitting the flag, and a
+    ``--attestation-key`` naming different key material is refused rather
+    than trusted. Without the anchor the caller IS the operator, and the
+    argument stands alone.
+    """
+
+    def _read(name: str, what: str) -> bytes:
+        try:
+            key = Path(name).read_bytes().strip()
+        except OSError as error:
+            raise ContextBuilderError(f"the {what} could not be read: {error}") from None
+        if len(key) < 32:
+            raise ContextBuilderError(
+                f"the {what} must hold at least 32 bytes of secret key material"
+            )
+        return key
+
+    anchor = os.environ.get(_ATTESTATION_ANCHOR_ENV, "")
+    if not anchor:
+        if not path:
+            raise ContextBuilderError(
+                "no attestation key: pass --attestation-key or set the "
+                f"{_ATTESTATION_ANCHOR_ENV} trust anchor"
+            )
+        return _read(path, "attestation key")
+    pinned = _read(anchor, f"attestation trust anchor ({_ATTESTATION_ANCHOR_ENV})")
+    if path and not hmac.compare_digest(pinned, _read(path, "attestation key")):
         raise ContextBuilderError(
-            "the attestation key must hold at least 32 bytes of secret key material"
+            "--attestation-key does not match the harness trust anchor "
+            f"({_ATTESTATION_ANCHOR_ENV}): the anchor pins the verification "
+            "key, so artifacts signed under a caller-supplied substitute key "
+            "are refused"
         )
-    return key
+    return pinned
+
+
+def _resolve_attestation_key(args: argparse.Namespace) -> bytes | None:
+    """The key for an optionally-attested command, or None for unattested.
+
+    The harness anchor forces attestation ON: a caller inside an anchored
+    harness cannot skip verification by omitting ``--attestation-key``.
+    """
+    flag = getattr(args, "attestation_key", None) or ""
+    if os.environ.get(_ATTESTATION_ANCHOR_ENV, "") or flag:
+        return _attestation_key_bytes(flag)
+    return None
 
 
 def _attest_document(document: Mapping, key: bytes) -> str:
@@ -1132,12 +1179,12 @@ def _verify_attested_input(args: argparse.Namespace, document, what: str, produc
     to mint one; only the trusted producer commands, run with the same key,
     emit documents dispatch accepts.
     """
-    if not getattr(args, "attestation_key", None):
+    key = _resolve_attestation_key(args)
+    if key is None:
         raise ContextBuilderError(
             f"dispatch requires --attestation-key to verify the {what}; "
             f"produce the artifact with {producer} under the same key"
         )
-    key = _attestation_key_bytes(args.attestation_key)
     mark = document.get(_ATTESTATION_FIELD) if isinstance(document, Mapping) else None
     if not isinstance(mark, str) or not hmac.compare_digest(mark, _attest_document(document, key)):
         raise ContextBuilderError(
@@ -1695,13 +1742,12 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
                 raise ContextBuilderError(
                     f"{error}; no other eligible agent declares a sufficient context window"
                 ) from error
-    if getattr(args, "attestation_key", None):
+    signing_key = _resolve_attestation_key(args)
+    if signing_key is not None:
         # The envelope seeds the attested run history: `orchestrate
         # start-run` under the same key accepts only envelopes a trusted
         # dispatch signed, so run attribution can never be hand-authored.
-        envelope[_ATTESTATION_FIELD] = _attest_document(
-            envelope, _attestation_key_bytes(args.attestation_key)
-        )
+        envelope[_ATTESTATION_FIELD] = _attest_document(envelope, signing_key)
     _write(envelope, args.output)
     return 0
 
@@ -1804,11 +1850,7 @@ def _require_attested_envelope(envelope, key: bytes, *, unit: str, kind: str) ->
 
 def _orchestrate(args: argparse.Namespace) -> int:
     state_path = Path(args.state)
-    key = (
-        _attestation_key_bytes(args.attestation_key)
-        if getattr(args, "attestation_key", None)
-        else None
-    )
+    key = _resolve_attestation_key(args)
     if state_path.is_file():
         document = json.loads(state_path.read_text(encoding="utf-8"))
         if key is not None:
@@ -1837,6 +1879,24 @@ def _orchestrate(args: argparse.Namespace) -> int:
             depends_on=tuple(args.depends_on),
         )
     elif args.action == "transition":
+        # The VERDICT edges belong to the verification/review actions and
+        # their signed outcomes: a generic transition taking one under a key
+        # would bypass the outcome gating and still receive a genuine state
+        # attestation. Operator aborts (cancelled, failed) stay generic.
+        if key is not None:
+            current = engine.get(args.unit).state.value
+            owned = {
+                "verifying": {"reviewing", "repair-needed", "blocked"},
+                "reviewing": {"ready-for-human-merge", "repair-needed", "blocked"},
+                "re-reviewing": {"ready-for-human-merge", "repair-needed", "blocked"},
+            }
+            if args.to in owned.get(current, frozenset()):
+                raise OrchestrationError(
+                    f"an attested transition from {current} to {args.to} is a "
+                    "verification or review verdict: record it with --action "
+                    "verification/review and the harness-signed --outcome, "
+                    "never as a generic transition"
+                )
         engine.transition(
             args.unit,
             args.to,
@@ -1963,6 +2023,15 @@ def _orchestrate(args: argparse.Namespace) -> int:
         # must be the one the reviewer harness signed for this exact run.
         if key is not None:
             outcome = _require_signed_outcome(args, key, kind="review")
+            # A reviewer that crashed or failed proves NOTHING about the
+            # patch: its genuine signed record must not advance the unit as
+            # a zero-finding pass — re-dispatch the review instead.
+            if outcome.get("result") != "succeeded":
+                raise OrchestrationError(
+                    "the outcome record attests a review run that did not "
+                    "succeed; a failed or crashed reviewer proves nothing "
+                    "about the patch, so re-dispatch the review"
+                )
             if outcome.get("runId") != args.run_id or outcome.get("findings") != args.findings:
                 raise OrchestrationError(
                     "the outcome record does not bind this run and findings "

@@ -449,6 +449,13 @@ def collect_series_patch(repository: str | Path, base: str, head: str) -> bytes:
             "--no-show-signature",
             "--no-ext-diff",
             "--no-textconv",
+            # The candidate's committed .gitattributes is honored by default:
+            # a `*.py -diff` rule would render source changes as an opaque
+            # "GIT binary patch" the reviewer cannot read, while the packet
+            # still labels the evidence ordinary text. Every file is forced
+            # to render AS TEXT; genuinely non-UTF-8 bytes still travel
+            # losslessly through the evidence's base64 encoding.
+            "--text",
             "--binary",
             "--full-index",
             "--patch",
