@@ -58,6 +58,8 @@ from .policy import ProjectPolicy
 
 __all__ = [
     "DEFAULT_PACKET_BYTES",
+    "OUTPUT_TOKEN_RESERVE",
+    "PROMPT_BYTES_PER_TOKEN",
     "PACKET_ROLES",
     "ROLE_BUILDER",
     "ROLE_REVIEWER",
@@ -84,6 +86,14 @@ PACKET_ROLES = frozenset({ROLE_BUILDER, ROLE_TESTER, ROLE_REVIEWER})
 
 #: Compact by default: a packet is the minimum useful evidence, not a dump.
 DEFAULT_PACKET_BYTES = 262_144
+
+#: Deterministic prompt-size heuristic, about four UTF-8 bytes per token:
+#: deliberately simple so the guard never depends on a tokenizer version.
+PROMPT_BYTES_PER_TOKEN = 4
+
+#: Room the mission's own answer needs inside its token budget: a packet
+#: that filled the whole budget could not be consumed within contract.
+OUTPUT_TOKEN_RESERVE = 256
 
 # Both Git object formats: SHA-1 repositories name 40-hex commits, SHA-256
 # repositories 64-hex ones, and the trusted Git helpers accept both.
@@ -215,6 +225,14 @@ class VerificationEvidence:
     base_sha: str = ""
 
     def __post_init__(self) -> None:
+        # The runtime checks below accept any sequence, but a frozen record
+        # must not retain the caller's mutable lists: a post-construction
+        # append could insert a credential or replace the verified changed
+        # paths without rerunning any validation.
+        if not isinstance(self.diff_paths, tuple):
+            object.__setattr__(self, "diff_paths", tuple(self.diff_paths))
+        if not isinstance(self.prior_findings, tuple):
+            object.__setattr__(self, "prior_findings", tuple(self.prior_findings))
         if not _COMMIT_SHA.fullmatch(self.head_sha):
             raise ContextBuilderError(
                 "verification head_sha must be the exact 40- or 64-hex candidate commit"
@@ -244,6 +262,14 @@ class VerificationEvidence:
                     "verification diff_paths carry a non-UTF-8 path; re-encode or "
                     "rename the file before packing"
                 ) from error
+            # The path is persisted by as_dict and rendered into the
+            # reviewer prompt, so a token-shaped filename fails closed like
+            # every other secret-bearing verification field.
+            if _secret_like_text(path):
+                raise ContextBuilderError(
+                    "verification diff_paths carry a secret-like filename; "
+                    "rename the file or redact it before packing"
+                )
         if not _SHA256.fullmatch(self.patch_sha256):
             raise ContextBuilderError("verification patch_sha256 must be a SHA-256 hex digest")
         if not isinstance(self.gate_report, Mapping) or not isinstance(
@@ -307,7 +333,7 @@ class VerificationEvidence:
             # A finding that quotes a credential (a token pasted from the
             # offending code, a provider error) would reach both the prompt
             # and the serialized packet; it fails closed instead.
-            if _secret_like(finding):
+            if _secret_like_text(finding):
                 raise ContextBuilderError(
                     "verification prior_findings carry secret-like content; "
                     "redact the finding before packing"
@@ -492,10 +518,12 @@ def _contains_secret(value: Any) -> bool:
     """Whether any RAW string in the structure is secret-like.
 
     Raw values, not their JSON encoding: escaping quotes would defeat the
-    quoted-assignment pattern.
+    quoted-assignment pattern. Each string is scanned raw AND sanitized, so
+    an embedded boundary marker cannot split a credential past the scan only
+    for rendering to reassemble it.
     """
     if isinstance(value, str):
-        return _secret_like(value)
+        return _secret_like_text(value)
     if isinstance(value, Mapping):
         return any(_contains_secret(item) for item in value.values())
     if isinstance(value, (list, tuple)):
@@ -510,7 +538,7 @@ def _safe_exclusion_path(path: str) -> str:
     errors for required evidence, so a valid forbidden filename that embeds a
     credential-shaped value must never travel through them verbatim.
     """
-    if _secret_like(path):
+    if _secret_like_text(path):
         return "path withheld: it is secret-like; rename the file or redact it at the source"
     return path
 
@@ -567,6 +595,17 @@ def _record_path(record: EvidenceRecord) -> str | None:
 
 def _secret_like(payload: str) -> bool:
     return any(pattern.search(payload) for pattern in _SECRET_PATTERNS)
+
+
+def _secret_like_text(value: str) -> bool:
+    """Secret-like raw OR after boundary-marker removal.
+
+    Sanitization strips marker text to a fixpoint, so a credential split by
+    an embedded boundary marker would be reconstructed exactly where the text
+    reaches the model; both representations are scanned wherever either can
+    reach a sink.
+    """
+    return _secret_like(value) or _secret_like(sanitize_payload(value))
 
 
 def _canonical_repository_path(path: str) -> bool:
@@ -807,7 +846,7 @@ def render_packet_for_prompt(packet: ContextPacket) -> str:
             # A retrieval-failure detail can quote a credential-bearing
             # provider error or URL; such a notice is withheld, like the
             # evidence scan withholds a leaked payload.
-            if _secret_like(line):
+            if _secret_like_text(line):
                 lines.append(
                     "- a qualification notice was withheld: it carried secret-like "
                     "content; redact the retrieval-failure detail at its source"
@@ -868,6 +907,20 @@ def build_context_packet(
         )
     if type(budget_bytes) is not int or not 1 <= budget_bytes <= MAX_PACK_BYTES:
         raise ContextBuilderError(f"budget_bytes must be between 1 and {MAX_PACK_BYTES}")
+    # The byte budget is independent of the mission contract, so the prompt
+    # is ALSO held under the mission's token budget (with an output reserve):
+    # the envelope must never advertise a limit the packet already exceeds.
+    token_budget_bytes = (mission.max_tokens - OUTPUT_TOKEN_RESERVE) * PROMPT_BYTES_PER_TOKEN
+    if token_budget_bytes < 1:
+        raise _blocked(
+            mission,
+            work_ref,
+            (
+                f"mission {mission.mission_id} allows {mission.max_tokens} tokens, "
+                f"not enough for any packet beside the {OUTPUT_TOKEN_RESERVE}-token "
+                "output reserve; raise the mission token budget",
+            ),
+        )
     if role == ROLE_REVIEWER and verification is None:
         raise _blocked(
             mission,
@@ -988,7 +1041,7 @@ def build_context_packet(
                 f"({_safe_exclusion_path(path)})"
             )
             continue
-        if _secret_like(_render_evidence(record)) or _contains_secret(record.as_dict()):
+        if _secret_like_text(_render_evidence(record)) or _contains_secret(record.as_dict()):
             # BOTH sinks are scanned: the rendered block (raw payload and
             # citation, where quoted-assignment shapes survive) and the whole
             # serialized record (author, scope, anchors, link targets - the
@@ -1004,7 +1057,7 @@ def build_context_packet(
     # URL) is redacted ONCE here, before anything serializes or raises with
     # it: the source prefix survives so required-source checks still match.
     def _redacted_failure(item: str) -> str:
-        if not _secret_like(item):
+        if not _secret_like_text(item):
             return item
         prefix = item.split(":", 1)[0].strip()
         # The prefix survives only when it is a DECLARED source id: anything
@@ -1107,6 +1160,19 @@ def build_context_packet(
             ),
             exclusions,
         )
+    if rendered > token_budget_bytes:
+        raise _blocked(
+            mission,
+            work_ref,
+            (
+                f"mandatory context is about {-(-rendered // PROMPT_BYTES_PER_TOKEN)} "
+                f"prompt tokens but mission {mission.mission_id} allows "
+                f"{mission.max_tokens} tokens with a {OUTPUT_TOKEN_RESERVE}-token "
+                "output reserve; raise the mission token budget or split the task",
+            ),
+            exclusions,
+        )
+    selection_budget = min(budget_bytes, token_budget_bytes)
 
     selection = [
         f"required: {record.evidence_id} from required source {record.source_id}"
@@ -1121,7 +1187,7 @@ def build_context_packet(
             selection.append(f"omitted by record limit: {record.evidence_id} (relevance {score})")
             continue
         block = len(("\n\n" + _render_evidence(record)).encode("utf-8"))
-        if rendered + block <= budget_bytes:
+        if rendered + block <= selection_budget:
             chosen.append(record)
             rendered += block
             selection.append(f"selected: {record.evidence_id} (relevance {score})")
@@ -1165,6 +1231,19 @@ def build_context_packet(
     # prompt size is only known now; they are mandatory content, never
     # truncated, so an overflow blocks instead of under-reporting.
     final_bytes = len(render_packet_for_prompt(packet).encode("utf-8"))
+    if final_bytes > token_budget_bytes:
+        raise _blocked(
+            mission,
+            work_ref,
+            (
+                f"the rendered packet is about {-(-final_bytes // PROMPT_BYTES_PER_TOKEN)} "
+                f"prompt tokens once its qualification notices are included but "
+                f"mission {mission.mission_id} allows {mission.max_tokens} tokens "
+                f"with a {OUTPUT_TOKEN_RESERVE}-token output reserve; raise the "
+                "mission token budget or split the task",
+            ),
+            exclusions,
+        )
     if final_bytes > budget_bytes:
         raise _blocked(
             mission,

@@ -893,10 +893,15 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
     registry, mission, packet = _build_packet_from_request(args)
     if args.packet:
         artifact = json.loads(Path(args.packet).read_text(encoding="utf-8"))
-        # The WHOLE document is compared, never just its digest field: an
-        # artifact whose content was edited while packetSha256 was left
-        # untouched must not read as matching.
-        if artifact != packet.as_dict():
+
+        # The WHOLE document is compared, never just its digest field, and
+        # through canonical JSON encodings: Python equality conflates JSON
+        # booleans and numbers (False == 0), which would let a schema-invalid
+        # artifact read as matching.
+        def _encoded(document: object) -> str:
+            return json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+        if _encoded(artifact) != _encoded(packet.as_dict()):
             raise ContextBuilderError(
                 "the packet artifact does not match the packet rebuilt from the "
                 "request; rebuild the packet before dispatching"

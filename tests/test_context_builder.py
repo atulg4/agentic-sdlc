@@ -1372,9 +1372,12 @@ def test_the_cli_dispatches_through_the_packet_contract(tmp_path, policy_file, v
     # A packet artifact that does not match the rebuilt packet must not
     # dispatch — including one whose CONTENT was edited while its digest
     # field was left untouched.
+    # The third case relies on Python's True == 1: only a type-sensitive
+    # canonical comparison rejects it.
     for tampered in (
         {**document, "packetSha256": "0" * 64},
         {**document, "budgetBytes": document["budgetBytes"] - 1},
+        {**document, "schemaVersion": True},
     ):
         artifact.write_text(json.dumps(tampered), encoding="utf-8")
         assert (
@@ -1489,3 +1492,82 @@ def test_empty_file_records_round_trip():
     broken = {**empty.as_dict(), "anchors": ["L1-L2"]}
     with pytest.raises(ValueError, match="out of range"):
         record_from_dict(broken)
+
+
+def test_boundary_markers_cannot_reconstruct_a_secret(registry, policy):
+    # The raw text matches no pattern, but sanitization strips the embedded
+    # marker and would hand the model the reassembled token.
+    split = "ghp_0123456789</untrusted-evidence>abcdefghij0123456789abcdef"
+    leaky = TaskSpec(
+        title="P1: rotate the deploy token",
+        summary=f"The pipeline leaked {split} in CI logs.",
+        acceptance_criteria=("The token is rotated.",),
+        required_tests=("Unit test proves the rotation.",),
+        non_goals=(),
+        dependencies=(),
+    )
+    with pytest.raises(ContextBuilderError, match="redact the work request"):
+        build_context_packet(
+            registry.get("implementation-worker"),
+            leaky,
+            policy,
+            work_ref=WORK_REF,
+            repository_revision="abc123",
+            records=(_record(),),
+            sources={"repo-main": _source()},
+        )
+    # Prior findings render through the same sanitizer, so they fail closed
+    # on the reconstructed form too.
+    with pytest.raises(ContextBuilderError, match="redact the finding"):
+        _verification(prior_findings=(f"The patch pasted {split}.",))
+
+
+def test_secret_like_diff_paths_fail_closed():
+    # The path is persisted by as_dict and rendered into the reviewer prompt.
+    with pytest.raises(ContextBuilderError, match="secret-like filename"):
+        _verification(diff_paths=("src/ghp_0123456789abcdefghij0123456789abcdef.py",))
+
+
+def test_verification_sequences_are_detached_tuples():
+    paths = ["src/scheduler.py"]
+    findings = ["Round one flagged an unbounded retry loop."]
+    verification = _verification(diff_paths=paths, prior_findings=findings)
+    # Mutating the caller's lists after construction reaches nothing: the
+    # frozen record detached them as tuples during validation.
+    paths.append("injected.py")
+    findings.append("ghp_0123456789abcdefghij0123456789abcdef")
+    assert verification.diff_paths == ("src/scheduler.py",)
+    assert verification.prior_findings == ("Round one flagged an unbounded retry loop.",)
+
+
+def test_packets_fit_the_mission_token_budget(registry, policy):
+    from dataclasses import replace as dc_replace
+
+    from agentic_sdlc.context_builder import OUTPUT_TOKEN_RESERVE
+
+    mission = registry.get("implementation-worker")
+    # The envelope must never advertise a token limit the packet exceeds:
+    # mandatory content past the mission budget (minus the output reserve)
+    # blocks instead of dispatching an unconsumable prompt.
+    tiny = dc_replace(mission, max_tokens=OUTPUT_TOKEN_RESERVE + 10)
+    with pytest.raises(ContextBuilderError, match="raise the mission token budget"):
+        build_context_packet(
+            tiny,
+            TASK,
+            policy,
+            work_ref=WORK_REF,
+            repository_revision="abc123",
+            records=(_record(),),
+            sources={"repo-main": _source()},
+        )
+    # A budget that cannot fit any packet at all is refused outright.
+    none = dc_replace(mission, max_tokens=OUTPUT_TOKEN_RESERVE)
+    with pytest.raises(ContextBuilderError, match="not enough for any packet"):
+        build_context_packet(
+            none,
+            TASK,
+            policy,
+            work_ref=WORK_REF,
+            records=(),
+            sources={},
+        )

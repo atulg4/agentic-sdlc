@@ -45,9 +45,11 @@ never review its own writes. Missions with neither capability set
   an agreeing aggregate), and prior findings, which fail closed when they
   carry secret-like content — as does a gate report whose command or name
   quotes a credential, since the report renders beneath the trusted-pipeline
-  heading. The validated gate report is detached from the caller's object
-  and stored recursively immutable, so it cannot be edited in place after
-  validation; the packet's policy limits are frozen the same way. For
+  heading, and a changed path whose filename is itself token-shaped. The
+  validated gate report is detached from the caller's object and stored
+  recursively immutable, so it cannot be edited in place after validation;
+  the packet's policy limits and the verification's path and finding
+  sequences are frozen the same way. For
   reviewer packets the pinned `repository_revision` must equal the verified
   candidate head, so the reviewer never reads source from one tree while
   judging the exact diff of another. Changed paths render inside an untrusted
@@ -62,7 +64,11 @@ never review its own writes. Missions with neither capability set
 Mandatory content — the task sections, policy limits, reviewer verification,
 and **every record from a `required` knowledge source** — is never truncated:
 when it cannot fit `budget_bytes` (default 256 KiB), the build blocks with a
-reason instead. Optional evidence fills the remaining budget in deterministic
+reason instead. The prompt is also held under the mission's own token
+budget: with a deterministic ~4-bytes-per-token estimate and a 256-token
+output reserve, mandatory content past `max_tokens` blocks, and optional
+selection stops at whichever budget binds first, so the envelope never
+advertises a limit the packet already exceeds. Optional evidence fills the remaining budget in deterministic
 relevance order (keyword overlap with the task, ties broken by evidence ID);
 records that do not fit are recorded as `omitted by budget` in the packet's
 selection notes. The pack's qualification notices count against the budget
@@ -80,7 +86,9 @@ Evidence never enters a packet when its repository path matches the policy's
 or the mission's forbidden paths or falls outside the mission's `read_paths` (matched case-sensitively — casefolding an allowlist would widen it, while the deny patterns stay casefolded),
 or when its rendered block — the payload and its citation metadata (locator,
 revision) alike — carries a secret-like value (key blocks, provider token
-shapes, quoted credential assignments). A record whose `sourceType` disagrees
+shapes, quoted credential assignments) — scanned both raw and after
+boundary-marker removal, so an embedded marker cannot split a credential
+past the scan only for sanitization to reassemble it. A record whose `sourceType` disagrees
 with its declared source is rejected outright; identical duplicate records
 are counted once, matching the knowledge layer, while records that share an
 evidence ID but differ in other fields fail closed, so the prompt never
@@ -185,5 +193,6 @@ the budget checks all run again — selects the agent (`--history` works as in
 with `contextPackDigest` bound to the packet digest and the rendered packet
 as the dispatched prompt. With `--packet`, the previously written packet
 artifact must equal the rebuilt packet's whole document — never just its
-digest field — so a stale or tampered artifact never dispatches. The plain `dispatch-mission` command remains for
+digest field, and compared through canonical JSON encodings so booleans and
+numbers never conflate — so a stale or tampered artifact never dispatches. The plain `dispatch-mission` command remains for
 non-factory missions whose prompt is not packet-built.
