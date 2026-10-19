@@ -180,8 +180,10 @@ that. It ships no credential to a browser, and it offers no action that writes
 to a repository, a tracker or a runner. Backlog URLs are refused at load when
 they embed a credential — URL userinfo, or a token-shaped value (`ghp_…`,
 `github_pat_…`, `glpat-…`) anywhere in the URL, query string and fragment
-included — so the snapshot never republishes a secret as a clickable link, and
-the console re-checks the same rule on every document it renders. A remediation descriptor *describes* the
+included, percent-encoded or not — and ledger references (`issueRef`,
+`changeRequestRef`, `runRef`) carrying the same shapes are redacted, so the
+snapshot never republishes a secret as a clickable link or a rendered chip;
+the console re-checks the same rules on every document it renders. A remediation descriptor *describes* the
 step and names who may take it; taking it stays with that authority. Mutating
 the control plane is a separately reviewed change, not a side effect of
 rendering a page.

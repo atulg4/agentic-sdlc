@@ -4069,6 +4069,28 @@ def test_a_malformed_sub_issue_total_is_a_controlled_error():
     assert _export(zero)["items"][0]["kind"] == "task"
 
 
+def test_a_truncated_sub_issue_listing_fails_closed():
+    # The parent's own declared total is proof of how many children exist: a
+    # listing that maps fewer (an unpaginated export) would render the
+    # omitted children as roots or drop them with a partial issues file.
+    parent = _issue(1, "EPIC: do it", subtotal=3)
+    children = [_issue(2, "P1: part one"), _issue(3, "P1: part two"), _issue(4, "P1: part three")]
+    with pytest.raises(ControlCenterError, match="declares 3 sub-issue.*only 2 are listed"):
+        _export(parent, *children, parents={2: 1, 3: 1})
+    # The complete listing exports cleanly, children placed under the epic.
+    document = _export(parent, *children, parents={2: 1, 3: 1, 4: 1})
+    assert [item.get("parentId") for item in document["items"]] == [
+        None,
+        "acme/forge#1",
+        "acme/forge#1",
+        "acme/forge#1",
+    ]
+    # A parent with NO supplied listing stays unchecked: the PARENT=path
+    # form deliberately narrows which parents are exported.
+    narrowed = _export(parent, *children)
+    assert [item.get("parentId") for item in narrowed["items"]] == [None, None, None, None]
+
+
 def test_spec_holds_name_the_configured_labels():
     from agentic_sdlc.control_center import RELEASED_SPEC_RULE, SPEC_WITHOUT_APPROVAL_RULE
     from agentic_sdlc.github_backlog import dispatch_rules
@@ -4990,6 +5012,15 @@ def test_credential_bearing_inputs_are_rejected_at_load():
         )
     assert "token-shaped credential" in str(token_error.value)
     assert "ghp_" not in str(token_error.value)
+    # Percent-encoding must not smuggle the same token past the scan: both
+    # an encoded separator (ghp%5F) and an encoded first letter (%67hp_)
+    # decode to the rejected shape.
+    for encoded in (
+        "https://tracker.example/issue/1?access=ghp%5F0123456789abcdefghij",
+        "https://tracker.example/issue/1?access=%67hp_0123456789abcdefghij",
+    ):
+        with pytest.raises(ControlCenterError, match="token-shaped credential"):
+            load_backlog_document(_document(_backlog(itemId="acme/forge#7", url=encoded)))
 
 
 def test_a_malformed_pull_request_marker_is_rejected():
@@ -5044,6 +5075,28 @@ def test_credential_bearing_references_are_redacted():
         generated_at=NOW, registry=REGISTRY, projections=tokened.projections()
     )
     assert "ghp-token-here" not in json.dumps(redacted.as_dict())
+    # A token-shaped credential in a QUERY STRING carries no userinfo yet is
+    # the secret itself; percent-encoding must not smuggle it past the scan.
+    for sneaky in (
+        "https://ci.example/run/7?access=ghp_0123456789abcdefghij",
+        "https://ci.example/run/7?access=ghp%5F0123456789abcdefghij",
+        "https://ci.example/run/7?access=%67hp_0123456789abcdefghij",
+    ):
+        query_tokened = _ledger(
+            *_chain(
+                TO_IMPLEMENTING,
+                workUnit={
+                    "projectId": "forge",
+                    "workUnitId": "wu-1",
+                    "runRef": sneaky,
+                },
+            )
+        )
+        query_redacted = build_control_center_snapshot(
+            generated_at=NOW, registry=REGISTRY, projections=query_tokened.projections()
+        )
+        assert "0123456789abcdefghij" not in json.dumps(query_redacted.as_dict())
+        assert [unit.run_ref for unit in query_redacted.get("forge").active] == [""]
     # The untouched reference survives; only the credential-bearing one is
     # withheld, with a warning naming the count.
     assert [unit.issue_ref for unit in view.active] == ["acme/forge#7"]
@@ -5408,6 +5461,16 @@ def test_the_console_validates_backlog_provenance_and_scoped_liveness():
     # nor a token-shaped credential in the query string or fragment.
     assert "url must not embed credentials" in html
     assert "url carries a token-shaped credential" in html
+    # Token shapes are scanned after bounded percent-decoding (mirroring the
+    # producer's _carries_credential_token) and applied to unit, incident,
+    # node-reference and status fields alongside the userinfo checks.
+    assert "const tokenShaped = (raw) =>" in html
+    assert "decodeURIComponent(decoded)" in html
+    assert html.count("|| tokenShaped(value)") >= 4
+    assert "tokenShaped(node.url)" in html
+    # parentMissing renders by truthiness, so a digest-consistent rewrite
+    # carrying the string "false" must be rejected as non-boolean.
+    assert "parentMissing must be a boolean." in html
     # Every node names its containing project, exactly as the producer
     # groups them, so a digest-consistent rewrite cannot move work between
     # projects; projectId is string-validated with the other node fields.
@@ -5966,6 +6029,25 @@ def test_overlong_references_are_withheld():
     assert [unit.issue_ref for unit in view.active] == [""]
     assert long_ref not in json.dumps(snapshot.as_dict())
     assert any("longer than 512 characters" in warning for warning in view.warnings)
+    # The bound is measured in the console's own units: 300 astral
+    # characters are 300 code points to Python but 600 UTF-16 units to
+    # JavaScript's value.length, so they must be withheld too — the producer
+    # must never emit a snapshot its bundled viewer rejects.
+    astral_ref = "acme/forge#" + "\U0001f600" * 300
+    astral_ledger = _ledger(
+        *_chain(
+            TO_IMPLEMENTING,
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "issueRef": astral_ref,
+            },
+        )
+    )
+    astral_snapshot = build_control_center_snapshot(
+        generated_at=NOW, registry=REGISTRY, projections=astral_ledger.projections()
+    )
+    assert [unit.issue_ref for unit in astral_snapshot.get("forge").active] == [""]
 
 
 def test_multi_provider_repository_names_are_ambiguous():
