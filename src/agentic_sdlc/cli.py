@@ -2124,7 +2124,12 @@ def _orchestrate(args: argparse.Namespace) -> int:
             # previously recorded digest refuses and a retry re-dispatches.
             digest = envelope.get("envelopeSha256")
             replayed = [run for run in engine.get(args.unit).runs if run.envelope_sha256 == digest]
-            if replayed:
+            # A retry of the SAME event with the SAME envelope is the
+            # orchestrator's documented event-key idempotency — a caller
+            # that lost the response — and start_run returns the recorded
+            # run unchanged, so neither replay check below applies to it.
+            retried = any(run.event_key == args.event_key for run in replayed)
+            if replayed and not retried:
                 raise OrchestrationError(
                     "this dispatch envelope was already recorded for work "
                     f"unit {args.unit} ({replayed[0].run_id}); every run "
@@ -2137,7 +2142,9 @@ def _orchestrate(args: argparse.Namespace) -> int:
             # latest-producer check passed against the stale unit, so the
             # envelope must also bind the unit's snapshot exactly as this
             # state records it now.
-            if envelope.get("unitStateSha256") != _unit_state_digest(engine.get(args.unit)):
+            if not retried and envelope.get("unitStateSha256") != _unit_state_digest(
+                engine.get(args.unit)
+            ):
                 raise OrchestrationError(
                     "the dispatch envelope does not bind this work unit's "
                     "current state snapshot: the unit advanced since the "
@@ -2181,13 +2188,15 @@ def _orchestrate(args: argparse.Namespace) -> int:
             bound = (
                 completion.get("unit"),
                 completion.get("runId"),
+                completion.get("result"),
                 completion.get("commitSha"),
             )
-            if bound != (args.unit, args.run_id, args.commit_sha):
+            if bound != (args.unit, args.run_id, args.result, args.commit_sha):
                 raise OrchestrationError(
-                    "the completion record does not bind this exact unit, run "
-                    "and commit; regenerate it with attest-completion for the "
-                    "run that produced the commit"
+                    "the completion record does not bind this exact unit, run, "
+                    "result and commit; regenerate it with attest-completion "
+                    "for the run that produced the commit, with the result the "
+                    "harness observed"
                 )
             # Run IDs RESTART at run-001 when state is recreated, so (unit,
             # runId) does not identify a run across histories: the completion
@@ -2436,10 +2445,17 @@ def _attest_completion(args: argparse.Namespace) -> int:
             "run IDs restart when state is recreated, so the envelope digest is "
             "the run's identity across histories"
         )
+    if args.result not in ("succeeded", "failed"):
+        raise OrchestrationError("--result must be succeeded or failed")
     document = {
         "schemaVersion": 1,
         "unit": args.unit,
         "runId": args.run_id,
+        # The RESULT the harness observed is part of the record: a failed
+        # producer's genuine completion replayed as finish-run --result
+        # succeeded would otherwise satisfy the reviewer dispatch's
+        # latest-producer success check on a commit the harness saw fail.
+        "result": args.result,
         "commitSha": args.commit_sha,
         "envelopeSha256": args.envelope_sha256,
         "recordedAt": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
@@ -3371,6 +3387,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="isolation wrapper command prefix derived gates run under, or "
         "the literal trusted-host to accept host execution",
     )
+    packet.add_argument(
+        "--run-kind",
+        choices=("implementation", "repair", "verification", "review"),
+        help="the lifecycle kind the packet is built for: a repair packet "
+        "carries the request's priorFindings, so dispatch-packet --run-kind "
+        "repair --packet compares against an identical document",
+    )
     packet.add_argument("--output")
     packet.set_defaults(handler=_context_packet)
 
@@ -3489,6 +3512,13 @@ def build_parser() -> argparse.ArgumentParser:
     attest_completion = commands.add_parser("attest-completion")
     attest_completion.add_argument("--unit", required=True)
     attest_completion.add_argument("--run-id", required=True)
+    attest_completion.add_argument(
+        "--result",
+        required=True,
+        help="the result the harness observed (succeeded or failed): finish-run "
+        "requires the completion to bind it, so a failed producer's record "
+        "cannot finish the run as succeeded",
+    )
     attest_completion.add_argument("--commit-sha", required=True)
     attest_completion.add_argument(
         "--commit-repository",

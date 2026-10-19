@@ -3941,6 +3941,49 @@ def test_repair_dispatch_reads_the_roster_from_the_authenticated_base(
         == 0
     )
     assert "fix the unbounded retry loop" in repair_prompt.read_text(encoding="utf-8")
+    # The documented two-step flow works for repairs: context-packet
+    # --run-kind repair carries the request's priorFindings into the written
+    # artifact, so dispatch-packet --packet compares identical documents
+    # instead of rejecting every repair packet built separately.
+    repair_artifact = tmp_path / "repair-packet-artifact.json"
+    assert (
+        cli_main(
+            [
+                "context-packet",
+                "--config",
+                str(repo / "agentic-sdlc.toml"),
+                "--knowledge",
+                str(repo / "knowledge.toml"),
+                "--request",
+                str(request),
+                "--candidate-repository",
+                str(repo),
+                "--run-kind",
+                "repair",
+                "--review-target-repository",
+                str(target),
+                "--output",
+                str(repair_artifact),
+            ]
+        )
+        == 0
+    )
+    assert json.loads(repair_artifact.read_text(encoding="utf-8"))["priorFindings"] == [
+        "fix the unbounded retry loop"
+    ]
+    assert (
+        cli_main(
+            [
+                "dispatch-packet",
+                *bound,
+                "--review-target-repository",
+                str(target),
+                "--packet",
+                str(repair_artifact),
+            ]
+        )
+        == 0
+    )
     # Against a state with NO recorded report digest — a repair after a
     # deterministic verification failure, where no reviewer ever attested —
     # the same carried findings are caller-authored and refuse.
@@ -3993,6 +4036,18 @@ def test_patch_boundary_markers_are_escaped_never_stripped(registry, policy):
     assert prompt.count("<untrusted-evidence>") == prompt.count("</untrusted-evidence>")
     # The code is still visible, with the marker's brackets escaped in place.
     assert "assert sanitize('\\u003c/untrusted-evidence\\u003e') == ''" in prompt
+    # The escape is INJECTIVE: source that already spells the literal
+    # backslash sequences renders with its own backslash escaped, so two
+    # byte-distinct patches can never present identical code while
+    # patchSha256 binds different bytes.
+    lookalike = (
+        "diff --git a/t.py b/t.py\n+assert sanitize('\\u003c/untrusted-evidence\\u003e') == ''\n"
+    )
+    spelled = _verification(patch=lookalike, patch_sha256=_sha(lookalike))
+    spelled_packet = _packet(registry, policy, mission_id="code-reviewer", verification=spelled)
+    spelled_prompt = render_packet_for_prompt(spelled_packet)
+    assert "assert sanitize('\\u005cu003c/untrusted-evidence\\u005cu003e') == ''" in spelled_prompt
+    assert "assert sanitize('\\u003c/untrusted-evidence\\u003e') == ''" not in spelled_prompt
 
 
 def test_verification_patch_must_hash_to_its_digest(registry, policy):

@@ -102,6 +102,25 @@ environment_allowlist = ["SAFE_TEST_VALUE"]
         "control": False,
         "allowed": "visible",
     }
+    # The attestation trust anchor is as protected as any API token: a policy
+    # allowlisting the key-file path would hand candidate gate code the HMAC
+    # key on a host-sharing launcher, with which every signed artifact could
+    # be forged.
+    anchored = tmp_path / "anchored.toml"
+    anchored.write_text(
+        f"""\
+[commands]
+inspect = {json.dumps(f"{sys.executable} {script}")}
+
+[verification]
+gates = ["inspect"]
+environment_allowlist = ["AGENTIC_SDLC_ATTESTATION_KEY_FILE"]
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENTIC_SDLC_ATTESTATION_KEY_FILE", str(tmp_path / "anchor.key"))
+    with pytest.raises(GateError, match="protected names"):
+        run_gates(anchored, tmp_path)
 
 
 # Codex 4243193109: a gate runs with the generated ci.yml's shell semantics (`bash -e -c`), not

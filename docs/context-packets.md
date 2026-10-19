@@ -387,15 +387,17 @@ canonical kind) must EQUAL the recorded kind — an implementation envelope
 replayed as a repair run would bypass the fresh repair dispatch with its
 current authorization, revision, and prompt. An attested `finish-run` with
 `--commit-sha` requires
-`--completion`: the `attest-completion` record (unit, run, commit, AND the
-dispatched envelope's digest, signed under the same key, with the commit
-verified to exist in
+`--completion`: the `attest-completion` record (unit, run, the RESULT the
+harness observed, commit, AND the dispatched envelope's digest, signed
+under the same key, with the commit verified to exist in
 `--commit-repository` when written) produced by the execution harness at
 run completion — mere existence of a commit proves nothing about which run
 produced it, and because run IDs restart when state is recreated, the
 envelope digest is verified against the finished run's recorded
 `envelopeSha256` so a genuine completion from an old history cannot finish
-a recreated run. Attested VERIFICATION and REVIEW transitions require
+a recreated run. The record's `result` must equal `finish-run --result`,
+so a failed producer's genuine completion cannot finish the run as
+succeeded and become the reviewer dispatch's latest successful producer. Attested VERIFICATION and REVIEW transitions require
 `--outcome` the same way: `--result succeeded` and `--findings 0` are
 otherwise raw CLI inputs an invoker could assert over failed gates or an
 unread diff, so the `attest-outcome` record (unit, kind, result, findings,

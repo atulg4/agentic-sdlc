@@ -804,6 +804,11 @@ def _boundary_safe_json(value: str) -> str:
 #: instead: review artifacts must reach the reviewer with every byte intact.
 _BOUNDARY_MARKER = re.compile(r"</?\s*untrusted-(?:evidence|work-request)\s*>", flags=re.IGNORECASE)
 
+#: A backslash opening a sequence this module itself inserts: left unescaped,
+#: source that already spells < (or >, \u0000, \) would render
+#: byte-identically to source whose real marker this function escaped.
+_ESCAPE_LOOKALIKE = re.compile(r"\\(?=u003c|u003e|u0000|u005c)")
+
 
 def _boundary_safe_text(text: str) -> str:
     """Escape boundary markers without deleting a single byte of the text.
@@ -819,8 +824,16 @@ def _boundary_safe_text(text: str) -> str:
     original bytes, so silently deleting NULs would render two distinct
     changes identically while the digest attests bytes the reviewer never
     saw.
+
+    The encoding is INJECTIVE: a pre-existing literal ``\\u003c``-style
+    sequence would otherwise be indistinguishable from one this function
+    inserts, so the backslash opening any such lookalike is escaped first to
+    ``\\u005c`` in one non-rescanning pass — two byte-distinct patches can
+    never render identically, and leftmost-first decoding recovers the exact
+    original.
     """
-    cleaned = text.replace("\x00", "\\u0000")
+    cleaned = _ESCAPE_LOOKALIKE.sub("\\\\u005c", text)
+    cleaned = cleaned.replace("\x00", "\\u0000")
     while True:
         escaped = _BOUNDARY_MARKER.sub(
             lambda match: match.group(0).replace("<", "\\u003c").replace(">", "\\u003e"),

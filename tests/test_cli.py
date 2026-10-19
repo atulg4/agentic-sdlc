@@ -902,11 +902,18 @@ def test_orchestrate_attests_only_runs_a_trusted_dispatch_produced(tmp_path: Pat
     )
     assert "current state snapshot" in capsys.readouterr().err
     assert main([*start, _envelope_file("signed.json", signed)]) == 0
-    # One digest identifies one dispatch: the recorded envelope cannot seed a
-    # second run (a reused review envelope would otherwise report on the
-    # pre-repair packet while advancing the repaired unit).
+    # A retry of the SAME event with the SAME envelope is the orchestrator's
+    # documented event-key idempotency (a caller that lost the response): it
+    # returns the recorded run instead of refusing, and records no second run.
+    assert main([*start, _envelope_file("retried.json", signed)]) == 0
+    assert len(json.loads(state.read_text(encoding="utf-8"))["units"]["42"]["runs"]) == 1
+    # Under a DIFFERENT event, one digest still identifies one dispatch: the
+    # recorded envelope cannot seed a second run (a reused review envelope
+    # would otherwise report on the pre-repair packet while advancing the
+    # repaired unit).
     capsys.readouterr()
-    assert main([*start, _envelope_file("replayed-digest.json", signed)]) == 2
+    replay_start = [entry if entry != "evt-run" else "evt-run-2" for entry in start]
+    assert main([*replay_start, _envelope_file("replayed-digest.json", signed)]) == 2
     assert "already recorded" in capsys.readouterr().err
 
     # The finished run's commit needs COMPLETION PROVENANCE: the execution
@@ -956,6 +963,8 @@ def test_orchestrate_attests_only_runs_a_trusted_dispatch_produced(tmp_path: Pat
         "42",
         "--run-id",
         run_id,
+        "--result",
+        "succeeded",
         "--envelope-sha256",
         signed["envelopeSha256"],
         "--commit-repository",
@@ -1005,6 +1014,19 @@ def test_orchestrate_attests_only_runs_a_trusted_dispatch_produced(tmp_path: Pat
     stale_file = tmp_path / "stale-completion.json"
     stale_file.write_text(json.dumps(stale), encoding="utf-8")
     assert main([*finish, "--completion", str(stale_file)]) == 2
+    # The RESULT is bound too: a genuinely signed completion the harness
+    # recorded as FAILED must not finish the run as succeeded, which would
+    # promote a failed producer into the reviewer dispatch's latest
+    # successful producer.
+    failed_completion = tmp_path / "failed-completion.json"
+    failed_attest = [
+        entry if entry != str(completion) else str(failed_completion) for entry in attest
+    ]
+    failed_attest[failed_attest.index("succeeded")] = "failed"
+    assert main([*failed_attest, "--commit-sha", commit]) == 0
+    capsys.readouterr()
+    assert main([*finish, "--completion", str(failed_completion)]) == 2
+    assert "result and commit" in capsys.readouterr().err
     assert main([*finish, "--completion", str(completion)]) == 0
 
     # VERIFICATION and REVIEW verdicts are caller input too: under a key each

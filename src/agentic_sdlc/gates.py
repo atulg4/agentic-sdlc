@@ -73,6 +73,10 @@ _BASE_ENVIRONMENT = {
 _FORBIDDEN_ENVIRONMENT = {
     "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
     "ACTIONS_RUNTIME_TOKEN",
+    # The attestation trust anchor: handing gate code the key-file PATH on a
+    # host-sharing launcher hands it the HMAC key itself, with which every
+    # authorization, state, completion and outcome artifact could be forged.
+    "AGENTIC_SDLC_ATTESTATION_KEY_FILE",
     "ANTHROPIC_API_KEY",
     "GH_TOKEN",
     "GITHUB_ENV",
