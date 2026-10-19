@@ -275,7 +275,15 @@ target must also BE separate, not merely spelled differently: canonical
 object-store identities (the realpath of each repository's common git
 directory) are compared, so the candidate itself, a symlink alias of it, a
 worktree sharing its store, or a repository nested inside the candidate's
-tree all refuse. The PACKET configuration — the policy AND the
+tree all refuse — and containment refuses in BOTH directions, since a
+candidate checkout nested inside the target's worktree could reach the
+parent's `.git` and move its refs. The evidence patch carries the
+PER-COMMIT SERIES (`git log --patch` over `base..head`): a commit that adds
+content a later commit removes leaves the endpoint tree diff empty while a
+push of the head still publishes the blob, so the reviewer reads every
+intermediate change, the endpoint and whole-series line counters both
+travel in the evidence (`historyAddedLines`/`historyDeletedLines`), and
+`patchSha256` binds the series bytes. The PACKET configuration — the policy AND the
 mission registry and knowledge sources — is read from the same committed
 tree on every candidate path (paths judged lexically with relative values
 repository-relative, never through symlinks), so an uncommitted caller-side
@@ -338,9 +346,26 @@ INPUTS before signing: `dispatch-packet --attestation-key` signs the
 envelope it emits, `orchestrate start-run` under the key accepts only an
 envelope whose mark verifies and whose `envelopeSha256` matches its content
 (so run attribution — agent and mission identity — can neither be
-hand-authored nor re-labeled on a signed envelope), and an attested
-`finish-run` with `--commit-sha` requires `--commit-repository`, where the
-commit must exist, before the state attests it. Reviewer dispatches require `--history`: the
+hand-authored nor re-labeled on a signed envelope), and the envelope must
+be FOR the record: its `workRef` must equal the target unit, and its
+digested `packetRole` must permit the run kind (builders
+implement/repair, testers verify, reviewers review), so a genuine envelope
+cannot be replayed into another work item or recorded under a
+non-producing kind. An attested `finish-run` with `--commit-sha` requires
+`--completion`: the `attest-completion` record (unit, run, commit, signed
+under the same key, with the commit verified to exist in
+`--commit-repository` when written) produced by the execution harness at
+run completion — mere existence of a commit proves nothing about which run
+produced it. The agent roster is repository-owned configuration exactly
+like the policy: `dispatch-packet` reads `--agents` from the committed
+candidate tree at the packet's pinned revision, so a caller-side roster
+cannot relabel a producing agent under a fresh `agentId` or route
+authorized work to an undeclared executor. And every command that derives
+or attests these artifacts (`context-packet`, `dispatch-packet`,
+`orchestrate`, `attest-completion`) runs under STRICT executable trust:
+working-tree `trust_mode` and the `AGENTIC_SDLC_GIT`/`AGENTIC_SDLC_GH`
+overrides are ignored, so a candidate-planted git cannot fabricate the
+commits and identities the artifacts are signed over. Reviewer dispatches require `--history`: the
 ORCHESTRATOR STATE document, verified against the attestation key and
 replayed through the orchestrator's own
 validation, whose recorded runs for this work item (mission and agent

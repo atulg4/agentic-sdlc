@@ -737,6 +737,38 @@ def test_orchestrate_cli_round_trips_state(tmp_path: Path) -> None:
     assert main([*base, "--action", "transition", "--event-key", "evt-3", "--to", "merged"]) == 2
 
 
+def test_packet_commands_run_under_strict_executable_trust(tmp_path: Path, monkeypatch, capsys):
+    # Packet derivation and attested orchestration derive trust artifacts:
+    # they resolve git strictly, and an executable override is ignored with a
+    # warning instead of trusting a candidate-planted program.
+    from agentic_sdlc.cli import GATE_COMMANDS
+
+    assert {"context-packet", "dispatch-packet", "orchestrate", "attest-completion"} <= (
+        GATE_COMMANDS
+    )
+    monkeypatch.setenv("AGENTIC_SDLC_GIT", str(tmp_path / "planted-git"))
+    state = tmp_path / "state.json"
+    assert (
+        main(
+            [
+                "orchestrate",
+                "--state",
+                str(state),
+                "--unit",
+                "9",
+                "--timestamp",
+                "2026-08-06T12:00:00Z",
+                "--action",
+                "create",
+                "--event-key",
+                "evt-1",
+            ]
+        )
+        == 0
+    )
+    assert "is ignored by" in capsys.readouterr().err
+
+
 def test_orchestrate_attests_only_runs_a_trusted_dispatch_produced(tmp_path: Path) -> None:
     # An attested state records only dispatch-signed envelopes: a
     # hand-authored envelope — or a signed one whose agent was re-labeled —
@@ -795,16 +827,26 @@ def test_orchestrate_attests_only_runs_a_trusted_dispatch_produced(tmp_path: Pat
         "workRef": "42",
         "inputRefs": [],
         "promptSha256": "0" * 64,
+        "packetRole": "builder",
     }
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
     envelope = {**body, "envelopeSha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest()}
     signed = {**envelope, "attestation": _attest_document(envelope, secret)}
-    unsigned_file = tmp_path / "unsigned-envelope.json"
-    unsigned_file.write_text(json.dumps(envelope), encoding="utf-8")
-    relabeled_file = tmp_path / "relabeled-envelope.json"
-    relabeled_file.write_text(json.dumps({**signed, "agentId": "innocent"}), encoding="utf-8")
-    signed_file = tmp_path / "signed-envelope.json"
-    signed_file.write_text(json.dumps(signed), encoding="utf-8")
+
+    def _envelope_file(name: str, document: dict) -> str:
+        path = tmp_path / name
+        path.write_text(json.dumps(document), encoding="utf-8")
+        return str(path)
+
+    def _signed_for(**overrides) -> dict:
+        changed = {**body, **overrides}
+        changed_canonical = json.dumps(changed, sort_keys=True, separators=(",", ":"))
+        changed = {
+            **changed,
+            "envelopeSha256": hashlib.sha256(changed_canonical.encode("utf-8")).hexdigest(),
+        }
+        return {**changed, "attestation": _attest_document(changed, secret)}
+
     start = [
         *base,
         "--action",
@@ -817,11 +859,18 @@ def test_orchestrate_attests_only_runs_a_trusted_dispatch_produced(tmp_path: Pat
         stamp,
         "--envelope",
     ]
-    assert main([*start, str(unsigned_file)]) == 2
-    assert main([*start, str(relabeled_file)]) == 2
-    assert main([*start, str(signed_file)]) == 0
+    # Unsigned, re-labeled after signing, replayed from another work item,
+    # or declared for a non-producing role: each refuses.
+    assert main([*start, _envelope_file("unsigned.json", envelope)]) == 2
+    assert main([*start, _envelope_file("relabeled.json", {**signed, "agentId": "x"})]) == 2
+    assert main([*start, _envelope_file("replayed.json", _signed_for(workRef="43"))]) == 2
+    assert main([*start, _envelope_file("reviewer.json", _signed_for(packetRole="reviewer"))]) == 2
+    assert main([*start, _envelope_file("signed.json", signed)]) == 0
 
-    # The finished run's commit must exist in the trusted checkout.
+    # The finished run's commit needs COMPLETION PROVENANCE: the execution
+    # harness's attest-completion record binding this unit, run and commit —
+    # and attest-completion itself requires the commit to exist in the
+    # trusted checkout.
     repo = tmp_path / "trusted-checkout"
     repo.mkdir()
     env = {
@@ -856,6 +905,24 @@ def test_orchestrate_attests_only_runs_a_trusted_dispatch_produced(tmp_path: Pat
         text=True,
     ).stdout.strip()
     run_id = "42:run-001"
+    completion = tmp_path / "completion.json"
+    # attest-completion refuses a commit that exists nowhere, and binds the
+    # record to this exact unit, run and commit.
+    attest = [
+        "attest-completion",
+        "--unit",
+        "42",
+        "--run-id",
+        run_id,
+        "--commit-repository",
+        str(repo),
+        "--attestation-key",
+        str(key_file),
+        "--output",
+        str(completion),
+    ]
+    assert main([*attest, "--commit-sha", "f" * 40]) == 2
+    assert main([*attest, "--commit-sha", commit]) == 0
     finish = [
         *base,
         "--action",
@@ -866,21 +933,27 @@ def test_orchestrate_attests_only_runs_a_trusted_dispatch_produced(tmp_path: Pat
         "succeeded",
         "--timestamp",
         stamp,
+        "--commit-sha",
+        commit,
     ]
-    assert main([*finish, "--commit-sha", commit]) == 2
-    assert (
-        main(
-            [
-                *finish,
-                "--commit-sha",
-                "f" * 40,
-                "--commit-repository",
-                str(repo),
-            ]
-        )
-        == 2
-    )
-    assert main([*finish, "--commit-sha", commit, "--commit-repository", str(repo)]) == 0
+    # Without the completion record — or with one bound to another run — the
+    # attested finish refuses; the genuine record finishes the run.
+    assert main(finish) == 2
+    other = json.loads(completion.read_text(encoding="utf-8"))
+    other["runId"] = "42:run-999"
+    from agentic_sdlc.cli import _attest_document as _sign
+
+    other["attestation"] = _sign(other, secret)
+    mismatched = tmp_path / "mismatched-completion.json"
+    mismatched.write_text(json.dumps(other), encoding="utf-8")
+    assert main([*finish, "--completion", str(mismatched)]) == 2
+    tampered_completion = json.loads(completion.read_text(encoding="utf-8"))
+    tampered_completion["commitSha"] = commit
+    tampered_completion["unit"] = "43"
+    unsigned_completion = tmp_path / "unsigned-completion.json"
+    unsigned_completion.write_text(json.dumps(tampered_completion), encoding="utf-8")
+    assert main([*finish, "--completion", str(unsigned_completion)]) == 2
+    assert main([*finish, "--completion", str(completion)]) == 0
 
 
 def test_orchestrate_attests_state_under_a_key(tmp_path: Path) -> None:

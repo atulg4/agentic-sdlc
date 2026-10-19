@@ -57,6 +57,20 @@ HEAD = "f" * 40
 BASE = "e" * 40
 WORK_REF = "example/project#118"
 
+#: The committed write-capable roster: dispatch reads --agents from the
+#: candidate tree at the pinned revision, never from a caller-side file.
+CODEX_ROSTER = [
+    {
+        "agentId": "codex-1",
+        "adapter": "codex",
+        "adapterVersion": "1.0.0",
+        "provider": "openai",
+        "model": "gpt-5",
+        "capabilities": ["edit-code", "author-tests", "run-commands"],
+        "contextWindowTokens": 4000000,
+    }
+]
+
 TASK = TaskSpec(
     title="P1: harden the packet scheduler",
     summary="Harden the scheduler so retries stay bounded.",
@@ -132,12 +146,16 @@ def _authorization(path, title: str, body: str, **overrides):
     return path
 
 
-def _candidate_fixture(tmp_path, policy_file, extra_knowledge=""):
+def _candidate_fixture(tmp_path, policy_file, extra_knowledge="", agents=None):
     """A committed candidate repository: every dispatch pins its config."""
     import subprocess
 
     repo = tmp_path / "candidate-config"
     repo.mkdir()
+    if agents is not None:
+        # The roster is repository-owned configuration: dispatch reads it
+        # from the committed tree at the pinned revision.
+        (repo / "agents.json").write_text(json.dumps(agents), encoding="utf-8")
     env = {
         "GIT_AUTHOR_NAME": "t",
         "GIT_AUTHOR_EMAIL": "t@example.com",
@@ -156,6 +174,8 @@ def _candidate_fixture(tmp_path, policy_file, extra_knowledge=""):
     )
     (repo / "knowledge.toml").write_text(KNOWLEDGE_TOML + extra_knowledge + "\n", encoding="utf-8")
     git("add", "agentic-sdlc.toml", "knowledge.toml")
+    if agents is not None:
+        git("add", "agents.json")
     git("commit", "-q", "-m", "config")
     pin = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "HEAD"],
@@ -1498,7 +1518,7 @@ def test_nonprintable_retrieval_failures_are_escaped(registry, policy):
 def test_the_cli_dispatches_through_the_packet_contract(tmp_path, policy_file, valid_body):
     from agentic_sdlc.cli import main as cli_main
 
-    repo, _git, pin = _candidate_fixture(tmp_path, policy_file)
+    repo, _git, pin = _candidate_fixture(tmp_path, policy_file, agents=CODEX_ROSTER)
     knowledge = repo / "knowledge.toml"
     request = tmp_path / "request.json"
     request.write_text(
@@ -1527,23 +1547,7 @@ def test_the_cli_dispatches_through_the_packet_contract(tmp_path, policy_file, v
         ),
         encoding="utf-8",
     )
-    agents = tmp_path / "agents.json"
-    agents.write_text(
-        json.dumps(
-            [
-                {
-                    "agentId": "codex-1",
-                    "adapter": "codex",
-                    "adapterVersion": "1.0.0",
-                    "provider": "openai",
-                    "model": "gpt-5",
-                    "capabilities": ["edit-code", "author-tests", "run-commands"],
-                    "contextWindowTokens": 4000000,
-                }
-            ]
-        ),
-        encoding="utf-8",
-    )
+    agents = repo / "agents.json"
     authorization = _authorization(tmp_path / "authorized.json", "P1: a bounded change", valid_body)
     key = _key_file(tmp_path)
     artifact = tmp_path / "packet.json"
@@ -1585,6 +1589,26 @@ def test_the_cli_dispatches_through_the_packet_contract(tmp_path, policy_file, v
     assert envelope["contextPackDigest"] == document["packetSha256"]
     assert f"sha256:{document['pack']['packSha256']}" in envelope["inputRefs"]
     assert len(envelope["promptSha256"]) == 64
+
+    # The roster is repository-owned configuration: a caller-side file
+    # outside the candidate repository never supplies agent identities.
+    outside = tmp_path / "outside-roster.json"
+    outside.write_text(json.dumps(CODEX_ROSTER), encoding="utf-8")
+    assert (
+        cli_main(
+            [
+                "dispatch-packet",
+                *base,
+                "--agents",
+                str(outside),
+                "--authorization",
+                str(authorization),
+                "--attestation-key",
+                str(key),
+            ]
+        )
+        == 2
+    )
 
     # A packet artifact that does not match the rebuilt packet must not
     # dispatch — including one whose CONTENT was edited while its digest
@@ -2016,6 +2040,33 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
         policy_file.read_text(encoding="utf-8"), encoding="utf-8"
     )
     (repo / "knowledge.toml").write_text(KNOWLEDGE_TOML + "\n", encoding="utf-8")
+    # The reviewer roster is repository-owned configuration: dispatch reads
+    # it from the committed tree at the pinned revision.
+    (repo / "reviewers.json").write_text(
+        json.dumps(
+            [
+                {
+                    "agentId": "tiny-reviewer",
+                    "adapter": "claude",
+                    "adapterVersion": "1.0.0",
+                    "provider": "anthropic",
+                    "model": "claude-haiku-5-5",
+                    "capabilities": ["review-code"],
+                    "contextWindowTokens": 300,
+                },
+                {
+                    "agentId": "roomy-reviewer",
+                    "adapter": "claude",
+                    "adapterVersion": "1.0.0",
+                    "provider": "anthropic",
+                    "model": "claude-opus-5",
+                    "capabilities": ["review-code"],
+                    "contextWindowTokens": 4000000,
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
     git(
         "add",
         "a.txt",
@@ -2024,6 +2075,7 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
         ".gitignore",
         "agentic-sdlc.toml",
         "knowledge.toml",
+        "reviewers.json",
     )
     git("commit", "-q", "-m", "base")
     base = subprocess.run(
@@ -2132,33 +2184,9 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
     history_file = _run_history(tmp_path / "history.json", commit_sha=head)
 
     # A derived artifact dispatches: durations are zeroed at derivation, so
-    # the whole-document comparison is exact.
-    agents_roster = tmp_path / "reviewers.json"
-    agents_roster.write_text(
-        json.dumps(
-            [
-                {
-                    "agentId": "tiny-reviewer",
-                    "adapter": "claude",
-                    "adapterVersion": "1.0.0",
-                    "provider": "anthropic",
-                    "model": "claude-haiku-5-5",
-                    "capabilities": ["review-code"],
-                    "contextWindowTokens": 300,
-                },
-                {
-                    "agentId": "roomy-reviewer",
-                    "adapter": "claude",
-                    "adapterVersion": "1.0.0",
-                    "provider": "anthropic",
-                    "model": "claude-opus-5",
-                    "capabilities": ["review-code"],
-                    "contextWindowTokens": 4000000,
-                },
-            ]
-        ),
-        encoding="utf-8",
-    )
+    # the whole-document comparison is exact. The roster was committed at the
+    # base like the rest of the repository-owned configuration.
+    agents_roster = repo / "reviewers.json"
     envelope_path = tmp_path / "envelope.json"
     assert (
         cli_main(
@@ -2541,6 +2569,49 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
         assert "must be a separate repository" in capsys.readouterr().err
     git("worktree", "remove", "--force", str(linked))
 
+    # Containment refuses in BOTH directions: a candidate nested inside the
+    # target's worktree could reach the parent's .git and move its refs.
+    outer = tmp_path / "outer-target"
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(outer)],
+        check=True,
+        env=env,
+        capture_output=True,
+    )
+    nested = outer / "nested-candidate"
+    subprocess.run(
+        ["git", "clone", "--quiet", str(repo), str(nested)],
+        check=True,
+        env=env,
+        capture_output=True,
+    )
+    capsys.readouterr()
+    assert (
+        cli_main(
+            [
+                "context-packet",
+                "--config",
+                str(nested / "agentic-sdlc.toml"),
+                "--knowledge",
+                str(nested / "knowledge.toml"),
+                "--request",
+                str(request),
+                "--candidate-repository",
+                str(nested),
+                "--candidate-base",
+                base,
+                "--candidate-head",
+                head,
+                "--review-target-repository",
+                str(outer),
+                "--gate-sandbox",
+                "trusted-host",
+            ]
+        )
+        == 2
+    )
+    assert "must be a separate repository" in capsys.readouterr().err
+
     # Gates run under the configuration committed at the AUTHENTICATED BASE:
     # a candidate commit that replaces the configured gates with an
     # always-passing command never records a passing report under its own
@@ -2735,7 +2806,7 @@ def test_dispatch_packet_enforces_task_policy(tmp_path, policy_file, valid_body,
     # envelope just because it came in as a packet.
     from agentic_sdlc.cli import main as cli_main
 
-    repo, _git, pin = _candidate_fixture(tmp_path, policy_file)
+    repo, _git, pin = _candidate_fixture(tmp_path, policy_file, agents=CODEX_ROSTER)
     knowledge = repo / "knowledge.toml"
     request = tmp_path / "request.json"
     request.write_text(
@@ -2750,23 +2821,7 @@ def test_dispatch_packet_enforces_task_policy(tmp_path, policy_file, valid_body,
         ),
         encoding="utf-8",
     )
-    agents = tmp_path / "agents.json"
-    agents.write_text(
-        json.dumps(
-            [
-                {
-                    "agentId": "codex-1",
-                    "adapter": "codex",
-                    "adapterVersion": "1.0.0",
-                    "provider": "openai",
-                    "model": "gpt-5",
-                    "capabilities": ["edit-code", "author-tests", "run-commands"],
-                    "contextWindowTokens": 4000000,
-                }
-            ]
-        ),
-        encoding="utf-8",
-    )
+    agents = repo / "agents.json"
     base = [
         "--config",
         str(repo / "agentic-sdlc.toml"),
@@ -2901,7 +2956,8 @@ def test_write_capable_dispatch_verifies_repository_evidence(
         policy_file.read_text(encoding="utf-8"), encoding="utf-8"
     )
     (repo / "knowledge.toml").write_text(KNOWLEDGE_TOML + "\n", encoding="utf-8")
-    git("add", "src/scheduler.py", "agentic-sdlc.toml", "knowledge.toml")
+    (repo / "agents.json").write_text(json.dumps(CODEX_ROSTER), encoding="utf-8")
+    git("add", "src/scheduler.py", "agentic-sdlc.toml", "knowledge.toml", "agents.json")
     git("commit", "-q", "-m", "pin")
     pin = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "HEAD"],
@@ -2940,23 +2996,7 @@ def test_write_capable_dispatch_verifies_repository_evidence(
         return path
 
     request = _request(tmp_path / "request.json")
-    agents = tmp_path / "agents.json"
-    agents.write_text(
-        json.dumps(
-            [
-                {
-                    "agentId": "codex-1",
-                    "adapter": "codex",
-                    "adapterVersion": "1.0.0",
-                    "provider": "openai",
-                    "model": "gpt-5",
-                    "capabilities": ["edit-code", "author-tests", "run-commands"],
-                    "contextWindowTokens": 4000000,
-                }
-            ]
-        ),
-        encoding="utf-8",
-    )
+    agents = repo / "agents.json"
     authorization = _authorization(
         tmp_path / "authorization.json", "P1: a bounded change", valid_body
     )
@@ -3061,8 +3101,10 @@ def test_write_capable_dispatch_verifies_repository_evidence(
     (repo / "agentic-sdlc.toml").unlink()
     os_.symlink("decoy.toml", repo / "agentic-sdlc.toml")
     # The knowledge configuration is committed too; its working copy is
-    # equally irrelevant.
+    # equally irrelevant — and so is the roster's: dispatch reads agent
+    # identities from the committed tree at the pinned revision.
     (repo / "knowledge.toml").write_text("not the knowledge config\n", encoding="utf-8")
+    (repo / "agents.json").write_text("not the roster\n", encoding="utf-8")
     envelope_path = tmp_path / "envelope.json"
     assert (
         cli_main(
@@ -3239,6 +3281,116 @@ def test_derived_patch_preserves_non_utf8_bytes(tmp_path, policy_file, valid_bod
     assert hashlib.sha256(raw).hexdigest() == verification["patchSha256"]
 
 
+def test_derived_patch_carries_intermediate_commits(tmp_path, policy_file, valid_body):
+    # A commit that adds content a later commit removes leaves the endpoint
+    # tree diff empty, but a push of the head still publishes the blob: the
+    # reviewer patch carries the per-commit series, and the history counters
+    # travel in the evidence.
+    import subprocess
+
+    from agentic_sdlc.cli import main as cli_main
+
+    repo = tmp_path / "series-candidate"
+    repo.mkdir()
+    env = {
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.com",
+        "HOME": str(tmp_path),
+        "PATH": "/usr/bin:/bin",
+    }
+
+    def git(*argv):
+        subprocess.run(["git", "-C", str(repo), *argv], check=True, env=env, capture_output=True)
+
+    def head_of() -> str:
+        return subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            check=True,
+            env=env,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    git("init", "-q", "-b", "main")
+    (repo / "src").mkdir()
+    (repo / "src" / "scheduler.py").write_text(
+        "class Scheduler:\n    retries = 2\n", encoding="utf-8"
+    )
+    (repo / "agentic-sdlc.toml").write_text(
+        policy_file.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (repo / "knowledge.toml").write_text(KNOWLEDGE_TOML + "\n", encoding="utf-8")
+    git("add", "src/scheduler.py", "agentic-sdlc.toml", "knowledge.toml")
+    git("commit", "-q", "-m", "base")
+    base_sha = head_of()
+    target = tmp_path / "series-target"
+    subprocess.run(
+        ["git", "clone", "--quiet", str(repo), str(target)],
+        check=True,
+        env=env,
+        capture_output=True,
+    )
+    (repo / "planted.txt").write_text("PLANTED = intermediate\n", encoding="utf-8")
+    git("add", "planted.txt")
+    git("commit", "-q", "-m", "plant")
+    git("rm", "-q", "planted.txt")
+    git("commit", "-q", "-m", "unplant")
+    head_sha = head_of()
+    request = tmp_path / "series-request.json"
+    request.write_text(
+        json.dumps(
+            {
+                "missionId": "code-reviewer",
+                "workRef": WORK_REF,
+                "task": {"title": "P1: a bounded change", "body": valid_body},
+                "records": [
+                    _record(external_id=f"src/scheduler.py@{head_sha}", revision=head_sha).as_dict()
+                ],
+                "repositoryRevision": head_sha,
+            }
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "series-packet.json"
+    assert (
+        cli_main(
+            [
+                "context-packet",
+                "--config",
+                str(repo / "agentic-sdlc.toml"),
+                "--knowledge",
+                str(repo / "knowledge.toml"),
+                "--request",
+                str(request),
+                "--candidate-repository",
+                str(repo),
+                "--candidate-base",
+                base_sha,
+                "--candidate-head",
+                head_sha,
+                "--review-target-repository",
+                str(target),
+                "--gate-sandbox",
+                "trusted-host",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    verification = json.loads(output.read_text(encoding="utf-8"))["verification"]
+    # The endpoint tree diff is empty, yet the published history is not: the
+    # reviewer still reads the intermediate change and its counters.
+    assert verification["addedLines"] == 0
+    assert verification["deletedLines"] == 0
+    assert "planted.txt" in verification["diffPaths"]
+    assert "PLANTED = intermediate" in verification["patch"]
+    assert verification["historyAddedLines"] >= 1
+    assert verification["historyDeletedLines"] >= 1
+
+
 def test_multiple_producing_agents_are_all_excluded(registry):
     # A work item can carry several runs of one producing mission by
     # different agents: every one of them is excluded from reviewing.
@@ -3280,7 +3432,9 @@ def test_dispatch_refuses_unattested_evidence(tmp_path, policy_file, valid_body,
         'locator = "https://github.com/example/project/issues"\n'
         'scope = "example/project"'
     )
-    repo, _git, pin = _candidate_fixture(tmp_path, policy_file, extra_knowledge=tracker_source)
+    repo, _git, pin = _candidate_fixture(
+        tmp_path, policy_file, extra_knowledge=tracker_source, agents=CODEX_ROSTER
+    )
     knowledge = repo / "knowledge.toml"
     record = _record(
         source_id="tracker",
@@ -3310,23 +3464,7 @@ def test_dispatch_refuses_unattested_evidence(tmp_path, policy_file, valid_body,
         ),
         encoding="utf-8",
     )
-    agents = tmp_path / "agents.json"
-    agents.write_text(
-        json.dumps(
-            [
-                {
-                    "agentId": "codex-1",
-                    "adapter": "codex",
-                    "adapterVersion": "1.0.0",
-                    "provider": "openai",
-                    "model": "gpt-5",
-                    "capabilities": ["edit-code", "author-tests", "run-commands"],
-                    "contextWindowTokens": 4000000,
-                }
-            ]
-        ),
-        encoding="utf-8",
-    )
+    agents = repo / "agents.json"
     authorization = _authorization(
         tmp_path / "authorization.json", "P1: a bounded change", valid_body
     )

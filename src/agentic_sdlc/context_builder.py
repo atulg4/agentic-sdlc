@@ -211,6 +211,11 @@ class VerificationEvidence:
     gate_report: Mapping[str, Any]
     prior_findings: tuple[str, ...] = ()
     base_sha: str = ""
+    #: The per-commit sums over the whole series: a push publishes the
+    #: history, not only the end state, so the reviewer is told how much the
+    #: series changed even when later commits shrank the endpoint diff.
+    history_added_lines: int = 0
+    history_deleted_lines: int = 0
     #: The candidate patch text itself (the raw bytes lossily decoded; the
     #: digest above binds the exact bytes). The reviewer must be able to READ
     #: the change under review, not only its hash and path names — and it is
@@ -269,6 +274,8 @@ class VerificationEvidence:
         for count, label in (
             (self.added_lines, "added_lines"),
             (self.deleted_lines, "deleted_lines"),
+            (self.history_added_lines, "history_added_lines"),
+            (self.history_deleted_lines, "history_deleted_lines"),
         ):
             if type(count) is not int or count < 0:
                 raise ContextBuilderError(f"verification {label} must be a non-negative integer")
@@ -400,6 +407,8 @@ class VerificationEvidence:
             "diffPaths": list(self.diff_paths),
             "addedLines": self.added_lines,
             "deletedLines": self.deleted_lines,
+            "historyAddedLines": self.history_added_lines,
+            "historyDeletedLines": self.history_deleted_lines,
             "patchSha256": self.patch_sha256,
             # Detached nested structures: a caller mutating the returned
             # report must never reach the validated original.
@@ -444,6 +453,8 @@ def verification_from_dict(document: Mapping[str, Any]) -> VerificationEvidence:
         diff_paths=tuple(diff_paths),
         added_lines=document.get("addedLines", -1),
         deleted_lines=document.get("deletedLines", -1),
+        history_added_lines=document.get("historyAddedLines", 0),
+        history_deleted_lines=document.get("historyDeletedLines", 0),
         patch_sha256=_text("patchSha256"),
         gate_report=dict(gate_report),
         prior_findings=tuple(findings),
@@ -889,7 +900,10 @@ def _verification_section(verification: VerificationEvidence) -> str:
         ),
         (
             f"- lines added {verification.added_lines}, deleted "
-            f"{verification.deleted_lines}; patch sha256 {verification.patch_sha256}"
+            f"{verification.deleted_lines} (whole series: added "
+            f"{verification.history_added_lines}, deleted "
+            f"{verification.history_deleted_lines}); patch sha256 "
+            f"{verification.patch_sha256}"
         ),
         # Canonical JSON is already one physical line (string content is
         # escaped), so only boundary markers are stripped: collapsing
@@ -920,7 +934,9 @@ def _verification_section(verification: VerificationEvidence) -> str:
         # marker text ESCAPED, never stripped: the reviewer must see the
         # candidate's code exactly, including code that spells a marker.
         described = (
-            "The candidate patch below is the change under review"
+            "The candidate patch below is the change under review (derived "
+            "evidence carries the per-commit series, since a push publishes "
+            "every intermediate change, not only the end state)"
             if verification.patch_encoding == "utf-8"
             else (
                 "The candidate patch below is the change under review, "
@@ -1581,4 +1597,8 @@ def dispatch_envelope_for_packet(
             *((f"revision:{packet.repository_revision}",) if packet.repository_revision else ()),
         ),
         context_pack_digest=packet.packet_sha256,
+        # The role travels in the digested body, so an attested orchestrate
+        # run can refuse this envelope under any kind its role does not
+        # permit.
+        packet_role=packet.role,
     )

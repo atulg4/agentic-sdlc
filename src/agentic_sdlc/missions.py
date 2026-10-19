@@ -694,6 +694,7 @@ def create_dispatch_envelope(
     prompt: str,
     input_refs: Sequence[str] = (),
     context_pack_digest: str | None = None,
+    packet_role: str = "",
 ) -> dict[str, Any]:
     """Pin one dispatch to mission version, adapter, model, and prompt digest.
 
@@ -723,6 +724,14 @@ def create_dispatch_envelope(
             "maxRetries": mission.max_retries,
         },
     }
+    if packet_role:
+        # The packet role declares which run kinds this dispatch may seed
+        # (builders implement/repair, testers verify, reviewers review): an
+        # attested orchestrate run refuses an envelope recorded under any
+        # other kind, so a producing envelope can never be laundered into a
+        # non-producing run record. Inside the body BEFORE the digest, so
+        # both the envelope digest and the attestation cover it.
+        body["packetRole"] = packet_role
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
     body["envelopeSha256"] = _sha256_text(canonical)
     return body

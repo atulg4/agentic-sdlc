@@ -424,6 +424,36 @@ def collect_commit_diff(repository: str | Path, base: str, head: str = "HEAD") -
     )
 
 
+def collect_series_patch(repository: str | Path, base: str, head: str) -> bytes:
+    """Every published change of ``base..head`` as per-commit patches.
+
+    A push of ``head`` publishes the whole series, not only its end state: a
+    commit that adds content a later commit removes leaves the endpoint tree
+    diff empty while the pushed history still carries the blob. The reviewer
+    therefore reads the per-commit patches (``git log --patch``), which show
+    every intermediate change the endpoint diff can hide. No external diff
+    or textconv program runs."""
+    for rev in (base, head):
+        if not rev or rev.startswith("-"):
+            raise GitDiffError(f"not a revision: {rev!r}")
+    root = _bind(repository)
+    return _run(
+        [
+            "git",
+            "log",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--binary",
+            "--full-index",
+            "--patch",
+            "--reverse",
+            f"{base}..{head}",
+            "--",
+        ],
+        root,
+    ).stdout
+
+
 def committed_path(repository: str | Path, path: str | Path) -> str:
     """`path` as a path inside the repository at `repository` (POSIX, relative to its top
     level), for reading it from a commit. A relative `path` is taken relative to the top level;

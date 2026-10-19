@@ -51,6 +51,7 @@ from .git_diff import (
     GitDiffError,
     collect_commit_diff,
     collect_git_diff,
+    collect_series_patch,
     committed_path,
     derivation_tree,
     read_committed_file,
@@ -917,17 +918,24 @@ def _derived_verification(
     # worktree sharing its store, or a repository inside the candidate's own
     # tree is candidate-mutable, and its refs would authenticate nothing.
     candidate_root = os.path.realpath(args.candidate_repository)
+    target_root = os.path.realpath(args.review_target_repository)
     target_identity = repository_identity(args.review_target_repository)
     if (
         target_identity == repository_identity(args.candidate_repository)
         or target_identity == candidate_root
         or target_identity.startswith(candidate_root + os.sep)
+        # Containment refuses in BOTH directions: a candidate checkout
+        # nested inside the target's worktree can reach the parent's .git
+        # and move its refs, so the "authoritative" base would be
+        # candidate-mutable again.
+        or candidate_root == target_root
+        or candidate_root.startswith(target_root + os.sep)
     ):
         raise ContextBuilderError(
             "--review-target-repository must be a separate repository: the "
             "candidate itself, a symlink alias, a worktree sharing its object "
-            "store, or a repository inside the candidate tree is "
-            "candidate-mutable and authenticates nothing"
+            "store, or a repository containing or contained by the candidate "
+            "tree is candidate-mutable and authenticates nothing"
         )
     try:
         expected_base = resolve_commit(
@@ -997,6 +1005,12 @@ def _derived_verification(
                 "--gate-sandbox must name a non-empty wrapper command, or the literal trusted-host"
             )
     snapshot = collect_commit_diff(args.candidate_repository, base, head)
+    # The reviewer reads the SERIES, not only its end state: a commit that
+    # adds content a later commit removes leaves the endpoint tree diff
+    # empty while a push of the head still publishes the blob, so the
+    # evidence patch carries the per-commit patches and the digest binds
+    # those bytes.
+    series_patch = collect_series_patch(args.candidate_repository, base, head)
     # The caller's own checkout is not evidence: it can be dirty, carry
     # ignored files a gate would read, or have status output suppressed by
     # repository-local configuration — and a gate run leaves caches behind
@@ -1052,10 +1066,10 @@ def _derived_verification(
     # non-UTF-8 changes identically, so bytes that are not UTF-8 travel
     # base64-encoded instead of lossily decoded.
     try:
-        patch_text = snapshot.patch.decode("utf-8")
+        patch_text = series_patch.decode("utf-8")
         patch_encoding = "utf-8"
     except UnicodeDecodeError:
-        patch_text = base64.b64encode(snapshot.patch).decode("ascii")
+        patch_text = base64.b64encode(series_patch).decode("ascii")
         patch_encoding = "base64"
     return VerificationEvidence(
         head_sha=head,
@@ -1063,7 +1077,9 @@ def _derived_verification(
         diff_paths=snapshot.paths,
         added_lines=snapshot.added_lines,
         deleted_lines=snapshot.deleted_lines,
-        patch_sha256=hashlib.sha256(snapshot.patch).hexdigest(),
+        history_added_lines=snapshot.history_added_lines,
+        history_deleted_lines=snapshot.history_deleted_lines,
+        patch_sha256=hashlib.sha256(series_patch).hexdigest(),
         gate_report=report,
         prior_findings=tuple(findings),
         patch=patch_text,
@@ -1484,7 +1500,19 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
                 "the packet artifact does not match the packet rebuilt from the "
                 "request; rebuild the packet before dispatching"
             )
-    agents = load_agents(json.loads(Path(args.agents).read_text(encoding="utf-8")))
+    # The roster is repository-owned configuration like the policy and the
+    # mission registry: an uncommitted caller-side roster could relabel a
+    # producing agent under a fresh agentId to evade the history exclusions,
+    # or route authorized write work to an undeclared executor — and the
+    # resulting envelope would then be SIGNED as a trusted dispatch. It is
+    # read from the committed tree at the packet's pinned revision.
+    agents = load_agents(
+        json.loads(
+            _committed_configuration(
+                args, packet.repository_revision, args.agents, "--agents"
+            ).decode("utf-8")
+        )
+    )
     history: dict[str, list[str]] = {}
     producing_agents: set[str] = set()
     unit_runs: tuple = ()
@@ -1617,14 +1645,27 @@ def _route_executor(args: argparse.Namespace) -> int:
     return 0 if decision.selected_executor_id else 2
 
 
-def _require_attested_envelope(envelope, key: bytes) -> None:
+#: The run kinds each packet role's dispatches may seed: builders produce,
+#: testers verify, reviewers review. A producing envelope recorded under a
+#: non-producing kind would launder its agent past review exclusions.
+_ROLE_RUN_KINDS = {
+    "builder": frozenset({"implementation", "repair"}),
+    "tester": frozenset({"verification"}),
+    "reviewer": frozenset({"review"}),
+}
+
+
+def _require_attested_envelope(envelope, key: bytes, *, unit: str, kind: str) -> None:
     """An attested state records only runs a trusted dispatch produced.
 
     The envelope names the run's agent and mission — exactly what review
     exclusions are later derived from — so a hand-authored envelope must not
     seed the state: its attestation must verify under the shared key, and its
     self-digest must match its content so a signed envelope cannot be
-    re-labeled either.
+    re-labeled either. The envelope must also be FOR this record: a genuine
+    envelope replayed into another work item, or recorded under a kind its
+    packet role does not permit, would fabricate run attribution exactly like
+    a forged one.
     """
     mark = envelope.get(_ATTESTATION_FIELD) if isinstance(envelope, Mapping) else None
     if not isinstance(mark, str) or not hmac.compare_digest(mark, _attest_document(envelope, key)):
@@ -1643,6 +1684,19 @@ def _require_attested_envelope(envelope, key: bytes) -> None:
         raise OrchestrationError(
             "the dispatch envelope's envelopeSha256 does not match its "
             "content; regenerate the envelope with dispatch-packet"
+        )
+    if envelope.get("workRef") != unit:
+        raise OrchestrationError(
+            f"the dispatch envelope names work item {envelope.get('workRef')!r}, "
+            f"not --unit {unit!r}; an attested run records only the envelope's "
+            "own work item"
+        )
+    permitted = _ROLE_RUN_KINDS.get(str(envelope.get("packetRole") or ""), frozenset())
+    if kind not in permitted:
+        raise OrchestrationError(
+            f"the dispatch envelope's packet role "
+            f"{envelope.get('packetRole')!r} does not permit a {kind} run; an "
+            "attested run records only the kind its dispatch declared"
         )
 
 
@@ -1693,7 +1747,7 @@ def _orchestrate(args: argparse.Namespace) -> int:
     elif args.action == "start-run":
         envelope = json.loads(Path(args.envelope).read_text(encoding="utf-8"))
         if key is not None:
-            _require_attested_envelope(envelope, key)
+            _require_attested_envelope(envelope, key, unit=args.unit, kind=args.kind)
         engine.start_run(
             args.unit,
             args.kind,
@@ -1703,18 +1757,40 @@ def _orchestrate(args: argparse.Namespace) -> int:
         )
     elif args.action == "finish-run":
         # A completion value is caller input: in an attested pipeline the
-        # recorded commit must at least BE a commit of the trusted checkout —
-        # a SHA that exists nowhere must never anchor review exclusions.
+        # recorded commit must carry COMPLETION PROVENANCE — the execution
+        # harness's attest-completion record binding this unit, run and
+        # commit, written when the run produced it. Mere existence of the
+        # commit proves nothing about who produced it, and an innocent
+        # agent's genuinely signed run finished at another agent's head
+        # would otherwise exclude the wrong reviewer.
         if key is not None and args.commit_sha:
-            if not args.commit_repository:
+            if not args.completion:
                 raise OrchestrationError(
                     "an attested finish-run with --commit-sha requires "
-                    "--commit-repository: the commit must exist in the "
-                    "trusted checkout before the state attests it"
+                    "--completion: the attest-completion record binding this "
+                    "unit, run and commit, written by the execution harness "
+                    "at run completion"
                 )
-            if resolve_commit(args.commit_repository, args.commit_sha) != args.commit_sha:
+            completion = json.loads(Path(args.completion).read_text(encoding="utf-8"))
+            mark = completion.get(_ATTESTATION_FIELD) if isinstance(completion, dict) else None
+            if not isinstance(mark, str) or not hmac.compare_digest(
+                mark, _attest_document(completion, key)
+            ):
                 raise OrchestrationError(
-                    "--commit-sha must be the full object name of a commit in --commit-repository"
+                    "the completion record carries no valid attestation under "
+                    "--attestation-key; produce it with attest-completion and "
+                    "the same key"
+                )
+            bound = (
+                completion.get("unit"),
+                completion.get("runId"),
+                completion.get("commitSha"),
+            )
+            if bound != (args.unit, args.run_id, args.commit_sha):
+                raise OrchestrationError(
+                    "the completion record does not bind this exact unit, run "
+                    "and commit; regenerate it with attest-completion for the "
+                    "run that produced the commit"
                 )
         engine.finish_run(
             args.unit,
@@ -1744,6 +1820,33 @@ def _orchestrate(args: argparse.Namespace) -> int:
     _write(state_document, str(state_path))
     if args.status_output:
         Path(args.status_output).write_text(engine.status_document(args.unit), encoding="utf-8")
+    return 0
+
+
+def _attest_completion(args: argparse.Namespace) -> int:
+    """Record WHICH commit a run produced, signed at the moment it happened.
+
+    Written by the execution harness — the operator-side component that
+    actually watched the agent produce the commit — never by the agent
+    itself, which holds no key. ``orchestrate finish-run`` under the same key
+    accepts a commit only with this record, so a later caller cannot finish
+    an innocent agent's run at another agent's head. The commit must exist
+    in the trusted checkout when the record is written.
+    """
+    key = _attestation_key_bytes(args.attestation_key)
+    if resolve_commit(args.commit_repository, args.commit_sha) != args.commit_sha:
+        raise OrchestrationError(
+            "--commit-sha must be the full object name of a commit in --commit-repository"
+        )
+    document = {
+        "schemaVersion": 1,
+        "unit": args.unit,
+        "runId": args.run_id,
+        "commitSha": args.commit_sha,
+        "recordedAt": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
+    }
+    document[_ATTESTATION_FIELD] = _attest_document(document, key)
+    _write(document, args.output)
     return 0
 
 
@@ -2750,9 +2853,9 @@ def build_parser() -> argparse.ArgumentParser:
     orchestrate.add_argument("--findings", type=int, default=0)
     orchestrate.add_argument("--commit-sha", default="")
     orchestrate.add_argument(
-        "--commit-repository",
-        help="with --attestation-key and --commit-sha: the trusted checkout "
-        "the finished run's commit must exist in",
+        "--completion",
+        help="with --attestation-key and --commit-sha: the attest-completion "
+        "record binding this unit, run and commit",
     )
     orchestrate.add_argument("--max-repair-cycles", type=int, default=2)
     orchestrate.add_argument("--status-output")
@@ -2761,6 +2864,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="secret key file: the written state carries an HMAC attestation "
         "dispatch-packet --history verifies, and existing state is verified on read",
     )
+
+    attest_completion = commands.add_parser("attest-completion")
+    attest_completion.add_argument("--unit", required=True)
+    attest_completion.add_argument("--run-id", required=True)
+    attest_completion.add_argument("--commit-sha", required=True)
+    attest_completion.add_argument(
+        "--commit-repository",
+        required=True,
+        help="the trusted checkout the finished run's commit must exist in",
+    )
+    attest_completion.add_argument("--attestation-key", required=True)
+    attest_completion.add_argument("--output")
+    attest_completion.set_defaults(handler=_attest_completion)
     orchestrate.set_defaults(handler=_orchestrate)
 
     registry = commands.add_parser("validate-registry")
@@ -3125,6 +3241,15 @@ GATE_COMMANDS = frozenset(
         "renew",
         "release",
         "confirm-cloud-routine",
+        # Packet derivation and attested orchestration DERIVE trust
+        # artifacts: resolving git through a working-tree trust_mode or an
+        # override variable would let a candidate-planted executable
+        # fabricate the commits, committed files, and identities those
+        # artifacts are then signed over.
+        "context-packet",
+        "dispatch-packet",
+        "orchestrate",
+        "attest-completion",
     }
 )
 
