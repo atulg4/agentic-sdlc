@@ -344,6 +344,20 @@ def test_gates_repoint_the_actions_workspace(tmp_path: Path, monkeypatch) -> Non
     assert out.read_text(encoding="utf-8") == str(tmp_path.resolve())
 
 
+def test_gates_run_under_the_command_prefix(tmp_path: Path) -> None:
+    # An isolation wrapper prefixes the gate shell (it must contain the
+    # shell and the gate command alike), and the recorded argv shows what
+    # actually ran; malformed prefixes fail closed.
+    config = tmp_path / "policy.toml"
+    _write_config(config, 'test "$SANDBOX_MARK" = "1"', "true")
+    assert run_gates(config, tmp_path)["passed"] is False
+    report = run_gates(config, tmp_path, command_prefix=("env", "SANDBOX_MARK=1"))
+    assert report["passed"] is True
+    assert report["gates"][0]["command"][:2] == ["env", "SANDBOX_MARK=1"]
+    with pytest.raises(GateError, match="command prefix"):
+        run_gates(config, tmp_path, command_prefix=("env", ""))
+
+
 def test_gates_rebind_revision_variables(tmp_path: Path, monkeypatch) -> None:
     # An isolated derivation rebinds the standard revision variables: the
     # ambient workflow's SHA and refs describe the caller's checkout.

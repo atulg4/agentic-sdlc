@@ -236,20 +236,37 @@ refs for repository-aware gates. The caller's own checkout is never
 executed, so uncommitted edits, ignored files, status-suppressing
 repository config, locally configured filters, and the caches one gate run
 leaves behind can neither block a derivation nor reach a gate. The gates
-run under the gate configuration AS COMMITTED at the candidate head
-(`--config` must resolve inside the candidate repository and be committed
-there), with `GITHUB_WORKSPACE` repointed at the disposable tree and the standard
+run under the gate configuration AS COMMITTED at the AUTHENTICATED REVIEW
+BASE (`--config` must resolve inside the candidate repository and be
+committed at the base): the configuration committed at the head is itself
+part of the untrusted candidate, so a candidate commit that replaces the
+configured gates with `true` never records a passing report under its own
+weakened rules — and a head that renames the policy's default branch (which
+would re-aim base authentication) refuses derivation outright. The gates
+run with `GITHUB_WORKSPACE` repointed at the disposable tree and the standard
 revision variables rebound (`GITHUB_SHA` to the candidate head,
-`GITHUB_BASE_REF` to the trusted base; `GITHUB_REF`/`GITHUB_HEAD_REF`
-cleared), so an Actions-style gate can neither read the caller's checkout
-nor test the ambient workflow's revision. The clone also mirrors the
+`GITHUB_BASE_REF` to the default BRANCH NAME — keeping Actions' semantics
+for gates diffing `origin/$GITHUB_BASE_REF...` — with the resolved base SHA
+in `AGENTIC_SDLC_BASE_SHA`; `GITHUB_REF`/`GITHUB_HEAD_REF` cleared), so an
+Actions-style gate can neither read the caller's checkout nor test the
+ambient workflow's revision. Because candidate gates are
+candidate-controlled COMMANDS — run bare they execute as the caller's OS
+user, and a disposable clone restricts nothing outside itself —
+`--gate-sandbox` is required: either an isolation wrapper command prefix
+(a container or sandbox launcher, prepended to every gate's argv and
+visible in the recorded report) or the literal `trusted-host` to explicitly
+accept host execution for a candidate the caller already trusts. The clone
+also mirrors the
 source's remote-tracking and tag refs, since CI checkouts often carry the
 candidate only on `origin/*`, and then disconnects its `origin` remote, so
 a gate — or candidate code a gate runs — cannot push to or edit the
-caller's real repository. The `--candidate-base` is authenticated against
-the review target: it must be the current `origin/<default branch>` of the
-candidate repository, so a caller-chosen later ancestor cannot hide
-already-landed changes from the verified diff. The PACKET configuration — the policy AND the
+caller's real repository. The `--candidate-base` is authenticated OUTSIDE
+the candidate repository: `--review-target-repository` names the caller's
+separately maintained repository, and the base must equal its current
+`origin/<default branch>` — a ref inside the candidate repository
+(remote-tracking refs included) is mutable by the producing run itself via
+`git update-ref`, so it authenticates nothing, and a caller-chosen later
+ancestor cannot hide already-landed changes from the verified diff. The PACKET configuration — the policy AND the
 mission registry and knowledge sources — is read from the same committed
 tree on every candidate path (paths judged lexically with relative values
 repository-relative, never through symlinks), so an uncommitted caller-side
@@ -261,8 +278,12 @@ pinned repository
 record's payload back from the candidate tree through the adapter's own
 sanitization — a fabricated payload with a self-consistent hash is
 rejected, and a token-shaped path is withheld from every readback error.
-The verification evidence carries the candidate patch text itself (the
-digest binds the exact bytes), rendered inside an untrusted boundary with
+The verification evidence carries the candidate patch itself, LOSSLESSLY:
+UTF-8 patch bytes travel as text, non-UTF-8 bytes travel base64-encoded
+(`patchEncoding`), and the carried patch must hash to `patchSha256` — a
+replacement-character decode would render two distinct non-UTF-8 changes
+identically while the digest described bytes the reviewer never saw. The
+patch renders inside an untrusted boundary with
 boundary-marker text ESCAPED rather than stripped — code that legitimately
 spells a marker reaches the reviewer intact — so the reviewer reads the
 change under review rather than only its hash, path names, and line
@@ -274,7 +295,10 @@ attested retrieval exists for them. Builder and tester dispatches carrying
 repository evidence take
 `--candidate-repository` alone (the derivation flags are reviewer-only) and
 are refused without it: the request's `repositoryRevision` must be the full
-commit SHA of the trusted pinned tree, and every pinned record is read back
+commit SHA of the trusted pinned tree AND that repository's current
+checkout (`HEAD`) — a genuine but historical pin would dispatch a
+write-capable envelope under stale, possibly weaker configuration and
+source — and every pinned record is read back
 from it the same way, so a write-capable dispatch can never hand the
 implementation agent fabricated source under a self-consistent citation.
 Write-capable dispatches also re-run the task policy
@@ -286,8 +310,17 @@ default 900, since labels, dependencies, and pull requests all move after
 a check), and whose verdict must cover exactly the policy's implementation,
 ready, and human-review labels — label names spelled into caller-supplied request
 JSON are not approval evidence, and neither is a verdict narrowed to a
-caller-selected label. Reviewer dispatches require `--history`: the
-ORCHESTRATOR STATE document, replayed through the orchestrator's own
+caller-selected label. Both trust artifacts are ATTESTED, because structure
+proves nothing about provenance — an invoker could author either as plain
+JSON: `dispatch-packet` requires `--attestation-key` (a secret key file of
+at least 32 bytes) and verifies an HMAC-SHA256 `attestation` field over
+each document's canonical JSON. `check-request --attestation-key` signs
+its result and `orchestrate --attestation-key` signs the state it writes
+(verifying existing state on read, so an out-of-band edit is refused at
+the next step); the secret never travels in the artifacts, so reading one
+confers no ability to mint one. Reviewer dispatches require `--history`: the
+ORCHESTRATOR STATE document, verified against the attestation key and
+replayed through the orchestrator's own
 validation, whose recorded runs for this work item (mission and agent
 identity) define the independence exclusions — EVERY agent that performed a
 producing mission is excluded, not only the last assignee, and producing

@@ -324,6 +324,39 @@ def test_check_request_passes_a_valid_request_without_dependencies(
     assert result["ready"] is True and result["dependencies"] == []
 
 
+def test_check_request_attests_its_result_under_a_key(monkeypatch, policy_file, tmp_path):
+    # With --attestation-key the written result carries the HMAC mark that
+    # dispatch-packet --authorization verifies: a hand-authored result has no
+    # way to mint it without the secret.
+    from agentic_sdlc.cli import _attest_document
+
+    gh = FakeGh(VALID.format(deps="None"))
+    monkeypatch.setattr(cli, "run_gh", gh)
+    secret = b"an-attestation-secret-of-at-least-32-bytes"
+    key_file = tmp_path / "attestation.key"
+    key_file.write_bytes(secret)
+    assert (
+        cli.main(
+            [
+                "check-request",
+                "--project",
+                PROJECT,
+                "--issue",
+                "7",
+                "--config",
+                str(policy_file),
+                "--output",
+                str(tmp_path / "request.json"),
+                "--attestation-key",
+                str(key_file),
+            ]
+        )
+        == 0
+    )
+    result = json.loads((tmp_path / "request.json").read_text())
+    assert result["attestation"] == _attest_document(result, secret)
+
+
 def test_check_request_passes_when_every_dependency_is_closed(monkeypatch, policy_file):
     gh = FakeGh(VALID.format(deps="- #3\n- #5"), states={3: "closed", 5: "closed"})
     assert _check_request(monkeypatch, policy_file, gh) == 0

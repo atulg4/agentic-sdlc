@@ -29,7 +29,7 @@ import subprocess
 import sys
 import time
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -236,7 +236,16 @@ def run_gates(
     repository: str | Path,
     *,
     environment_overrides: Mapping[str, str | None] | None = None,
+    command_prefix: Sequence[str] | None = None,
 ) -> dict[str, Any]:
+    # The prefix runs OUTSIDE the gate shell: an isolation wrapper (a
+    # container or sandbox launcher) must contain the shell and the gate
+    # command alike, and it travels into each gate entry's recorded argv so
+    # the report shows what actually ran.
+    if command_prefix is not None and (
+        not all(isinstance(entry, str) and entry for entry in command_prefix)
+    ):
+        raise GateError("command prefix entries must be non-empty strings")
     commands, verification, python_version = _load(config)
     names = verification.get("gates", list(commands))
     allowed_exit_codes = verification.get("allowed_exit_codes", {})
@@ -275,7 +284,7 @@ def run_gates(
             raise GateError(f"verification command is empty: {name}")
         if "\n" in command or "\r" in command or "\0" in command:
             raise GateError(f"verification command must be a single line: {name}")
-        arguments = [*gate_shell(), command]
+        arguments = [*(command_prefix or ()), *gate_shell(), command]
         accepted = allowed_exit_codes.get(name, [0])
         if not isinstance(accepted, list) or not all(isinstance(code, int) for code in accepted):
             raise GateError(f"allowed exit codes are invalid: {name}")

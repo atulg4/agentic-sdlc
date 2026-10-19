@@ -737,6 +737,38 @@ def test_orchestrate_cli_round_trips_state(tmp_path: Path) -> None:
     assert main([*base, "--action", "transition", "--event-key", "evt-3", "--to", "merged"]) == 2
 
 
+def test_orchestrate_attests_state_under_a_key(tmp_path: Path) -> None:
+    # With --attestation-key the written state carries an HMAC mark over
+    # everything else in it (what dispatch-packet --history verifies), the
+    # pipeline round-trips its own marks, and state edited outside
+    # orchestrate is refused on the next read.
+    from agentic_sdlc.cli import _attest_document
+
+    secret = b"an-attestation-secret-of-at-least-32-bytes"
+    key_file = tmp_path / "attestation.key"
+    key_file.write_bytes(secret)
+    state = tmp_path / "state.json"
+    base = [
+        "orchestrate",
+        "--state",
+        str(state),
+        "--unit",
+        "42",
+        "--timestamp",
+        "2026-08-06T12:00:00Z",
+        "--attestation-key",
+        str(key_file),
+    ]
+    assert main([*base, "--action", "create", "--event-key", "evt-1"]) == 0
+    document = json.loads(state.read_text(encoding="utf-8"))
+    assert document["attestation"] == _attest_document(document, secret)
+    assert main([*base, "--action", "transition", "--event-key", "evt-2", "--to", "triaged"]) == 0
+    document = json.loads(state.read_text(encoding="utf-8"))
+    document["units"]["42"]["state"] = "merged"
+    state.write_text(json.dumps(document), encoding="utf-8")
+    assert main([*base, "--action", "transition", "--event-key", "evt-3", "--to", "specified"]) == 2
+
+
 def _registry_document() -> dict:
     return {
         "schemaVersion": 1,

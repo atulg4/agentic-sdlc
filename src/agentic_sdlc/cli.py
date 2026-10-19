@@ -6,6 +6,7 @@ import argparse
 import base64
 import datetime
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -722,6 +723,13 @@ def _check_request(args: argparse.Namespace) -> int:
     # authorization: labels, dependencies, and pull requests all move after
     # a check, so the result's age is part of what it attests.
     result["checkedAt"] = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
+    if getattr(args, "attestation_key", None):
+        # Dispatch consumes this result as its authorization gate: the mark
+        # binds every field, checkedAt included, to the shared secret, so a
+        # caller cannot author an acceptable result by hand.
+        result[_ATTESTATION_FIELD] = _attest_document(
+            result, _attestation_key_bytes(args.attestation_key)
+        )
     _write(result, args.output)
     _status(message)
     return code
@@ -879,7 +887,8 @@ def _derived_verification(
     The diff summary comes from ``collect_commit_diff`` over the resolved
     base and head commits and the gate report from ``run_gates`` run here,
     in the trusted caller — request JSON never impersonates pipeline
-    evidence, and the base is bound to the actual review target.
+    evidence, the base is authenticated outside the candidate repository,
+    and the gates run under the configuration committed at that base.
     """
     if not args.candidate_base or not args.candidate_head:
         raise ContextBuilderError(
@@ -887,27 +896,89 @@ def _derived_verification(
         )
     base = resolve_commit(args.candidate_repository, args.candidate_base)
     head = resolve_commit(args.candidate_repository, args.candidate_head)
-    # The base is AUTHENTICATED, never merely resolvable: a caller-chosen
-    # later ancestor would hide already-landed changes from the verified
-    # diff while still presenting it as trusted verification of the head.
+    # The base is AUTHENTICATED against a repository the candidate cannot
+    # write: every ref inside the candidate repository — remote-tracking
+    # origin/<branch> included — is mutable by the producing run itself
+    # (`git update-ref`), so a caller-chosen later ancestor could pose as
+    # the review target and hide already-landed changes from the verified
+    # diff. The review target therefore resolves in the caller's separately
+    # maintained repository.
+    if not getattr(args, "review_target_repository", None):
+        raise ContextBuilderError(
+            "--review-target-repository is required to derive reviewer "
+            "verification: the trusted repository whose "
+            f"origin/{policy.default_branch} defines the review base — a ref "
+            "inside the candidate repository is candidate-mutable and "
+            "authenticates nothing"
+        )
     try:
-        expected_base = resolve_commit(args.candidate_repository, f"origin/{policy.default_branch}")
+        expected_base = resolve_commit(
+            args.review_target_repository, f"origin/{policy.default_branch}"
+        )
     except GitDiffError as error:
         raise ContextBuilderError(
-            f"the candidate repository has no origin/{policy.default_branch}; "
-            "fetch the authoritative review target before deriving verification"
+            "the review target repository has no "
+            f"origin/{policy.default_branch}; fetch the authoritative review "
+            "target before deriving verification"
         ) from error
     if base != expected_base:
         raise ContextBuilderError(
             "--candidate-base must be the current authoritative review target "
-            f"(origin/{policy.default_branch} is {expected_base})"
+            f"(origin/{policy.default_branch} in the review target repository "
+            f"is {expected_base})"
         )
-    snapshot = collect_commit_diff(args.candidate_repository, base, head)
-    # Gate definitions are repository-owned: reading --config from the
-    # caller's checkout would let an uncommitted edit replace the real test
-    # command while the report binds to the candidate head, so the gates run
-    # under the configuration AS COMMITTED at the candidate head.
+    # Gate definitions come from the AUTHENTICATED BASE, never the head: the
+    # configuration committed at the head is itself part of the untrusted
+    # candidate, so a candidate commit replacing the configured gates with
+    # `true` would otherwise record a passing report under its own weakened
+    # rules. The base SHA is content-addressed, so reading it from the
+    # candidate's object database reads trusted bytes.
     config_rel = _candidate_rel(args, args.config, "--config")
+    try:
+        base_config = read_committed_file(
+            args.candidate_repository, base, config_rel.as_posix(), label="the review base"
+        )
+    except GitDiffError as error:
+        raise ContextBuilderError(
+            "the gate configuration is not committed at the authenticated "
+            "review base; derived gates run only repository-owned, "
+            "base-trusted definitions"
+        ) from error
+    # The branch name that authenticated the base is itself policy read at
+    # the candidate HEAD: a head that renames the default branch could re-aim
+    # the resolution at a stale origin/<other> ref in the review target, so
+    # the base-committed policy must agree on the branch.
+    if load_policy_bytes(base_config).default_branch != policy.default_branch:
+        raise ContextBuilderError(
+            "the candidate head changes the policy's default branch; that "
+            "re-aims base authentication, so land the configuration change "
+            "through the human-controlled path before reviewing candidates "
+            "against it"
+        )
+    # Candidate gates are candidate-controlled COMMANDS: run bare they
+    # execute as the caller's OS user, and a disposable clone restricts
+    # nothing outside itself (dotfiles, credentials, the original checkout
+    # through /proc, background processes that survive the clone's
+    # deletion). The caller must either name the isolation wrapper the
+    # commands run under or explicitly accept host execution for a
+    # candidate it already trusts.
+    if not getattr(args, "gate_sandbox", None):
+        raise ContextBuilderError(
+            "--gate-sandbox is required: derived gates execute "
+            "candidate-controlled commands, so name the isolation wrapper "
+            "they run under (a container or sandbox command prefix), or pass "
+            "--gate-sandbox trusted-host to accept execution on this host "
+            "for a candidate you already trust"
+        )
+    if args.gate_sandbox == "trusted-host":
+        sandbox_prefix: tuple[str, ...] = ()
+    else:
+        sandbox_prefix = tuple(shlex.split(args.gate_sandbox))
+        if not sandbox_prefix:
+            raise ContextBuilderError(
+                "--gate-sandbox must name a non-empty wrapper command, or the literal trusted-host"
+            )
+    snapshot = collect_commit_diff(args.candidate_repository, base, head)
     # The caller's own checkout is not evidence: it can be dirty, carry
     # ignored files a gate would read, or have status output suppressed by
     # repository-local configuration — and a gate run leaves caches behind
@@ -916,25 +987,25 @@ def _derived_verification(
     # head (no checkout, so no local smudge filter or hook runs), observing
     # exactly the committed content and leaving the caller's state untouched.
     with derivation_tree(args.candidate_repository, head) as tree:
-        tree_config = tree / config_rel
-        if not tree_config.is_file():
-            raise ContextBuilderError(
-                "the gate configuration is not committed at the candidate "
-                "head; commit it so derived gates run repository-owned "
-                "definitions"
-            )
+        gate_config = tree.parent / "gate-config-at-base.toml"
+        gate_config.write_bytes(base_config)
         report = run_gates(
-            tree_config,
+            gate_config,
             tree,
             # The ambient workflow's revision variables describe the
             # caller's checkout; gates in the isolated tree see the
-            # candidate's instead.
+            # candidate's instead. GITHUB_BASE_REF keeps Actions' BRANCH
+            # NAME semantics — a gate diffing `origin/$GITHUB_BASE_REF...`
+            # must find the ref — and the resolved base SHA travels in its
+            # own variable.
             environment_overrides={
                 "GITHUB_SHA": head,
-                "GITHUB_BASE_REF": base,
+                "GITHUB_BASE_REF": policy.default_branch,
+                "AGENTIC_SDLC_BASE_SHA": base,
                 "GITHUB_REF": None,
                 "GITHUB_HEAD_REF": None,
             },
+            command_prefix=sandbox_prefix,
         )
     # Wall-clock timings are not evidence, and they make everything bound to
     # the report nondeterministic: the rendered size, the budget accounting,
@@ -949,6 +1020,16 @@ def _derived_verification(
     findings = request.get("priorFindings", [])
     if not isinstance(findings, list) or not all(isinstance(item, str) for item in findings):
         raise ContextBuilderError("packet request priorFindings must be an array of strings")
+    # The reviewer reads the change itself, and reads EVERY byte the digest
+    # binds: a replacement-character decode would render two distinct
+    # non-UTF-8 changes identically, so bytes that are not UTF-8 travel
+    # base64-encoded instead of lossily decoded.
+    try:
+        patch_text = snapshot.patch.decode("utf-8")
+        patch_encoding = "utf-8"
+    except UnicodeDecodeError:
+        patch_text = base64.b64encode(snapshot.patch).decode("ascii")
+        patch_encoding = "base64"
     return VerificationEvidence(
         head_sha=head,
         base_sha=base,
@@ -958,10 +1039,56 @@ def _derived_verification(
         patch_sha256=hashlib.sha256(snapshot.patch).hexdigest(),
         gate_report=report,
         prior_findings=tuple(findings),
-        # The reviewer reads the change itself, not only its hash and paths;
-        # the digest above still binds the exact bytes.
-        patch=snapshot.patch.decode("utf-8", errors="replace"),
+        patch=patch_text,
+        patch_encoding=patch_encoding,
     )
+
+
+_ATTESTATION_FIELD = "attestation"
+
+
+def _attestation_key_bytes(path: str) -> bytes:
+    """The shared attestation secret: at least 32 bytes of key material."""
+    try:
+        key = Path(path).read_bytes().strip()
+    except OSError as error:
+        raise ContextBuilderError(f"the attestation key could not be read: {error}") from None
+    if len(key) < 32:
+        raise ContextBuilderError(
+            "the attestation key must hold at least 32 bytes of secret key material"
+        )
+    return key
+
+
+def _attest_document(document: Mapping, key: bytes) -> str:
+    """HMAC-SHA256 over the document's canonical JSON, attestation field excluded."""
+    body = {name: value for name, value in document.items() if name != _ATTESTATION_FIELD}
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hmac.new(key, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _verify_attested_input(args: argparse.Namespace, document, what: str, producer: str) -> None:
+    """Accept a caller-supplied trust artifact only under a valid attestation.
+
+    These documents are plain JSON an invoker could author: without a mark
+    from the shared secret, a fabricated run history or authorization result
+    satisfies every structural check this CLI can run. The secret never
+    travels in the artifact, so holding or reading a file confers no ability
+    to mint one; only the trusted producer commands, run with the same key,
+    emit documents dispatch accepts.
+    """
+    if not getattr(args, "attestation_key", None):
+        raise ContextBuilderError(
+            f"dispatch requires --attestation-key to verify the {what}; "
+            f"produce the artifact with {producer} under the same key"
+        )
+    key = _attestation_key_bytes(args.attestation_key)
+    mark = document.get(_ATTESTATION_FIELD) if isinstance(document, Mapping) else None
+    if not isinstance(mark, str) or not hmac.compare_digest(mark, _attest_document(document, key)):
+        raise ContextBuilderError(
+            f"the {what} carries no valid attestation under --attestation-key; "
+            f"regenerate it with {producer} and the same key"
+        )
 
 
 def _check_dispatch_authorization(args: argparse.Namespace, policy, packet) -> None:
@@ -983,6 +1110,16 @@ def _check_dispatch_authorization(args: argparse.Namespace, policy, packet) -> N
     document = json.loads(Path(args.authorization).read_text(encoding="utf-8"))
     if not isinstance(document, dict):
         raise ContextBuilderError("the authorization result must be a JSON object")
+    # Structure proves nothing about provenance: the result is plain JSON an
+    # invoker could author with every expected field, so it is accepted only
+    # under a valid mark from the shared attestation key the trusted
+    # check-request run signed it with.
+    _verify_attested_input(
+        args,
+        document,
+        "authorization result",
+        "check-request --authorize-labels --attestation-key",
+    )
     verdict = document.get("authorization")
     stable = document.get("stable")
     if (
@@ -1200,6 +1337,18 @@ def _build_packet_from_request(
                     "repositoryRevision must be the full commit SHA of the "
                     "trusted pinned tree in the candidate repository"
                 )
+            # The pin must be the CURRENT trusted checkout, not any
+            # resolvable historical SHA: policy, missions, knowledge and
+            # repository evidence all load from the pin, so a request naming
+            # an older revision would dispatch a write-capable envelope
+            # under stale, possibly weaker configuration and source.
+            current = resolve_commit(args.candidate_repository, "HEAD")
+            if repository_revision != current:
+                raise ContextBuilderError(
+                    "repositoryRevision must be the candidate repository's "
+                    f"current checkout ({current}); a historical pin would "
+                    "dispatch under stale configuration and source"
+                )
             pin = repository_revision
         _readback_repository_records(args.candidate_repository, pin, records)
     elif request.get("verification") is not None:
@@ -1320,6 +1469,11 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
         # records of THIS work item — their mission and agent identity —
         # define the exclusions.
         document = json.loads(Path(args.history).read_text(encoding="utf-8"))
+        # ``Orchestrator.from_dict`` validates shape, not provenance: a
+        # fabricated state could record an innocent agent as the producer
+        # and omit the real one, so the state is accepted only under a valid
+        # mark from the key the trusted ``orchestrate`` runs signed it with.
+        _verify_attested_input(args, document, "run history", "orchestrate --attestation-key")
         engine = Orchestrator.from_dict(document)
         try:
             unit = engine.get(packet.work_ref)
@@ -1431,8 +1585,26 @@ def _route_executor(args: argparse.Namespace) -> int:
 
 def _orchestrate(args: argparse.Namespace) -> int:
     state_path = Path(args.state)
+    key = (
+        _attestation_key_bytes(args.attestation_key)
+        if getattr(args, "attestation_key", None)
+        else None
+    )
     if state_path.is_file():
         document = json.loads(state_path.read_text(encoding="utf-8"))
+        if key is not None:
+            # An attested pipeline round-trips its own marks: state edited
+            # outside orchestrate, or written under another key, is refused
+            # here exactly as dispatch would refuse it.
+            mark = document.get(_ATTESTATION_FIELD) if isinstance(document, dict) else None
+            if not isinstance(mark, str) or not hmac.compare_digest(
+                mark, _attest_document(document, key)
+            ):
+                raise OrchestrationError(
+                    "the orchestration state carries no valid attestation "
+                    "under --attestation-key; it was edited outside "
+                    "orchestrate or written under a different key"
+                )
         engine = Orchestrator.from_dict(document)
     else:
         engine = Orchestrator(max_repair_cycles=args.max_repair_cycles)
@@ -1487,7 +1659,10 @@ def _orchestrate(args: argparse.Namespace) -> int:
             event_key=args.event_key,
             timestamp=args.timestamp,
         )
-    _write(engine.as_dict(), str(state_path))
+    state_document = engine.as_dict()
+    if key is not None:
+        state_document[_ATTESTATION_FIELD] = _attest_document(state_document, key)
+    _write(state_document, str(state_path))
     if args.status_output:
         Path(args.status_output).write_text(engine.status_document(args.unit), encoding="utf-8")
     return 0
@@ -2345,6 +2520,11 @@ def build_parser() -> argparse.ArgumentParser:
         "of the policy (as committed on --base when given)",
     )
     check_request.add_argument("--output")
+    check_request.add_argument(
+        "--attestation-key",
+        help="secret key file: the written result carries an HMAC attestation "
+        "dispatch-packet --authorization verifies",
+    )
     check_request.set_defaults(handler=_check_request)
 
     manifest = commands.add_parser("create-manifest")
@@ -2400,6 +2580,16 @@ def build_parser() -> argparse.ArgumentParser:
     packet.add_argument("--candidate-repository")
     packet.add_argument("--candidate-base")
     packet.add_argument("--candidate-head")
+    packet.add_argument(
+        "--review-target-repository",
+        help="trusted repository (not the candidate's) whose origin/<default "
+        "branch> authenticates --candidate-base",
+    )
+    packet.add_argument(
+        "--gate-sandbox",
+        help="isolation wrapper command prefix derived gates run under, or "
+        "the literal trusted-host to accept host execution",
+    )
     packet.add_argument("--output")
     packet.set_defaults(handler=_context_packet)
 
@@ -2411,9 +2601,24 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch_packet.add_argument("--candidate-repository")
     dispatch_packet.add_argument("--candidate-base")
     dispatch_packet.add_argument("--candidate-head")
+    dispatch_packet.add_argument(
+        "--review-target-repository",
+        help="trusted repository (not the candidate's) whose origin/<default "
+        "branch> authenticates --candidate-base",
+    )
+    dispatch_packet.add_argument(
+        "--gate-sandbox",
+        help="isolation wrapper command prefix derived gates run under, or "
+        "the literal trusted-host to accept host execution",
+    )
     dispatch_packet.add_argument("--agents", required=True)
     dispatch_packet.add_argument("--history")
     dispatch_packet.add_argument("--authorization")
+    dispatch_packet.add_argument(
+        "--attestation-key",
+        help="secret key file verifying the --history and --authorization "
+        "artifacts' HMAC attestations",
+    )
     dispatch_packet.add_argument("--authorization-max-age-seconds", type=int, default=900)
     dispatch_packet.add_argument("--packet")
     dispatch_packet.add_argument("--input-ref", action="append", default=[])
@@ -2467,6 +2672,11 @@ def build_parser() -> argparse.ArgumentParser:
     orchestrate.add_argument("--commit-sha", default="")
     orchestrate.add_argument("--max-repair-cycles", type=int, default=2)
     orchestrate.add_argument("--status-output")
+    orchestrate.add_argument(
+        "--attestation-key",
+        help="secret key file: the written state carries an HMAC attestation "
+        "dispatch-packet --history verifies, and existing state is verified on read",
+    )
     orchestrate.set_defaults(handler=_orchestrate)
 
     registry = commands.add_parser("validate-registry")

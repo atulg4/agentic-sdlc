@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import datetime
 import hashlib
 import json
@@ -32,6 +33,24 @@ from agentic_sdlc.policy import load_policy
 
 def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+#: The shared attestation secret trusted producers sign artifacts with and
+#: dispatch verifies them under (at least 32 bytes of key material).
+ATTESTATION_KEY = b"an-attestation-secret-of-at-least-32-bytes"
+
+
+def _key_file(directory) -> Path:
+    path = Path(directory) / "attestation.key"
+    path.write_bytes(ATTESTATION_KEY)
+    return path
+
+
+def _attested(document: dict) -> dict:
+    from agentic_sdlc.cli import _attest_document
+
+    document["attestation"] = _attest_document(document, ATTESTATION_KEY)
+    return document
 
 
 HEAD = "f" * 40
@@ -107,7 +126,9 @@ def _authorization(path, title: str, body: str, **overrides):
         "checkedAt": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
     }
     document.update(overrides)
-    path.write_text(json.dumps(document), encoding="utf-8")
+    # Signed AFTER the overrides: each broken document still carries a valid
+    # attestation, so the targeted field check is what refuses it.
+    path.write_text(json.dumps(_attested(document)), encoding="utf-8")
     return path
 
 
@@ -189,7 +210,7 @@ def _run_history(path, agent_id="builder-agent", work_ref=WORK_REF, commit_sha="
             timestamp="2026-10-12T09:20:00Z",
             commit_sha=commit_sha,
         )
-    path.write_text(json.dumps(engine.as_dict()), encoding="utf-8")
+    path.write_text(json.dumps(_attested(engine.as_dict())), encoding="utf-8")
     return path
 
 
@@ -1509,6 +1530,7 @@ def test_the_cli_dispatches_through_the_packet_contract(tmp_path, policy_file, v
         encoding="utf-8",
     )
     authorization = _authorization(tmp_path / "authorized.json", "P1: a bounded change", valid_body)
+    key = _key_file(tmp_path)
     artifact = tmp_path / "packet.json"
     base = [
         "--config",
@@ -1531,6 +1553,8 @@ def test_the_cli_dispatches_through_the_packet_contract(tmp_path, policy_file, v
                 str(agents),
                 "--authorization",
                 str(authorization),
+                "--attestation-key",
+                str(key),
                 "--packet",
                 str(artifact),
                 "--output",
@@ -1567,6 +1591,8 @@ def test_the_cli_dispatches_through_the_packet_contract(tmp_path, policy_file, v
                     str(agents),
                     "--authorization",
                     str(authorization),
+                    "--attestation-key",
+                    str(key),
                     "--packet",
                     str(artifact),
                 ]
@@ -1992,8 +2018,25 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
         capture_output=True,
         text=True,
     ).stdout.strip()
-    # The base is authenticated against the review target: origin/main in
-    # the candidate repository IS the base commit.
+    # The review target is the CALLER'S separately maintained repository:
+    # the base authenticates against ITS origin/main, never against a ref
+    # inside the candidate repository (those are candidate-mutable).
+    target = tmp_path / "review-target"
+    subprocess.run(
+        ["git", "clone", "--quiet", str(repo), str(target)],
+        check=True,
+        env=env,
+        capture_output=True,
+    )
+    derive = [
+        "--review-target-repository",
+        str(target),
+        "--gate-sandbox",
+        "trusted-host",
+    ]
+    key = _key_file(tmp_path)
+    # The candidate's own remote-tracking ref exists too — and proves
+    # nothing: derivations below succeed and refuse regardless of it.
     git("update-ref", "refs/remotes/origin/main", base)
     (repo / "a.txt").write_text("one\ntwo\n", encoding="utf-8")
     git("commit", "-q", "-am", "head")
@@ -2046,6 +2089,7 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
                 base,
                 "--candidate-head",
                 head,
+                *derive,
                 "--output",
                 str(output),
             ]
@@ -2117,10 +2161,13 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
                 base,
                 "--candidate-head",
                 head,
+                *derive,
                 "--agents",
                 str(agents_roster),
                 "--history",
                 str(history_file),
+                "--attestation-key",
+                str(key),
                 "--packet",
                 str(output),
                 "--output",
@@ -2146,7 +2193,7 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
     runless = Orchestrator()
     runless.create_unit(WORK_REF, event_key="evt-0", timestamp="2026-10-12T09:00:00Z")
     runless_file = tmp_path / "runless-history.json"
-    runless_file.write_text(json.dumps(runless.as_dict()), encoding="utf-8")
+    runless_file.write_text(json.dumps(_attested(runless.as_dict())), encoding="utf-8")
     for history_args, said in (
         ([], "reviewer dispatch requires --history"),
         (["--history", str(other_unit)], "records no work unit"),
@@ -2171,9 +2218,53 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
                     base,
                     "--candidate-head",
                     head,
+                    *derive,
                     "--agents",
                     str(agents_roster),
+                    "--attestation-key",
+                    str(key),
                     *history_args,
+                ]
+            )
+            == 2
+        )
+        assert said in capsys.readouterr().err
+
+    # The state is accepted only under a valid attestation: a tampered
+    # document — here laundering the producing run onto an innocent agent —
+    # or a dispatch without the key refuses before any exclusion is derived.
+    tampered_state = json.loads(history_file.read_text(encoding="utf-8"))
+    tampered_state["units"][WORK_REF]["runs"][0]["agentId"] = "innocent-agent"
+    tampered_history = tmp_path / "tampered-history.json"
+    tampered_history.write_text(json.dumps(tampered_state), encoding="utf-8")
+    for extra, said in (
+        (
+            ["--history", str(tampered_history), "--attestation-key", str(key)],
+            "no valid attestation",
+        ),
+        (["--history", str(history_file)], "requires --attestation-key"),
+    ):
+        capsys.readouterr()
+        assert (
+            cli_main(
+                [
+                    "dispatch-packet",
+                    "--config",
+                    str(repo / "agentic-sdlc.toml"),
+                    "--knowledge",
+                    str(knowledge),
+                    "--request",
+                    str(request),
+                    "--candidate-repository",
+                    str(repo),
+                    "--candidate-base",
+                    base,
+                    "--candidate-head",
+                    head,
+                    *derive,
+                    "--agents",
+                    str(agents_roster),
+                    *extra,
                 ]
             )
             == 2
@@ -2217,6 +2308,7 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
                 base,
                 "--candidate-head",
                 head,
+                *derive,
             ]
         )
         == 2
@@ -2260,6 +2352,7 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
                 base,
                 "--candidate-head",
                 head,
+                *derive,
             ]
         )
         == 2
@@ -2291,6 +2384,7 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
                 base,
                 "--candidate-head",
                 head,
+                *derive,
             ]
         )
         == 0
@@ -2308,10 +2402,11 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
     (repo / "ignored.txt").unlink()
     git("checkout", "--", "a.txt")
 
-    # The base is AUTHENTICATED: a caller-chosen base that is not the
-    # current review target refuses derivation.
+    # The base is AUTHENTICATED outside the candidate repository: the
+    # producing run can move the candidate's own remote-tracking ref with
+    # `git update-ref`, but the moved ref neither breaks the true base nor
+    # authenticates the moved value as a base.
     git("update-ref", "refs/remotes/origin/main", head)
-    capsys.readouterr()
     assert (
         cli_main(
             [
@@ -2328,12 +2423,193 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
                 base,
                 "--candidate-head",
                 head,
+                *derive,
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert (
+        cli_main(
+            [
+                "context-packet",
+                "--config",
+                str(repo / "agentic-sdlc.toml"),
+                "--knowledge",
+                str(knowledge),
+                "--request",
+                str(request),
+                "--candidate-repository",
+                str(repo),
+                "--candidate-base",
+                head,
+                "--candidate-head",
+                head,
+                *derive,
             ]
         )
         == 2
     )
     assert "authoritative review target" in capsys.readouterr().err
     git("update-ref", "refs/remotes/origin/main", base)
+
+    # Without the trusted review target, or without a sandbox decision,
+    # derivation refuses outright: candidate gates are candidate-controlled
+    # commands, and candidate-local refs authenticate nothing.
+    for partial, said in (
+        (
+            ["--gate-sandbox", "trusted-host"],
+            "--review-target-repository is required",
+        ),
+        (
+            ["--review-target-repository", str(target)],
+            "--gate-sandbox is required",
+        ),
+    ):
+        capsys.readouterr()
+        assert (
+            cli_main(
+                [
+                    "context-packet",
+                    "--config",
+                    str(repo / "agentic-sdlc.toml"),
+                    "--knowledge",
+                    str(knowledge),
+                    "--request",
+                    str(request),
+                    "--candidate-repository",
+                    str(repo),
+                    "--candidate-base",
+                    base,
+                    "--candidate-head",
+                    head,
+                    *partial,
+                ]
+            )
+            == 2
+        )
+        assert said in capsys.readouterr().err
+
+    # Gates run under the configuration committed at the AUTHENTICATED BASE:
+    # a candidate commit that replaces the configured gates with an
+    # always-passing command never records a passing report under its own
+    # weakened rules.
+    (repo / "agentic-sdlc.toml").write_text(
+        policy_file.read_text(encoding="utf-8")
+        + '\n[commands]\nlie = "true"\n\n[verification]\ngates = ["lie"]\n',
+        encoding="utf-8",
+    )
+    git("commit", "-q", "-am", "weaken gates")
+    head2 = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        env=env,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    weakened_request = tmp_path / "weakened-request.json"
+    weakened_request.write_text(
+        json.dumps(
+            {
+                "missionId": "code-reviewer",
+                "workRef": WORK_REF,
+                "task": {"title": "P1: a bounded change", "body": valid_body},
+                "records": [
+                    _record(external_id=f"src/scheduler.py@{head2}", revision=head2).as_dict()
+                ],
+                "repositoryRevision": head2,
+            }
+        ),
+        encoding="utf-8",
+    )
+    weakened_packet = tmp_path / "weakened-packet.json"
+    assert (
+        cli_main(
+            [
+                "context-packet",
+                "--config",
+                str(repo / "agentic-sdlc.toml"),
+                "--knowledge",
+                str(knowledge),
+                "--request",
+                str(weakened_request),
+                "--candidate-repository",
+                str(repo),
+                "--candidate-base",
+                base,
+                "--candidate-head",
+                head2,
+                *derive,
+                "--output",
+                str(weakened_packet),
+            ]
+        )
+        == 0
+    )
+    weakened_verification = json.loads(weakened_packet.read_text(encoding="utf-8"))["verification"]
+    # The base configuration defines no commands, so the lying gate never ran.
+    assert weakened_verification["gateReport"] == {"passed": False, "gates": []}
+
+    # A head that renames the default branch could re-aim base
+    # authentication at a stale ref in the review target; the base-committed
+    # policy must agree on the branch.
+    subprocess.run(
+        ["git", "-C", str(target), "update-ref", "refs/remotes/origin/release", base],
+        check=True,
+        env=env,
+        capture_output=True,
+    )
+    (repo / "agentic-sdlc.toml").write_text(
+        policy_file.read_text(encoding="utf-8").replace(
+            'default_branch = "main"', 'default_branch = "release"'
+        ),
+        encoding="utf-8",
+    )
+    git("commit", "-q", "-am", "pivot the default branch")
+    head3 = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        env=env,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    pivot_request = tmp_path / "pivot-request.json"
+    pivot_request.write_text(
+        json.dumps(
+            {
+                "missionId": "code-reviewer",
+                "workRef": WORK_REF,
+                "task": {"title": "P1: a bounded change", "body": valid_body},
+                "records": [],
+                "repositoryRevision": head3,
+            }
+        ),
+        encoding="utf-8",
+    )
+    capsys.readouterr()
+    assert (
+        cli_main(
+            [
+                "context-packet",
+                "--config",
+                str(repo / "agentic-sdlc.toml"),
+                "--knowledge",
+                str(knowledge),
+                "--request",
+                str(pivot_request),
+                "--candidate-repository",
+                str(repo),
+                "--candidate-base",
+                base,
+                "--candidate-head",
+                head3,
+                *derive,
+            ]
+        )
+        == 2
+    )
+    assert "default branch" in capsys.readouterr().err
+    git("reset", "-q", "--hard", head)
 
     # The dispatch path never accepts request JSON as pipeline evidence.
     tainted = tmp_path / "tainted.json"
@@ -2451,6 +2727,8 @@ def test_dispatch_packet_enforces_task_policy(tmp_path, policy_file, valid_body,
         str(agents),
         "--candidate-repository",
         str(repo),
+        "--attestation-key",
+        str(_key_file(tmp_path)),
     ]
     assert cli_main(["dispatch-packet", *base]) == 2
     assert "dispatch blocked by task policy" in capsys.readouterr().err
@@ -2504,6 +2782,21 @@ def test_dispatch_packet_enforces_task_policy(tmp_path, policy_file, valid_body,
             tmp_path / "authorization.json", "P1: a bounded change", valid_body, **broken
         )
         assert cli_main(["dispatch-packet", *base, "--authorization", str(bad)]) == 2
+    # The result is plain JSON an invoker could author: without a valid mark
+    # under the shared key — or without the key at all — every structurally
+    # perfect document is refused.
+    forged = _authorization(tmp_path / "forged.json", "P1: a bounded change", valid_body)
+    forged_document = json.loads(forged.read_text(encoding="utf-8"))
+    forged_document["attestation"] = "0" * 64
+    forged.write_text(json.dumps(forged_document), encoding="utf-8")
+    capsys.readouterr()
+    assert cli_main(["dispatch-packet", *base, "--authorization", str(forged)]) == 2
+    assert "no valid attestation" in capsys.readouterr().err
+    keyless = [entry for entry in base if entry not in ("--attestation-key",)]
+    keyless.remove(str(_key_file(tmp_path)))
+    fine = _authorization(tmp_path / "fine.json", "P1: a bounded change", valid_body)
+    assert cli_main(["dispatch-packet", *keyless, "--authorization", str(fine)]) == 2
+    assert "requires --attestation-key" in capsys.readouterr().err
     good = _authorization(tmp_path / "authorization.json", "P1: a bounded change", valid_body)
     envelope_path = tmp_path / "envelope.json"
     assert (
@@ -2616,6 +2909,7 @@ def test_write_capable_dispatch_verifies_repository_evidence(
     authorization = _authorization(
         tmp_path / "authorization.json", "P1: a bounded change", valid_body
     )
+    key = _key_file(tmp_path)
     base = [
         "--config",
         str(repo / "agentic-sdlc.toml"),
@@ -2627,6 +2921,8 @@ def test_write_capable_dispatch_verifies_repository_evidence(
         str(agents),
         "--authorization",
         str(authorization),
+        "--attestation-key",
+        str(key),
     ]
     # Without the trusted tree, repository evidence never dispatches.
     capsys.readouterr()
@@ -2668,6 +2964,8 @@ def test_write_capable_dispatch_verifies_repository_evidence(
                 str(agents),
                 "--authorization",
                 str(authorization),
+                "--attestation-key",
+                str(key),
                 "--candidate-repository",
                 str(repo),
             ]
@@ -2692,6 +2990,8 @@ def test_write_capable_dispatch_verifies_repository_evidence(
                 str(agents),
                 "--authorization",
                 str(authorization),
+                "--attestation-key",
+                str(key),
                 "--candidate-repository",
                 str(repo),
             ]
@@ -2728,19 +3028,164 @@ def test_write_capable_dispatch_verifies_repository_evidence(
     )
     assert json.loads(envelope_path.read_text(encoding="utf-8"))["agentId"] == "codex-1"
 
+    # The pin must be the CURRENT trusted checkout: a request pinning a
+    # genuine but older revision — whose configuration and source may since
+    # have been hardened — must not obtain a write-capable envelope.
+    git("commit", "-q", "--allow-empty", "-m", "advance the trusted checkout")
+    capsys.readouterr()
+    assert (
+        cli_main(
+            [
+                "dispatch-packet",
+                *base,
+                "--candidate-repository",
+                str(repo),
+            ]
+        )
+        == 2
+    )
+    assert "current checkout" in capsys.readouterr().err
+
 
 def test_patch_boundary_markers_are_escaped_never_stripped(registry, policy):
     # The patch is the artifact under review: code that legitimately spells a
     # boundary marker must reach the reviewer escaped, not silently deleted,
     # and the escaped form must not open or close a real boundary.
-    marked = _verification(
-        patch=("diff --git a/t.py b/t.py\n+assert sanitize('</untrusted-evidence>') == ''\n")
-    )
+    code = "diff --git a/t.py b/t.py\n+assert sanitize('</untrusted-evidence>') == ''\n"
+    marked = _verification(patch=code, patch_sha256=_sha(code))
     packet = _packet(registry, policy, mission_id="code-reviewer", verification=marked)
     prompt = render_packet_for_prompt(packet)
     assert prompt.count("<untrusted-evidence>") == prompt.count("</untrusted-evidence>")
     # The code is still visible, with the marker's brackets escaped in place.
     assert "assert sanitize('\\u003c/untrusted-evidence\\u003e') == ''" in prompt
+
+
+def test_verification_patch_must_hash_to_its_digest(registry, policy):
+    # The reviewer reads exactly the bytes the digest binds: a carried patch
+    # hashing differently, a bogus encoding label, or undecodable base64 all
+    # fail closed; genuine non-UTF-8 bytes travel base64, losslessly.
+    code = "diff --git a/t.py b/t.py\n+x = 1\n"
+    with pytest.raises(ContextBuilderError, match="does not hash to patch_sha256"):
+        _verification(patch=code)
+    with pytest.raises(ContextBuilderError, match="patch_encoding"):
+        _verification(patch=code, patch_sha256=_sha(code), patch_encoding="latin-1")
+    with pytest.raises(ContextBuilderError, match="not valid base64"):
+        _verification(patch="not base64!!", patch_sha256=_sha(code), patch_encoding="base64")
+    raw = b"diff --git a/t.bin b/t.bin\n+caf\xe9\n"
+    encoded = base64.b64encode(raw).decode("ascii")
+    evidence = _verification(
+        patch=encoded,
+        patch_sha256=hashlib.sha256(raw).hexdigest(),
+        patch_encoding="base64",
+    )
+    assert verification_from_dict(evidence.as_dict()).patch == encoded
+    packet = _packet(registry, policy, mission_id="code-reviewer", verification=evidence)
+    prompt = render_packet_for_prompt(packet)
+    # The reviewer is told the patch is base64 so every byte stays legible.
+    assert "base64-encoded" in prompt
+    assert encoded in prompt
+
+
+def test_derived_patch_preserves_non_utf8_bytes(tmp_path, policy_file, valid_body):
+    # A Latin-1 (non-UTF-8) text change must reach the reviewer byte-exact:
+    # the derived patch travels base64 and hashes to patchSha256.
+    import subprocess
+
+    from agentic_sdlc.cli import main as cli_main
+
+    repo = tmp_path / "latin-candidate"
+    repo.mkdir()
+    env = {
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.com",
+        "HOME": str(tmp_path),
+        "PATH": "/usr/bin:/bin",
+    }
+
+    def git(*argv):
+        subprocess.run(["git", "-C", str(repo), *argv], check=True, env=env, capture_output=True)
+
+    def head_of() -> str:
+        return subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            check=True,
+            env=env,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    git("init", "-q", "-b", "main")
+    (repo / "src").mkdir()
+    (repo / "src" / "scheduler.py").write_text(
+        "class Scheduler:\n    retries = 2\n", encoding="utf-8"
+    )
+    (repo / "latin.txt").write_bytes(b"caf\xe9\n")
+    (repo / "agentic-sdlc.toml").write_text(
+        policy_file.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (repo / "knowledge.toml").write_text(KNOWLEDGE_TOML + "\n", encoding="utf-8")
+    git("add", "src/scheduler.py", "latin.txt", "agentic-sdlc.toml", "knowledge.toml")
+    git("commit", "-q", "-m", "base")
+    base_sha = head_of()
+    target = tmp_path / "latin-target"
+    subprocess.run(
+        ["git", "clone", "--quiet", str(repo), str(target)],
+        check=True,
+        env=env,
+        capture_output=True,
+    )
+    (repo / "latin.txt").write_bytes(b"caf\xe9 bar\xff\n")
+    git("commit", "-q", "-am", "head")
+    head_sha = head_of()
+    request = tmp_path / "latin-request.json"
+    request.write_text(
+        json.dumps(
+            {
+                "missionId": "code-reviewer",
+                "workRef": WORK_REF,
+                "task": {"title": "P1: a bounded change", "body": valid_body},
+                "records": [
+                    _record(external_id=f"src/scheduler.py@{head_sha}", revision=head_sha).as_dict()
+                ],
+                "repositoryRevision": head_sha,
+            }
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "latin-packet.json"
+    assert (
+        cli_main(
+            [
+                "context-packet",
+                "--config",
+                str(repo / "agentic-sdlc.toml"),
+                "--knowledge",
+                str(repo / "knowledge.toml"),
+                "--request",
+                str(request),
+                "--candidate-repository",
+                str(repo),
+                "--candidate-base",
+                base_sha,
+                "--candidate-head",
+                head_sha,
+                "--review-target-repository",
+                str(target),
+                "--gate-sandbox",
+                "trusted-host",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    verification = json.loads(output.read_text(encoding="utf-8"))["verification"]
+    assert verification["patchEncoding"] == "base64"
+    raw = base64.b64decode(verification["patch"])
+    assert b"\xff" in raw
+    assert hashlib.sha256(raw).hexdigest() == verification["patchSha256"]
 
 
 def test_multiple_producing_agents_are_all_excluded(registry):
@@ -2834,6 +3279,7 @@ def test_dispatch_refuses_unattested_evidence(tmp_path, policy_file, valid_body,
     authorization = _authorization(
         tmp_path / "authorization.json", "P1: a bounded change", valid_body
     )
+    key = _key_file(tmp_path)
     capsys.readouterr()
     assert (
         cli_main(
@@ -2849,6 +3295,8 @@ def test_dispatch_refuses_unattested_evidence(tmp_path, policy_file, valid_body,
                 str(agents),
                 "--authorization",
                 str(authorization),
+                "--attestation-key",
+                str(key),
                 "--candidate-repository",
                 str(repo),
             ]
