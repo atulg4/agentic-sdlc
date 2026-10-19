@@ -680,12 +680,24 @@ def incidents_from_change_requests(
 
     _require_repository(repository)
     checks = dict(failing or {})
-    for key in checks:
+    for key, name in checks.items():
         # Dictionary equality would let True or 1.0 match change request 1,
         # fabricating a failing-check blocker _record_number already rejects.
         _require(
             isinstance(key, int) and not isinstance(key, bool) and key > 0,
             f"failing-check key must be a positive integer: {key!r}",
+        )
+        # The name is interpolated into an incident summary: a non-string
+        # value would be coerced whole (nested payloads, credentials and
+        # all), and a blank one would fabricate a CI blocker with no named
+        # check, so both fail closed before any formatting.
+        _require(
+            isinstance(name, str) and bool(name.strip()),
+            f"failing-check name for change request {key} must be a non-empty string",
+        )
+        _require(
+            len(name) <= 512,
+            f"change request {key}: too many failing check names to record; narrow --failing",
         )
     incidents: list[dict[str, Any]] = []
     # One record per change request: a concatenated export carrying the same

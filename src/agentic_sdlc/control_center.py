@@ -1361,17 +1361,44 @@ class ControlCenterSnapshot:
         return payload
 
 
+def _join_provider_agrees(
+    item: BacklogItem,
+    status: WorkUnitStatus,
+    repository_providers: Mapping[str, set[str]],
+) -> bool:
+    """Whether the issue-reference join's providers agree.
+
+    The join is exact-string, and tracker references are only unique within
+    one provider: a GitHub-exported ``acme/forge#1`` must not display a
+    GitLab unit's ledger progress. The item's declared provider must agree
+    with a provider the registry declares for the unit's repository; an
+    unknown provider on either side, or a repository the registry does not
+    declare, keeps the join — disagreement is proven, never guessed (and the
+    foreign-reference warnings already name undeclared data).
+    """
+
+    if not item.source_provider or not status.repository:
+        return True
+    declared = repository_providers.get(status.repository.lower())
+    if not declared:
+        return True
+    return item.source_provider in declared
+
+
 def _resolve_state(
     item: BacklogItem,
     statuses: Mapping[str, WorkUnitStatus],
     by_issue_ref: Mapping[str, WorkUnitStatus],
+    repository_providers: Mapping[str, set[str]],
 ) -> tuple[str, str, WorkUnitStatus | None]:
     """Resolve a backlog item's state, naming the basis and never inventing one.
 
     A declared work-unit key wins; an unambiguous issue reference joins next,
     because tracker-exported backlogs carry ``issueRef`` while the ledger's
-    projections carry the same reference. Only then does a source-declared
-    state apply, and with no evidence at all the state is *unknown*.
+    projections carry the same reference — but only when the item's source
+    provider agrees with the unit repository's registered provider. Only then
+    does a source-declared state apply, and with no evidence at all the state
+    is *unknown*.
     """
 
     if item.work_unit_id:
@@ -1384,9 +1411,10 @@ def _resolve_state(
         if item.declared_state:
             return item.declared_state, STATE_BASIS_DECLARED, None
         return "unknown", STATE_BASIS_UNKNOWN, None
-    if item.issue_ref and item.issue_ref in by_issue_ref:
-        status = by_issue_ref[item.issue_ref]
-        return status.state.value, STATE_BASIS_LEDGER, status
+    if item.issue_ref:
+        status = by_issue_ref.get(item.issue_ref)
+        if status is not None and _join_provider_agrees(item, status, repository_providers):
+            return status.state.value, STATE_BASIS_LEDGER, status
     if item.declared_state:
         return item.declared_state, STATE_BASIS_DECLARED, None
     return "unknown", STATE_BASIS_UNKNOWN, None
@@ -1425,6 +1453,7 @@ def _build_backlog_tree(
     items: Sequence[BacklogItem],
     statuses: Mapping[str, WorkUnitStatus],
     by_issue_ref: Mapping[str, WorkUnitStatus],
+    repository_providers: Mapping[str, set[str]],
 ) -> tuple[tuple[BacklogNode, ...], tuple[str, ...]]:
     """Build the epic/story/task forest, rooting any item whose parent is absent."""
 
@@ -1450,7 +1479,7 @@ def _build_backlog_tree(
         roots.append(item)
 
     def node_for(item: BacklogItem) -> BacklogNode:
-        state, basis, status = _resolve_state(item, statuses, by_issue_ref)
+        state, basis, status = _resolve_state(item, statuses, by_issue_ref, repository_providers)
         return BacklogNode(
             item=item,
             state=state,
@@ -1626,8 +1655,20 @@ def build_control_center_snapshot(
                 status = replace(status, **redactions)
             statuses[unit_id] = status
 
+        # Provider declarations gate the issue-reference join: references are
+        # only unique within one tracker provider, so a backlog item whose
+        # declared provider disagrees with a unit repository's registered
+        # provider keeps its declared state instead of adopting that unit's.
+        repository_providers: dict[str, set[str]] = {}
+        if registered:
+            for repository in registry.get(project_id).repositories:
+                repository_providers.setdefault(repository.identifier.lower(), set()).add(
+                    repository.provider
+                )
         by_issue_ref, reference_warnings = _index_by_issue_ref(statuses)
-        tree, tree_warnings = _build_backlog_tree(items, statuses, by_issue_ref)
+        tree, tree_warnings = _build_backlog_tree(
+            items, statuses, by_issue_ref, repository_providers
+        )
         view_warnings = list(reference_warnings) + list(tree_warnings)
         if malformed_repositories:
             view_warnings.append(
@@ -1657,12 +1698,9 @@ def build_control_center_snapshot(
             # Ownership is PROVIDER-QUALIFIED: gitlab:acme/forge does not own
             # GitHub-adapter data about acme/forge, so a reference matches
             # only a declaration whose provider agrees (or any declaration,
-            # for data whose provider is unknown).
-            declared_providers: dict[str, set[str]] = {}
-            for repository in registry.get(project_id).repositories:
-                declared_providers.setdefault(repository.identifier.lower(), set()).add(
-                    repository.provider
-                )
+            # for data whose provider is unknown). The same declarations
+            # gated the issue-reference join above.
+            declared_providers = repository_providers
 
             def owned(
                 name: str, provider: str, declared: Mapping[str, set[str]] = declared_providers
@@ -1725,16 +1763,24 @@ def build_control_center_snapshot(
         known_items = frozenset(item.item_id for item in items)
         item_status: dict[str, WorkUnitStatus] = {}
         for item in items:
-            _, basis, status = _resolve_state(item, statuses, by_issue_ref)
+            _, basis, status = _resolve_state(item, statuses, by_issue_ref, repository_providers)
             if basis == STATE_BASIS_LEDGER and status is not None:
                 item_status[item.item_id] = status
         # Ledger statuses by the change-request reference they carry, for
         # merge retirement. The ledger permits the same reference on more
-        # than one unit, so merge proof is resolved per unit below.
+        # than one unit, so merge proof is resolved per unit below. The
+        # HISTORICAL merged references count as carried too: a unit that
+        # merged one change request and was later re-pointed at another is
+        # the carrier a stale incident for the original request (adapter
+        # incidents name no work unit) retires against; proof still needs
+        # every carrier of the reference to agree.
         by_change_request: dict[str, list[WorkUnitStatus]] = {}
         for status in statuses.values():
-            if status.change_request_ref:
-                by_change_request.setdefault(status.change_request_ref, []).append(status)
+            carried = set(status.merged_change_request_refs)
+            carried.add(status.change_request_ref)
+            for reference in sorted(carried):
+                if reference:
+                    by_change_request.setdefault(reference, []).append(status)
         retained: list[Incident] = []
         for incident in project_incidents:
             # A change-request-scoped incident is moot once the ledger proves
