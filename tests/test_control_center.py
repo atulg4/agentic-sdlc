@@ -5220,6 +5220,16 @@ def test_the_console_pins_state_vocabulary_and_note_freshness():
     # any drop, since eviction from the bounded query is not deletion.
     assert "deleted or merely EVICTED" in html
     assert "entry.incidentId === keyIncident && entry.projectId === keyProject" in html
+    # The delivery sequence is re-checked immediately before each cache
+    # mutation (two adoption gates plus the per-read gate), so a superseded
+    # delivery's late read never restores or deletes a newer verification.
+    assert html.count("if (delivery !== notesDelivery) return;") == 3
+    # A failed exact read keeps the key retry-eligible even though it left
+    # liveNoteKeys, and a key delivered live again leaves the retry set.
+    assert "const retryNoteKeys = new Set();" in html
+    assert "if (delivery === notesDelivery) retryNoteKeys.add(key);" in html
+    assert "new Set([...liveNoteKeys, ...retryNoteKeys])" in html
+    assert "for (const key of retryNoteKeys) if (live.has(key)) retryNoteKeys.delete(key);" in html
     # Exact reads attach only records naming this project and incident.
     assert "entry.incidentId !== incidentId || entry.projectId !== projectId" in html
 
@@ -5242,3 +5252,185 @@ def test_the_console_validates_backlog_provenance_and_scoped_liveness():
     assert "state disagrees with its declared state" in html
     assert "names an unknown state basis" in html
     assert "carries a status without ledger provenance" in html
+
+
+def test_historical_merge_references_still_retire_their_incidents():
+    # The unit merged !1 and was later re-pointed at !2: a stale incident for
+    # the already-merged ORIGINAL request (adapter incidents name no work
+    # unit) must still find its carrier and retire, while !2 stays blocked.
+    swap = _event(
+        eventId="e-swap",
+        idempotencyKey="k-swap",
+        state="merged",
+        stage="merge",
+        workUnit={
+            "projectId": "forge",
+            "workUnitId": "wu-1",
+            "changeRequestRef": "acme/forge!2",
+        },
+        activity="re-pointed at a follow-up change request",
+    )
+    ledger = _ledger(
+        *_chain(
+            TO_MERGED,
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "changeRequestRef": "acme/forge!1",
+            },
+        ),
+        swap,
+    )
+    stale = _incident(
+        incidentId="acme/forge!1:merge-state-blocked",
+        kind="unclassified",
+        severity="degraded",
+        evidenceRef="acme/forge!1",
+        summary="The merged change request still reports blocked",
+    )
+    blocked = _incident(
+        incidentId="acme/forge!2:merge-state-blocked",
+        kind="unclassified",
+        severity="degraded",
+        evidenceRef="acme/forge!2",
+        summary="The follow-up change request is blocked",
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        incidents=load_incident_document(_incidents(stale, blocked)),
+    )
+    kept = [item.incident_id for item in snapshot.get("forge").incidents]
+    assert kept == ["acme/forge!2:merge-state-blocked"]
+    # The all-carriers rule is preserved: a second unit CURRENTLY carrying !1
+    # without merge proof keeps the incident, whatever wu-1's history says.
+    contested = _ledger(
+        *_chain(
+            TO_MERGED,
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "changeRequestRef": "acme/forge!1",
+            },
+        ),
+        swap,
+        *_chain(
+            TO_IMPLEMENTING,
+            work_unit="wu-2",
+            prefix="b",
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-2",
+                "changeRequestRef": "acme/forge!1",
+            },
+        ),
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=contested.projections(),
+        incidents=load_incident_document(_incidents(stale)),
+    )
+    kept = [item.incident_id for item in snapshot.get("forge").incidents]
+    assert kept == ["acme/forge!1:merge-state-blocked"]
+
+
+def test_issue_reference_joins_are_provider_qualified():
+    # Issue references are only unique within one tracker provider: a
+    # GitHub-exported item must not display a GitLab unit's ledger progress
+    # just because the reference strings coincide.
+    gitlab_registry = load_project_registry(
+        {
+            "schemaVersion": 1,
+            "projects": [
+                {
+                    "projectId": "forge",
+                    "displayName": "Forge",
+                    "group": "platform",
+                    "defaultBranch": "main",
+                    "repositories": [
+                        {"provider": "gitlab", "identifier": "acme/forge", "role": "primary"}
+                    ],
+                    "environments": [{"name": "production", "kind": "production"}],
+                    "capabilities": ["planning", "implementation"],
+                }
+            ],
+        }
+    )
+    ledger = _ledger(
+        *_chain(
+            TO_IMPLEMENTING,
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "issueRef": "acme/forge#1",
+                "repository": "acme/forge",
+            },
+        )
+    )
+    github_backlog = load_backlog_document(
+        _document(_backlog(issueRef="acme/forge#1", declaredState="approved"))
+        | {"source": "github"}
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=gitlab_registry,
+        projections=ledger.projections(),
+        backlog=github_backlog,
+    )
+    view = snapshot.get("forge")
+    node = view.backlog[0]
+    # The foreign item is preserved and warned about, but never joined.
+    assert (node.state, node.state_basis) == ("approved", STATE_BASIS_DECLARED)
+    assert node.status is None
+    assert any("declares only for gitlab" in warning for warning in view.warnings)
+    # An agreeing provider keeps the join; so does a document whose provider
+    # is unknown, since disagreement is proven, never guessed.
+    agreeing = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        backlog=github_backlog,
+    )
+    assert agreeing.get("forge").backlog[0].state_basis == STATE_BASIS_LEDGER
+    unknown_provider = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=gitlab_registry,
+        projections=ledger.projections(),
+        backlog=load_backlog_document(
+            _document(_backlog(issueRef="acme/forge#1", declaredState="approved"))
+        ),
+    )
+    assert unknown_provider.get("forge").backlog[0].state_basis == STATE_BASIS_LEDGER
+
+
+def test_failing_check_names_must_be_nonempty_bounded_strings():
+    # The name is interpolated into the incident summary: a non-string value
+    # would be coerced whole (nested credentials and all), and a blank one
+    # would fabricate a CI blocker with no named check.
+    pull = {
+        "number": 7,
+        "title": "red",
+        "state": "open",
+        "draft": False,
+        "mergeable_state": "unstable",
+        "base": {"repo": {"full_name": "acme/forge"}},
+    }
+    for name in (None, 7, {"token": "ghp-secret"}, ["test"], "", "   "):
+        with pytest.raises(ControlCenterError, match="must be a non-empty string"):
+            incidents_from_change_requests(
+                [pull],
+                project_id="forge",
+                repository="acme/forge",
+                observed_at=NOW,
+                failing={7: name},
+            )
+    with pytest.raises(ControlCenterError, match="narrow --failing"):
+        incidents_from_change_requests(
+            [pull],
+            project_id="forge",
+            repository="acme/forge",
+            observed_at=NOW,
+            failing={7: "x" * 513},
+        )

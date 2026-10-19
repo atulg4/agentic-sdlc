@@ -405,14 +405,24 @@
         next.set(key, entry);
       }
       if (delivery !== notesDelivery) return;
+      // A key delivered live again needs no retry: its scoped document is in
+      // the window, and dropping it keeps the retry set bounded.
+      for (const key of retryNoteKeys) if (live.has(key)) retryNoteKeys.delete(key);
       // A key the previous delivery carried but this one does not was either
       // deleted or merely EVICTED from the bounded window; only an exact read
       // can tell, so vanished cached keys are verified rather than dropped.
-      const vanished = Array.from(liveNoteKeys).filter((key) => !live.has(key) && backfilledEntries.has(key));
+      // Keys whose last verification FAILED stay eligible through the retry
+      // set even after liveNoteKeys stops carrying them.
+      const vanished = Array.from(new Set([...liveNoteKeys, ...retryNoteKeys]))
+        .filter((key) => !live.has(key) && backfilledEntries.has(key));
       for (let start = 0; start < vanished.length; start += 10) {
         await Promise.all(vanished.slice(start, start + 10).map(async (key) => {
           try {
             const snap = await state.db.doc("notes/" + (await docId(key))).get();
+            // Re-checked after the awaits, immediately before any cache
+            // mutation: a superseded delivery's late read must not restore
+            // or delete what the newer delivery just verified.
+            if (delivery !== notesDelivery) return;
             const entry = snap?.data?.();
             const separator = key.indexOf("\u0000");
             const keyProject = key.slice(0, separator);
@@ -422,7 +432,13 @@
             } else {
               backfilledEntries.delete(key);
             }
-          } catch { /* keep the cached copy; the next adoption re-reads it */ }
+            retryNoteKeys.delete(key);
+          } catch {
+            // Keep the cached copy AND its retry eligibility: the key is
+            // about to leave liveNoteKeys, so without the retry set the next
+            // deliveries would never re-verify it.
+            if (delivery === notesDelivery) retryNoteKeys.add(key);
+          }
         }));
       }
       if (delivery !== notesDelivery) return;
@@ -512,6 +528,9 @@
 
   const backfilledEntries = new Map();
   let liveNoteKeys = new Set();
+  // Vanished keys whose exact verification failed: they left liveNoteKeys,
+  // so this set alone keeps them re-verified on later notes deliveries.
+  const retryNoteKeys = new Set();
   let backfillGeneration = 0;
   async function backfillNotes(document_) {
     // The notes subscription is a bounded window, so a note outside it is
