@@ -38,8 +38,9 @@ never review its own writes. Missions with neither capability set
   retrieval-controlled text, so metadata never holds a privileged prompt
   position.
 - **Reviewer verification** (`VerificationEvidence`): the candidate's exact
-  40- or 64-hex head SHA, the changed paths and line counts, the patch
-  digest, the complete `run_gates` report (exactly the keys `run_gates`
+  40- or 64-hex head SHA and the trusted review base SHA it was diffed
+  against (required and distinct — the head alone does not identify a
+  diff), the changed paths and line counts, the patch digest, the complete `run_gates` report (exactly the keys `run_gates`
   emits, top level and per entry — a nonempty gates array whose entries each
   carry name, command, exitCode, durationSeconds and a boolean verdict, with
   an agreeing aggregate), and prior findings, which fail closed when they
@@ -65,10 +66,11 @@ Mandatory content — the task sections, policy limits, reviewer verification,
 and **every record from a `required` knowledge source** — is never truncated:
 when it cannot fit `budget_bytes` (default 256 KiB), the build blocks with a
 reason instead. The prompt is also held under the mission's own token
-budget: with a deterministic ~4-bytes-per-token estimate and a 256-token
-output reserve, mandatory content past `max_tokens` blocks, and optional
-selection stops at whichever budget binds first, so the envelope never
-advertises a limit the packet already exceeds. Optional evidence fills the remaining budget in deterministic
+budget: counted at the provably conservative one-token-per-UTF-8-byte
+ceiling (a BPE token encodes at least one byte, for any tokenizer) with a
+256-token output reserve, mandatory content past `max_tokens` blocks, and
+optional selection stops at whichever budget binds first, so the envelope
+never advertises a limit the packet already exceeds. Optional evidence fills the remaining budget in deterministic
 relevance order (keyword overlap with the task, ties broken by evidence ID);
 records that do not fit are recorded as `omitted by budget` in the packet's
 selection notes. The pack's qualification notices count against the budget
@@ -88,8 +90,10 @@ or when its rendered block — the payload and its citation metadata (locator,
 revision) alike — carries a secret-like value (key blocks, provider token
 shapes, quoted credential assignments) — scanned both raw and after
 boundary-marker removal, so an embedded marker cannot split a credential
-past the scan only for sanitization to reassemble it. A record whose `sourceType` disagrees
-with its declared source is rejected outright; identical duplicate records
+past the scan only for sanitization to reassemble it. A record whose `sourceType`, `scope`, or
+`classification` disagrees with its declared source is rejected outright —
+adapter-controlled fields must agree with the source whose permissions the
+record rides; identical duplicate records
 are counted once, matching the knowledge layer, while records that share an
 evidence ID but differ in other fields fail closed, so the prompt never
 depends on input order. Each exclusion is recorded on the packet, and the
@@ -127,7 +131,16 @@ reason — naming the source or evidence and the remedy — when:
   repository record was retrieved at a different revision — all repository
   evidence must come from one trusted pinned tree, never a mix of commits,
 - `work_ref` does not identify a request within the configured project
-  (`projectId#N`, the same binding the harness manifest enforces).
+  (`projectId#N`, the same binding the harness manifest enforces),
+- the policy limits themselves carry a secret-like value (a
+  credential-shaped path pattern in the protected configuration) — they
+  render outside the untrusted boundary, so they fail closed like every
+  other packet string.
+
+Evidence documents reconstructed by `record_from_dict` must be UTF-8
+encodable in every string field: a surrogate-escaped value (a non-UTF-8
+Git filename, say) fails closed with a remedy instead of raising an
+uncaught encoding error when the packet is rendered.
 
 Exclusion notes are serialized by `as_dict` and echoed in blocking errors,
 so a forbidden or out-of-scope filename that is itself token-shaped is

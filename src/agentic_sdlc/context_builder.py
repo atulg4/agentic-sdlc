@@ -87,9 +87,11 @@ PACKET_ROLES = frozenset({ROLE_BUILDER, ROLE_TESTER, ROLE_REVIEWER})
 #: Compact by default: a packet is the minimum useful evidence, not a dump.
 DEFAULT_PACKET_BYTES = 262_144
 
-#: Deterministic prompt-size heuristic, about four UTF-8 bytes per token:
-#: deliberately simple so the guard never depends on a tokenizer version.
-PROMPT_BYTES_PER_TOKEN = 4
+#: PROVABLY conservative token accounting: a BPE token encodes at least one
+#: UTF-8 byte, so the byte count is an upper bound on the token count for any
+#: tokenizer — token-dense text (emoji, dense punctuation) can never slip
+#: past the mission budget, and the guard depends on no tokenizer version.
+PROMPT_BYTES_PER_TOKEN = 1
 
 #: Room the mission's own answer needs inside its token budget: a packet
 #: that filled the whole budget could not be consumed within contract.
@@ -237,8 +239,18 @@ class VerificationEvidence:
             raise ContextBuilderError(
                 "verification head_sha must be the exact 40- or 64-hex candidate commit"
             )
-        if self.base_sha and not _COMMIT_SHA.fullmatch(self.base_sha):
-            raise ContextBuilderError("verification base_sha must be a 40- or 64-hex commit")
+        # The head alone does not identify a diff: the same candidate can be
+        # diffed against different bases, so the trusted review base is
+        # required and travels into the packet digest with everything else.
+        if not _COMMIT_SHA.fullmatch(self.base_sha):
+            raise ContextBuilderError(
+                "verification base_sha must be the 40- or 64-hex trusted review base commit"
+            )
+        if self.base_sha == self.head_sha:
+            raise ContextBuilderError(
+                "verification base_sha must differ from head_sha; a commit cannot "
+                "be its own review base"
+            )
         if not self.diff_paths or not all(
             isinstance(path, str) and path.strip() for path in self.diff_paths
         ):
@@ -976,6 +988,17 @@ def build_context_packet(
             authorize_source(source, mission)
         except KnowledgeError as error:
             raise ContextBuilderError(f"context packet rejected: {error}") from error
+        if record.scope != source.scope or record.classification != source.classification:
+            # Adapter-controlled fields must agree with the DECLARED source:
+            # a record claiming an authorized source id while carrying another
+            # scope or classification would ride that source's permissions.
+            # The record's own values are not echoed — they are
+            # retrieval-controlled text.
+            raise ContextBuilderError(
+                f"evidence {record.evidence_id} declares a scope or classification "
+                f"other than source {record.source_id}'s ({source.scope}, "
+                f"{source.classification}); fix the retrieval adapter"
+            )
         if record.source_type != source.source_type:
             # A record claiming another type for a declared source would dodge
             # the repository-path checks below (_record_path returns None for
@@ -1126,6 +1149,14 @@ def build_context_packet(
             )
 
     limits = _policy_limits(policy, mission)
+    # The limits render OUTSIDE the untrusted boundary and persist in the
+    # serialized packet, so a credential-shaped path pattern in the protected
+    # configuration fails closed like every other packet string.
+    if _contains_secret(limits):
+        raise ContextBuilderError(
+            "policy limits carry secret-like content; redact the protected "
+            "configuration (forbidden, protected, or mission paths) before packing"
+        )
     keywords = _task_keywords(task)
     mandatory = sorted(
         (record for record in admitted if sources[record.source_id].required),
@@ -1165,7 +1196,7 @@ def build_context_packet(
             mission,
             work_ref,
             (
-                f"mandatory context is about {-(-rendered // PROMPT_BYTES_PER_TOKEN)} "
+                f"mandatory context is up to {-(-rendered // PROMPT_BYTES_PER_TOKEN)} "
                 f"prompt tokens but mission {mission.mission_id} allows "
                 f"{mission.max_tokens} tokens with a {OUTPUT_TOKEN_RESERVE}-token "
                 "output reserve; raise the mission token budget or split the task",
@@ -1236,7 +1267,7 @@ def build_context_packet(
             mission,
             work_ref,
             (
-                f"the rendered packet is about {-(-final_bytes // PROMPT_BYTES_PER_TOKEN)} "
+                f"the rendered packet is up to {-(-final_bytes // PROMPT_BYTES_PER_TOKEN)} "
                 f"prompt tokens once its qualification notices are included but "
                 f"mission {mission.mission_id} allows {mission.max_tokens} tokens "
                 f"with a {OUTPUT_TOKEN_RESERVE}-token output reserve; raise the "

@@ -226,6 +226,20 @@ def record_from_dict(document: Mapping[str, Any]) -> EvidenceRecord:
         value = document.get(key, default)
         if not isinstance(value, str):
             raise KnowledgeError(f"evidence record field {key} must be a string")
+        return _utf8(value, key)
+
+    def _utf8(value: str, label: str) -> str:
+        # A surrogate-escaped string (a non-UTF-8 Git filename, say) would
+        # pass every shape check here only to raise an uncaught
+        # UnicodeEncodeError when the packet is rendered or serialized, so
+        # it fails closed with the remedy instead.
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise KnowledgeError(
+                f"evidence record field {label} is not UTF-8 encodable; "
+                "re-encode or rename it at the source"
+            ) from error
         return value
 
     anchors = document.get("anchors", [])
@@ -235,6 +249,8 @@ def record_from_dict(document: Mapping[str, Any]) -> EvidenceRecord:
         or not all(isinstance(item, str) for item in anchors)
     ):
         raise KnowledgeError("evidence record anchors must be an array of strings")
+    for item in anchors:
+        _utf8(item, "anchors")
     raw_links = document.get("links", [])
     if not isinstance(raw_links, Sequence) or isinstance(raw_links, str):
         raise KnowledgeError("evidence record links must be an array of objects")
@@ -246,7 +262,12 @@ def record_from_dict(document: Mapping[str, Any]) -> EvidenceRecord:
             or not isinstance(entry.get("target"), str)
         ):
             raise KnowledgeError("evidence record links must be objects with kind and target")
-        links.append(EvidenceLink(kind=entry["kind"], target_evidence_id=entry["target"]))
+        links.append(
+            EvidenceLink(
+                kind=_utf8(entry["kind"], "links.kind"),
+                target_evidence_id=_utf8(entry["target"], "links.target"),
+            )
+        )
     record = EvidenceRecord(
         source_id=_text("sourceId"),
         source_type=_text("sourceType"),

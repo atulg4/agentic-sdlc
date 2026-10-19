@@ -34,6 +34,7 @@ def _sha(text: str) -> str:
 
 
 HEAD = "f" * 40
+BASE = "e" * 40
 WORK_REF = "example/project#118"
 
 TASK = TaskSpec(
@@ -102,6 +103,7 @@ def _verification(**overrides) -> VerificationEvidence:
         "patch_sha256": _sha("patch"),
         "gate_report": {"passed": True, "gates": [_gate()]},
         "prior_findings": ("Round one flagged an unbounded retry loop.",),
+        "base_sha": BASE,
     }
     values.update(overrides)
     return VerificationEvidence(**values)
@@ -1571,3 +1573,55 @@ def test_packets_fit_the_mission_token_budget(registry, policy):
             records=(),
             sources={},
         )
+
+
+def test_verification_requires_the_trusted_base():
+    # The head alone does not identify a diff: the same candidate can be
+    # diffed against different bases, so the trusted base is required.
+    with pytest.raises(ContextBuilderError, match="trusted review base"):
+        _verification(base_sha="")
+    with pytest.raises(ContextBuilderError, match="cannot be its own review base"):
+        _verification(base_sha=HEAD)
+
+
+def test_policy_limits_carrying_credentials_fail_closed(registry, policy):
+    # The limits render OUTSIDE the untrusted boundary, so a credential-shaped
+    # path pattern in the protected configuration fails closed.
+    leaky = _mission(forbidden_paths=("src/ghp_0123456789abcdefghij0123456789abcdef.py",))
+    with pytest.raises(ContextBuilderError, match="redact the protected configuration"):
+        build_context_packet(
+            leaky,
+            TASK,
+            policy,
+            work_ref=WORK_REF,
+            repository_revision="abc123",
+            records=(_record(),),
+            sources={"repo-main": _source()},
+        )
+
+
+def test_records_bind_scope_and_classification_to_the_source(registry, policy):
+    # A record riding an authorized source id with a foreign scope or
+    # classification would carry that source's permissions.
+    with pytest.raises(ContextBuilderError, match="scope or classification"):
+        _packet(registry, policy, records=(_record(scope="other/project"),))
+    with pytest.raises(ContextBuilderError, match="scope or classification"):
+        _packet(registry, policy, records=(_record(classification="restricted"),))
+
+
+def test_token_accounting_is_provably_conservative():
+    from agentic_sdlc.context_builder import PROMPT_BYTES_PER_TOKEN
+
+    # A BPE token encodes at least one UTF-8 byte, so counting one token per
+    # byte can never under-count for any tokenizer.
+    assert PROMPT_BYTES_PER_TOKEN == 1
+
+
+def test_surrogate_escaped_documents_fail_closed():
+    document = _record().as_dict()
+    document["externalId"] = "src/caf\udce9.py@abc123"
+    with pytest.raises(ValueError, match="not UTF-8 encodable"):
+        record_from_dict(document)
+    tainted_payload = {**_record().as_dict(), "payload": "bad\udce9"}
+    with pytest.raises(ValueError, match="not UTF-8 encodable"):
+        record_from_dict(tainted_payload)
