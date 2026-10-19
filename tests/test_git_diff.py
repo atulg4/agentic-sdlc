@@ -70,41 +70,57 @@ def test_collect_diff_includes_both_sides_of_rename(tmp_path: Path) -> None:
 
 
 def test_derivation_tree_materializes_the_committed_content(tmp_path: Path) -> None:
+    import os
+
     from agentic_sdlc.git_diff import derivation_tree
 
-    _git(tmp_path, "init", "-q", "-b", "main")
-    _git(tmp_path, "config", "user.email", "test@example.com")
-    _git(tmp_path, "config", "user.name", "Test")
-    (tmp_path / "a.txt").write_text("committed\n", encoding="utf-8")
-    (tmp_path / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+    repo = tmp_path / "source"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    (repo / "a.txt").write_text("committed\n", encoding="utf-8")
+    (repo / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
     # A committed .gitattributes selecting a filter whose driver lives only
-    # in repository-local config: a checkout would run it and hand gates
-    # content absent from the commit; the archive-based tree must not.
-    (tmp_path / ".gitattributes").write_text("a.txt filter=sneaky\n", encoding="utf-8")
-    _git(tmp_path, "add", "--", ".")
-    _git(tmp_path, "commit", "-qm", "base")
-    _git(tmp_path, "config", "filter.sneaky.smudge", "sed s/committed/smudged/")
+    # in repository-local config: a checkout IN THAT REPOSITORY would run it,
+    # but the derivation clone's pristine configuration defines no driver, so
+    # the committed bytes materialize unaltered.
+    (repo / ".gitattributes").write_text("a.txt filter=sneaky\n", encoding="utf-8")
+    # A committed symlink materializes exactly as a real checkout would.
+    os.symlink("a.txt", repo / "alias.txt")
+    _git(repo, "add", "--", ".")
+    _git(repo, "commit", "-qm", "base")
+    _git(repo, "config", "filter.sneaky.smudge", "sed s/committed/smudged/")
     head = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=tmp_path, check=True, capture_output=True, text=True
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
     ).stdout.strip()
 
     # Dirty the caller's checkout in every way a gate could observe: an
     # uncommitted edit, an ignored file, and status output suppressed by
     # repository-local configuration.
-    (tmp_path / "a.txt").write_text("uncommitted\n", encoding="utf-8")
-    (tmp_path / "ignored.txt").write_text("SECRET=1\n", encoding="utf-8")
-    _git(tmp_path, "config", "status.showUntrackedFiles", "no")
+    (repo / "a.txt").write_text("uncommitted\n", encoding="utf-8")
+    (repo / "ignored.txt").write_text("SECRET=1\n", encoding="utf-8")
+    _git(repo, "config", "status.showUntrackedFiles", "no")
 
-    with derivation_tree(tmp_path, head) as tree:
+    with derivation_tree(repo, head) as tree:
         kept = tree
-        # The disposable tree holds exactly the committed content: no
+        # The disposable checkout holds exactly the committed content: no
         # uncommitted edit, no ignored file, and no locally configured
         # smudge filter applied.
         assert (tree / "a.txt").read_text(encoding="utf-8") == "committed\n"
         assert not (tree / "ignored.txt").exists()
-        # It is a plain directory materialized from the object database,
-        # not a linked worktree carrying the repository's configuration.
-        assert not (tree / ".git").exists()
+        assert (tree / "alias.txt").is_symlink()
+        assert os.readlink(tree / "alias.txt") == "a.txt"
+        # Full Git metadata rides along for repository-aware gates, with a
+        # pristine configuration: no filter driver, no hooks from the source.
+        assert (tree / ".git").exists()
+        cloned_config = subprocess.run(
+            ["git", "config", "--local", "--get", "filter.sneaky.smudge"],
+            cwd=tree,
+            capture_output=True,
+            text=True,
+        )
+        assert cloned_config.returncode != 0
     # The tree is removed afterwards and the caller's own state is untouched.
     assert not kept.exists()
-    assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "uncommitted\n"
+    assert (repo / "a.txt").read_text(encoding="utf-8") == "uncommitted\n"

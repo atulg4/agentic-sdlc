@@ -453,93 +453,61 @@ def resolve_commit(repository: str | Path, rev: str) -> str:
     return commit
 
 
-def _tree_member(tree: Path, path: str) -> Path:
-    """The path of one tree entry under `tree`, refused when it could escape."""
-    member = PurePosixPath(path)
-    if member.is_absolute() or any(part in ("", ".", "..") for part in member.parts):
-        raise GitDiffError("refusing to materialize a non-canonical tree path")
-    return tree.joinpath(*member.parts)
-
-
 @contextmanager
 def derivation_tree(repository: str | Path, rev: str) -> Iterator[Path]:
-    """A disposable directory holding exactly the content of commit `rev`.
+    """A disposable checkout of commit `rev` under pristine configuration.
 
     For callers about to RUN programs against a commit (gate commands): the
     caller's own checkout is not evidence — it can carry uncommitted edits,
-    ignored files a gate would read, or repository-local status configuration
-    that suppresses either — and a gate run leaves its own caches behind, so
-    two derivations in one checkout would observe each other. The tree is
-    materialized RAW from the object database (``ls-tree`` and ``cat-file``),
-    never through a checkout or ``git archive``: both run the smudge filters
-    that ``filter.<driver>.smudge`` in ``.git/config`` can define for a
-    committed ``.gitattributes``, handing gates content absent from the
-    commit while the local config stays invisible to any cleanliness read.
-    A symlink entry is recreated only when its target stays inside the tree;
-    a gitlink becomes an empty directory. The directory is removed
-    afterwards."""
+    ignored files a gate would read, or repository-local configuration that
+    suppresses status output or defines smudge filters for a committed
+    ``.gitattributes`` — and a gate run leaves its own caches behind, so two
+    derivations in one checkout would observe each other. The tree is a
+    fresh CLONE (``--no-local``, then a detached checkout): its brand-new
+    configuration defines no filter drivers and no hooks, so the committed
+    bytes materialize unaltered, while the clone still carries full Git
+    metadata and the origin refs a repository-aware gate (one diffing
+    against ``origin/<branch>``, say) needs. Every committed entry —
+    symlinks included — materializes exactly as a real checkout would, so
+    gates test the candidate tree itself, and the whole directory is removed
+    afterwards. The commit must be reachable from the source repository's
+    refs, as any published candidate is."""
     commit = resolve_commit(repository, rev)
     root = _bind(repository)
-    listing = _run(["git", "ls-tree", "-r", "-z", commit], root).stdout
-    entries: list[tuple[str, str, str, str]] = []
-    for raw in listing.split(b"\0"):
-        if not raw:
-            continue
-        meta, _, name = raw.partition(b"\t")
-        mode, kind, sha = meta.decode("ascii", errors="replace").split()
-        entries.append((mode, kind, sha, _decode_path(name)))
-    # One batch read pairs blob contents with requests by order; `cat-file
-    # --batch` answers in request order.
-    wanted = [sha for _, kind, sha, _ in entries if kind == "blob"]
-    blobs: dict[str, bytes] = {}
-    if wanted:
-        batch = _run(
-            ["git", "cat-file", "--batch"],
-            root,
-            stdin="".join(f"{sha}\n" for sha in wanted).encode("ascii"),
-        ).stdout
-        offset = 0
-        for sha in wanted:
-            if sha in blobs:
-                continue
-            newline = batch.index(b"\n", offset)
-            header = batch[offset:newline].decode("ascii", errors="replace").split()
-            if len(header) != 3 or header[0] != sha or header[1] != "blob":
-                raise GitDiffError(f"cat-file answered out of order for {sha}")
-            size = int(header[2])
-            start = newline + 1
-            blobs[sha] = batch[start : start + size]
-            offset = start + size + 1  # the trailing newline after each object
+    program = _git_program()
     base = tempfile.mkdtemp(prefix="agentic-sdlc-derivation-")
     tree = Path(base) / "tree"
-    tree.mkdir()
     try:
-        for mode, kind, sha, path in entries:
-            target = _tree_member(tree, path)
-            if kind == "commit":
-                # A gitlink: the submodule's content is not in this object
-                # database, so the mount point is an empty directory exactly
-                # as a fresh clone without submodule init would leave it.
-                target.mkdir(parents=True, exist_ok=True)
-                continue
-            if kind != "blob":
-                continue
-            content = blobs[sha]
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if mode == "120000":
-                # Recreate a symlink only when it lexically stays inside the
-                # materialized tree: a committed link to an absolute path or
-                # out through .. would hand gates the caller's files.
-                link = _decode_path(content)
-                anchor = target.parent.relative_to(tree)
-                resolved = os.path.normpath(str(PurePosixPath(anchor) / link))
-                if PurePosixPath(link).is_absolute() or resolved.startswith(".."):
-                    continue
-                os.symlink(link, target)
-                continue
-            target.write_bytes(content)
-            if mode == "100755":
-                os.chmod(target, 0o755)
+        _exec(
+            [
+                program,
+                "clone",
+                "--quiet",
+                "--no-local",
+                "--no-checkout",
+                "--",
+                root.git_dir,
+                str(tree),
+            ],
+            base,
+            "clone",
+        )
+        _exec(
+            [
+                program,
+                "-C",
+                str(tree),
+                "--no-replace-objects",
+                "-c",
+                "core.fsmonitor=false",
+                "checkout",
+                "--quiet",
+                "--detach",
+                commit,
+            ],
+            str(tree),
+            "checkout",
+        )
         yield tree
     finally:
         shutil.rmtree(base, ignore_errors=True)

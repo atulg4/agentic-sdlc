@@ -821,6 +821,18 @@ def _dispatch_mission(args: argparse.Namespace) -> int:
     return 0
 
 
+def _candidate_config_rel(args: argparse.Namespace) -> Path:
+    """The --config path relative to the candidate repository, refused outside it."""
+    repo_root = Path(args.candidate_repository).resolve()
+    try:
+        return Path(args.config).resolve().relative_to(repo_root)
+    except ValueError:
+        raise ContextBuilderError(
+            "derived gates run under the gate configuration committed in the "
+            "candidate repository; pass --config as a path inside it"
+        ) from None
+
+
 def _derived_verification(args: argparse.Namespace, request: dict) -> VerificationEvidence:
     """Reviewer verification DERIVED from the candidate repository itself.
 
@@ -840,14 +852,7 @@ def _derived_verification(args: argparse.Namespace, request: dict) -> Verificati
     # caller's checkout would let an uncommitted edit replace the real test
     # command while the report binds to the candidate head, so the gates run
     # under the configuration AS COMMITTED at the candidate head.
-    repo_root = Path(args.candidate_repository).resolve()
-    try:
-        config_rel = Path(args.config).resolve().relative_to(repo_root)
-    except ValueError:
-        raise ContextBuilderError(
-            "derived gates run under the gate configuration committed in the "
-            "candidate repository; pass --config as a path inside it"
-        ) from None
+    config_rel = _candidate_config_rel(args)
     # The caller's own checkout is not evidence: it can be dirty, carry
     # ignored files a gate would read, or have status output suppressed by
     # repository-local configuration — and a gate run leaves caches behind
@@ -1009,12 +1014,45 @@ def _build_packet_from_request(
     the same evidence authorization, verification requirement, and budgeting
     that produced the packet artifact.
     """
-    policy = load_policy(args.config)
-    registry = load_registry(args.missions, policy)
-    sources = {source.source_id: source for source in load_sources(args.knowledge)}
     request = json.loads(Path(args.request).read_text(encoding="utf-8"))
     if not isinstance(request, dict):
         raise ContextBuilderError("packet request must be a JSON object")
+    repository_revision = request.get("repositoryRevision", "")
+    if not isinstance(repository_revision, str):
+        raise ContextBuilderError("packet request repositoryRevision must be a string")
+    if getattr(args, "candidate_repository", None):
+        # The policy that shapes the packet — limits, forbidden paths, task
+        # policy — is read from the COMMITTED candidate tree, exactly like
+        # the gate configuration: an uncommitted caller-side edit must not
+        # loosen the packet while the gate report presents the committed
+        # definitions. The pin is role-independent: reviewer derivations name
+        # --candidate-head, builder paths pin repositoryRevision.
+        pin_source = args.candidate_head or repository_revision
+        if not pin_source:
+            raise ContextBuilderError(
+                "--candidate-repository requires --candidate-head or a pinned "
+                "repositoryRevision to locate the committed configuration"
+            )
+        pinned = resolve_commit(args.candidate_repository, pin_source)
+        config_rel = _candidate_config_rel(args)
+        try:
+            policy_bytes = read_committed_file(
+                args.candidate_repository,
+                pinned,
+                config_rel.as_posix(),
+                label="the pinned tree",
+            )
+        except GitDiffError as error:
+            raise ContextBuilderError(
+                "the policy configuration is not committed at the pinned "
+                "revision; commit it so the packet is built under "
+                "repository-owned definitions"
+            ) from error
+        policy = load_policy_bytes(policy_bytes)
+    else:
+        policy = load_policy(args.config)
+    registry = load_registry(args.missions, policy)
+    sources = {source.source_id: source for source in load_sources(args.knowledge)}
 
     def _request_text(key: str) -> str:
         value = request.get(key)
@@ -1041,10 +1079,6 @@ def _build_packet_from_request(
     failures = request.get("retrievalFailures", [])
     if not isinstance(failures, list) or not all(isinstance(item, str) for item in failures):
         raise ContextBuilderError("packet request retrievalFailures must be an array of strings")
-    repository_revision = request.get("repositoryRevision", "")
-    if not isinstance(repository_revision, str):
-        raise ContextBuilderError("packet request repositoryRevision must be a string")
-
     mission = registry.get(_request_text("missionId"))
     role = mission_role(mission)
     verification = None
@@ -1112,11 +1146,11 @@ def _build_packet_from_request(
         retrieval_failures=tuple(failures),
         repository_revision=repository_revision,
     )
-    return registry, mission, packet
+    return registry, mission, packet, policy
 
 
 def _context_packet(args: argparse.Namespace) -> int:
-    _registry, _mission, packet = _build_packet_from_request(args)
+    _registry, _mission, packet, _policy = _build_packet_from_request(args)
     _write(packet.as_dict(), args.output)
     return 0
 
@@ -1130,8 +1164,9 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
     envelope carries the packet digest as ``contextPackDigest`` and the
     rendered packet as its prompt.
     """
-    registry, mission, packet = _build_packet_from_request(args, trusted_verification_only=True)
-    policy = load_policy(args.config)
+    registry, mission, packet, policy = _build_packet_from_request(
+        args, trusted_verification_only=True
+    )
     if mission_role(mission) != "reviewer":
         # The official dispatch path binds write-capable work to the same
         # eligibility decision the implementation-readiness path enforces: a
@@ -1168,7 +1203,7 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
                 "request; rebuild the packet before dispatching"
             )
     agents = load_agents(json.loads(Path(args.agents).read_text(encoding="utf-8")))
-    history: dict[str, str] = {}
+    history: dict[str, list[str]] = {}
     if args.history:
         # The history is the ORCHESTRATOR STATE, not a bare mission→agent
         # map: a caller-authored map could record "" (or any other agent) for
@@ -1186,7 +1221,12 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
                 "the orchestrator state that dispatched this work item"
             ) from error
         for run in unit.runs:
-            history[run.mission_id] = run.agent_id
+            # EVERY agent that performed the mission is excluded, not only
+            # the last assignee: a work item can carry several runs of one
+            # producing mission by different agents.
+            agents_for = history.setdefault(run.mission_id, [])
+            if run.agent_id not in agents_for:
+                agents_for.append(run.agent_id)
     if mission_role(mission) == "reviewer":
         # A review necessarily follows a producing run, so an absent history
         # — or one recording no producing run for this work item — is not

@@ -74,8 +74,11 @@ never advertises a limit the packet already exceeds. Optional evidence fills the
 relevance order (keyword overlap with the task, ties broken by evidence ID);
 records that do not fit are recorded as `omitted by budget` in the packet's
 selection notes. The pack's qualification notices count against the budget
-too: `renderedBytes` reports the real rendered prompt size, and a packet
-whose notices push it past the budget blocks rather than under-reporting.
+too: `renderedBytes` reports the real rendered prompt size, and when the
+notices push the rendered packet past a budget the least-relevant selected
+optional records are evicted (recorded in the selection notes) until it
+fits — the build blocks only when no optional selection remains to give
+back.
 The knowledge layer's record cap is a second selection budget: mandatory
 records past it block the build, and excess optional records are recorded
 as `omitted by record limit`. For high- and critical-risk missions,
@@ -177,10 +180,12 @@ against the packet's bound limits, so a mission edited without a version
 bump cannot dispatch a prompt that still encodes the old policy or reuse
 evidence the mission may no longer read. The bound limits carry the FULL
 execution contract — purpose, success criteria, output artifacts, and the
-command allowlist — which renders into the prompt's policy section, so the
-agent is told its mission-specific contract (not generic role text) and a
-same-version edit to any of those fields refuses dispatch of the stale
-packet.
+command allowlist render into the prompt's policy section, and the complete
+canonical mission document (retries, approval, capabilities, inputs,
+evidence, concurrency, independence included) travels in the digest and is
+compared at dispatch — so the agent is told its mission-specific contract
+(not generic role text) and a same-version edit to any execution-relevant
+field refuses dispatch of the stale packet.
 
 ## CLI
 
@@ -221,26 +226,33 @@ DERIVED, never declared: with `--candidate-repository`, `--candidate-base`
 and `--candidate-head`, the CLI resolves both commits in that repository,
 computes the diff summary with `collect_commit_diff`, runs the
 gates itself (`run_gates`, with wall-clock durations zeroed so derived
-packets are deterministic end to end) inside a disposable tree materialized
-RAW from the object database at the candidate head (`ls-tree`/`cat-file`,
-never a checkout or `git archive` — both run the smudge filters
-repository-local config can define for a committed `.gitattributes`) — the
-caller's own checkout is never executed, so uncommitted edits, ignored
-files, status-suppressing repository config, locally configured filters,
-and the caches one gate run leaves
-behind can neither block a derivation nor reach a gate. The gates run under
-the gate configuration AS COMMITTED at the candidate head (`--config` must
-resolve inside the candidate repository and be committed there), with
-`GITHUB_WORKSPACE` repointed at the disposable tree so an Actions-style
-gate cannot read the caller's checkout. The derivation also reads every
+packets are deterministic end to end) inside a disposable PRISTINE CLONE
+checked out detached at the candidate head: its brand-new configuration
+defines no filter drivers and no hooks (so the smudge filters
+repository-local config can define for a committed `.gitattributes` never
+run), every committed entry — symlinks included — materializes exactly as a
+real checkout would, and the clone carries full Git metadata and origin
+refs for repository-aware gates. The caller's own checkout is never
+executed, so uncommitted edits, ignored files, status-suppressing
+repository config, locally configured filters, and the caches one gate run
+leaves behind can neither block a derivation nor reach a gate. The gates
+run under the gate configuration AS COMMITTED at the candidate head
+(`--config` must resolve inside the candidate repository and be committed
+there), with `GITHUB_WORKSPACE` repointed at the disposable tree so an
+Actions-style gate cannot read the caller's checkout — and the PACKET
+policy itself (limits, forbidden paths, task policy) is read from the same
+committed tree on every candidate path, so an uncommitted caller-side
+policy edit shapes nothing. The derivation also reads every
 pinned repository
 record's payload back from the candidate tree through the adapter's own
 sanitization — a fabricated payload with a self-consistent hash is
 rejected, and a token-shaped path is withheld from every readback error.
 The verification evidence carries the candidate patch text itself (the
-digest binds the exact bytes), rendered inside an untrusted boundary, so
-the reviewer reads the change under review rather than only its hash,
-path names, and line counts.
+digest binds the exact bytes), rendered inside an untrusted boundary with
+boundary-marker text ESCAPED rather than stripped — code that legitimately
+spells a marker reaches the reviewer intact — so the reviewer reads the
+change under review rather than only its hash, path names, and line
+counts.
 Builder and tester dispatches carrying repository evidence take
 `--candidate-repository` alone (the derivation flags are reviewer-only) and
 are refused without it: the request's `repositoryRevision` must be the full
@@ -257,9 +269,11 @@ JSON are not approval evidence, and neither is a verdict narrowed to a
 caller-selected label. Reviewer dispatches require `--history`: the
 ORCHESTRATOR STATE document, replayed through the orchestrator's own
 validation, whose recorded runs for this work item (mission and agent
-identity) define the independence exclusions — a caller-authored
-mission→agent map is not authoritative, and a state recording no producing
-run for any mission the review is independent of refuses dispatch.
+identity) define the independence exclusions — EVERY agent that performed a
+producing mission is excluded, not only the last assignee. A
+caller-authored mission→agent map is not authoritative, and a state
+recording no producing run for any mission the review is independent of
+refuses dispatch.
 Request
 JSON can never impersonate pipeline evidence: `dispatch-packet` refuses a
 request-supplied `verification` object outright, and `context-packet`

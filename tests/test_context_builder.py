@@ -2443,7 +2443,12 @@ def test_write_capable_dispatch_verifies_repository_evidence(
     (repo / "src" / "scheduler.py").write_text(
         "class Scheduler:\n    retries = 2\n", encoding="utf-8"
     )
-    git("add", "src/scheduler.py")
+    # Candidate paths read the policy from the committed tree, so the
+    # fixture commits it like a real project.
+    (repo / "agentic-sdlc.toml").write_text(
+        policy_file.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    git("add", "src/scheduler.py", "agentic-sdlc.toml")
     git("commit", "-q", "-m", "pin")
     pin = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "HEAD"],
@@ -2505,7 +2510,7 @@ def test_write_capable_dispatch_verifies_repository_evidence(
     )
     base = [
         "--config",
-        str(policy_file),
+        str(repo / "agentic-sdlc.toml"),
         "--knowledge",
         str(knowledge),
         "--request",
@@ -2546,7 +2551,7 @@ def test_write_capable_dispatch_verifies_repository_evidence(
             [
                 "dispatch-packet",
                 "--config",
-                str(policy_file),
+                str(repo / "agentic-sdlc.toml"),
                 "--knowledge",
                 str(knowledge),
                 "--request",
@@ -2570,7 +2575,7 @@ def test_write_capable_dispatch_verifies_repository_evidence(
             [
                 "dispatch-packet",
                 "--config",
-                str(policy_file),
+                str(repo / "agentic-sdlc.toml"),
                 "--knowledge",
                 str(knowledge),
                 "--request",
@@ -2586,6 +2591,10 @@ def test_write_capable_dispatch_verifies_repository_evidence(
         == 2
     )
     assert "does not match the pinned" in capsys.readouterr().err
+    # The packet policy comes from the COMMITTED tree on candidate paths: an
+    # uncommitted edit to the working-tree policy file — even one that would
+    # not parse — shapes nothing.
+    (repo / "agentic-sdlc.toml").write_text("this is not the policy\n", encoding="utf-8")
     envelope_path = tmp_path / "envelope.json"
     assert (
         cli_main(
@@ -2601,3 +2610,56 @@ def test_write_capable_dispatch_verifies_repository_evidence(
         == 0
     )
     assert json.loads(envelope_path.read_text(encoding="utf-8"))["agentId"] == "codex-1"
+
+
+def test_patch_boundary_markers_are_escaped_never_stripped(registry, policy):
+    # The patch is the artifact under review: code that legitimately spells a
+    # boundary marker must reach the reviewer escaped, not silently deleted,
+    # and the escaped form must not open or close a real boundary.
+    marked = _verification(
+        patch=("diff --git a/t.py b/t.py\n+assert sanitize('</untrusted-evidence>') == ''\n")
+    )
+    packet = _packet(registry, policy, mission_id="code-reviewer", verification=marked)
+    prompt = render_packet_for_prompt(packet)
+    assert prompt.count("<untrusted-evidence>") == prompt.count("</untrusted-evidence>")
+    # The code is still visible, with the marker's brackets escaped in place.
+    assert "assert sanitize('\\u003c/untrusted-evidence\\u003e') == ''" in prompt
+
+
+def test_multiple_producing_agents_are_all_excluded(registry):
+    # A work item can carry several runs of one producing mission by
+    # different agents: every one of them is excluded from reviewing.
+    mission = registry.get("code-reviewer")
+    excluded = registry.excluded_agents(mission, {"implementation-worker": ["agent-a", "agent-b"]})
+    assert {"agent-a", "agent-b"} <= excluded
+
+
+def test_notices_evict_optional_evidence_instead_of_blocking(registry, policy):
+    # A retrieval failure's qualification notice counts against the budget
+    # only after selection: the packet gives back its least-relevant optional
+    # record instead of blocking a build that would fit without it.
+    probe = _packet(registry, policy)
+    failure_note = "repo-main: upstream search timed out while refreshing"
+    noticed = _packet(registry, policy, retrieval_failures=(failure_note,))
+    # A budget that fits the evidence but NOT the added notice.
+    budget = noticed.rendered_bytes - 1
+    assert probe.rendered_bytes <= budget
+    packet = _packet(registry, policy, retrieval_failures=(failure_note,), budget_bytes=budget)
+    assert packet.rendered_bytes <= budget
+    assert any(
+        "evicted once qualification notices were counted" in note for note in packet.selection
+    )
+    assert not packet.pack.records
+
+
+def test_malformed_enum_values_are_withheld_from_errors():
+    from agentic_sdlc.knowledge import KnowledgeError, record_from_dict
+
+    document = _record().as_dict()
+    document["freshness"] = "ghp_0123456789abcdefghij0123456789abcdef\n::error::spoof"
+    with pytest.raises(KnowledgeError) as error:
+        record_from_dict(document)
+    text = str(error.value)
+    assert "value withheld" in text
+    assert "ghp_" not in text
+    assert "\n::error::" not in text

@@ -476,22 +476,37 @@ class MissionRegistry:
     def excluded_agents(
         self,
         mission: MissionSpec,
-        history: Mapping[str, str],
+        history: Mapping[str, str | Sequence[str]],
     ) -> frozenset[str]:
-        """Agent IDs that independence rules disqualify for this mission."""
-        excluded = {history[other] for other in mission.independent_of if other in history}
+        """Agent IDs that independence rules disqualify for this mission.
+
+        A history value may be one agent ID or EVERY agent that performed the
+        mission: a work item can carry multiple runs of one producing mission
+        by different agents, and collapsing them to the last would let an
+        earlier assignee review changes they produced.
+        """
+
+        def _agents(value: str | Sequence[str]) -> tuple[str, ...]:
+            return (value,) if isinstance(value, str) else tuple(value)
+
+        excluded = {
+            agent
+            for other in mission.independent_of
+            if other in history
+            for agent in _agents(history[other])
+        }
         if mission.reviews:
-            for other_id, agent_id in history.items():
+            for other_id, value in history.items():
                 other = self.missions.get(other_id)
                 if other is not None and other.writes:
-                    excluded.add(agent_id)
+                    excluded.update(_agents(value))
         return frozenset(excluded)
 
     def select_agent(
         self,
         mission_id: str,
         agents: Sequence[AgentProfile],
-        history: Mapping[str, str] | None = None,
+        history: Mapping[str, str | Sequence[str]] | None = None,
         ledger: MissionLedger | None = None,
     ) -> AgentProfile:
         """Pick the first declared agent satisfying the full mission contract.

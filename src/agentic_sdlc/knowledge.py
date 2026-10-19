@@ -186,11 +186,23 @@ class EvidenceRecord:
         }
 
 
+#: The only shape an unknown-enum error echoes back: anything else — a
+#: credential-shaped value, a newline, a terminal escape — is withheld, since
+#: these errors print to stderr and CI logs.
+_TAME_ENUM = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+def _shown_enum(value: str) -> str:
+    if _TAME_ENUM.fullmatch(value):
+        return value
+    return "(value withheld: not a plain identifier)"
+
+
 def _validate_record(record: EvidenceRecord) -> None:
     if not _SOURCE_ID.fullmatch(record.source_id):
         raise KnowledgeError("evidence source_id is invalid")
     if record.source_type not in SOURCE_TYPES:
-        raise KnowledgeError(f"evidence source_type is unknown: {record.source_type}")
+        raise KnowledgeError(f"evidence source_type is unknown: {_shown_enum(record.source_type)}")
     if not record.external_id.strip():
         raise KnowledgeError("evidence external_id is required")
     if not record.locator.strip():
@@ -202,14 +214,16 @@ def _validate_record(record: EvidenceRecord) -> None:
     if not record.revision.strip():
         raise KnowledgeError("evidence revision is required")
     if record.classification not in CLASSIFICATIONS:
-        raise KnowledgeError(f"evidence classification is unknown: {record.classification}")
+        raise KnowledgeError(
+            f"evidence classification is unknown: {_shown_enum(record.classification)}"
+        )
     if record.freshness not in FRESHNESS_STATES:
-        raise KnowledgeError(f"evidence freshness is unknown: {record.freshness}")
+        raise KnowledgeError(f"evidence freshness is unknown: {_shown_enum(record.freshness)}")
     if len(record.payload.encode("utf-8")) > MAX_PAYLOAD_BYTES:
         raise KnowledgeError("evidence payload exceeds the payload byte limit")
     for link in record.links:
         if link.kind not in LINK_KINDS:
-            raise KnowledgeError(f"evidence link kind is unknown: {link.kind}")
+            raise KnowledgeError(f"evidence link kind is unknown: {_shown_enum(link.kind)}")
 
 
 def record_from_dict(document: Mapping[str, Any]) -> EvidenceRecord:
