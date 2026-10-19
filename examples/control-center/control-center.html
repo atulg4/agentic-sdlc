@@ -475,29 +475,52 @@
   }
 
   function subscribe(collection, adopt, bound, recencyField) {
-    try {
-      // Bounded: a long-lived store accumulates history, and an unrestricted
-      // collection subscription would materialize every document on every
-      // delivery for every viewer.
-      let query = state.db.collection(collection);
-      if (recencyField) query = query.orderBy(recencyField, "desc");
-      query.limit(bound).onSnapshot(
-        async (snapshot) => {
-          // Each entry carries its document id, so adopters can tell a
-          // legacy-id document from a scoped one.
-          await adopt(snapshot.docs.map((entry) => {
-            const data = entry.data();
-            return data ? { ...data, docId: entry.id } : null;
-          }).filter(Boolean));
-          render();
-        },
-        (error) => { feedStopped(collection, error); },
-      );
-    } catch (error) {
-      // A setup throw (collection/orderBy/limit/onSnapshot) is the same
-      // operator-facing failure as a terminated listener: this view keeps
-      // its last (or empty) set, visibly.
-      feedStopped(collection, error);
+    const open = () => {
+      try {
+        // Bounded: a long-lived store accumulates history, and an
+        // unrestricted collection subscription would materialize every
+        // document on every delivery for every viewer.
+        let query = state.db.collection(collection);
+        if (recencyField) {
+          // The save clamps bound every console-written timestamp a day
+          // ahead, so the recency window excludes rows beyond that same
+          // ceiling: enough far-future store rows would otherwise occupy
+          // the whole descending window for good while every fresh save —
+          // deliberately clamped near now — lands outside it. The ceiling
+          // is refreshed with the subscription below.
+          const ceiling = new Date(Date.now() + 86_400_000).toISOString();
+          query = query.where(recencyField, "<=", ceiling).orderBy(recencyField, "desc");
+        }
+        return query.limit(bound).onSnapshot(
+          async (snapshot) => {
+            // Each entry carries its document id, so adopters can tell a
+            // legacy-id document from a scoped one.
+            await adopt(snapshot.docs.map((entry) => {
+              const data = entry.data();
+              return data ? { ...data, docId: entry.id } : null;
+            }).filter(Boolean));
+            render();
+          },
+          (error) => { feedStopped(collection, error); },
+        );
+      } catch (error) {
+        // A setup throw (collection/where/orderBy/limit/onSnapshot) is the
+        // same operator-facing failure as a terminated listener: this view
+        // keeps its last (or empty) set, visibly.
+        feedStopped(collection, error);
+        return null;
+      }
+    };
+    let stop = open();
+    // The ceiling must track the clock, or a session older than a day would
+    // stop seeing fresh in-range rows; re-open hourly only when the store
+    // hands back a working unsubscribe, so listeners never stack.
+    if (recencyField && typeof stop === "function") {
+      setInterval(() => {
+        try { stop(); } catch { /* already terminated */ }
+        const next = open();
+        stop = typeof next === "function" ? next : stop;
+      }, 3_600_000);
     }
   }
 
