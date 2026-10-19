@@ -416,6 +416,15 @@
       // through the retry set even after liveNoteKeys stops carrying them.
       const vanished = Array.from(new Set([...liveNoteKeys, ...retryNoteKeys]))
         .filter((key) => !live.has(key));
+      // A live note that was never backfilled has no cached copy: seed it
+      // from the current view BEFORE the reads, so a failed verification
+      // keeps the acknowledgement visible instead of dropping it with the
+      // map replacement below.
+      for (const key of vanished) {
+        if (!backfilledEntries.has(key) && state.notes.has(key)) {
+          backfilledEntries.set(key, state.notes.get(key));
+        }
+      }
       for (let start = 0; start < vanished.length; start += 10) {
         await Promise.all(vanished.slice(start, start + 10).map(async (key) => {
           try {
@@ -451,7 +460,11 @@
       // for these, and refreshes everything else on each adoption.
       liveNoteKeys = live;
       state.notes = next;
-    }, 1000);
+    // Recency-ordered like drafts: once the store exceeds the bound, an
+    // unordered window could permanently exclude a note another viewer just
+    // recorded (notes written by this console always carry "at"; older
+    // documents without it are covered by the per-adoption exact backfill).
+    }, 1000, "at");
     // Recency-ordered window: a newly saved draft is always retrievable.
     subscribe("projectDrafts", (docs) => { state.drafts = docs; }, 500, "at");
     render();
@@ -1767,7 +1780,10 @@
             copyButton(JSON.stringify(draft.entry, null, 2), "Copy"),
             state.db ? el("button", { class: "btn sm", type: "button", on: { click: async (event) => {
               event.currentTarget.disabled = true;
-              try { await state.db.doc("projectDrafts/" + (await docId(draft.projectId))).delete(); } catch { event.currentTarget.textContent = "Failed"; }
+              // Delete the DELIVERED document: deriving the path from the
+              // untrusted projectId would let a noncanonical-id store row
+              // remove the canonical draft while itself staying visible.
+              try { await state.db.doc("projectDrafts/" + draft.docId).delete(); } catch { event.currentTarget.textContent = "Failed"; }
             } } }, "Discard") : null,
           ),
         )),

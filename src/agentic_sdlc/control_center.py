@@ -249,18 +249,24 @@ def _change_request_scoped(incident: Incident) -> bool:
     """The incident describes an obstacle to MERGING its evidenceRef.
 
     ``unclassified`` is provider-neutral and its evidenceRef is free text, so
-    only the adapter's own merge-state records count: the id spelling
-    (``<ref>:merge-state-<x>``) AND the document's declared GitHub source,
-    since only the GitHub adapter defines that spelling. Any other
-    unclassified incident citing a merged change request may describe
-    something else entirely (a post-merge regression) and must stay.
+    only the adapter's own merge-state records count: the EXACT id spellings
+    the adapter emits (``<ref>:merge-state-blocked`` and ``-unstable`` — a
+    prefix match would also capture ``...:merge-state-blocked:post-merge``,
+    a distinct record) AND the document's declared GitHub source, since only
+    the GitHub adapter defines that spelling. Any other unclassified
+    incident citing a merged change request may describe something else
+    entirely (a post-merge regression) and must stay.
     """
     if incident.kind in _CHANGE_REQUEST_RETIREMENT:
         return True
     return (
         incident.source_provider == "github"
         and incident.kind == "unclassified"
-        and incident.incident_id.startswith(incident.evidence_ref + ":merge-state-")
+        and incident.incident_id
+        in (
+            f"{incident.evidence_ref}:merge-state-blocked",
+            f"{incident.evidence_ref}:merge-state-unstable",
+        )
     )
 
 
@@ -1367,6 +1373,12 @@ def _provider_agrees(
     declared = repository_providers.get(status.repository.lower())
     if not declared:
         return True
+    if len(declared) > 1:
+        # The registry declares this repository name for several providers
+        # and ledger statuses carry no provider of their own, so NOTHING
+        # identifies which provider's unit this is: the match is ambiguous
+        # and provider-qualified data never joins or retires against it.
+        return False
     return provider in declared
 
 
