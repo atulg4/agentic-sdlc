@@ -800,7 +800,8 @@ def incidents_from_change_requests(
         assert isinstance(full_name, str)
         _require(
             full_name.lower() == repository.lower(),
-            f"change request {number} belongs to {full_name}, not repository {repository}",
+            f"change request {number} belongs to {_shown_url(full_name)}, "
+            f"not repository {repository}",
         )
         if state_field != "open":
             # A merged or closed change request is not an open problem,
@@ -975,8 +976,8 @@ def parent_links(
                 _require(
                     False,
                     f"sub-issue record {number} belongs to another repository "
-                    f"({match.group(1)}); cross-repository sub-issues are not "
-                    "supported by this export",
+                    f"({_shown_url(match.group(1))}); cross-repository "
+                    "sub-issues are not supported by this export",
                 )
 
     def link(child: int, parent: int) -> None:

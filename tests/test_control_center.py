@@ -5248,17 +5248,19 @@ def test_the_console_binds_incidents_and_enforces_full_membership():
     assert "during a dependency wait." in html
     assert "dependencyWaitByState" in html
     assert "(project.counts.byState[key] || 0) - waiting" in html
-    # The dependency-wait exemptions reconcile against the stage census: a
-    # re-signed store document cannot park running implementing units behind
-    # inflated exemptions while byStage still says implementation.
+    # byStage is fully derived from byState and the dependency-wait
+    # exemptions via the canonical state->stage map, and must equal that
+    # census exactly — no freely reassignable stage mass, visible or not.
     assert "counts.byStage must be an object." in html
-    assert "counts.byStage names an unknown stage" in html
-    assert "byStage disagrees with byState on the unit total." in html
-    assert "must sum to the dependency-wait stage count." in html
-    # The stage census must cover the visibly listed units, not merely match
-    # the aggregate total.
-    assert "visibleByStage[unit.stage] = (visibleByStage[unit.stage] || 0) + 1;" in html
-    assert "holds fewer ${key} units than are visibly listed." in html
+    assert "const canonicalStage = {" in html
+    assert "disagrees with the canonical stage census." in html
+    # Dependency-held units are surfaced on their own rail, reconciled
+    # exactly against the serialized exemptions, and the project reads
+    # waiting, never idle.
+    assert "waiting lists work unit" in html
+    assert "must list every dependency-waiting unit its counts declare." in html
+    assert "Waiting on dependencies (" in html
+    assert 'waiting.length ? "waiting" :' in html
     # Every formerly live key is exact-read verified, cached or not.
     assert ".filter((key) => !live.has(key));" in html
     # A live note that was never backfilled is seeded into the cache before
@@ -6327,10 +6329,117 @@ def test_dependency_waits_are_not_running_now():
     view = snapshot.get("forge")
     assert view.active == ()
     assert view.dependency_wait_counts == {"implementing": 1}
+    # Held units are SURFACED, never silently dropped: a project held
+    # entirely by upstream dependencies must not read as idle with no unit
+    # in flight and no explanation.
+    assert [status.work_unit_id for status in view.waiting] == ["wu-1"]
     document = snapshot.as_dict()
-    counts = document["projects"][0]["counts"]
+    project = document["projects"][0]
+    counts = project["counts"]
     assert counts["dependencyWaitByState"] == {"implementing": 1}
     assert counts["byState"]["implementing"] == 1
+    assert [unit["workUnitId"] for unit in project["waiting"]] == ["wu-1"]
+
+
+def test_a_repositoryless_status_never_joins_a_conflicting_provider():
+    # A ledger status that omits its repository is not thereby in agreement
+    # with every provider: the joined reference names acme/forge, and a
+    # registry declaring acme/forge ONLY for gitlab is positive disagreement
+    # with a github-sourced item — the item keeps its declared state.
+    gitlab_registry = load_project_registry(
+        {
+            "schemaVersion": 1,
+            "projects": [
+                {
+                    "projectId": "forge",
+                    "displayName": "Forge",
+                    "group": "platform",
+                    "defaultBranch": "main",
+                    "repositories": [
+                        {"provider": "gitlab", "identifier": "acme/forge", "role": "primary"}
+                    ],
+                    "environments": [{"name": "production", "kind": "production"}],
+                    "capabilities": ["planning"],
+                }
+            ],
+        }
+    )
+    ledger = _ledger(
+        *_chain(
+            TO_IMPLEMENTING,
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "issueRef": "acme/forge#1",
+            },
+        )
+    )
+    github_items = load_backlog_document(
+        {
+            "schemaVersion": BACKLOG_SCHEMA_VERSION,
+            "source": "github",
+            "items": [
+                _backlog(title="GitHub task", issueRef="acme/forge#1", declaredState="specified")
+            ],
+        }
+    )
+    conflicted = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=gitlab_registry,
+        projections=ledger.projections(),
+        backlog=tuple(github_items),
+        incidents=load_incident_document(_incidents()),
+    )
+    bases = [node.state_basis for node in conflicted.get("forge").backlog]
+    assert bases == ["state declared by the backlog source"]
+    # The same join under a registry declaring the repository FOR github
+    # still adopts the ledger state.
+    agreeing = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        backlog=tuple(github_items),
+        incidents=load_incident_document(_incidents()),
+    )
+    assert [node.state_basis for node in agreeing.get("forge").backlog] != [
+        "state declared by the backlog source"
+    ]
+
+
+def test_mismatch_errors_withhold_credentialed_identities():
+    # Rejection messages reach stderr and CI logs: a captured repository
+    # identity carrying token-shaped text is withheld from the
+    # change-request and sub-issue mismatch errors like every rejected URL.
+    with pytest.raises(ControlCenterError) as pull_error:
+        incidents_from_change_requests(
+            [
+                {
+                    "number": 7,
+                    "state": "open",
+                    "base": {"repo": {"full_name": "acme/forge?access_token=SUPERSECRET"}},
+                }
+            ],
+            project_id="forge",
+            repository="acme/forge",
+            observed_at="2026-10-12T10:30:00Z",
+        )
+    assert "SUPERSECRET" not in str(pull_error.value)
+    assert "withheld" in str(pull_error.value)
+    with pytest.raises(ControlCenterError) as parent_error:
+        parent_links(
+            [
+                {
+                    "number": 3,
+                    "repository_url": "https://api.github.com/repos/acme/forge",
+                    "parent_issue_url": (
+                        "https://api.github.com/repos/access_token=TOPSECRET/repo/issues/1"
+                    ),
+                }
+            ],
+            repository="acme/forge",
+        )
+    assert "TOPSECRET" not in str(parent_error.value)
+    assert "withheld" in str(parent_error.value)
 
 
 def test_contested_issue_references_stay_unresolved():
