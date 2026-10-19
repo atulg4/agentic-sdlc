@@ -47,10 +47,10 @@ from .executors import (
 from .gates import GateError, run_gates, write_report
 from .git_diff import (
     GitDiffError,
-    checked_out_state,
     collect_commit_diff,
     collect_git_diff,
     committed_path,
+    derivation_worktree,
     read_committed_file,
     resolve_commit,
 )
@@ -564,6 +564,10 @@ def _judge_request(
     digest = request_digest(title, body)
     result: dict[str, Any] = {
         "issue": args.issue,
+        # The project is part of what the result attests: a consumer binding
+        # work to this record must not accept a same-numbered issue from
+        # another project.
+        "project": args.project,
         "ready": False,
         "dependencies": [],
         "contentDigest": digest,
@@ -831,17 +835,16 @@ def _derived_verification(args: argparse.Namespace, request: dict) -> Verificati
         )
     base = resolve_commit(args.candidate_repository, args.candidate_base)
     head = resolve_commit(args.candidate_repository, args.candidate_head)
-    # run_gates executes the CHECKOUT, while collect_commit_diff reads the
-    # object database: a dirty tree or another checked-out revision would
-    # bind gate results for different code to the candidate head.
-    checked_out, clean = checked_out_state(args.candidate_repository)
-    if checked_out != head or not clean:
-        raise ContextBuilderError(
-            "the candidate repository must be checked out exactly at "
-            "--candidate-head with a clean working tree before gates run"
-        )
     snapshot = collect_commit_diff(args.candidate_repository, base, head)
-    report = run_gates(args.config, args.candidate_repository)
+    # run_gates executes a CHECKOUT, and the caller's own is not evidence:
+    # it can be dirty, carry ignored files a gate would read, or have its
+    # status output suppressed by repository-local configuration — and a
+    # gate run leaves caches behind that would fail the next derivation.
+    # Gates therefore run in a disposable worktree materialized from the
+    # object database at the candidate head, so they observe exactly the
+    # committed tree and leave nothing in the caller's checkout.
+    with derivation_worktree(args.candidate_repository, head) as tree:
+        report = run_gates(args.config, tree)
     # Wall-clock timings are not evidence, and they make everything bound to
     # the report nondeterministic: the rendered size, the budget accounting,
     # the evidence selection, and the packet digest would all differ between
@@ -865,6 +868,95 @@ def _derived_verification(args: argparse.Namespace, request: dict) -> Verificati
         gate_report=report,
         prior_findings=tuple(findings),
     )
+
+
+def _check_dispatch_authorization(args: argparse.Namespace, policy, packet) -> None:
+    """Bind a write-capable dispatch to the trusted label-authorization gate.
+
+    Request labels are caller-supplied text: a caller could spell the
+    approval label names into the request without any authorized writer ever
+    applying them to the work item. The `check-request --authorize-labels`
+    result is the trusted record of that gate, so dispatch requires it and
+    verifies it names this exact project, work item, and request content,
+    passed its authorization, and held still across its two reads.
+    """
+    if not getattr(args, "authorization", None):
+        raise ContextBuilderError(
+            "write-capable dispatch requires --authorization: the "
+            "check-request --authorize-labels result proving the approval "
+            "labels were applied to the work item by authorized writers"
+        )
+    document = json.loads(Path(args.authorization).read_text(encoding="utf-8"))
+    if not isinstance(document, dict):
+        raise ContextBuilderError("the authorization result must be a JSON object")
+    verdict = document.get("authorization")
+    stable = document.get("stable")
+    if (
+        document.get("ready") is not True
+        or not isinstance(verdict, dict)
+        or verdict.get("authorized") is not True
+        or not isinstance(stable, dict)
+    ):
+        raise ContextBuilderError(
+            "the authorization result does not record a ready, label-authorized, "
+            "stable check; re-run check-request --authorize-labels"
+        )
+    work_ref = f"{document.get('project')}#{document.get('issue')}"
+    if document.get("project") != policy.project_id or work_ref != packet.work_ref:
+        raise ContextBuilderError(
+            f"the authorization result names {work_ref}, not the packet's "
+            f"work item {packet.work_ref}; authorize the dispatched work item"
+        )
+    digest = request_digest(packet.task.title, packet.task.raw_body)
+    if document.get("contentDigest") != digest:
+        raise ContextBuilderError(
+            "the authorization result was taken for different request content; "
+            "re-run check-request --authorize-labels against the current title "
+            "and body"
+        )
+
+
+def _readback_repository_records(repository: str, pin: str, records: tuple) -> None:
+    """Read every pinned repository payload back from the trusted tree.
+
+    The record's self-declared content hash proves nothing about the TREE: a
+    fabricated payload with a recomputed hash would hand the agent
+    attacker-chosen source under a self-consistent citation, so each record
+    pinned at `pin` is read back from that commit and compared through the
+    adapter's own sanitization (a file legitimately containing boundary
+    marker text is not misread as fabricated). Off-pin or malformed records
+    are left to the builder, which rejects them itself.
+    """
+    for record in records:
+        if record.source_type != "git-repository":
+            continue
+        if record.revision != pin:
+            continue  # the builder rejects off-pin records itself
+        suffix = "@" + record.revision
+        if not record.external_id.endswith(suffix):
+            continue  # the builder rejects the malformed shape itself
+        path = record.external_id[: -len(suffix)]
+        # Paths are retrieval-controlled text: a token-shaped filename is
+        # withheld from every error this readback can raise, exactly as
+        # the builder withholds it from exclusion notes.
+        shown = _safe_exclusion_path(path)
+        try:
+            committed = read_committed_file(repository, pin, path, label="the pinned tree")
+        except GitDiffError as error:
+            raise ContextBuilderError(
+                f"repository evidence for {shown} could not be read from "
+                "the pinned candidate tree; re-retrieve it from the "
+                "pinned revision"
+            ) from error
+        try:
+            expected = sanitize_payload(committed.decode("utf-8"))
+        except UnicodeDecodeError:
+            expected = None
+        if expected != record.payload:
+            raise ContextBuilderError(
+                f"repository evidence for {shown} does not match the pinned "
+                "candidate tree; re-retrieve it from the pinned revision"
+            )
 
 
 def _build_packet_from_request(
@@ -908,6 +1000,12 @@ def _build_packet_from_request(
     failures = request.get("retrievalFailures", [])
     if not isinstance(failures, list) or not all(isinstance(item, str) for item in failures):
         raise ContextBuilderError("packet request retrievalFailures must be an array of strings")
+    repository_revision = request.get("repositoryRevision", "")
+    if not isinstance(repository_revision, str):
+        raise ContextBuilderError("packet request repositoryRevision must be a string")
+
+    mission = registry.get(_request_text("missionId"))
+    role = mission_role(mission)
     verification = None
     if getattr(args, "candidate_repository", None):
         if request.get("verification") is not None:
@@ -915,51 +1013,30 @@ def _build_packet_from_request(
                 "the packet request must not carry verification when the CLI "
                 "derives it from the candidate repository"
             )
-        verification = _derived_verification(args, request)
-        # The record's self-declared content hash proves nothing about the
-        # TREE: a fabricated payload with a recomputed hash would hand the
-        # reviewer attacker-chosen source beside a genuine diff and gate
-        # report, so every pinned repository payload is read back from the
-        # candidate head itself.
-        for record in records:
-            if record.source_type != "git-repository":
-                continue
-            if record.revision != verification.head_sha:
-                continue  # the builder rejects off-pin records itself
-            suffix = "@" + record.revision
-            if not record.external_id.endswith(suffix):
-                continue  # the builder rejects the malformed shape itself
-            path = record.external_id[: -len(suffix)]
-            # Paths are retrieval-controlled text: a token-shaped filename is
-            # withheld from every error this readback can raise, exactly as
-            # the builder withholds it from exclusion notes.
-            shown = _safe_exclusion_path(path)
-            try:
-                committed = read_committed_file(
-                    args.candidate_repository,
-                    verification.head_sha,
-                    path,
-                    label="--candidate-head",
-                )
-            except GitDiffError as error:
+        if role == "reviewer":
+            verification = _derived_verification(args, request)
+            pin = verification.head_sha
+        else:
+            # Builders and testers must not receive verification evidence,
+            # but their repository records still need a trusted tree: the
+            # candidate repository verifies the request's pinned revision.
+            if args.candidate_base or args.candidate_head:
                 raise ContextBuilderError(
-                    f"repository evidence for {shown} could not be read from "
-                    "the pinned candidate tree; re-retrieve it from the "
-                    "candidate head"
-                ) from error
-            # The adapter sanitizes payloads (boundary markers stripped to a
-            # fixpoint), so the committed text is compared through the SAME
-            # transformation — a file legitimately containing marker text is
-            # not misread as fabricated.
-            try:
-                expected = sanitize_payload(committed.decode("utf-8"))
-            except UnicodeDecodeError:
-                expected = None
-            if expected != record.payload:
-                raise ContextBuilderError(
-                    f"repository evidence for {shown} does not match the pinned "
-                    "candidate tree; re-retrieve it from the candidate head"
+                    "--candidate-base and --candidate-head derive reviewer "
+                    f"verification; a {role} mission takes --candidate-repository "
+                    "alone"
                 )
+            if (
+                not repository_revision
+                or resolve_commit(args.candidate_repository, repository_revision)
+                != repository_revision
+            ):
+                raise ContextBuilderError(
+                    "repositoryRevision must be the full commit SHA of the "
+                    "trusted pinned tree in the candidate repository"
+                )
+            pin = repository_revision
+        _readback_repository_records(args.candidate_repository, pin, records)
     elif request.get("verification") is not None:
         if trusted_verification_only:
             # Schema-valid request JSON is not pipeline evidence: a dispatch
@@ -971,11 +1048,17 @@ def _build_packet_from_request(
                 "--candidate-head instead of request verification"
             )
         verification = verification_from_dict(request["verification"])
-    repository_revision = request.get("repositoryRevision", "")
-    if not isinstance(repository_revision, str):
-        raise ContextBuilderError("packet request repositoryRevision must be a string")
-
-    mission = registry.get(_request_text("missionId"))
+    elif trusted_verification_only and any(
+        record.source_type == "git-repository" for record in records
+    ):
+        # A record's self-declared content hash proves nothing about any
+        # TREE: without readback a write-capable dispatch would hand the
+        # implementation agent attacker-chosen source under a self-consistent
+        # citation, so repository evidence never dispatches unverified.
+        raise ContextBuilderError(
+            "dispatch with repository evidence requires --candidate-repository "
+            "so every pinned payload is read back from the trusted tree"
+        )
     packet = build_context_packet(
         mission,
         task,
@@ -1007,17 +1090,23 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
     rendered packet as its prompt.
     """
     registry, mission, packet = _build_packet_from_request(args, trusted_verification_only=True)
+    policy = load_policy(args.config)
     if mission_role(mission) != "reviewer":
         # The official dispatch path binds write-capable work to the same
         # eligibility decision the implementation-readiness path enforces: a
         # request without the approval labels, or matching a forbidden task
         # pattern, must not reach an envelope just because it came in as a
         # packet.
-        decision = evaluate_task(packet.task, load_policy(args.config), "implement")
+        decision = evaluate_task(packet.task, policy, "implement")
         if not decision.allowed:
             raise ContextBuilderError(
                 "dispatch blocked by task policy: " + "; ".join(decision.reasons)
             )
+        # evaluate_task proves only that the configured label NAMES appear in
+        # the caller-supplied request: approval itself is the trusted
+        # `check-request --authorize-labels` gate, whose result must name
+        # this exact work item and content.
+        _check_dispatch_authorization(args, policy, packet)
     if args.packet:
         artifact = json.loads(Path(args.packet).read_text(encoding="utf-8"))
 
@@ -1046,6 +1135,19 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
         ):
             raise MissionError("history must map mission IDs to agent IDs")
         history = raw
+    if mission_role(mission) == "reviewer":
+        # A review necessarily follows a producing run, so an absent or
+        # partial history is not authoritative: with nothing to exclude,
+        # the roster's first eligible agent could review its own earlier
+        # work despite the mission's independence contract.
+        missing = [other for other in mission.independent_of if other not in history]
+        if not args.history or missing:
+            named = ", ".join(missing) if missing else "the producing missions"
+            raise MissionError(
+                "reviewer dispatch requires --history recording which agent "
+                f"performed each mission this review is independent of ({named}); "
+                'record "" for a mission that never ran'
+            )
     # Roster order defines fallbacks: an eligible agent whose declared
     # context window cannot fit the packet is skipped for the next eligible
     # one instead of blocking a dispatch a fallback could carry.
@@ -2085,6 +2187,7 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch_packet.add_argument("--candidate-head")
     dispatch_packet.add_argument("--agents", required=True)
     dispatch_packet.add_argument("--history")
+    dispatch_packet.add_argument("--authorization")
     dispatch_packet.add_argument("--packet")
     dispatch_packet.add_argument("--input-ref", action="append", default=[])
     dispatch_packet.add_argument("--output")

@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -444,21 +448,29 @@ def resolve_commit(repository: str | Path, rev: str) -> str:
     return commit
 
 
-def checked_out_state(repository: str | Path) -> tuple[str, bool]:
-    """The commit HEAD names and whether the working tree and index match it.
+@contextmanager
+def derivation_worktree(repository: str | Path, rev: str) -> Iterator[Path]:
+    """A disposable worktree holding exactly the tree of the commit `rev` names.
 
-    For callers about to RUN programs inside the checkout (gate commands):
-    the object-database readers here never see uncommitted edits, but a
-    subprocess does, so such a caller must know the checkout is exactly one
-    committed tree."""
+    For callers about to RUN programs against a commit (gate commands): the
+    caller's own checkout is not evidence — it can carry uncommitted edits,
+    ignored files a gate would read, or repository-local status configuration
+    that suppresses either — and a gate run leaves its own caches behind, so
+    two derivations in one checkout would observe each other. A fresh
+    detached worktree is materialized from the object database instead,
+    handed to the caller, and removed afterwards, so every gate run observes
+    exactly the committed tree and leaves nothing for the next."""
+    commit = resolve_commit(repository, rev)
     root = _bind(repository)
-    head = _run(["git", "rev-parse", "--verify", "HEAD^{commit}"], root).stdout.decode().strip()
-    if not _OBJECT_NAME.fullmatch(head):
-        raise GitDiffError("HEAD does not name a commit")
-    # --ignored: a gate can read an ignored .env or build artifact absent
-    # from the commit, so ignored checkout contents count as unclean too.
-    status = _run(["git", "status", "--porcelain", "--ignored"], root).stdout
-    return head, not status.strip()
+    base = tempfile.mkdtemp(prefix="agentic-sdlc-derivation-")
+    tree = Path(base) / "tree"
+    try:
+        _run(["git", "worktree", "add", "--detach", str(tree), commit], root)
+        yield tree
+    finally:
+        with suppress(GitDiffError):
+            _run(["git", "worktree", "remove", "--force", str(tree)], root)
+        shutil.rmtree(base, ignore_errors=True)
 
 
 def read_committed_file(

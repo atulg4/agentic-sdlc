@@ -82,6 +82,23 @@ def _record(
     return EvidenceRecord(**values)
 
 
+def _authorization(path, title: str, body: str, **overrides):
+    """A `check-request --authorize-labels` result bound to the request content."""
+    from agentic_sdlc.cli import request_digest
+
+    document = {
+        "issue": 118,
+        "project": "example/project",
+        "ready": True,
+        "contentDigest": request_digest(title, body),
+        "authorization": {"authorized": True},
+        "stable": {"updatedAt": "2026-10-12T10:00:00Z", "attempts": 1},
+    }
+    document.update(overrides)
+    path.write_text(json.dumps(document), encoding="utf-8")
+    return path
+
+
 def _gate(**overrides) -> dict:
     entry = {
         "name": "test",
@@ -441,6 +458,7 @@ def test_the_packet_digest_reaches_the_agent_run_record(registry, policy):
         provider="anthropic",
         model="claude-sonnet-5-5",
         capabilities=mission.capabilities,
+        context_window_tokens=4_000_000,
     )
     envelope = dispatch_envelope_for_packet(packet, mission, agent)
     assert envelope["contextPackDigest"] == packet.packet_sha256
@@ -1332,8 +1350,10 @@ def test_the_cli_dispatches_through_the_packet_contract(tmp_path, policy_file, v
                         "implementation-approved",
                     ],
                 },
-                "records": [_record().as_dict()],
-                "repositoryRevision": "abc123",
+                # Repository evidence would (rightly) demand the trusted
+                # candidate tree; this test exercises the packet contract
+                # itself, so the packet carries no records.
+                "records": [],
             }
         ),
         encoding="utf-8",
@@ -1349,11 +1369,13 @@ def test_the_cli_dispatches_through_the_packet_contract(tmp_path, policy_file, v
                     "provider": "openai",
                     "model": "gpt-5",
                     "capabilities": ["edit-code", "author-tests", "run-commands"],
+                    "contextWindowTokens": 4000000,
                 }
             ]
         ),
         encoding="utf-8",
     )
+    authorization = _authorization(tmp_path / "authorized.json", "P1: a bounded change", valid_body)
     artifact = tmp_path / "packet.json"
     base = ["--config", str(policy_file), "--knowledge", str(knowledge), "--request", str(request)]
     assert cli_main(["context-packet", *base, "--output", str(artifact)]) == 0
@@ -1365,6 +1387,8 @@ def test_the_cli_dispatches_through_the_packet_contract(tmp_path, policy_file, v
                 *base,
                 "--agents",
                 str(agents),
+                "--authorization",
+                str(authorization),
                 "--packet",
                 str(artifact),
                 "--output",
@@ -1393,7 +1417,18 @@ def test_the_cli_dispatches_through_the_packet_contract(tmp_path, policy_file, v
     ):
         artifact.write_text(json.dumps(tampered), encoding="utf-8")
         assert (
-            cli_main(["dispatch-packet", *base, "--agents", str(agents), "--packet", str(artifact)])
+            cli_main(
+                [
+                    "dispatch-packet",
+                    *base,
+                    "--agents",
+                    str(agents),
+                    "--authorization",
+                    str(authorization),
+                    "--packet",
+                    str(artifact),
+                ]
+            )
             == 2
         )
 
@@ -1432,6 +1467,32 @@ def test_secret_like_paths_never_reach_exclusion_text(registry, policy):
     )
     assert any("outside mission read paths excluded" in note for note in scoped.exclusions)
     assert "ghp_" not in json.dumps(scoped.as_dict())
+
+
+def test_control_characters_in_paths_are_escaped_in_exclusions(policy):
+    # Git permits a newline or escape sequence in a filename, and exclusion
+    # notes are echoed in blocking errors that main prints to stderr: a
+    # candidate-controlled path must not inject extra log lines or terminal
+    # control sequences, so a non-printable path travels JSON-escaped on one
+    # line.
+    sneaky = "src/\n::error::spoof.py"
+    narrow = _mission(read_paths=("docs/**",))
+    scoped = build_context_packet(
+        narrow,
+        TASK,
+        policy,
+        work_ref=WORK_REF,
+        repository_revision="abc123",
+        records=(
+            _record(external_id=f"{sneaky}@abc123", payload="# x\n"),
+            _record(external_id="docs/notes.md@abc123", payload="# notes\n"),
+        ),
+        sources={"repo-main": _source()},
+    )
+    note = next(note for note in scoped.exclusions if "read paths excluded" in note)
+    assert "\n" not in note
+    assert "\x1b" not in note
+    assert '"src/\\n::error::spoof.py"' in note
 
 
 def test_reviewer_pins_bind_to_the_verified_head(registry, policy):
@@ -1724,6 +1785,11 @@ def test_dispatch_respects_the_agent_context_window(registry, policy):
     # the packet: a declared smaller window fails dispatch closed.
     with pytest.raises(ContextBuilderError, match="context window"):
         dispatch_envelope_for_packet(packet, mission, tiny)
+    # An UNDECLARED window (the roster default of zero) is unknown, not
+    # unlimited: packet dispatch refuses it rather than skipping the check.
+    undeclared = dc_replace(tiny, context_window_tokens=0)
+    with pytest.raises(ContextBuilderError, match="declares no context window"):
+        dispatch_envelope_for_packet(packet, mission, undeclared)
     roomy = dc_replace(tiny, context_window_tokens=4_000_000)
     assert dispatch_envelope_for_packet(packet, mission, roomy)["contextPackDigest"]
 
@@ -1838,8 +1904,20 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
     assert verification["gateReport"] == {"passed": False, "gates": []}
     assert verification["priorFindings"] == ["Round one flagged an unbounded retry loop."]
 
-    # A derived artifact dispatches: the comparison is timing-insensitive
-    # and the digest-field equality applies only to deterministic rebuilds.
+    # A review follows a producing run: dispatch demands the orchestrator's
+    # run history naming who performed each mission the review must be
+    # independent of, so an empty default can never let the roster's first
+    # agent review its own work.
+    history_file = tmp_path / "history.json"
+    history_file.write_text(
+        json.dumps(
+            {"implementation-worker": "builder-agent", "repair-agent": "", "test-author": ""}
+        ),
+        encoding="utf-8",
+    )
+
+    # A derived artifact dispatches: durations are zeroed at derivation, so
+    # the whole-document comparison is exact.
     agents_roster = tmp_path / "reviewers.json"
     agents_roster.write_text(
         json.dumps(
@@ -1885,6 +1963,8 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
                 head,
                 "--agents",
                 str(agents_roster),
+                "--history",
+                str(history_file),
                 "--packet",
                 str(output),
                 "--output",
@@ -1897,6 +1977,40 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
     # Roster order defines fallbacks: the too-small window is skipped for
     # the next eligible agent instead of blocking the dispatch.
     assert envelope["agentId"] == "roomy-reviewer"
+
+    # Without the run history — or with a mission it is independent of left
+    # unrecorded — reviewer dispatch refuses rather than trusting an empty
+    # or partial exclusion set.
+    capsys.readouterr()
+    partial_history = tmp_path / "partial-history.json"
+    partial_history.write_text(
+        json.dumps({"implementation-worker": "builder-agent"}), encoding="utf-8"
+    )
+    for history_args in ([], ["--history", str(partial_history)]):
+        assert (
+            cli_main(
+                [
+                    "dispatch-packet",
+                    "--config",
+                    str(policy_file),
+                    "--knowledge",
+                    str(knowledge),
+                    "--request",
+                    str(request),
+                    "--candidate-repository",
+                    str(repo),
+                    "--candidate-base",
+                    base,
+                    "--candidate-head",
+                    head,
+                    "--agents",
+                    str(agents_roster),
+                    *history_args,
+                ]
+            )
+            == 2
+        )
+    assert "reviewer dispatch requires --history" in capsys.readouterr().err
 
     # A fabricated payload with a self-consistent hash is read back from the
     # pinned tree and rejected.
@@ -1985,32 +2099,14 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
     captured = capsys.readouterr().err
     assert "ghp_" not in captured
 
-    # Ignored checkout contents are unclean too: a gate could read them.
+    # Gates run in a disposable worktree materialized from the object
+    # database, so a dirty caller checkout — uncommitted edits, ignored
+    # files, even status output suppressed by repository-local config —
+    # neither blocks derivation nor reaches a gate, and the derivation
+    # leaves the caller's state untouched with no worktree behind.
     (repo / "ignored.txt").write_text("SECRET=1\n", encoding="utf-8")
-    assert (
-        cli_main(
-            [
-                "context-packet",
-                "--config",
-                str(policy_file),
-                "--knowledge",
-                str(knowledge),
-                "--request",
-                str(request),
-                "--candidate-repository",
-                str(repo),
-                "--candidate-base",
-                base,
-                "--candidate-head",
-                head,
-            ]
-        )
-        == 2
-    )
-    (repo / "ignored.txt").unlink()
-
-    # A dirty checkout must not run gates bound to the candidate head.
     (repo / "a.txt").write_text("one\ntwo\nthree uncommitted\n", encoding="utf-8")
+    git("config", "status.showUntrackedFiles", "no")
     assert (
         cli_main(
             [
@@ -2029,8 +2125,19 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
                 head,
             ]
         )
-        == 2
+        == 0
     )
+    assert (repo / "a.txt").read_text(encoding="utf-8") == "one\ntwo\nthree uncommitted\n"
+    assert (repo / "ignored.txt").read_text(encoding="utf-8") == "SECRET=1\n"
+    worktrees = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        check=True,
+        env=env,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert worktrees.count("worktree ") == 1
+    (repo / "ignored.txt").unlink()
     git("checkout", "--", "a.txt")
 
     # The dispatch path never accepts request JSON as pipeline evidence.
@@ -2115,8 +2222,7 @@ def test_dispatch_packet_enforces_task_policy(tmp_path, policy_file, valid_body,
                 "missionId": "implementation-worker",
                 "workRef": WORK_REF,
                 "task": {"title": "P1: a bounded change", "body": valid_body},
-                "records": [_record().as_dict()],
-                "repositoryRevision": "abc123",
+                "records": [],
             }
         ),
         encoding="utf-8",
@@ -2132,11 +2238,210 @@ def test_dispatch_packet_enforces_task_policy(tmp_path, policy_file, valid_body,
                     "provider": "openai",
                     "model": "gpt-5",
                     "capabilities": ["edit-code", "author-tests", "run-commands"],
+                    "contextWindowTokens": 4000000,
                 }
             ]
         ),
         encoding="utf-8",
     )
+    base = [
+        "--config",
+        str(policy_file),
+        "--knowledge",
+        str(knowledge),
+        "--request",
+        str(request),
+        "--agents",
+        str(agents),
+    ]
+    assert cli_main(["dispatch-packet", *base]) == 2
+    assert "dispatch blocked by task policy" in capsys.readouterr().err
+
+    # With the approval label names spelled into the request, the policy
+    # check passes — but label names in caller-supplied JSON are not approval
+    # evidence, so dispatch still demands the trusted authorization record.
+    request.write_text(
+        json.dumps(
+            {
+                "missionId": "implementation-worker",
+                "workRef": WORK_REF,
+                "task": {
+                    "title": "P1: a bounded change",
+                    "body": valid_body,
+                    "labels": [
+                        "agent-ready",
+                        "human-review-required",
+                        "implementation-approved",
+                    ],
+                },
+                "records": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert cli_main(["dispatch-packet", *base]) == 2
+    assert "requires --authorization" in capsys.readouterr().err
+
+    # The authorization must be ready, authorized, stable, and bound to THIS
+    # project, work item, and content — a record for other content or another
+    # issue proves nothing about this dispatch.
+    for broken in (
+        {"ready": False},
+        {"authorization": {"authorized": False}},
+        {"stable": None},
+        {"issue": 119},
+        {"project": "another/project"},
+        {"contentDigest": "0" * 64},
+    ):
+        bad = _authorization(
+            tmp_path / "authorization.json", "P1: a bounded change", valid_body, **broken
+        )
+        assert cli_main(["dispatch-packet", *base, "--authorization", str(bad)]) == 2
+    good = _authorization(tmp_path / "authorization.json", "P1: a bounded change", valid_body)
+    envelope_path = tmp_path / "envelope.json"
+    assert (
+        cli_main(
+            [
+                "dispatch-packet",
+                *base,
+                "--authorization",
+                str(good),
+                "--output",
+                str(envelope_path),
+            ]
+        )
+        == 0
+    )
+    assert json.loads(envelope_path.read_text(encoding="utf-8"))["agentId"] == "codex-1"
+
+
+def test_write_capable_dispatch_verifies_repository_evidence(
+    tmp_path, policy_file, valid_body, capsys
+):
+    # A record's self-declared hash proves nothing about any tree: a builder
+    # dispatch with repository evidence must read every pinned payload back
+    # from the trusted pinned tree, exactly like the reviewer path.
+    import subprocess
+
+    from agentic_sdlc.cli import main as cli_main
+
+    repo = tmp_path / "trusted"
+    repo.mkdir()
+    env = {
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.com",
+        "HOME": str(tmp_path),
+        "PATH": "/usr/bin:/bin",
+    }
+
+    def git(*argv):
+        subprocess.run(["git", "-C", str(repo), *argv], check=True, env=env, capture_output=True)
+
+    git("init", "-q", "-b", "main")
+    (repo / "src").mkdir()
+    (repo / "src" / "scheduler.py").write_text(
+        "class Scheduler:\n    retries = 2\n", encoding="utf-8"
+    )
+    git("add", "src/scheduler.py")
+    git("commit", "-q", "-m", "pin")
+    pin = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        env=env,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    knowledge = tmp_path / "knowledge.toml"
+    knowledge.write_text(KNOWLEDGE_TOML + "\n", encoding="utf-8")
+
+    def _request(path, **record_overrides):
+        record = _record(
+            external_id=f"src/scheduler.py@{pin}", revision=pin, **record_overrides
+        ).as_dict()
+        path.write_text(
+            json.dumps(
+                {
+                    "missionId": "implementation-worker",
+                    "workRef": WORK_REF,
+                    "task": {
+                        "title": "P1: a bounded change",
+                        "body": valid_body,
+                        "labels": [
+                            "agent-ready",
+                            "human-review-required",
+                            "implementation-approved",
+                        ],
+                    },
+                    "records": [record],
+                    "repositoryRevision": pin,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    request = _request(tmp_path / "request.json")
+    agents = tmp_path / "agents.json"
+    agents.write_text(
+        json.dumps(
+            [
+                {
+                    "agentId": "codex-1",
+                    "adapter": "codex",
+                    "adapterVersion": "1.0.0",
+                    "provider": "openai",
+                    "model": "gpt-5",
+                    "capabilities": ["edit-code", "author-tests", "run-commands"],
+                    "contextWindowTokens": 4000000,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    authorization = _authorization(
+        tmp_path / "authorization.json", "P1: a bounded change", valid_body
+    )
+    base = [
+        "--config",
+        str(policy_file),
+        "--knowledge",
+        str(knowledge),
+        "--request",
+        str(request),
+        "--agents",
+        str(agents),
+        "--authorization",
+        str(authorization),
+    ]
+    # Without the trusted tree, repository evidence never dispatches.
+    capsys.readouterr()
+    assert cli_main(["dispatch-packet", *base]) == 2
+    assert "requires --candidate-repository" in capsys.readouterr().err
+    # The reviewer derivation flags do not apply to a builder mission.
+    assert (
+        cli_main(
+            [
+                "dispatch-packet",
+                *base,
+                "--candidate-repository",
+                str(repo),
+                "--candidate-base",
+                pin,
+            ]
+        )
+        == 2
+    )
+    assert "takes --candidate-repository alone" in capsys.readouterr().err
+    # The pin must be the full commit SHA the records carry.
+    short = _request(tmp_path / "short.json")
+    short_doc = json.loads(short.read_text(encoding="utf-8"))
+    short_doc["repositoryRevision"] = pin[:12]
+    short_doc["records"][0]["revision"] = pin[:12]
+    short_doc["records"][0]["externalId"] = f"src/scheduler.py@{pin[:12]}"
+    short.write_text(json.dumps(short_doc), encoding="utf-8")
     assert (
         cli_main(
             [
@@ -2146,11 +2451,54 @@ def test_dispatch_packet_enforces_task_policy(tmp_path, policy_file, valid_body,
                 "--knowledge",
                 str(knowledge),
                 "--request",
-                str(request),
+                str(short),
                 "--agents",
                 str(agents),
+                "--authorization",
+                str(authorization),
+                "--candidate-repository",
+                str(repo),
             ]
         )
         == 2
     )
-    assert "dispatch blocked by task policy" in capsys.readouterr().err
+    assert "full commit SHA" in capsys.readouterr().err
+    # A fabricated payload with a self-consistent hash is read back and
+    # rejected; the genuine payload dispatches.
+    forged = _request(tmp_path / "forged.json", payload="class Scheduler:\n    retries = 999\n")
+    assert (
+        cli_main(
+            [
+                "dispatch-packet",
+                "--config",
+                str(policy_file),
+                "--knowledge",
+                str(knowledge),
+                "--request",
+                str(forged),
+                "--agents",
+                str(agents),
+                "--authorization",
+                str(authorization),
+                "--candidate-repository",
+                str(repo),
+            ]
+        )
+        == 2
+    )
+    assert "does not match the pinned" in capsys.readouterr().err
+    envelope_path = tmp_path / "envelope.json"
+    assert (
+        cli_main(
+            [
+                "dispatch-packet",
+                *base,
+                "--candidate-repository",
+                str(repo),
+                "--output",
+                str(envelope_path),
+            ]
+        )
+        == 0
+    )
+    assert json.loads(envelope_path.read_text(encoding="utf-8"))["agentId"] == "codex-1"

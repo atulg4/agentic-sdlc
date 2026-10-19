@@ -144,7 +144,11 @@ uncaught encoding error when the packet is rendered.
 
 Exclusion notes are serialized by `as_dict` and echoed in blocking errors,
 so a forbidden or out-of-scope filename that is itself token-shaped is
-withheld from the exclusion text rather than quoted.
+withheld from the exclusion text rather than quoted, and one carrying a
+newline, carriage return, or other non-printable character travels
+JSON-escaped on a single line — a candidate-controlled filename must not
+inject extra log lines or terminal control sequences into the stderr and CI
+output that echo these errors.
 
 A required source the mission may not read — its `permitted_missions` or the
 mission's explicit `knowledge_sources` exclude it — is not demanded of that
@@ -201,23 +205,39 @@ sdlcctl dispatch-packet \
 
 `dispatch-packet` rebuilds and re-validates the packet from the same request
 inputs — evidence authorization, the reviewer-verification requirement, and
-the budget checks all run again — selects the agent (`--history` works as in
-`dispatch-mission`), and emits the envelope via `dispatch_envelope_for_packet`
+the budget checks all run again — selects the agent, and emits the envelope
+via `dispatch_envelope_for_packet`
 with `contextPackDigest` bound to the packet digest and the rendered packet
 as the dispatched prompt. Reviewer verification on the dispatch path is
 DERIVED, never declared: with `--candidate-repository`, `--candidate-base`
 and `--candidate-head`, the CLI resolves both commits in that repository,
-requires the checkout to BE the resolved head with a clean working tree —
-ignored files included, since gates execute the checkout, not the object
-database — computes the diff summary with `collect_commit_diff`, runs the
+computes the diff summary with `collect_commit_diff`, runs the
 gates itself (`run_gates`, with wall-clock durations zeroed so derived
-packets are deterministic end to end), and reads every pinned repository
+packets are deterministic end to end) inside a disposable worktree
+materialized from the object database at the candidate head — the caller's
+own checkout is never executed, so uncommitted edits, ignored files,
+status-suppressing repository config, and the caches one gate run leaves
+behind can neither block a derivation nor reach a gate — and reads every
+pinned repository
 record's payload back from the candidate tree through the adapter's own
 sanitization — a fabricated payload with a self-consistent hash is
 rejected, and a token-shaped path is withheld from every readback error.
+Builder and tester dispatches carrying repository evidence take
+`--candidate-repository` alone (the derivation flags are reviewer-only) and
+are refused without it: the request's `repositoryRevision` must be the full
+commit SHA of the trusted pinned tree, and every pinned record is read back
+from it the same way, so a write-capable dispatch can never hand the
+implementation agent fabricated source under a self-consistent citation.
 Write-capable dispatches also re-run the task policy
-(`evaluate_task(..., "implement")`), so a request without the approval
-labels never reaches an envelope. Request
+(`evaluate_task(..., "implement")`) and require `--authorization`: the
+`check-request --authorize-labels` result, which must be ready, authorized
+and stable, and must name this exact project, work item, and content digest
+— label names spelled into caller-supplied request JSON are not approval
+evidence. Reviewer dispatches require `--history` recording which agent
+performed each mission the review is independent of (`""` for a mission
+that never ran): an absent or partial run history is not authoritative, and
+would otherwise let the roster's first eligible agent review its own work.
+Request
 JSON can never impersonate pipeline evidence: `dispatch-packet` refuses a
 request-supplied `verification` object outright, and `context-packet`
 accepts the same flags (request `priorFindings` carries prior review
@@ -225,10 +245,10 @@ findings on the derived path). The `--packet` comparison is exact on every
 path, digest field included, because derived gate reports carry zeroed
 durations and rebuilds are therefore deterministic. When the selected agent's declared window cannot
 fit the packet, dispatch falls back through the roster order to the next
-eligible agent. An
-agent that declares `contextWindowTokens` is also checked at dispatch: the
-rendered prompt plus the output reserve must fit its window, not only the
-mission budget. With `--packet`, the previously written packet
+eligible agent. Every agent is checked at packet dispatch: the
+rendered prompt plus the output reserve must fit its declared
+`contextWindowTokens`, and an agent that declares none is refused — an
+undeclared window is unknown, not unlimited. With `--packet`, the previously written packet
 artifact must equal the rebuilt packet's whole document — never just its
 digest field, and compared through canonical JSON encodings so booleans and
 numbers never conflate — so a stale or tampered artifact never dispatches. The plain `dispatch-mission` command remains for

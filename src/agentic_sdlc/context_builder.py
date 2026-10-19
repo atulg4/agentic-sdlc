@@ -562,6 +562,12 @@ def _safe_exclusion_path(path: str) -> str:
     """
     if _secret_like_text(path):
         return "path withheld: it is secret-like; rename the file or redact it at the source"
+    if not path.isprintable():
+        # A newline, carriage return, or escape sequence in a filename would
+        # let a candidate-controlled path inject extra log lines or terminal
+        # control sequences into the stderr and CI output that echo these
+        # errors, so such a path travels JSON-escaped on one line.
+        return json.dumps(path, ensure_ascii=True)
     return path
 
 
@@ -1382,18 +1388,26 @@ def dispatch_envelope_for_packet(
             "role and limits; rebuild the packet against the current mission"
         )
     prompt = render_packet_for_prompt(packet)
-    if agent.context_window_tokens:
-        # The mission budget alone cannot guarantee the SELECTED model can
-        # consume the packet: a 500k-token mission dispatched to a smaller-
-        # window agent would be rejected or truncated by the model itself.
-        needed = -(-len(prompt.encode("utf-8")) // PROMPT_BYTES_PER_TOKEN) + OUTPUT_TOKEN_RESERVE
-        if needed > agent.context_window_tokens:
-            raise ContextBuilderError(
-                f"agent {agent.agent_id} declares a {agent.context_window_tokens}-token "
-                f"context window but the packet needs up to {needed} tokens including "
-                f"the {OUTPUT_TOKEN_RESERVE}-token output reserve; route a larger-window "
-                "agent or split the task"
-            )
+    # The mission budget alone cannot guarantee the SELECTED model can
+    # consume the packet: a 500k-token mission dispatched to a smaller-
+    # window agent would be rejected or truncated by the model itself. An
+    # UNDECLARED window (the roster default of zero) is not unlimited — it
+    # is unknown, so packet dispatch refuses it rather than skipping the
+    # only check that compares the prompt to the model.
+    if agent.context_window_tokens <= 0:
+        raise ContextBuilderError(
+            f"agent {agent.agent_id} declares no context window; packet dispatch "
+            "requires a positive contextWindowTokens declaration so the rendered "
+            "prompt is known to fit the selected model"
+        )
+    needed = -(-len(prompt.encode("utf-8")) // PROMPT_BYTES_PER_TOKEN) + OUTPUT_TOKEN_RESERVE
+    if needed > agent.context_window_tokens:
+        raise ContextBuilderError(
+            f"agent {agent.agent_id} declares a {agent.context_window_tokens}-token "
+            f"context window but the packet needs up to {needed} tokens including "
+            f"the {OUTPUT_TOKEN_RESERVE}-token output reserve; route a larger-window "
+            "agent or split the task"
+        )
     return create_dispatch_envelope(
         mission,
         agent,

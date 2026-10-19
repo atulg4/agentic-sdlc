@@ -67,3 +67,44 @@ def test_collect_diff_includes_both_sides_of_rename(tmp_path: Path) -> None:
     assert snapshot.paths == (".github/workflows/ci.yml", "renamed.yml")
     assert b"rename from .github/workflows/ci.yml" in snapshot.patch
     assert b"rename to renamed.yml" in snapshot.patch
+
+
+def test_derivation_worktree_materializes_the_committed_tree(tmp_path: Path) -> None:
+    from agentic_sdlc.git_diff import derivation_worktree
+
+    _git(tmp_path, "init", "-q", "-b", "main")
+    _git(tmp_path, "config", "user.email", "test@example.com")
+    _git(tmp_path, "config", "user.name", "Test")
+    (tmp_path / "a.txt").write_text("committed\n", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+    _git(tmp_path, "add", "--", ".")
+    _git(tmp_path, "commit", "-qm", "base")
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=tmp_path, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    # Dirty the caller's checkout in every way a gate could observe: an
+    # uncommitted edit, an ignored file, and status output suppressed by
+    # repository-local configuration.
+    (tmp_path / "a.txt").write_text("uncommitted\n", encoding="utf-8")
+    (tmp_path / "ignored.txt").write_text("SECRET=1\n", encoding="utf-8")
+    _git(tmp_path, "config", "status.showUntrackedFiles", "no")
+
+    with derivation_worktree(tmp_path, head) as tree:
+        kept = tree
+        # The disposable tree holds exactly the committed content: no
+        # uncommitted edit, no ignored file.
+        assert (tree / "a.txt").read_text(encoding="utf-8") == "committed\n"
+        assert not (tree / "ignored.txt").exists()
+    # The worktree is removed afterwards, administrative entry included,
+    # and the caller's own state is untouched.
+    assert not kept.exists()
+    listed = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert listed.count("worktree ") == 1
+    assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "uncommitted\n"
