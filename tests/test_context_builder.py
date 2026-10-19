@@ -3203,6 +3203,113 @@ def test_write_capable_dispatch_verifies_repository_evidence(
     assert "current checkout" in capsys.readouterr().err
 
 
+def test_repair_dispatch_reads_the_roster_from_the_authenticated_base(
+    tmp_path, policy_file, valid_body, capsys
+):
+    # A repair candidate's pinned HEAD is the failed implementation's own
+    # commits: a roster replaced there must not route the write-capable
+    # repair to a planted executor, so repair rosters load from the
+    # authenticated base.
+    import subprocess
+
+    from agentic_sdlc.cli import main as cli_main
+
+    repo, git, _pin = _candidate_fixture(tmp_path, policy_file, agents=CODEX_ROSTER)
+    env = {
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.com",
+        "HOME": str(tmp_path),
+        "PATH": "/usr/bin:/bin",
+    }
+    target = tmp_path / "repair-target"
+    subprocess.run(
+        ["git", "clone", "--quiet", str(repo), str(target)],
+        check=True,
+        env=env,
+        capture_output=True,
+    )
+    # The failed implementation committed a replacement roster at the head.
+    (repo / "agents.json").write_text("not the roster\n", encoding="utf-8")
+    git("add", "agents.json")
+    git("commit", "-q", "-m", "plant a roster")
+    head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        env=env,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    request = tmp_path / "repair-request.json"
+    request.write_text(
+        json.dumps(
+            {
+                "missionId": "implementation-worker",
+                "workRef": WORK_REF,
+                "task": {
+                    "title": "P1: a bounded change",
+                    "body": valid_body,
+                    "labels": [
+                        "agent-ready",
+                        "human-review-required",
+                        "implementation-approved",
+                    ],
+                },
+                "records": [],
+                "repositoryRevision": head,
+            }
+        ),
+        encoding="utf-8",
+    )
+    authorization = _authorization(
+        tmp_path / "repair-authorization.json", "P1: a bounded change", valid_body
+    )
+    key = _key_file(tmp_path)
+    base = [
+        "--config",
+        str(repo / "agentic-sdlc.toml"),
+        "--knowledge",
+        str(repo / "knowledge.toml"),
+        "--request",
+        str(request),
+        "--agents",
+        str(repo / "agents.json"),
+        "--candidate-repository",
+        str(repo),
+        "--authorization",
+        str(authorization),
+        "--attestation-key",
+        str(key),
+        "--run-kind",
+        "repair",
+    ]
+    capsys.readouterr()
+    assert cli_main(["dispatch-packet", *base]) == 2
+    assert "requires --review-target-repository" in capsys.readouterr().err
+    assert cli_main(["dispatch-packet", *base, "--review-target-repository", str(repo)]) == 2
+    assert "must be a separate repository" in capsys.readouterr().err
+    envelope_path = tmp_path / "repair-envelope.json"
+    assert (
+        cli_main(
+            [
+                "dispatch-packet",
+                *base,
+                "--review-target-repository",
+                str(target),
+                "--output",
+                str(envelope_path),
+            ]
+        )
+        == 0
+    )
+    envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
+    # The planted head roster shaped nothing: the base-committed roster
+    # selected the agent, and the envelope digests the repair kind.
+    assert envelope["agentId"] == "codex-1"
+    assert envelope["runKind"] == "repair"
+
+
 def test_patch_boundary_markers_are_escaped_never_stripped(registry, policy):
     # The patch is the artifact under review: code that legitimately spells a
     # boundary marker must reach the reviewer escaped, not silently deleted,

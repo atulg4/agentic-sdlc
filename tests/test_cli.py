@@ -769,7 +769,7 @@ def test_packet_commands_run_under_strict_executable_trust(tmp_path: Path, monke
     assert "is ignored by" in capsys.readouterr().err
 
 
-def test_orchestrate_attests_only_runs_a_trusted_dispatch_produced(tmp_path: Path) -> None:
+def test_orchestrate_attests_only_runs_a_trusted_dispatch_produced(tmp_path: Path, capsys) -> None:
     # An attested state records only dispatch-signed envelopes: a
     # hand-authored envelope — or a signed one whose agent was re-labeled —
     # must not seed run attribution, and a finished run's commit must exist
@@ -871,6 +871,12 @@ def test_orchestrate_attests_only_runs_a_trusted_dispatch_produced(tmp_path: Pat
     repair_start = [entry if entry != "implementation" else "repair" for entry in start]
     assert main([*repair_start, _envelope_file("replay-kind.json", signed)]) == 2
     assert main([*start, _envelope_file("signed.json", signed)]) == 0
+    # One digest identifies one dispatch: the recorded envelope cannot seed a
+    # second run (a reused review envelope would otherwise report on the
+    # pre-repair packet while advancing the repaired unit).
+    capsys.readouterr()
+    assert main([*start, _envelope_file("replayed-digest.json", signed)]) == 2
+    assert "already recorded" in capsys.readouterr().err
 
     # The finished run's commit needs COMPLETION PROVENANCE: the execution
     # harness's attest-completion record binding this unit, run and commit —

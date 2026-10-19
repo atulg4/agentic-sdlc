@@ -372,7 +372,15 @@ dispatches, whose pin is the untrusted candidate head, from the
 AUTHENTICATED BASE instead, so a producer cannot commit a roster aliasing
 itself as a fresh reviewer — which means a caller-side roster
 cannot relabel a producing agent under a fresh `agentId` or route
-authorized work to an undeclared executor. And every command that derives
+authorized work to an undeclared executor. REPAIR dispatches
+(`--run-kind repair`) have the same exposure from the other side: the
+repair candidate's pinned HEAD is the failed implementation's own commits,
+so they require `--review-target-repository` (same separation checks) and
+load the roster at its `origin/<default branch>` too. And one envelope
+digest seeds at most ONE recorded run: an attested `start-run` refuses an
+envelope whose digest the unit already recorded (unless every such run
+failed, since a retry re-dispatches byte-identical content), so a
+pre-repair review envelope can never report on the repaired head. And every command that derives
 or attests these artifacts (`context-packet`, `dispatch-packet`,
 `orchestrate`, `attest-completion`) runs under STRICT executable trust:
 working-tree `trust_mode` and the `AGENTIC_SDLC_GIT`/`AGENTIC_SDLC_GH`

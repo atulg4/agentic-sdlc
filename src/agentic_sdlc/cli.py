@@ -881,6 +881,36 @@ def _committed_configuration(args: argparse.Namespace, pinned: str, value: str, 
         ) from error
 
 
+def _require_separate_target(args: argparse.Namespace) -> None:
+    """The review target must BE a separate repository, not merely spelled so.
+
+    A flag is a caller declaration; identity is not: the candidate itself, a
+    symlink alias of it, a worktree sharing its object store, or a repository
+    containing or contained by the candidate's tree is candidate-mutable, and
+    its refs would authenticate nothing.
+    """
+    candidate_root = os.path.realpath(args.candidate_repository)
+    target_root = os.path.realpath(args.review_target_repository)
+    target_identity = repository_identity(args.review_target_repository)
+    if (
+        target_identity == repository_identity(args.candidate_repository)
+        or target_identity == candidate_root
+        or target_identity.startswith(candidate_root + os.sep)
+        # Containment refuses in BOTH directions: a candidate checkout
+        # nested inside the target's worktree can reach the parent's .git
+        # and move its refs, so the "authoritative" base would be
+        # candidate-mutable again.
+        or candidate_root == target_root
+        or candidate_root.startswith(target_root + os.sep)
+    ):
+        raise ContextBuilderError(
+            "--review-target-repository must be a separate repository: the "
+            "candidate itself, a symlink alias, a worktree sharing its object "
+            "store, or a repository containing or contained by the candidate "
+            "tree is candidate-mutable and authenticates nothing"
+        )
+
+
 def _derived_verification(
     args: argparse.Namespace, request: dict, policy: ProjectPolicy
 ) -> VerificationEvidence:
@@ -913,30 +943,7 @@ def _derived_verification(
             "inside the candidate repository is candidate-mutable and "
             "authenticates nothing"
         )
-    # A flag is a caller declaration; identity is not. The target must be a
-    # SEPARATE object store: the candidate itself, a symlink alias of it, a
-    # worktree sharing its store, or a repository inside the candidate's own
-    # tree is candidate-mutable, and its refs would authenticate nothing.
-    candidate_root = os.path.realpath(args.candidate_repository)
-    target_root = os.path.realpath(args.review_target_repository)
-    target_identity = repository_identity(args.review_target_repository)
-    if (
-        target_identity == repository_identity(args.candidate_repository)
-        or target_identity == candidate_root
-        or target_identity.startswith(candidate_root + os.sep)
-        # Containment refuses in BOTH directions: a candidate checkout
-        # nested inside the target's worktree can reach the parent's .git
-        # and move its refs, so the "authoritative" base would be
-        # candidate-mutable again.
-        or candidate_root == target_root
-        or candidate_root.startswith(target_root + os.sep)
-    ):
-        raise ContextBuilderError(
-            "--review-target-repository must be a separate repository: the "
-            "candidate itself, a symlink alias, a worktree sharing its object "
-            "store, or a repository containing or contained by the candidate "
-            "tree is candidate-mutable and authenticates nothing"
-        )
+    _require_separate_target(args)
     try:
         expected_base = resolve_commit(
             args.review_target_repository, f"origin/{policy.default_branch}"
@@ -1509,9 +1516,41 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
     # for REVIEWER dispatches, whose pin is the untrusted candidate head: a
     # producer could commit a roster aliasing itself under a fresh reviewer
     # agentId there, so reviewer identities come from the AUTHENTICATED BASE.
+    # The envelope digests the EXACT lifecycle kind it may seed (validated
+    # against the role here, since the roster pin depends on it).
+    role = mission_role(mission)
+    canonical_kind = {"builder": "implementation", "tester": "verification", "reviewer": "review"}
+    run_kind = getattr(args, "run_kind", None) or canonical_kind[role]
+    if run_kind not in _ROLE_RUN_KINDS[role]:
+        raise ContextBuilderError(
+            f"--run-kind {run_kind} is not a {role} run; builders dispatch "
+            "implementation or repair, testers verification, reviewers review"
+        )
     roster_pin = packet.repository_revision
-    if mission_role(mission) == "reviewer" and packet.verification is not None:
+    if role == "reviewer" and packet.verification is not None:
         roster_pin = packet.verification.base_sha
+    if run_kind == "repair":
+        # A repair candidate's pinned HEAD is the failed implementation's own
+        # commits: a replaced roster committed there would route the
+        # write-capable repair to a planted executor, so repair rosters load
+        # from the authenticated base exactly like reviewer rosters.
+        if not getattr(args, "review_target_repository", None):
+            raise ContextBuilderError(
+                "--run-kind repair requires --review-target-repository: the "
+                "repair candidate's own head can carry a replaced roster, so "
+                "repair rosters load from the authenticated base"
+            )
+        _require_separate_target(args)
+        try:
+            roster_pin = resolve_commit(
+                args.review_target_repository, f"origin/{policy.default_branch}"
+            )
+        except GitDiffError as error:
+            raise ContextBuilderError(
+                "the review target repository has no "
+                f"origin/{policy.default_branch}; fetch the authoritative "
+                "base before dispatching a repair"
+            ) from error
     agents = load_agents(
         json.loads(
             _committed_configuration(args, roster_pin, args.agents, "--agents").decode("utf-8")
@@ -1585,19 +1624,7 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
     # context window cannot fit the packet is skipped for the next eligible
     # one instead of blocking a dispatch a fallback could carry.
     roster = list(agents)
-    reviewer = mission_role(mission) == "reviewer"
-    # The envelope digests the EXACT lifecycle kind it may seed, not just the
-    # role's category: an implementation envelope replayed as a repair run
-    # would bypass the fresh repair dispatch with its current authorization,
-    # revision, and prompt.
-    role = mission_role(mission)
-    canonical_kind = {"builder": "implementation", "tester": "verification", "reviewer": "review"}
-    run_kind = getattr(args, "run_kind", None) or canonical_kind[role]
-    if run_kind not in _ROLE_RUN_KINDS[role]:
-        raise ContextBuilderError(
-            f"--run-kind {run_kind} is not a {role} run; builders dispatch "
-            "implementation or repair, testers verification, reviewers review"
-        )
+    reviewer = role == "reviewer"
     while True:
         agent = registry.select_agent(
             mission.mission_id,
@@ -1773,6 +1800,24 @@ def _orchestrate(args: argparse.Namespace) -> int:
         envelope = json.loads(Path(args.envelope).read_text(encoding="utf-8"))
         if key is not None:
             _require_attested_envelope(envelope, key, unit=args.unit, kind=args.kind)
+            # One digest identifies ONE dispatch: a review envelope reused
+            # after a repair would report on the pre-repair packet and head
+            # while record_review advances the repaired unit toward merge.
+            # Only a FAILED run's envelope may seed a retry — the re-dispatch
+            # of the same content is byte-identical by construction.
+            digest = envelope.get("envelopeSha256")
+            replayed = [
+                run
+                for run in engine.get(args.unit).runs
+                if run.envelope_sha256 == digest and run.result != "failed"
+            ]
+            if replayed:
+                raise OrchestrationError(
+                    "this dispatch envelope was already recorded for work "
+                    f"unit {args.unit} ({replayed[0].run_id}); every run "
+                    "records a fresh dispatch, so re-dispatch the packet to "
+                    "obtain a new envelope"
+                )
         engine.start_run(
             args.unit,
             args.kind,
