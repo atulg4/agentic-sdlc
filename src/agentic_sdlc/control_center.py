@@ -114,6 +114,11 @@ _ID = re.compile(r"[A-Za-z0-9._-][A-Za-z0-9._/#!:-]{0,511}")
 _REPOSITORY_REFERENCE = re.compile(
     r"(?P<name>[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+?)[#!]\d+(?::.+)?"
 )
+#: The UNSUFFIXED form, for registry evidence: the ``:suffix`` above exists
+#: for incident ids, so ``acme/forge#1:ticket`` is loader-valid — but only
+#: the exact ``repo#N``/``repo!N`` shape proves which repository a joined
+#: reference names.
+_UNSUFFIXED_REFERENCE = re.compile(r"(?P<name>[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+?)[#!]\d+")
 #: A bare repository identifier, for fields whose CONTRACT is a repository
 #: (a ledger status's repository field), never for free-form references.
 _REPOSITORY_IDENTIFIER = re.compile(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+")
@@ -121,6 +126,11 @@ _REPOSITORY_IDENTIFIER = re.compile(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+")
 #: userinfo before the host carries a credential the snapshot must never
 #: republish - tokens are commonly supplied username-only.
 _CREDENTIAL_REFERENCE = re.compile(r"://[^/?#\s]*@")
+#: Real provider token SHAPES (GitHub ghp_/gho_/ghu_/ghs_/ghr_/github_pat_,
+#: GitLab glpat-): a credential supplied as a query parameter or fragment
+#: (``?access=ghp_...``) carries no URL userinfo yet IS the secret, and the
+#: snapshot republishes URLs as clickable links.
+_TOKEN_SHAPED = re.compile(r"gh[pousr]_|github_pat_|glpat-", re.IGNORECASE)
 _TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})")
 _SECRET_KEY = re.compile(
     r"credential|secret|token|password|passphrase|api_?key|authorization|bearer|private_?key",
@@ -803,6 +813,14 @@ def _load_backlog_item(raw: Any, index: int) -> BacklogItem:
             not _CREDENTIAL_REFERENCE.search(url),
             f"{label}.url must not embed credentials; strip the URL userinfo",
         )
+        # Userinfo is not the only carrier: a token-shaped credential in the
+        # query string or fragment is the secret itself, and the value is
+        # withheld from the error exactly because it carries one.
+        _require(
+            not _TOKEN_SHAPED.search(url),
+            f"{label}.url carries a token-shaped credential (value withheld); "
+            "strip the token from the URL",
+        )
     return BacklogItem(
         item_id=_identifier(entry, "itemId", label),
         kind=BacklogKind(kind),
@@ -1403,24 +1421,29 @@ def _provider_agrees(
     OMITS its repository is not thereby in agreement with every provider:
     the provider-scoped ``reference`` being joined names a repository too,
     and a registry declaring that repository for other providers only is
-    positive disagreement.
+    positive disagreement. The reference's OWN named repository outranks the
+    unit's current one: the join concerns the reference, and a unit
+    re-pointed at another provider's repository after a historical merge
+    must neither re-qualify nor disqualify the reference it still carries.
     """
 
     if not provider:
         return True
-    repository = status.repository or _reference_repository(reference)
-    if not repository:
-        return True
-    declared = repository_providers.get(repository.lower())
-    if not declared:
-        return True
-    if len(declared) > 1:
-        # The registry declares this repository name for several providers
-        # and ledger statuses carry no provider of their own, so NOTHING
-        # identifies which provider's unit this is: the match is ambiguous
-        # and provider-qualified data never joins or retires against it.
-        return False
-    return provider in declared
+    for repository in (_reference_repository(reference), status.repository):
+        if not repository:
+            continue
+        declared = repository_providers.get(repository.lower())
+        if not declared:
+            continue
+        if len(declared) > 1:
+            # The registry declares this repository name for several
+            # providers and ledger statuses carry no provider of their own,
+            # so NOTHING identifies which provider's unit this is: the match
+            # is ambiguous and provider-qualified data never joins or
+            # retires against it.
+            return False
+        return provider in declared
+    return True
 
 
 def _reference_repository(reference: str) -> str:
@@ -1430,7 +1453,7 @@ def _reference_repository(reference: str) -> str:
     a loader-permitted free-form identifier like ``acme/forge#ticket`` proves
     nothing about the repository and must neither join nor refuse a match.
     """
-    match = _REPOSITORY_REFERENCE.fullmatch(reference) if reference else None
+    match = _UNSUFFIXED_REFERENCE.fullmatch(reference) if reference else None
     return match.group("name") if match else ""
 
 
@@ -1441,17 +1464,23 @@ def _positively_identified(
 ) -> bool:
     """Whether registry evidence proves the status belongs to ITEM's provider.
 
-    A status without its own repository is still judged through the joined
-    reference's repository, exactly like ``_provider_agrees``: the registry
-    declaring that repository for exactly the item's provider is positive
-    identification, so contested joins do not reject the one provider the
-    registry vouches for.
+    The joined reference's own repository is judged FIRST, exactly like
+    ``_provider_agrees``: the registry declaring that repository for exactly
+    the item's provider is positive identification, so contested joins do
+    not reject the one provider the registry vouches for — and a unit
+    re-pointed at another repository after the fact neither gains nor loses
+    identification for the reference it still carries.
     """
-    repository = status.repository or _reference_repository(item.issue_ref)
-    if not item.source_provider or not repository:
+    if not item.source_provider:
         return False
-    declared = repository_providers.get(repository.lower())
-    return declared == {item.source_provider}
+    for repository in (_reference_repository(item.issue_ref), status.repository):
+        if not repository:
+            continue
+        declared = repository_providers.get(repository.lower())
+        if declared is None:
+            continue
+        return declared == {item.source_provider}
+    return False
 
 
 def _resolve_state(

@@ -401,6 +401,15 @@
       const live = new Set();
       for (const entry of docs) {
         if (!entry?.incidentId) continue;
+        // Store rows are viewer-writable and bypass the snapshot's identity
+        // checks: a component carrying the key delimiter (projectId
+        // "forge\0github" with an empty provider) would collide with another
+        // incident's key and display the row's remediation state on the
+        // wrong card, so every component must be a delimiter-free string (or
+        // absent) before it may feed noteKey.
+        const identity = [entry.projectId, entry.sourceProvider, entry.incidentId];
+        if (!identity.every((part) => part == null
+          || (typeof part === "string" && !part.includes("\u0000")))) continue;
         const key = noteKey(entry.projectId, entry.sourceProvider, entry.incidentId);
         if (scopedKeys.has(key)) continue;
         const scoped = entry.docId === (await docId(key));
@@ -1096,8 +1105,15 @@
         const itemKey = project.projectId + "\u0000" + (node.sourceProvider || "") + "\u0000" + node.itemId;
         if (seenItems.has(itemKey)) return `Duplicate backlog itemId in ${where}: ${node.itemId}.`;
         seenItems.add(itemKey);
-        for (const key of ["itemId", "kind", "state", "stateBasis", "url", "issueRef", "parentId", "declaredState", "workUnitId", "sourceProvider"]) {
+        for (const key of ["itemId", "kind", "state", "stateBasis", "url", "issueRef", "parentId", "declaredState", "workUnitId", "sourceProvider", "projectId"]) {
           if (node[key] !== undefined && typeof node[key] !== "string") return `${where} backlog node field ${key} must be a string.`;
+        }
+        // The producer groups nodes by their item's own projectId, so every
+        // serialized node names its containing project; a store-rewritten,
+        // digest-consistent snapshot must not move a node whose identity
+        // still names project A under project B's backlog and counts.
+        if (node.projectId !== project.projectId) {
+          return `${where} backlog node ${node.itemId} names another project.`;
         }
         // NUL delimits the disclosure and identity keys exactly as it does
         // note keys, so identity components must never contain it.
@@ -1118,6 +1134,9 @@
         // Mirror the producer: userinfo in a rendered href would expose the
         // credential to every viewer and send it during navigation.
         if (node.url && /:\/\/[^/?#\s]*@/.test(node.url)) return `${where} backlog node ${node.itemId || ""} url must not embed credentials.`;
+        // Userinfo is not the only carrier: a token-shaped credential in the
+        // query string or fragment is the secret itself, rendered clickable.
+        if (node.url && /gh[pousr]_|github_pat_|glpat-/i.test(node.url)) return `${where} backlog node ${node.itemId || ""} url carries a token-shaped credential.`;
         // Placement must agree with the serialized parent link: the renderer
         // follows the nested arrays, so a child moved under another parent
         // would display a hierarchy no producer could build.
