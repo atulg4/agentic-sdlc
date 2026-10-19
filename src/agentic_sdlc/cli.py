@@ -55,6 +55,7 @@ from .github_backlog import (
     LifecycleLabels,
     backlog_document_from_issues,
     canonical_repository,
+    canonical_repository_from_pulls,
     incident_document,
     incidents_from_change_requests,
     incidents_from_issues,
@@ -1237,7 +1238,14 @@ def _github_backlog(args: argparse.Namespace) -> int:
     issues = _record_array(_json_file(args.issues), "--issues", require_number=True)
     # The payloads themselves carry the provider's canonical spelling: with or
     # without a policy, the export must emit the strings ledger records join.
+    # An empty issues payload cannot supply one, so the pulls payload is the
+    # canonical source then — never the caller's own casing.
     args.repository = canonical_repository(issues, args.repository)
+    pulls = None
+    if args.pulls:
+        pulls = _record_array(_json_file(args.pulls), "--pulls", require_number=True)
+        if not issues:
+            args.repository = canonical_repository_from_pulls(pulls, args.repository)
     links = parent_links(
         *(_sub_issue_group(entry) for entry in args.sub_issues),
         repository=args.repository,
@@ -1262,8 +1270,7 @@ def _github_backlog(args: argparse.Namespace) -> int:
     ]
     if args.failing and not args.pulls:
         raise ControlCenterError("--failing names change-request checks, so it requires --pulls")
-    if args.pulls:
-        pulls = _record_array(_json_file(args.pulls), "--pulls", require_number=True)
+    if pulls is not None:
         failing = _failing_checks(args.failing)
         present = {int(pull["number"]) for pull in pulls}
         missing = sorted(set(failing) - present)

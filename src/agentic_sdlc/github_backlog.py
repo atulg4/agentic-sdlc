@@ -143,6 +143,30 @@ def canonical_repository(issues: Iterable[Mapping[str, Any]], declared: str) -> 
     return canonical
 
 
+def canonical_repository_from_pulls(pulls: Iterable[Mapping[str, Any]], declared: str) -> str:
+    """The provider's spelling of ``declared``, taken from pull payloads.
+
+    For an export whose issues payload is empty, the pulls still carry the
+    provider's canonical ``base.repo.full_name``: the read model joins
+    references by exact string equality, so the export must not fall back to
+    the caller's spelling while the payloads carry the provider's. Pull
+    validation itself stays with :func:`incidents_from_change_requests`.
+    """
+
+    _require_repository(declared)
+    for pull in pulls:
+        base = pull.get("base")
+        if not isinstance(base, Mapping):
+            continue
+        repo = base.get("repo")
+        if not isinstance(repo, Mapping):
+            continue
+        name = repo.get("full_name")
+        if isinstance(name, str) and name.lower() == declared.lower():
+            return name
+    return declared
+
+
 def _issue_state(issue: Mapping[str, Any]) -> str:
     """The issue's explicit state, or a controlled error: a record without
     "open" or "closed" must never silently classify as open."""

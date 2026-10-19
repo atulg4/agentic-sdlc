@@ -487,7 +487,15 @@
           }).filter(Boolean));
           render();
         },
-        () => { /* a dropped subscription leaves the last view in place */ },
+        (error) => {
+          // A terminated subscription must be visible, exactly like the
+          // snapshot listener: the last view stays rendered, but operators
+          // are told these updates stopped rather than left trusting
+          // acknowledgements that no longer arrive.
+          state.error = "Live " + collection + " updates stopped (" + describe(error)
+            + "). Showing the last loaded view; reload the page to reconnect.";
+          render();
+        },
       );
     } catch { /* this view keeps an empty set */ }
   }
@@ -1652,6 +1660,17 @@
   }
 
   async function saveNote(incident, status, text) {
+    // Clamped like draft saves: the "at"-ordered notes window must never
+    // drop a fresh note behind a peer's forward-skewed timestamp or an
+    // already future-dated store row.
+    let newest = 0;
+    for (const source of [state.notes, backfilledEntries]) {
+      for (const cached of source.values()) {
+        const parsed = Date.parse(cached?.at || "");
+        if (!Number.isNaN(parsed) && parsed > newest) newest = parsed;
+      }
+    }
+    const now = Date.now();
     const entry = {
       incidentId: incident.incidentId,
       projectId: incident.projectId || "",
@@ -1659,7 +1678,7 @@
       status,
       text,
       byId: state.viewer?.id || "",
-      at: new Date().toISOString(),
+      at: new Date(newest >= now ? newest + 1000 : now).toISOString(),
     };
     try {
       const key = noteKey(incident.projectId, incident.incidentId);
