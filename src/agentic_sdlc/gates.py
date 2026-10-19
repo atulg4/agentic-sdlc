@@ -29,6 +29,7 @@ import subprocess
 import sys
 import time
 import tomllib
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -233,6 +234,8 @@ def gate_shell() -> list[str]:
 def run_gates(
     config: str | Path,
     repository: str | Path,
+    *,
+    environment_overrides: Mapping[str, str | None] | None = None,
 ) -> dict[str, Any]:
     commands, verification, python_version = _load(config)
     names = verification.get("gates", list(commands))
@@ -252,6 +255,15 @@ def run_gates(
     # checkout, not the tree under test.
     if "GITHUB_WORKSPACE" in environment:
         environment["GITHUB_WORKSPACE"] = str(root.resolve())
+    # Isolated derivations rebind the standard revision variables too: the
+    # ambient workflow's SHA and refs describe the caller's checkout, not
+    # the tree under test, and a gate reading them would test — or fail on —
+    # another revision while the report binds to the candidate head.
+    for name, value in (environment_overrides or {}).items():
+        if value is None:
+            environment.pop(name, None)
+        else:
+            environment[name] = value
     warning = check_gate_python(python_version, environment, root)
     if warning:
         print(f"::warning::{warning}", file=sys.stderr, flush=True)

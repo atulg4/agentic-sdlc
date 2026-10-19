@@ -1916,7 +1916,16 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
     (repo / "agentic-sdlc.toml").write_text(
         policy_file.read_text(encoding="utf-8"), encoding="utf-8"
     )
-    git("add", "a.txt", "src/scheduler.py", "src/marked.py", ".gitignore", "agentic-sdlc.toml")
+    (repo / "knowledge.toml").write_text(KNOWLEDGE_TOML + "\n", encoding="utf-8")
+    git(
+        "add",
+        "a.txt",
+        "src/scheduler.py",
+        "src/marked.py",
+        ".gitignore",
+        "agentic-sdlc.toml",
+        "knowledge.toml",
+    )
     git("commit", "-q", "-m", "base")
     base = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "HEAD"],
@@ -1935,8 +1944,7 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
         text=True,
     ).stdout.strip()
 
-    knowledge = tmp_path / "knowledge.toml"
-    knowledge.write_text(KNOWLEDGE_TOML + "\n", encoding="utf-8")
+    knowledge = repo / "knowledge.toml"
     request = tmp_path / "request.json"
     request.write_text(
         json.dumps(
@@ -2448,7 +2456,8 @@ def test_write_capable_dispatch_verifies_repository_evidence(
     (repo / "agentic-sdlc.toml").write_text(
         policy_file.read_text(encoding="utf-8"), encoding="utf-8"
     )
-    git("add", "src/scheduler.py", "agentic-sdlc.toml")
+    (repo / "knowledge.toml").write_text(KNOWLEDGE_TOML + "\n", encoding="utf-8")
+    git("add", "src/scheduler.py", "agentic-sdlc.toml", "knowledge.toml")
     git("commit", "-q", "-m", "pin")
     pin = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "HEAD"],
@@ -2458,8 +2467,7 @@ def test_write_capable_dispatch_verifies_repository_evidence(
         text=True,
     ).stdout.strip()
 
-    knowledge = tmp_path / "knowledge.toml"
-    knowledge.write_text(KNOWLEDGE_TOML + "\n", encoding="utf-8")
+    knowledge = repo / "knowledge.toml"
 
     def _request(path, **record_overrides):
         record = _record(
@@ -2593,8 +2601,17 @@ def test_write_capable_dispatch_verifies_repository_evidence(
     assert "does not match the pinned" in capsys.readouterr().err
     # The packet policy comes from the COMMITTED tree on candidate paths: an
     # uncommitted edit to the working-tree policy file — even one that would
-    # not parse — shapes nothing.
-    (repo / "agentic-sdlc.toml").write_text("this is not the policy\n", encoding="utf-8")
+    # not parse — shapes nothing, and neither does an uncommitted SYMLINK
+    # planted at the configured path (containment is judged lexically, so the
+    # committed file at the configured spelling is what gets read).
+    import os as os_
+
+    (repo / "decoy.toml").write_text("version = 99\n", encoding="utf-8")
+    (repo / "agentic-sdlc.toml").unlink()
+    os_.symlink("decoy.toml", repo / "agentic-sdlc.toml")
+    # The knowledge configuration is committed too; its working copy is
+    # equally irrelevant.
+    (repo / "knowledge.toml").write_text("not the knowledge config\n", encoding="utf-8")
     envelope_path = tmp_path / "envelope.json"
     assert (
         cli_main(
@@ -2632,6 +2649,113 @@ def test_multiple_producing_agents_are_all_excluded(registry):
     mission = registry.get("code-reviewer")
     excluded = registry.excluded_agents(mission, {"implementation-worker": ["agent-a", "agent-b"]})
     assert {"agent-a", "agent-b"} <= excluded
+
+
+def test_explicit_exclusions_hold_without_registry_lookup(registry):
+    # Producing status comes from the run's persisted kind: an agent proved
+    # to have produced the work item stays excluded even when the mission it
+    # ran no longer exists in the registry — the caller passes it explicitly.
+    from agentic_sdlc.missions import MissionError
+
+    reviewer = AgentProfile(
+        agent_id="former-producer",
+        adapter="claude",
+        adapter_version="1.0.0",
+        provider="anthropic",
+        model="claude-opus-5",
+        capabilities=registry.get("code-reviewer").capabilities,
+        context_window_tokens=4_000_000,
+    )
+    with pytest.raises(MissionError, match="independence conflict"):
+        registry.select_agent("code-reviewer", (reviewer,), excluded_agents={"former-producer"})
+
+
+def test_dispatch_refuses_unattested_evidence(tmp_path, policy_file, valid_body, capsys):
+    # Only repository evidence has a trusted readback: any other source type
+    # would dispatch exactly the payload the request chose, so it is refused
+    # on the dispatch path.
+    from agentic_sdlc.cli import main as cli_main
+
+    knowledge = tmp_path / "knowledge.toml"
+    knowledge.write_text(
+        KNOWLEDGE_TOML
+        + "\n\n[[source]]\n"
+        + 'id = "tracker"\n'
+        + 'type = "github-issues"\n'
+        + 'provider = "github"\n'
+        + 'locator = "https://github.com/example/project/issues"\n'
+        + 'scope = "example/project"\n',
+        encoding="utf-8",
+    )
+    record = _record(
+        source_id="tracker",
+        source_type="github-issues",
+        external_id="example/project#9",
+        payload="The tracker says so.\n",
+    ).as_dict()
+    record["locator"] = "https://github.com/example/project/issues/9"
+    request = tmp_path / "request.json"
+    request.write_text(
+        json.dumps(
+            {
+                "missionId": "implementation-worker",
+                "workRef": WORK_REF,
+                "task": {
+                    "title": "P1: a bounded change",
+                    "body": valid_body,
+                    "labels": [
+                        "agent-ready",
+                        "human-review-required",
+                        "implementation-approved",
+                    ],
+                },
+                "records": [record],
+            }
+        ),
+        encoding="utf-8",
+    )
+    agents = tmp_path / "agents.json"
+    agents.write_text(
+        json.dumps(
+            [
+                {
+                    "agentId": "codex-1",
+                    "adapter": "codex",
+                    "adapterVersion": "1.0.0",
+                    "provider": "openai",
+                    "model": "gpt-5",
+                    "capabilities": ["edit-code", "author-tests", "run-commands"],
+                    "contextWindowTokens": 4000000,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    authorization = _authorization(
+        tmp_path / "authorization.json", "P1: a bounded change", valid_body
+    )
+    capsys.readouterr()
+    assert (
+        cli_main(
+            [
+                "dispatch-packet",
+                "--config",
+                str(policy_file),
+                "--knowledge",
+                str(knowledge),
+                "--request",
+                str(request),
+                "--agents",
+                str(agents),
+                "--authorization",
+                str(authorization),
+            ]
+        )
+        == 2
+    )
+    err = capsys.readouterr().err
+    assert "accepts repository evidence only" in err
+    assert "github-issues" in err
 
 
 def test_notices_evict_optional_evidence_instead_of_blocking(registry, policy):

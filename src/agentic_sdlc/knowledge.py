@@ -186,14 +186,46 @@ class EvidenceRecord:
         }
 
 
+#: Payloads matching any of these are treated as credential material
+#: everywhere a packet string can reach a sink (key blocks, provider token
+#: shapes, quoted literal assignments) — the one scan shared by the packet
+#: layer and this module's own error text.
+SECRET_PATTERNS = (
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"\bgh[oprsu]_[A-Za-z0-9]{20,}"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"\bxox[a-z]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
+    re.compile(
+        r"(?i)\b(?:api[_-]?key|secret|token|password|passwd|credential)s?\b"
+        r"\s*[:=]\s*[\"\'][^\"\'\s]{8,}[\"\']"
+    ),
+)
+
+
+def secret_like_text(value: str) -> bool:
+    """Secret-like raw OR after boundary-marker removal.
+
+    Sanitization strips marker text to a fixpoint, so a credential split by
+    an embedded boundary marker would be reconstructed exactly where the text
+    reaches the model; both representations are scanned wherever either can
+    reach a sink.
+    """
+    return any(pattern.search(value) for pattern in SECRET_PATTERNS) or any(
+        pattern.search(sanitize_payload(value)) for pattern in SECRET_PATTERNS
+    )
+
+
 #: The only shape an unknown-enum error echoes back: anything else — a
 #: credential-shaped value, a newline, a terminal escape — is withheld, since
-#: these errors print to stderr and CI logs.
+#: these errors print to stderr and CI logs. Character shape alone is not
+#: enough: an identifier-shaped provider token is scanned like any payload.
 _TAME_ENUM = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
 
 def _shown_enum(value: str) -> str:
-    if _TAME_ENUM.fullmatch(value):
+    if _TAME_ENUM.fullmatch(value) and not secret_like_text(value):
         return value
     return "(value withheld: not a plain identifier)"
 
@@ -365,6 +397,15 @@ def load_sources(path: str | Path) -> tuple[KnowledgeSource, ...]:
     """Load declared knowledge sources from protected configuration."""
     with Path(path).open("rb") as handle:
         document = tomllib.load(handle)
+    return sources_from_document(document)
+
+
+def load_sources_bytes(data: bytes) -> tuple[KnowledgeSource, ...]:
+    """Load declared knowledge sources from committed configuration bytes."""
+    return sources_from_document(tomllib.loads(data.decode("utf-8")))
+
+
+def sources_from_document(document: dict[str, Any]) -> tuple[KnowledgeSource, ...]:
     if document.get("version") != 1:
         raise KnowledgeError("knowledge configuration version must be 1")
     entries = document.get("source", [])

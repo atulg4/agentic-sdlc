@@ -238,11 +238,17 @@ repository config, locally configured filters, and the caches one gate run
 leaves behind can neither block a derivation nor reach a gate. The gates
 run under the gate configuration AS COMMITTED at the candidate head
 (`--config` must resolve inside the candidate repository and be committed
-there), with `GITHUB_WORKSPACE` repointed at the disposable tree so an
-Actions-style gate cannot read the caller's checkout — and the PACKET
-policy itself (limits, forbidden paths, task policy) is read from the same
-committed tree on every candidate path, so an uncommitted caller-side
-policy edit shapes nothing. The derivation also reads every
+there), with `GITHUB_WORKSPACE` repointed at the disposable tree and the standard
+revision variables rebound (`GITHUB_SHA` to the candidate head,
+`GITHUB_BASE_REF` to the trusted base; `GITHUB_REF`/`GITHUB_HEAD_REF`
+cleared), so an Actions-style gate can neither read the caller's checkout
+nor test the ambient workflow's revision. The clone also mirrors the
+source's remote-tracking and tag refs, since CI checkouts often carry the
+candidate only on `origin/*`. The PACKET configuration — the policy AND the
+mission registry and knowledge sources — is read from the same committed
+tree on every candidate path (paths judged lexically, never through
+symlinks), so an uncommitted caller-side edit to any of those files shapes
+nothing. The derivation also reads every
 pinned repository
 record's payload back from the candidate tree through the adapter's own
 sanitization — a fabricated payload with a self-consistent hash is
@@ -253,7 +259,11 @@ boundary-marker text ESCAPED rather than stripped — code that legitimately
 spells a marker reaches the reviewer intact — so the reviewer reads the
 change under review rather than only its hash, path names, and line
 counts.
-Builder and tester dispatches carrying repository evidence take
+Dispatch accepts repository evidence only: every other source type would
+dispatch exactly the payload the request chose under a self-consistent
+hash, so non-repository records are refused on the dispatch path until an
+attested retrieval exists for them. Builder and tester dispatches carrying
+repository evidence take
 `--candidate-repository` alone (the derivation flags are reviewer-only) and
 are refused without it: the request's `repositoryRevision` must be the full
 commit SHA of the trusted pinned tree, and every pinned record is read back
@@ -270,7 +280,10 @@ caller-selected label. Reviewer dispatches require `--history`: the
 ORCHESTRATOR STATE document, replayed through the orchestrator's own
 validation, whose recorded runs for this work item (mission and agent
 identity) define the independence exclusions — EVERY agent that performed a
-producing mission is excluded, not only the last assignee. A
+producing mission is excluded, not only the last assignee, and producing
+status comes from each run's persisted `implementation`/`repair` kind, so a
+mission later removed or rewritten cannot launder its agents back into
+review eligibility. A
 caller-authored mission→agent map is not authoritative, and a state
 recording no producing run for any mission the review is independent of
 refuses dispatch.

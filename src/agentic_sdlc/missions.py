@@ -13,7 +13,7 @@ import hashlib
 import json
 import re
 import tomllib
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -508,14 +508,19 @@ class MissionRegistry:
         agents: Sequence[AgentProfile],
         history: Mapping[str, str | Sequence[str]] | None = None,
         ledger: MissionLedger | None = None,
+        excluded_agents: Collection[str] = (),
     ) -> AgentProfile:
         """Pick the first declared agent satisfying the full mission contract.
 
         Agent order expresses preference: later entries are fallbacks and must
         satisfy exactly the same capability, risk, and independence rules.
+        ``excluded_agents`` adds caller-established exclusions — agents whose
+        PERSISTED run kinds prove they produced this work item — which hold
+        even when the mission that ran no longer exists in this registry or
+        no longer declares a write capability.
         """
         mission = self.get(mission_id)
-        excluded = self.excluded_agents(mission, history or {})
+        excluded = set(self.excluded_agents(mission, history or {})) | set(excluded_agents)
         if ledger is not None:
             ledger.check(mission)
         required = set(mission.capabilities)
@@ -559,8 +564,22 @@ def load_registry(
     if path is not None:
         with Path(path).open("rb") as handle:
             document = tomllib.load(handle)
-        if document.get("version") != 1:
-            raise MissionError("mission registry version must be 1")
+    return registry_from_document(document, policy, declared=path is not None)
+
+
+def load_registry_bytes(data: bytes, policy: ProjectPolicy) -> MissionRegistry:
+    """Load the registry from committed configuration bytes (see load_registry)."""
+    return registry_from_document(tomllib.loads(data.decode("utf-8")), policy, declared=True)
+
+
+def registry_from_document(
+    document: dict[str, Any],
+    policy: ProjectPolicy,
+    *,
+    declared: bool = True,
+) -> MissionRegistry:
+    if declared and document.get("version") != 1:
+        raise MissionError("mission registry version must be 1")
 
     registry_table = document.get("registry", {})
     if not isinstance(registry_table, dict):

@@ -492,6 +492,28 @@ def derivation_tree(repository: str | Path, rev: str) -> Iterator[Path]:
             base,
             "clone",
         )
+        # An ordinary clone maps only the source's HEADS to origin/*: a CI
+        # checkout often carries the candidate solely on remote-tracking
+        # refs, so the source's refs/remotes/* and refs/tags/* are mirrored
+        # in verbatim — gates diffing against origin/<branch> find the ref,
+        # and a head reachable only through those refs transfers too.
+        _exec(
+            [
+                program,
+                "-C",
+                str(tree),
+                "--no-replace-objects",
+                "-c",
+                "core.fsmonitor=false",
+                "fetch",
+                "--quiet",
+                "origin",
+                "+refs/remotes/*:refs/remotes/*",
+                "+refs/tags/*:refs/tags/*",
+            ],
+            str(tree),
+            "fetch",
+        )
         _exec(
             [
                 program,

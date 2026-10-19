@@ -65,7 +65,13 @@ from .infra_recovery import (
     retry_state_from_comments,
     write_retry_state,
 )
-from .knowledge import KnowledgeError, load_sources, record_from_dict, sanitize_payload
+from .knowledge import (
+    KnowledgeError,
+    load_sources,
+    load_sources_bytes,
+    record_from_dict,
+    sanitize_payload,
+)
 from .leases import (
     DEFAULT_TTL_MINUTES,
     LEASE_BOT_LOGINS_ENV,
@@ -88,6 +94,7 @@ from .missions import (
     create_dispatch_envelope,
     load_agents,
     load_registry,
+    load_registry_bytes,
 )
 from .models import RiskLevel
 from .onboard import (
@@ -821,16 +828,38 @@ def _dispatch_mission(args: argparse.Namespace) -> int:
     return 0
 
 
-def _candidate_config_rel(args: argparse.Namespace) -> Path:
-    """The --config path relative to the candidate repository, refused outside it."""
-    repo_root = Path(args.candidate_repository).resolve()
+def _candidate_rel(args: argparse.Namespace, value: str, flag: str) -> Path:
+    """`value` relative to the candidate repository, derived LEXICALLY.
+
+    Never through ``Path.resolve``: following symlinks would let an
+    uncommitted symlink planted at the configured path select another
+    committed file, so containment is judged on the normalized spelling and
+    the committed object at that exact path is what gets read.
+    """
+    repo_root = Path(os.path.abspath(args.candidate_repository))
+    candidate = Path(os.path.abspath(value))
     try:
-        return Path(args.config).resolve().relative_to(repo_root)
+        return candidate.relative_to(repo_root)
     except ValueError:
         raise ContextBuilderError(
-            "derived gates run under the gate configuration committed in the "
-            "candidate repository; pass --config as a path inside it"
+            f"{flag} must name a path inside the candidate repository; "
+            "candidate paths read repository-owned configuration committed "
+            "at the pinned revision"
         ) from None
+
+
+def _committed_configuration(args: argparse.Namespace, pinned: str, value: str, flag: str) -> bytes:
+    """The bytes of a configuration file as COMMITTED at the pinned revision."""
+    rel = _candidate_rel(args, value, flag)
+    try:
+        return read_committed_file(
+            args.candidate_repository, pinned, rel.as_posix(), label="the pinned tree"
+        )
+    except GitDiffError as error:
+        raise ContextBuilderError(
+            f"the {flag} configuration is not committed at the pinned revision; "
+            "commit it so the packet is built under repository-owned definitions"
+        ) from error
 
 
 def _derived_verification(args: argparse.Namespace, request: dict) -> VerificationEvidence:
@@ -852,7 +881,7 @@ def _derived_verification(args: argparse.Namespace, request: dict) -> Verificati
     # caller's checkout would let an uncommitted edit replace the real test
     # command while the report binds to the candidate head, so the gates run
     # under the configuration AS COMMITTED at the candidate head.
-    config_rel = _candidate_config_rel(args)
+    config_rel = _candidate_rel(args, args.config, "--config")
     # The caller's own checkout is not evidence: it can be dirty, carry
     # ignored files a gate would read, or have status output suppressed by
     # repository-local configuration — and a gate run leaves caches behind
@@ -868,7 +897,19 @@ def _derived_verification(args: argparse.Namespace, request: dict) -> Verificati
                 "head; commit it so derived gates run repository-owned "
                 "definitions"
             )
-        report = run_gates(tree_config, tree)
+        report = run_gates(
+            tree_config,
+            tree,
+            # The ambient workflow's revision variables describe the
+            # caller's checkout; gates in the isolated tree see the
+            # candidate's instead.
+            environment_overrides={
+                "GITHUB_SHA": head,
+                "GITHUB_BASE_REF": base,
+                "GITHUB_REF": None,
+                "GITHUB_HEAD_REF": None,
+            },
+        )
     # Wall-clock timings are not evidence, and they make everything bound to
     # the report nondeterministic: the rendered size, the budget accounting,
     # the evidence selection, and the packet digest would all differ between
@@ -1034,25 +1075,27 @@ def _build_packet_from_request(
                 "repositoryRevision to locate the committed configuration"
             )
         pinned = resolve_commit(args.candidate_repository, pin_source)
-        config_rel = _candidate_config_rel(args)
-        try:
-            policy_bytes = read_committed_file(
-                args.candidate_repository,
-                pinned,
-                config_rel.as_posix(),
-                label="the pinned tree",
+        policy = load_policy_bytes(_committed_configuration(args, pinned, args.config, "--config"))
+        # The mission registry and knowledge sources are the same
+        # human-reviewed, baseline-forbidden configuration the policy is: an
+        # uncommitted edit must not widen a consumer mission or a source's
+        # permissions while the artifact and rebuild agree on it.
+        if args.missions:
+            registry = load_registry_bytes(
+                _committed_configuration(args, pinned, args.missions, "--missions"), policy
             )
-        except GitDiffError as error:
-            raise ContextBuilderError(
-                "the policy configuration is not committed at the pinned "
-                "revision; commit it so the packet is built under "
-                "repository-owned definitions"
-            ) from error
-        policy = load_policy_bytes(policy_bytes)
+        else:
+            registry = load_registry(None, policy)
+        sources = {
+            source.source_id: source
+            for source in load_sources_bytes(
+                _committed_configuration(args, pinned, args.knowledge, "--knowledge")
+            )
+        }
     else:
         policy = load_policy(args.config)
-    registry = load_registry(args.missions, policy)
-    sources = {source.source_id: source for source in load_sources(args.knowledge)}
+        registry = load_registry(args.missions, policy)
+        sources = {source.source_id: source for source in load_sources(args.knowledge)}
 
     def _request_text(key: str) -> str:
         value = request.get(key)
@@ -1134,6 +1177,22 @@ def _build_packet_from_request(
             "dispatch with repository evidence requires --candidate-repository "
             "so every pinned payload is read back from the trusted tree"
         )
+    if trusted_verification_only:
+        # Only repository evidence has a trusted readback today: every other
+        # source type would dispatch exactly the payload the request chose,
+        # under a self-consistent hash and a copied scope, so it is refused
+        # on this path until an attested retrieval exists for it.
+        unattested = sorted(
+            {record.source_type for record in records if record.source_type != "git-repository"}
+        )
+        if unattested:
+            raise ContextBuilderError(
+                "dispatch accepts repository evidence only (read back from the "
+                "pinned tree); no attested retrieval exists for "
+                + ", ".join(unattested)
+                + " records — retrieve them through the trusted pipeline, not "
+                "request JSON"
+            )
     packet = build_context_packet(
         mission,
         task,
@@ -1204,6 +1263,7 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
             )
     agents = load_agents(json.loads(Path(args.agents).read_text(encoding="utf-8")))
     history: dict[str, list[str]] = {}
+    producing_agents: set[str] = set()
     if args.history:
         # The history is the ORCHESTRATOR STATE, not a bare mission→agent
         # map: a caller-authored map could record "" (or any other agent) for
@@ -1227,6 +1287,11 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
             agents_for = history.setdefault(run.mission_id, [])
             if run.agent_id not in agents_for:
                 agents_for.append(run.agent_id)
+            # Producing status comes from the run's PERSISTED kind, never a
+            # registry lookup: a mission removed or rewritten after the run
+            # must not launder its agents back into review eligibility.
+            if run.kind in ("implementation", "repair"):
+                producing_agents.add(run.agent_id)
     if mission_role(mission) == "reviewer":
         # A review necessarily follows a producing run, so an absent history
         # — or one recording no producing run for this work item — is not
@@ -1244,8 +1309,14 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
     # context window cannot fit the packet is skipped for the next eligible
     # one instead of blocking a dispatch a fallback could carry.
     roster = list(agents)
+    reviewer = mission_role(mission) == "reviewer"
     while True:
-        agent = registry.select_agent(mission.mission_id, tuple(roster), history=history)
+        agent = registry.select_agent(
+            mission.mission_id,
+            tuple(roster),
+            history=history,
+            excluded_agents=frozenset(producing_agents) if reviewer else frozenset(),
+        )
         try:
             envelope = dispatch_envelope_for_packet(
                 packet, mission, agent, input_refs=tuple(args.input_ref)

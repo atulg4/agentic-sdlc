@@ -124,3 +124,36 @@ def test_derivation_tree_materializes_the_committed_content(tmp_path: Path) -> N
     # The tree is removed afterwards and the caller's own state is untouched.
     assert not kept.exists()
     assert (repo / "a.txt").read_text(encoding="utf-8") == "uncommitted\n"
+
+
+def test_derivation_tree_mirrors_remote_tracking_refs(tmp_path: Path) -> None:
+    # CI checkouts often carry the candidate only on remote-tracking refs: a
+    # repository-aware gate diffing against origin/<branch> must find the ref
+    # inside the derivation clone.
+    from agentic_sdlc.git_diff import derivation_tree
+
+    repo = tmp_path / "ci"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    (repo / "a.txt").write_text("one\n", encoding="utf-8")
+    _git(repo, "add", "--", ".")
+    _git(repo, "commit", "-qm", "base")
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    # Only a remote-tracking ref holds the commit, like a detached CI clone.
+    _git(repo, "update-ref", "refs/remotes/origin/main", head)
+    _git(repo, "checkout", "-q", "--detach", head)
+    _git(repo, "branch", "-q", "-D", "main")
+
+    with derivation_tree(repo, head) as tree:
+        resolved = subprocess.run(
+            ["git", "rev-parse", "origin/main"],
+            cwd=tree,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert resolved == head

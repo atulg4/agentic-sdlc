@@ -46,6 +46,7 @@ from .knowledge import (
     authorize_source,
     build_context_pack,
     sanitize_payload,
+    secret_like_text,
 )
 from .missions import (
     WRITE_CAPABILITIES,
@@ -102,22 +103,6 @@ OUTPUT_TOKEN_RESERVE = 256
 _COMMIT_SHA = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _WORD = re.compile(r"[a-z0-9_]{4,}")
-
-#: Payloads matching any of these never enter a packet. Patterns target
-#: credential material (key blocks, provider token shapes, quoted literal
-#: assignments), not ordinary code that merely names a ``token`` variable.
-_SECRET_PATTERNS = (
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
-    re.compile(r"\bgh[oprsu]_[A-Za-z0-9]{20,}"),
-    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
-    re.compile(r"\bxox[a-z]-[A-Za-z0-9-]{10,}"),
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
-    re.compile(
-        r"(?i)\b(?:api[_-]?key|secret|token|password|passwd|credential)s?\b"
-        r"\s*[:=]\s*[\"'][^\"'\s]{8,}[\"']"
-    ),
-)
 
 
 def _complete_gate_entry(entry: Any) -> bool:
@@ -653,19 +638,8 @@ def _record_path(record: EvidenceRecord) -> str | None:
     return record.external_id[: -len(suffix)]
 
 
-def _secret_like(payload: str) -> bool:
-    return any(pattern.search(payload) for pattern in _SECRET_PATTERNS)
-
-
-def _secret_like_text(value: str) -> bool:
-    """Secret-like raw OR after boundary-marker removal.
-
-    Sanitization strips marker text to a fixpoint, so a credential split by
-    an embedded boundary marker would be reconstructed exactly where the text
-    reaches the model; both representations are scanned wherever either can
-    reach a sink.
-    """
-    return _secret_like(value) or _secret_like(sanitize_payload(value))
+#: The one secret scan, shared with the knowledge layer's own error text.
+_secret_like_text = secret_like_text
 
 
 def _canonical_repository_path(path: str) -> bool:

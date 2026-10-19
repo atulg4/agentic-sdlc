@@ -342,3 +342,24 @@ def test_gates_repoint_the_actions_workspace(tmp_path: Path, monkeypatch) -> Non
     report = run_gates(config, tmp_path)
     assert report["passed"] is True
     assert out.read_text(encoding="utf-8") == str(tmp_path.resolve())
+
+
+def test_gates_rebind_revision_variables(tmp_path: Path, monkeypatch) -> None:
+    # An isolated derivation rebinds the standard revision variables: the
+    # ambient workflow's SHA and refs describe the caller's checkout.
+    monkeypatch.setenv("GITHUB_SHA", "f" * 40)
+    monkeypatch.setenv("GITHUB_REF", "refs/pull/1/merge")
+    config = tmp_path / "policy.toml"
+    out = tmp_path / "revisions.txt"
+    _write_config(
+        config,
+        'printf "%s|%s" "$GITHUB_SHA" "${GITHUB_REF-unset}" > revisions.txt',
+        "true",
+    )
+    report = run_gates(
+        config,
+        tmp_path,
+        environment_overrides={"GITHUB_SHA": "a" * 40, "GITHUB_REF": None},
+    )
+    assert report["passed"] is True
+    assert out.read_text(encoding="utf-8") == "a" * 40 + "|unset"
