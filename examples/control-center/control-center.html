@@ -234,6 +234,10 @@
     db: null, user: null, sample: null, viewer: null, canWrite: null,
     snapshot: null, snapshotMeta: null, notes: new Map(), drafts: [],
     tab: "portfolio", project: null, open: new Set(), connecting: true, error: "",
+    // Listener failures per collection: a later snapshot adoption clears
+    // state.error, but a dead notes or drafts feed stays dead until reload,
+    // so its banner must survive adoption.
+    feedErrors: new Map(),
   };
 
   /* ---------- tiny DOM helper: text is always set as text ---------- */
@@ -487,17 +491,25 @@
           }).filter(Boolean));
           render();
         },
-        (error) => {
-          // A terminated subscription must be visible, exactly like the
-          // snapshot listener: the last view stays rendered, but operators
-          // are told these updates stopped rather than left trusting
-          // acknowledgements that no longer arrive.
-          state.error = "Live " + collection + " updates stopped (" + describe(error)
-            + "). Showing the last loaded view; reload the page to reconnect.";
-          render();
-        },
+        (error) => { feedStopped(collection, error); },
       );
-    } catch { /* this view keeps an empty set */ }
+    } catch (error) {
+      // A setup throw (collection/orderBy/limit/onSnapshot) is the same
+      // operator-facing failure as a terminated listener: this view keeps
+      // its last (or empty) set, visibly.
+      feedStopped(collection, error);
+    }
+  }
+
+  function feedStopped(collection, error) {
+    // A dead subscription must be visible, exactly like the snapshot
+    // listener's failure: the last view stays rendered, but operators are
+    // told these updates stopped rather than left trusting acknowledgements
+    // that no longer arrive. Kept per collection and OUTSIDE state.error,
+    // which the next snapshot adoption clears while the feed stays dead.
+    state.feedErrors.set(collection, "Live " + collection + " updates stopped ("
+      + describe(error) + "). Showing the last loaded view; reload the page to reconnect.");
+    render();
   }
 
   function describe(error) {
@@ -1037,6 +1049,9 @@
     renderTabs();
     viewNode.replaceChildren();
     if (state.error) viewNode.append(el("div", { class: "banner bad", text: state.error }));
+    for (const message of state.feedErrors.values()) {
+      viewNode.append(el("div", { class: "banner bad", text: message }));
+    }
     if (!state.db && !state.snapshot) viewNode.append(offlineNotice());
     if (state.tab === "portfolio") viewNode.append(...portfolioView());
     else if (state.tab === "project") viewNode.append(...projectView());
@@ -1660,27 +1675,32 @@
   }
 
   async function saveNote(incident, status, text) {
-    // Clamped like draft saves: the "at"-ordered notes window must never
-    // drop a fresh note behind a peer's forward-skewed timestamp or an
-    // already future-dated store row.
-    let newest = 0;
-    for (const source of [state.notes, backfilledEntries]) {
-      for (const cached of source.values()) {
-        const parsed = Date.parse(cached?.at || "");
-        if (!Number.isNaN(parsed) && parsed > newest) newest = parsed;
-      }
-    }
-    const now = Date.now();
-    const entry = {
-      incidentId: incident.incidentId,
-      projectId: incident.projectId || "",
-      kind: incident.kind || "",
-      status,
-      text,
-      byId: state.viewer?.id || "",
-      at: new Date(newest >= now ? newest + 1000 : now).toISOString(),
-    };
     try {
+      // Clamped like draft saves: the "at"-ordered notes window must never
+      // drop a fresh note behind a peer's forward-skewed timestamp or an
+      // already future-dated store row. BOUNDED: a viewer-writable note can
+      // carry the maximum parseable timestamp, and an unbounded newest+1000
+      // would overflow the Date range and throw — so absurd cached values
+      // (more than a day ahead) are ignored, and the whole construction
+      // stays inside this handled save path.
+      const now = Date.now();
+      let newest = 0;
+      const ceiling = now + 86_400_000;
+      for (const source of [state.notes, backfilledEntries]) {
+        for (const cached of source.values()) {
+          const parsed = Date.parse(cached?.at || "");
+          if (!Number.isNaN(parsed) && parsed > newest && parsed <= ceiling) newest = parsed;
+        }
+      }
+      const entry = {
+        incidentId: incident.incidentId,
+        projectId: incident.projectId || "",
+        kind: incident.kind || "",
+        status,
+        text,
+        byId: state.viewer?.id || "",
+        at: new Date(newest >= now ? newest + 1000 : now).toISOString(),
+      };
       const key = noteKey(incident.projectId, incident.incidentId);
       await state.db.doc("notes/" + (await docId(key))).set(entry);
       // The notes subscription is a bounded recency window, so the write is

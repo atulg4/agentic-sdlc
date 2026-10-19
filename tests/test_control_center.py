@@ -829,6 +829,7 @@ def test_change_request_incidents_distinguish_conflict_ci_and_merge_wait():
                 "state": "open",
                 "draft": True,
                 "mergeable_state": "clean",
+                "base": {"repo": {"full_name": "acme/forge"}},
             },
         ],
         project_id="forge",
@@ -1028,6 +1029,7 @@ def test_a_draft_change_request_is_never_a_blocker():
                 "state": "open",
                 "draft": True,
                 "mergeable_state": "dirty",
+                "base": {"repo": {"full_name": "acme/forge"}},
             },
             {
                 "number": 2,
@@ -1035,6 +1037,7 @@ def test_a_draft_change_request_is_never_a_blocker():
                 "state": "open",
                 "draft": True,
                 "mergeable_state": "blocked",
+                "base": {"repo": {"full_name": "acme/forge"}},
             },
         ],
         project_id="forge",
@@ -1200,6 +1203,7 @@ def test_a_non_boolean_draft_flag_is_a_controlled_error():
                         "state": "open",
                         "draft": bad,
                         "mergeable_state": "dirty",
+                        "base": {"repo": {"full_name": "acme/forge"}},
                     }
                 ],
                 project_id="forge",
@@ -2195,14 +2199,22 @@ def test_a_malformed_record_number_is_a_controlled_error():
 
 
 def test_an_absent_draft_verdict_is_a_controlled_error():
+    base = {"repo": {"full_name": "acme/forge"}}
     for pull in (
-        {"number": 1, "title": "no draft", "state": "open", "mergeable_state": "clean"},
+        {
+            "number": 1,
+            "title": "no draft",
+            "state": "open",
+            "mergeable_state": "clean",
+            "base": base,
+        },
         {
             "number": 1,
             "title": "null draft",
             "state": "open",
             "draft": None,
             "mergeable_state": "clean",
+            "base": base,
         },
     ):
         with pytest.raises(ControlCenterError, match="draft must be a boolean"):
@@ -5202,8 +5214,16 @@ def test_the_console_binds_incidents_and_enforces_full_membership():
     # skewed clock cannot park a fresh note behind the recency cutoff.
     assert "for (const source of [state.notes, backfilledEntries])" in html
     assert html.count("newest >= now ? newest + 1000 : now") == 2
-    # A terminated collection subscription is surfaced, never silent.
+    # A terminated collection subscription is surfaced, never silent — on
+    # setup throws too — and the banner survives snapshot adoption (which
+    # clears state.error while the feed stays dead).
     assert 'Live " + collection + " updates stopped' in html
+    assert "function feedStopped(collection, error)" in html
+    assert "feedErrors: new Map()" in html
+    assert "for (const message of state.feedErrors.values())" in html
+    # The note-timestamp clamp is bounded: an absurd cached timestamp cannot
+    # overflow the Date range and break every save.
+    assert "parsed <= ceiling" in html
     # A backfill read that resumes after a notes delivery made the key live
     # leaves the subscription's newer data alone.
     assert "if (liveNoteKeys.has(key)) return;" in html
@@ -5857,3 +5877,31 @@ def test_pulls_canonicalize_the_repository_when_issues_are_empty(tmp_path):
     incidents = json.loads(incidents_output.read_text(encoding="utf-8"))
     refs = [item["evidenceRef"] for item in incidents["incidents"]]
     assert refs == ["Acme/Forge!1"]
+
+
+def test_draft_ownership_is_validated_before_the_skip():
+    # A mistargeted or partial export must fail closed even when every pull
+    # is a draft: the skip must not hide missing or foreign ownership.
+    foreign = {
+        "number": 9,
+        "title": "wip",
+        "state": "open",
+        "draft": True,
+        "mergeable_state": "unknown",
+        "base": {"repo": {"full_name": "other/repo"}},
+    }
+    with pytest.raises(ControlCenterError, match="belongs to other/repo"):
+        incidents_from_change_requests(
+            [foreign], project_id="forge", repository="acme/forge", observed_at=NOW
+        )
+    partial = {
+        "number": 9,
+        "title": "wip",
+        "state": "open",
+        "draft": True,
+        "mergeable_state": "unknown",
+    }
+    with pytest.raises(ControlCenterError, match="base.repo.full_name is required"):
+        incidents_from_change_requests(
+            [partial], project_id="forge", repository="acme/forge", observed_at=NOW
+        )
