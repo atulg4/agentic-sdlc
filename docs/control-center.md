@@ -155,7 +155,11 @@ detail payloads, not the list response. `--sub-issues` prefers the
 `PARENT=path` form, which does not depend on each child carrying its own
 parent reference; a bare path still works when the payload carries
 `parent_issue_url`, and a child whose reference disagrees with the declared
-parent is rejected rather than silently relinked.
+parent is rejected rather than silently relinked. A supplied listing must
+be COMPLETE: a parent whose declared `sub_issues_summary.total` exceeds the
+children the listing maps — an explicitly supplied empty listing included —
+fails the export closed, so an unpaginated fetch cannot silently drop the
+hierarchy.
 
 Fetching stays outside the library: the operator's own client supplies the
 credential, and the library only ever sees already-fetched JSON.
@@ -181,9 +185,14 @@ to a repository, a tracker or a runner. Backlog URLs are refused at load when
 they embed a credential — URL userinfo, or a token-shaped value (`ghp_…`,
 `github_pat_…`, `glpat-…`) anywhere in the URL, query string and fragment
 included, percent-encoded or not — and ledger references (`issueRef`,
-`changeRequestRef`, `runRef`) carrying the same shapes are redacted, so the
-snapshot never republishes a secret as a clickable link or a rendered chip;
-the console re-checks the same rules on every document it renders. A remediation descriptor *describes* the
+`changeRequestRef`, `runRef`) carrying the same shapes are redacted, while
+an incident `evidenceRef` or `backlogItemId` carrying them is refused at
+load, so the snapshot never republishes a secret as a clickable link or a
+rendered chip; the console re-checks the same rules on every document it
+renders, peeling percent-escapes individually so one malformed escape never
+hides a valid one beside it. A ledger project identifier carrying NUL — the
+console's identity-key delimiter — fails the build closed, since the
+bundled viewer would refuse the otherwise valid snapshot. A remediation descriptor *describes* the
 step and names who may take it; taking it stays with that authority. Mutating
 the control plane is a separately reviewed change, not a side effect of
 rendering a page.

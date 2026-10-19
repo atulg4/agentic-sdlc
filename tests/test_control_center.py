@@ -4089,6 +4089,11 @@ def test_a_truncated_sub_issue_listing_fails_closed():
     # form deliberately narrows which parents are exported.
     narrowed = _export(parent, *children)
     assert [item.get("parentId") for item in narrowed["items"]] == [None, None, None, None]
+    # An EXPLICITLY supplied but empty (fully truncated) listing is not a
+    # narrowed export: the declared parent's nonzero total still fails
+    # closed instead of silently publishing none of its hierarchy.
+    with pytest.raises(ControlCenterError, match="declares 3 sub-issue.*only 0 are listed"):
+        _export(parent, *children, parents=parent_links(([], 1)))
 
 
 def test_spec_holds_name_the_configured_labels():
@@ -5014,13 +5019,29 @@ def test_credential_bearing_inputs_are_rejected_at_load():
     assert "ghp_" not in str(token_error.value)
     # Percent-encoding must not smuggle the same token past the scan: both
     # an encoded separator (ghp%5F) and an encoded first letter (%67hp_)
-    # decode to the rejected shape.
+    # decode to the rejected shape — a malformed escape beside a valid one
+    # must not stop the peeling either.
     for encoded in (
         "https://tracker.example/issue/1?access=ghp%5F0123456789abcdefghij",
         "https://tracker.example/issue/1?access=%67hp_0123456789abcdefghij",
+        "https://tracker.example/issue/1?x=%ZZ%67hp_0123456789abcdefghij",
     ):
         with pytest.raises(ControlCenterError, match="token-shaped credential"):
             load_backlog_document(_document(_backlog(itemId="acme/forge#7", url=encoded)))
+    # Incident references republish into the snapshot exactly like backlog
+    # URLs: a token shape in evidenceRef or a token-shaped backlogItemId is
+    # refused at load, so the producer can never emit a snapshot the
+    # console's own token check rejects.
+    with pytest.raises(ControlCenterError, match="evidenceRef must not embed credentials"):
+        load_incident_document(
+            _incidents(
+                _incident(evidenceRef="https://ci.example/run?access=ghp_0123456789abcdefghij")
+            )
+        )
+    with pytest.raises(ControlCenterError, match="token-shaped credential"):
+        load_incident_document(
+            _incidents(_incident(backlogItemId="ghp_0123456789abcdefghij0123456789abcdef"))
+        )
 
 
 def test_a_malformed_pull_request_marker_is_rejected():
@@ -5463,11 +5484,19 @@ def test_the_console_validates_backlog_provenance_and_scoped_liveness():
     assert "url carries a token-shaped credential" in html
     # Token shapes are scanned after bounded percent-decoding (mirroring the
     # producer's _carries_credential_token) and applied to unit, incident,
-    # node-reference and status fields alongside the userinfo checks.
+    # node-reference and status fields alongside the userinfo checks. Valid
+    # escapes are peeled INDIVIDUALLY: decodeURIComponent throws on one
+    # malformed escape (%ZZ%67hp_...) and would stop the scan before the
+    # valid escape beside it decoded.
     assert "const tokenShaped = (raw) =>" in html
-    assert "decodeURIComponent(decoded)" in html
+    assert "try { peeled = decodeURIComponent(decoded); } catch" not in html
+    assert "const peel = (text) => text.replace(/%([0-9a-fA-F]{2})/g," in html
     assert html.count("|| tokenShaped(value)") >= 4
     assert "tokenShaped(node.url)" in html
+    # Snapshot loads are serialized: the button disables BEFORE the first
+    # await and re-enables in finally, so two overlapping loads cannot adopt
+    # out of order on a path with no delivery-generation check.
+    assert "if (button.disabled) return;" in html
     # parentMissing renders by truthiness, so a digest-consistent rewrite
     # carrying the string "false" must be rejected as non-boolean.
     assert "parentMissing must be a boolean." in html
@@ -5972,6 +6001,34 @@ def test_historical_merge_proof_is_bound_to_the_references_repository():
         incidents=load_incident_document(_incidents(stale)),
     )
     assert [item.incident_id for item in agreeing.get("forge").incidents] == []
+
+
+def test_nul_delimited_project_identifiers_fail_closed():
+    # NUL delimits the console's identity keys: a ledger-permitted project
+    # id carrying it would produce a validly digested snapshot the bundled
+    # viewer refuses outright, so the producer fails closed instead. The
+    # ledger here runs registry-less, like a portfolio ingesting events for
+    # projects the registry does not yet declare.
+    ledger = EventLedger()
+    for index, state in enumerate(TO_IMPLEMENTING):
+        ledger.append(
+            load_lifecycle_event(
+                _event(
+                    eventId=f"n-{index}",
+                    idempotencyKey=f"nk-{index}",
+                    workUnit={"projectId": "forge\u0000github", "workUnitId": "wu-1"},
+                    stage=_STAGE_FOR[state],
+                    state=state,
+                )
+            )
+        )
+    with pytest.raises(ControlCenterError, match="carries a NUL delimiter"):
+        build_control_center_snapshot(
+            generated_at=NOW,
+            registry=REGISTRY,
+            projections=ledger.projections(),
+            incidents=load_incident_document(_incidents()),
+        )
 
 
 def test_credential_bearing_unit_identifiers_fail_closed():

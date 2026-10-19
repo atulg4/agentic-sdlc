@@ -625,16 +625,20 @@ def backlog_document_from_issues(
     # listing that maps FEWER (an unpaginated sub-issue export) would render
     # the omitted children as roots or drop them with a partial issues file,
     # so a listed parent whose explicit sub_issues_summary.total exceeds its
-    # mapped children fails closed. More mapped than declared is a lagging
-    # summary, not a truncation, and parents with no supplied listing stay
-    # unchecked - the PARENT=path form deliberately narrows which parents
-    # are exported.
+    # mapped children fails closed. An EXPLICITLY supplied listing counts
+    # even when it mapped nothing (empty or fully truncated), via the
+    # declared-parents set parent_links carries. More mapped than declared
+    # is a lagging summary, not a truncation, and parents with no supplied
+    # listing stay unchecked - the PARENT=path form deliberately narrows
+    # which parents are exported.
+    declared_listing_parents = frozenset(getattr(parents, "declared_parents", ()))
     mapped_children: dict[int, int] = {}
     for parent in links.values():
         mapped_children[parent] = mapped_children.get(parent, 0) + 1
     by_number = {_record_number(issue, "issue"): issue for issue in rows}
     truncated = []
-    for parent, count in sorted(mapped_children.items()):
+    for parent in sorted(set(mapped_children) | declared_listing_parents):
+        count = mapped_children.get(parent, 0)
         summary = by_number.get(parent, {}).get("sub_issues_summary")
         total = summary.get("total") if isinstance(summary, Mapping) else None
         if type(total) is int and total > count:
@@ -967,6 +971,20 @@ def incident_document(
     }
 
 
+class ParentLinks(dict):
+    """Child→parent links that remember the explicitly DECLARED parents.
+
+    An explicitly supplied listing that maps no children (empty, or fully
+    truncated) leaves no trace in the links alone; the declared set lets the
+    export's totals check fail closed on it instead of publishing none of
+    the parent's hierarchy.
+    """
+
+    def __init__(self, links: Mapping[int, int], declared: Iterable[int] = ()) -> None:
+        super().__init__(links)
+        self.declared_parents = frozenset(declared)
+
+
 def parent_links(
     *groups: Iterable[Mapping[str, Any]] | tuple[Iterable[Mapping[str, Any]], int | None],
     repository: str | None = None,
@@ -988,9 +1006,16 @@ def parent_links(
     without one is rejected, not presumed local, because a partial foreign
     payload could otherwise reparent the same-numbered local issue - and a
     ``parent_issue_url`` naming a different repository is rejected too.
+
+    The result is a mapping that ALSO remembers which parents were explicitly
+    declared (``declared_parents``), empty listings included: a fully
+    truncated listing maps no children, and only the declared set lets the
+    totals check fail closed on it instead of silently dropping the
+    hierarchy.
     """
 
     links: dict[int, int] = {}
+    declared_parents: set[int] = set()
 
     def require_local(entry: Mapping[str, Any], number: int) -> None:
         if repository is None:
@@ -1030,6 +1055,8 @@ def parent_links(
                 or (isinstance(declared, int) and not isinstance(declared, bool) and declared > 0),
                 f"declared parent number must be a positive integer: {declared!r}",
             )
+            if declared is not None:
+                declared_parents.add(declared)
         for entry in payload:
             _require(isinstance(entry, Mapping), "every sub-issue record must be an object")
             # The shared validator, not a type check: bool is an int, so a
@@ -1069,4 +1096,4 @@ def parent_links(
             parent = declared if declared is not None else referenced
             if parent is not None:
                 link(int(number), parent)
-    return links
+    return ParentLinks(links, declared_parents)
