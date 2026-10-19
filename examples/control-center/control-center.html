@@ -815,8 +815,8 @@
       return "";
     };
     for (const project of value.projects) {
-      if (!isObj(project) || typeof project.projectId !== "string" || !project.projectId) {
-        return "Every project needs a projectId.";
+      if (!isObj(project) || typeof project.projectId !== "string" || !project.projectId || project.projectId.includes("\u0000")) {
+        return "Every project needs a delimiter-free projectId.";
       }
       if (seenProjects.has(project.projectId)) return `Duplicate projectId: ${project.projectId}.`;
       seenProjects.add(project.projectId);
@@ -1020,7 +1020,11 @@
         }
       }
       for (const key of ["reviewing", "re-reviewing"]) {
-        if ((activeByState[key] || 0) > (project.counts.byState[key] || 0)) {
+        // Waiting units are not reviewable capacity: the active review rows
+        // fit within the state count MINUS the dependency-wait exemptions,
+        // or a rewrite could fabricate running review work behind them.
+        const held = (project.counts.dependencyWaitByState || {})[key] || 0;
+        if ((activeByState[key] || 0) > (project.counts.byState[key] || 0) - held) {
           return `${where} active lists more ${key} units than its state counts hold.`;
         }
       }
@@ -1031,7 +1035,7 @@
       }
       for (const incident of project.incidents || []) {
         if (!isObj(incident)) return `${where} has an incident that is not an object.`;
-        if (typeof incident.incidentId !== "string" || !incident.incidentId) return `${where} has an incident without a string incidentId.`;
+        if (typeof incident.incidentId !== "string" || !incident.incidentId || incident.incidentId.includes("\u0000")) return `${where} has an incident without a delimiter-free string incidentId.`;
         // The note key and card actions read incident.projectId, so an
         // incident filed under one project while declaring another would
         // read or overwrite the other project's remediation notes.
@@ -1039,8 +1043,11 @@
         // Identity is provider-scoped like the producer's: two providers
         // hosting the same repository path legitimately emit same-spelled
         // incident ids for different trackers.
-        if (incident.sourceProvider !== undefined && (typeof incident.sourceProvider !== "string" || incident.sourceProvider.length > 64)) {
-          return `${where} incident ${incident.incidentId} sourceProvider must be a short string.`;
+        // NUL is the note-key component delimiter: an identity containing it
+        // would split into extra components and the saved note would fail
+        // the vanished-note verifier and be dropped from the local overlay.
+        if (incident.sourceProvider !== undefined && (typeof incident.sourceProvider !== "string" || incident.sourceProvider.length > 64 || incident.sourceProvider.includes("\u0000"))) {
+          return `${where} incident ${incident.incidentId} sourceProvider must be a short delimiter-free string.`;
         }
         const incidentKey = project.projectId + "\u0000" + (incident.sourceProvider || "") + "\u0000" + incident.incidentId;
         if (seenIncidents.has(incidentKey)) return `Duplicate incidentId in ${where}: ${incident.incidentId}.`;
@@ -1091,6 +1098,13 @@
         seenItems.add(itemKey);
         for (const key of ["itemId", "kind", "state", "stateBasis", "url", "issueRef", "parentId", "declaredState", "workUnitId", "sourceProvider"]) {
           if (node[key] !== undefined && typeof node[key] !== "string") return `${where} backlog node field ${key} must be a string.`;
+        }
+        // NUL delimits the disclosure and identity keys exactly as it does
+        // note keys, so identity components must never contain it.
+        for (const key of ["itemId", "sourceProvider"]) {
+          if (typeof node[key] === "string" && node[key].includes("\u0000")) {
+            return `${where} backlog node field ${key} must be delimiter-free.`;
+          }
         }
         // treeNode renders these references verbatim, so they carry the same
         // bounded no-userinfo rule as unit and incident references.

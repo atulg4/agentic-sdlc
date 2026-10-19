@@ -1745,3 +1745,42 @@ def test_github_backlog_withholds_credentialed_urls_from_errors(tmp_path, capsys
     )
     err = capsys.readouterr().err
     assert "hunter2qs" not in err
+    # A real token SHAPE under an innocuous parameter name names no
+    # credential word, yet IS the credential: withheld by prefix.
+    issues.write_text(
+        json.dumps(
+            [
+                {
+                    "number": 11,
+                    "title": "A task",
+                    "state": "open",
+                    "repository_url": (
+                        "https://api.github.com/repos/acme/forge?x=ghp_0123456789abcdefghij000"
+                    ),
+                    "labels": [],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        cli_main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+                "--observed-at",
+                "2026-10-12T10:30:00Z",
+                "--backlog-output",
+                str(tmp_path / "backlog.json"),
+            ]
+        )
+        == 2
+    )
+    err = capsys.readouterr().err
+    assert "ghp_0123456789" not in err
+    assert "withheld" in err

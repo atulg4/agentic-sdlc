@@ -5261,6 +5261,13 @@ def test_the_console_binds_incidents_and_enforces_full_membership():
     assert "must list every dependency-waiting unit its counts declare." in html
     assert "Waiting on dependencies (" in html
     assert 'waiting.length ? "waiting" :' in html
+    # Review-gate capacity excludes dependency-held units, and NUL — the
+    # note/disclosure key delimiter — is rejected in every identity field.
+    assert "(project.counts.byState[key] || 0) - held" in html
+    assert "delimiter-free projectId" in html
+    assert "delimiter-free string incidentId" in html
+    assert "sourceProvider must be a short delimiter-free string." in html
+    assert "must be delimiter-free." in html
     # Every formerly live key is exact-read verified, cached or not.
     assert ".filter((key) => !live.has(key));" in html
     # A live note that was never backfilled is seeded into the cache before
@@ -6333,12 +6340,16 @@ def test_dependency_waits_are_not_running_now():
     # entirely by upstream dependencies must not read as idle with no unit
     # in flight and no explanation.
     assert [status.work_unit_id for status in view.waiting] == ["wu-1"]
+    # Serialized health says WAITING, not idle: non-browser consumers read
+    # the same state the console derives.
+    assert view.health == "waiting"
     document = snapshot.as_dict()
     project = document["projects"][0]
     counts = project["counts"]
     assert counts["dependencyWaitByState"] == {"implementing": 1}
     assert counts["byState"]["implementing"] == 1
     assert [unit["workUnitId"] for unit in project["waiting"]] == ["wu-1"]
+    assert project["health"] == "waiting"
 
 
 def test_a_repositoryless_status_never_joins_a_conflicting_provider():
@@ -6404,6 +6415,42 @@ def test_a_repositoryless_status_never_joins_a_conflicting_provider():
     assert [node.state_basis for node in agreeing.get("forge").backlog] != [
         "state declared by the backlog source"
     ]
+    # Only the CANONICAL repo#N / repo!N shape supplies registry evidence: a
+    # free-form identifier like acme/forge#ticket proves nothing about the
+    # repository, so the otherwise exact join is not refused.
+    freeform_ledger = _ledger(
+        *_chain(
+            TO_IMPLEMENTING,
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "issueRef": "acme/forge#ticket",
+            },
+        )
+    )
+    freeform_items = load_backlog_document(
+        {
+            "schemaVersion": BACKLOG_SCHEMA_VERSION,
+            "source": "github",
+            "items": [
+                _backlog(
+                    title="Free-form task",
+                    issueRef="acme/forge#ticket",
+                    declaredState="specified",
+                )
+            ],
+        }
+    )
+    freeform = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=gitlab_registry,
+        projections=freeform_ledger.projections(),
+        backlog=tuple(freeform_items),
+        incidents=load_incident_document(_incidents()),
+    )
+    assert [node.state_basis for node in freeform.get("forge").backlog] == [
+        "state projected from the lifecycle ledger"
+    ]
 
 
 def test_mismatch_errors_withhold_credentialed_identities():
@@ -6444,8 +6491,30 @@ def test_mismatch_errors_withhold_credentialed_identities():
 
 def test_contested_issue_references_stay_unresolved():
     # Items of two providers share an issue reference and the ledger status
-    # carries no repository: nothing identifies whose unit it is, so neither
-    # tree adopts the ledger state.
+    # carries no repository. With the registry declaring the repository for
+    # BOTH providers, nothing identifies whose unit it is, so neither tree
+    # adopts the ledger state; with it declared for exactly ONE provider,
+    # the reference itself is registry evidence and only that provider's
+    # tree adopts.
+    both_registry = load_project_registry(
+        {
+            "schemaVersion": 1,
+            "projects": [
+                {
+                    "projectId": "forge",
+                    "displayName": "Forge",
+                    "group": "platform",
+                    "defaultBranch": "main",
+                    "repositories": [
+                        {"provider": "github", "identifier": "acme/forge", "role": "primary"},
+                        {"provider": "gitlab", "identifier": "acme/forge", "role": "secondary"},
+                    ],
+                    "environments": [{"name": "production", "kind": "production"}],
+                    "capabilities": ["planning"],
+                }
+            ],
+        }
+    )
     ledger = _ledger(
         *_chain(
             TO_IMPLEMENTING,
@@ -6476,7 +6545,7 @@ def test_contested_issue_references_stay_unresolved():
     )
     snapshot = build_control_center_snapshot(
         generated_at=NOW,
-        registry=REGISTRY,
+        registry=both_registry,
         projections=ledger.projections(),
         backlog=tuple(github_items) + tuple(gitlab_items),
         incidents=load_incident_document(_incidents()),
@@ -6484,5 +6553,20 @@ def test_contested_issue_references_stay_unresolved():
     bases = {node.item.title: node.state_basis for node in snapshot.get("forge").backlog}
     assert bases == {
         "GitHub task": "state declared by the backlog source",
+        "GitLab task": "state declared by the backlog source",
+    }
+    # REGISTRY declares acme/forge for github alone: the contested join
+    # adopts for exactly that provider through the reference's repository,
+    # even though the status itself omits one.
+    proven = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        backlog=tuple(github_items) + tuple(gitlab_items),
+        incidents=load_incident_document(_incidents()),
+    )
+    proven_bases = {node.item.title: node.state_basis for node in proven.get("forge").backlog}
+    assert proven_bases == {
+        "GitHub task": "state projected from the lifecycle ledger",
         "GitLab task": "state declared by the backlog source",
     }

@@ -63,7 +63,10 @@ _REPOSITORY_URL = re.compile(r"^https://api\.github\.com/repos/([^/\s?#]+/[^/\s?
 #: characters. Rejection messages reach stderr and typically CI logs, so a
 #: value showing any of those is withheld from the error rather than echoed.
 _SECRETISH_TEXT = re.compile(
-    r"credential|secret|token|password|passphrase|api_?key|authorization|bearer|private_?key",
+    r"credential|secret|token|password|passphrase|api_?key|authorization|bearer|private_?key"
+    # Real provider token SHAPES, not only credential-suggesting words: a
+    # value like ?x=ghp_... names no secret-ish word yet IS the secret.
+    r"|gh[pousr]_|github_pat_|glpat-",
     re.IGNORECASE,
 )
 
