@@ -295,10 +295,12 @@
   });
 
   /* ---------- store ---------- */
-  function noteKey(projectId, incidentId) {
-    // Incident identity is project-scoped, so a note's key carries both: two
-    // projects sharing an incident id must never overwrite each other's note.
-    return (projectId || "") + "\u0000" + (incidentId || "");
+  function noteKey(projectId, provider, incidentId) {
+    // Incident identity is project- AND provider-scoped: two providers
+    // hosting the same repository path legitimately emit same-spelled
+    // incident ids, and acknowledging one must never overwrite the other's
+    // remediation state.
+    return (projectId || "") + "\u0000" + (provider || "") + "\u0000" + (incidentId || "");
   }
 
   async function docId(value) {
@@ -398,7 +400,7 @@
       const live = new Set();
       for (const entry of docs) {
         if (!entry?.incidentId) continue;
-        const key = noteKey(entry.projectId, entry.incidentId);
+        const key = noteKey(entry.projectId, entry.sourceProvider, entry.incidentId);
         if (scopedKeys.has(key)) continue;
         const scoped = entry.docId === (await docId(key));
         // Only a SCOPED live document makes the key live: a window that
@@ -615,29 +617,41 @@
     const wanted = [];
     outer: for (const project of document_.projects || []) {
       for (const incident of project.incidents || []) {
-        const key = noteKey(project.projectId, incident.incidentId);
+        const key = noteKey(project.projectId, incident.sourceProvider, incident.incidentId);
         if (!incident.incidentId || liveNoteKeys.has(key) || attempted.has(key)) continue;
-        wanted.push([key, project.projectId, incident.incidentId]);
+        wanted.push([key, project.projectId, incident.sourceProvider || "", incident.incidentId]);
         if (wanted.length >= 200) break outer;
       }
     }
     if (!wanted.length) break;
     for (let start = 0; start < wanted.length; start += 10) {
-      await Promise.all(wanted.slice(start, start + 10).map(async ([key, projectId, incidentId]) => {
+      await Promise.all(wanted.slice(start, start + 10).map(async ([key, projectId, provider, incidentId]) => {
         attempted.add(key);
         try {
           let snap = await state.db.doc("notes/" + (await docId(key))).get();
           let entry = snap?.data?.();
           if (!entry) {
-            // Notes recorded before keys were project-scoped live at the
-            // legacy id derived from the incident id alone.
+            // Notes recorded before keys were provider-scoped live at the
+            // project-scoped key, and older ones at the incident id alone.
+            snap = await state.db.doc(
+              "notes/" + (await docId(projectId + "\u0000" + incidentId)),
+            ).get();
+            entry = snap?.data?.();
+          }
+          if (!entry) {
             snap = await state.db.doc("notes/" + (await docId(incidentId))).get();
             entry = snap?.data?.();
           }
           // The store is viewer-writable: a record attaches only when it
-          // names exactly this project and incident, so an overwritten or
-          // mismatched document never displays another incident's note.
-          if (entry && (entry.incidentId !== incidentId || entry.projectId !== projectId)) {
+          // names exactly this project and incident — and, when it declares
+          // a provider, THIS provider — so an overwritten or mismatched
+          // document never displays another incident's note. A legacy record
+          // without the field predates provider scoping and may attach.
+          if (entry && (
+            entry.incidentId !== incidentId
+            || entry.projectId !== projectId
+            || (entry.sourceProvider && entry.sourceProvider !== provider)
+          )) {
             entry = undefined;
           }
           if (generation !== backfillGeneration) return;
@@ -1411,7 +1425,9 @@
   }
 
   function incidentCard(incident, project) {
-    const note = state.notes.get(noteKey(incident.projectId, incident.incidentId));
+    const note = state.notes.get(
+      noteKey(incident.projectId, incident.sourceProvider, incident.incidentId),
+    );
     // The incident being in the current snapshot already contradicts a
     // "resolved" note, whatever the timestamps say: export times are not
     // occurrence times, so no clock comparison decides this.
@@ -1748,13 +1764,14 @@
       const entry = {
         incidentId: incident.incidentId,
         projectId: incident.projectId || "",
+        sourceProvider: incident.sourceProvider || "",
         kind: incident.kind || "",
         status,
         text,
         byId: state.viewer?.id || "",
         at: new Date(newest >= now ? newest + 1000 : now).toISOString(),
       };
-      const key = noteKey(incident.projectId, incident.incidentId);
+      const key = noteKey(incident.projectId, incident.sourceProvider, incident.incidentId);
       await state.db.doc("notes/" + (await docId(key))).set(entry);
       // The notes subscription is a bounded recency window, so the write is
       // mirrored into the local overlay too: the saved note stays visible

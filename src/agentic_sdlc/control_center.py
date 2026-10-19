@@ -1552,6 +1552,15 @@ def build_control_center_snapshot(
 
     by_project_units: dict[str, dict[str, WorkUnitStatus]] = {}
     for projection in projections:
+        # The ledger's project identifier contract is as unrestricted as its
+        # unit ids, but the snapshot serializes project ids as keys, display
+        # names and warning text, so one embedding URL userinfo fails closed
+        # with the value withheld — like unit identifiers do.
+        _require(
+            not _CREDENTIAL_REFERENCE.search(projection.project_id),
+            "a ledger project identifier embeds URL userinfo (value withheld); "
+            "rename the project in the lifecycle ledger",
+        )
         units = by_project_units.setdefault(projection.project_id, {})
         _require(
             projection.work_unit_id not in units,
@@ -1828,18 +1837,24 @@ def build_control_center_snapshot(
                 item_status[(item.source_provider, item.item_id)] = status
 
         def _item_status_for(
-            incident: Incident, *, item_status=item_status
+            incident: Incident, *, item_status=item_status, known_items=known_items
         ) -> WorkUnitStatus | None:
             exact = item_status.get((incident.source_provider, incident.backlog_item_id))
             if exact is not None:
                 return exact
-            candidates = [
-                status
-                for (provider, item_id), status in item_status.items()
-                if item_id == incident.backlog_item_id
-                and (not provider or not incident.source_provider)
-            ]
-            return candidates[0] if len(candidates) == 1 else None
+            # Ambiguity is judged over EVERY item carrying the id, not only
+            # the ledger-backed ones: when the id exists under more than one
+            # provider, one provider's ledger evidence must not retire the
+            # other provider's incident.
+            providers = known_items.get(incident.backlog_item_id, set())
+            if incident.source_provider:
+                if providers == {""}:
+                    return item_status.get(("", incident.backlog_item_id))
+                return None
+            if len(providers) == 1:
+                (only,) = providers
+                return item_status.get((only, incident.backlog_item_id))
+            return None
 
         def _item_known_for(incident: Incident, *, known_items=known_items) -> bool:
             providers = known_items.get(incident.backlog_item_id)
