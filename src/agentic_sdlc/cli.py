@@ -27,8 +27,10 @@ from .context_builder import (
     DEFAULT_PACKET_BYTES,
     ContextBuilderError,
     VerificationEvidence,
+    _safe_exclusion_path,
     build_context_packet,
     dispatch_envelope_for_packet,
+    mission_role,
     verification_from_dict,
 )
 from .dashboard_efficiency import build_infrastructure_blocker_panel
@@ -63,7 +65,7 @@ from .infra_recovery import (
     retry_state_from_comments,
     write_retry_state,
 )
-from .knowledge import KnowledgeError, load_sources, record_from_dict
+from .knowledge import KnowledgeError, load_sources, record_from_dict, sanitize_payload
 from .leases import (
     DEFAULT_TTL_MINUTES,
     LEASE_BOT_LOGINS_ENV,
@@ -840,6 +842,16 @@ def _derived_verification(args: argparse.Namespace, request: dict) -> Verificati
         )
     snapshot = collect_commit_diff(args.candidate_repository, base, head)
     report = run_gates(args.config, args.candidate_repository)
+    # Wall-clock timings are not evidence, and they make everything bound to
+    # the report nondeterministic: the rendered size, the budget accounting,
+    # the evidence selection, and the packet digest would all differ between
+    # the artifact build and the dispatch rebuild. Zeroed HERE, so derived
+    # packets are deterministic end to end and the artifact comparison below
+    # stays exact.
+    report = {
+        "passed": report.get("passed"),
+        "gates": [{**gate, "durationSeconds": 0.0} for gate in report.get("gates", [])],
+    }
     findings = request.get("priorFindings", [])
     if not isinstance(findings, list) or not all(isinstance(item, str) for item in findings):
         raise ContextBuilderError("packet request priorFindings must be an array of strings")
@@ -918,15 +930,34 @@ def _build_packet_from_request(
             if not record.external_id.endswith(suffix):
                 continue  # the builder rejects the malformed shape itself
             path = record.external_id[: -len(suffix)]
-            committed = read_committed_file(
-                args.candidate_repository,
-                verification.head_sha,
-                path,
-                label="--candidate-head",
-            )
-            if committed != record.payload.encode("utf-8"):
+            # Paths are retrieval-controlled text: a token-shaped filename is
+            # withheld from every error this readback can raise, exactly as
+            # the builder withholds it from exclusion notes.
+            shown = _safe_exclusion_path(path)
+            try:
+                committed = read_committed_file(
+                    args.candidate_repository,
+                    verification.head_sha,
+                    path,
+                    label="--candidate-head",
+                )
+            except GitDiffError as error:
                 raise ContextBuilderError(
-                    f"repository evidence for {path} does not match the pinned "
+                    f"repository evidence for {shown} could not be read from "
+                    "the pinned candidate tree; re-retrieve it from the "
+                    "candidate head"
+                ) from error
+            # The adapter sanitizes payloads (boundary markers stripped to a
+            # fixpoint), so the committed text is compared through the SAME
+            # transformation — a file legitimately containing marker text is
+            # not misread as fabricated.
+            try:
+                expected = sanitize_payload(committed.decode("utf-8"))
+            except UnicodeDecodeError:
+                expected = None
+            if expected != record.payload:
+                raise ContextBuilderError(
+                    f"repository evidence for {shown} does not match the pinned "
                     "candidate tree; re-retrieve it from the candidate head"
                 )
     elif request.get("verification") is not None:
@@ -976,6 +1007,17 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
     rendered packet as its prompt.
     """
     registry, mission, packet = _build_packet_from_request(args, trusted_verification_only=True)
+    if mission_role(mission) != "reviewer":
+        # The official dispatch path binds write-capable work to the same
+        # eligibility decision the implementation-readiness path enforces: a
+        # request without the approval labels, or matching a forbidden task
+        # pattern, must not reach an envelope just because it came in as a
+        # packet.
+        decision = evaluate_task(packet.task, load_policy(args.config), "implement")
+        if not decision.allowed:
+            raise ContextBuilderError(
+                "dispatch blocked by task policy: " + "; ".join(decision.reasons)
+            )
     if args.packet:
         artifact = json.loads(Path(args.packet).read_text(encoding="utf-8"))
 
@@ -986,33 +1028,11 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
         def _encoded(document: object) -> str:
             return json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
-        def _comparable(document: Any) -> Any:
-            # A derived rebuild reruns the gates, and wall-clock durations
-            # differ run to run: the comparison is timing-insensitive (the
-            # verdicts and every other field still compare), with the digest
-            # fields that bind those timings dropped alongside.
-            projection = json.loads(_encoded(document))
-            if not isinstance(projection, dict):
-                return projection
-            projection.pop("packetSha256", None)
-            projection.pop("renderedBytes", None)
-            verification_entry = projection.get("verification")
-            if isinstance(verification_entry, dict):
-                report = verification_entry.get("gateReport")
-                if isinstance(report, dict):
-                    for gate in report.get("gates") or []:
-                        if isinstance(gate, dict):
-                            gate.pop("durationSeconds", None)
-            return projection
-
-        if _encoded(_comparable(artifact)) != _encoded(_comparable(packet.as_dict())):
-            raise ContextBuilderError(
-                "the packet artifact does not match the packet rebuilt from the "
-                "request; rebuild the packet before dispatching"
-            )
-        if not args.candidate_repository and artifact.get("packetSha256") != packet.packet_sha256:
-            # Without derived gates the rebuild is deterministic, so the
-            # digest field itself must match too.
+        # Derived gate reports carry zeroed durations, so every rebuild —
+        # derived or not — is deterministic and the comparison stays EXACT,
+        # digest field included: a digest-inconsistent audit artifact is
+        # rejected whatever path produced it.
+        if _encoded(artifact) != _encoded(packet.as_dict()):
             raise ContextBuilderError(
                 "the packet artifact does not match the packet rebuilt from the "
                 "request; rebuild the packet before dispatching"

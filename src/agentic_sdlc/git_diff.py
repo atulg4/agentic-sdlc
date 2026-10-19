@@ -455,7 +455,9 @@ def checked_out_state(repository: str | Path) -> tuple[str, bool]:
     head = _run(["git", "rev-parse", "--verify", "HEAD^{commit}"], root).stdout.decode().strip()
     if not _OBJECT_NAME.fullmatch(head):
         raise GitDiffError("HEAD does not name a commit")
-    status = _run(["git", "status", "--porcelain"], root).stdout
+    # --ignored: a gate can read an ignored .env or build artifact absent
+    # from the commit, so ignored checkout contents count as unclean too.
+    status = _run(["git", "status", "--porcelain", "--ignored"], root).stdout
     return head, not status.strip()
 
 

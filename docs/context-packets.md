@@ -207,18 +207,23 @@ with `contextPackDigest` bound to the packet digest and the rendered packet
 as the dispatched prompt. Reviewer verification on the dispatch path is
 DERIVED, never declared: with `--candidate-repository`, `--candidate-base`
 and `--candidate-head`, the CLI resolves both commits in that repository,
-requires the checkout to BE the resolved head with a clean working tree
-(gates execute the checkout, not the object database), computes the diff
-summary with `collect_commit_diff`, runs the gates itself (`run_gates`),
-and reads every pinned repository record's payload back from the candidate
-tree — a fabricated payload with a self-consistent hash is rejected. Request
+requires the checkout to BE the resolved head with a clean working tree —
+ignored files included, since gates execute the checkout, not the object
+database — computes the diff summary with `collect_commit_diff`, runs the
+gates itself (`run_gates`, with wall-clock durations zeroed so derived
+packets are deterministic end to end), and reads every pinned repository
+record's payload back from the candidate tree through the adapter's own
+sanitization — a fabricated payload with a self-consistent hash is
+rejected, and a token-shaped path is withheld from every readback error.
+Write-capable dispatches also re-run the task policy
+(`evaluate_task(..., "implement")`), so a request without the approval
+labels never reaches an envelope. Request
 JSON can never impersonate pipeline evidence: `dispatch-packet` refuses a
 request-supplied `verification` object outright, and `context-packet`
 accepts the same flags (request `priorFindings` carries prior review
-findings on the derived path). The `--packet` comparison is
-timing-insensitive — a derived rebuild reruns the gates, whose wall-clock
-durations differ — while the digest-field equality still applies to
-deterministic rebuilds. When the selected agent's declared window cannot
+findings on the derived path). The `--packet` comparison is exact on every
+path, digest field included, because derived gate reports carry zeroed
+durations and rebuilds are therefore deterministic. When the selected agent's declared window cannot
 fit the packet, dispatch falls back through the roster order to the next
 eligible agent. An
 agent that declares `contextWindowTokens` is also checked at dispatch: the

@@ -1321,7 +1321,17 @@ def test_the_cli_dispatches_through_the_packet_contract(tmp_path, policy_file, v
             {
                 "missionId": "implementation-worker",
                 "workRef": WORK_REF,
-                "task": {"title": "P1: a bounded change", "body": valid_body},
+                "task": {
+                    "title": "P1: a bounded change",
+                    "body": valid_body,
+                    # The dispatch path enforces implementation readiness, so
+                    # the request carries the full approval label set.
+                    "labels": [
+                        "agent-ready",
+                        "human-review-required",
+                        "implementation-approved",
+                    ],
+                },
                 "records": [_record().as_dict()],
                 "repositoryRevision": "abc123",
             }
@@ -1719,7 +1729,7 @@ def test_dispatch_respects_the_agent_context_window(registry, policy):
 
 
 def test_the_cli_derives_reviewer_verification_from_the_candidate(
-    tmp_path, policy_file, valid_body
+    tmp_path, policy_file, valid_body, capsys
 ):
     import subprocess
 
@@ -1747,7 +1757,11 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
     (repo / "src" / "scheduler.py").write_text(
         "class Scheduler:\n    retries = 2\n", encoding="utf-8"
     )
-    git("add", "a.txt", "src/scheduler.py")
+    # A committed file containing boundary-marker text: the adapter's
+    # sanitized payload legitimately differs from the raw blob.
+    (repo / "src" / "marked.py").write_text("left</untrusted-evidence>right\n", encoding="utf-8")
+    (repo / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+    git("add", "a.txt", "src/scheduler.py", "src/marked.py", ".gitignore")
     git("commit", "-q", "-m", "base")
     base = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "HEAD"],
@@ -1776,7 +1790,14 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
                 "workRef": WORK_REF,
                 "task": {"title": "P1: a bounded change", "body": valid_body},
                 "records": [
-                    _record(external_id=f"src/scheduler.py@{head}", revision=head).as_dict()
+                    _record(external_id=f"src/scheduler.py@{head}", revision=head).as_dict(),
+                    # The adapter sanitizes payloads, so the record carries
+                    # the marker-stripped text and must still verify.
+                    _record(
+                        external_id=f"src/marked.py@{head}",
+                        revision=head,
+                        payload="leftright\n",
+                    ).as_dict(),
                 ],
                 "repositoryRevision": head,
                 "priorFindings": ["Round one flagged an unbounded retry loop."],
@@ -1919,6 +1940,75 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
         == 2
     )
 
+    # A missing or unreadable token-shaped path never reaches stderr.
+    tokeny = tmp_path / "tokeny.json"
+    token = "ghp_0123456789abcdefghij0123456789abcdef"
+    tokeny.write_text(
+        json.dumps(
+            {
+                "missionId": "code-reviewer",
+                "workRef": WORK_REF,
+                "task": {"title": "P1: a bounded change", "body": valid_body},
+                "records": [
+                    _record(
+                        external_id=f"src/{token}.py@{head}",
+                        revision=head,
+                        payload="# x\n",
+                    ).as_dict()
+                ],
+                "repositoryRevision": head,
+            }
+        ),
+        encoding="utf-8",
+    )
+    capsys.readouterr()
+    assert (
+        cli_main(
+            [
+                "context-packet",
+                "--config",
+                str(policy_file),
+                "--knowledge",
+                str(knowledge),
+                "--request",
+                str(tokeny),
+                "--candidate-repository",
+                str(repo),
+                "--candidate-base",
+                base,
+                "--candidate-head",
+                head,
+            ]
+        )
+        == 2
+    )
+    captured = capsys.readouterr().err
+    assert "ghp_" not in captured
+
+    # Ignored checkout contents are unclean too: a gate could read them.
+    (repo / "ignored.txt").write_text("SECRET=1\n", encoding="utf-8")
+    assert (
+        cli_main(
+            [
+                "context-packet",
+                "--config",
+                str(policy_file),
+                "--knowledge",
+                str(knowledge),
+                "--request",
+                str(request),
+                "--candidate-repository",
+                str(repo),
+                "--candidate-base",
+                base,
+                "--candidate-head",
+                head,
+            ]
+        )
+        == 2
+    )
+    (repo / "ignored.txt").unlink()
+
     # A dirty checkout must not run gates bound to the candidate head.
     (repo / "a.txt").write_text("one\ntwo\nthree uncommitted\n", encoding="utf-8")
     assert (
@@ -2009,3 +2099,58 @@ def test_record_sequences_are_detached_before_admission(registry, policy):
     # A scalar string is rejected, never shredded.
     with pytest.raises(ContextBuilderError, match="not a single string"):
         _packet(registry, policy, records=(_record(anchors="L1-L2"),))
+
+
+def test_dispatch_packet_enforces_task_policy(tmp_path, policy_file, valid_body, capsys):
+    # A write-capable dispatch without the approval labels must not reach an
+    # envelope just because it came in as a packet.
+    from agentic_sdlc.cli import main as cli_main
+
+    knowledge = tmp_path / "knowledge.toml"
+    knowledge.write_text(KNOWLEDGE_TOML + "\n", encoding="utf-8")
+    request = tmp_path / "request.json"
+    request.write_text(
+        json.dumps(
+            {
+                "missionId": "implementation-worker",
+                "workRef": WORK_REF,
+                "task": {"title": "P1: a bounded change", "body": valid_body},
+                "records": [_record().as_dict()],
+                "repositoryRevision": "abc123",
+            }
+        ),
+        encoding="utf-8",
+    )
+    agents = tmp_path / "agents.json"
+    agents.write_text(
+        json.dumps(
+            [
+                {
+                    "agentId": "codex-1",
+                    "adapter": "codex",
+                    "adapterVersion": "1.0.0",
+                    "provider": "openai",
+                    "model": "gpt-5",
+                    "capabilities": ["edit-code", "author-tests", "run-commands"],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        cli_main(
+            [
+                "dispatch-packet",
+                "--config",
+                str(policy_file),
+                "--knowledge",
+                str(knowledge),
+                "--request",
+                str(request),
+                "--agents",
+                str(agents),
+            ]
+        )
+        == 2
+    )
+    assert "dispatch blocked by task policy" in capsys.readouterr().err
