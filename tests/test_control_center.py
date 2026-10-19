@@ -4038,6 +4038,12 @@ def test_a_malformed_sub_issue_total_is_a_controlled_error():
     issue["sub_issues_summary"] = "two"
     with pytest.raises(ControlCenterError, match="sub_issues_summary must be an object"):
         _export(issue)
+    # The count must be explicit: a present summary with no total is a
+    # partial payload, never affirmative no-children evidence.
+    partial = _issue(1, "weird")
+    partial["sub_issues_summary"] = {"completed": 0}
+    with pytest.raises(ControlCenterError, match="sub_issues_summary.total"):
+        _export(partial)
     zero = _issue(1, "childless")
     zero["sub_issues_summary"] = {"total": 0, "completed": 0}
     assert _export(zero)["items"][0]["kind"] == "task"
@@ -4689,7 +4695,7 @@ def test_the_console_requires_collections_and_bounds_its_views():
     assert "backlog holds more than 5000 nodes or is cyclic" in html
     assert '("github:" + match[1]).toLowerCase()' in html
     assert ".limit(bound).onSnapshot(" in html
-    assert "}, 1000);" in html
+    assert '}, 1000, "at");' in html
 
 
 def test_supplied_documents_require_their_collection_fields():
@@ -5185,6 +5191,13 @@ def test_the_console_binds_incidents_and_enforces_full_membership():
     assert "status is not joined by its issue reference." in html
     # Every formerly live key is exact-read verified, cached or not.
     assert ".filter((key) => !live.has(key));" in html
+    # A live note that was never backfilled is seeded into the cache before
+    # the verification reads, so a failed read cannot drop it.
+    assert "if (!backfilledEntries.has(key) && state.notes.has(key))" in html
+    # The notes window is recency-ordered like drafts, and Discard deletes
+    # the DELIVERED draft document, never a path derived from its projectId.
+    assert '}, 1000, "at");' in html
+    assert 'state.db.doc("projectDrafts/" + draft.docId).delete()' in html
     # A backfill read that resumes after a notes delivery made the key live
     # leaves the subscription's newer data alone.
     assert "if (liveNoteKeys.has(key)) return;" in html
@@ -5676,3 +5689,113 @@ def test_overlong_references_are_withheld():
     assert [unit.issue_ref for unit in view.active] == [""]
     assert long_ref not in json.dumps(snapshot.as_dict())
     assert any("longer than 512 characters" in warning for warning in view.warnings)
+
+
+def test_multi_provider_repository_names_are_ambiguous():
+    # The registry declares acme/forge for BOTH providers and ledger
+    # statuses carry no provider, so nothing identifies which provider's
+    # unit this is: provider-qualified data neither joins nor retires.
+    both_registry = load_project_registry(
+        {
+            "schemaVersion": 1,
+            "projects": [
+                {
+                    "projectId": "forge",
+                    "displayName": "Forge",
+                    "group": "platform",
+                    "defaultBranch": "main",
+                    "repositories": [
+                        {"provider": "github", "identifier": "acme/forge", "role": "primary"},
+                        {"provider": "gitlab", "identifier": "acme/forge", "role": "secondary"},
+                    ],
+                    "environments": [{"name": "production", "kind": "production"}],
+                    "capabilities": ["planning", "implementation"],
+                }
+            ],
+        }
+    )
+    implementing = _ledger(
+        *_chain(
+            TO_IMPLEMENTING,
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "issueRef": "acme/forge#1",
+                "repository": "acme/forge",
+            },
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=both_registry,
+        projections=implementing.projections(),
+        backlog=load_backlog_document(
+            _document(_backlog(issueRef="acme/forge#1", declaredState="approved"))
+            | {"source": "github"}
+        ),
+    )
+    node = snapshot.get("forge").backlog[0]
+    assert (node.state, node.state_basis) == ("approved", STATE_BASIS_DECLARED)
+    merged = _ledger(
+        *_chain(
+            TO_MERGED,
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "changeRequestRef": "acme/forge!1",
+                "repository": "acme/forge",
+            },
+        )
+    )
+    stale = _incident(
+        incidentId="acme/forge!1:merge-state-blocked",
+        kind="unclassified",
+        severity="degraded",
+        evidenceRef="acme/forge!1",
+        summary="The change request reports blocked",
+    )
+    retained = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=both_registry,
+        projections=merged.projections(),
+        incidents=load_incident_document(_incidents(stale)),
+    )
+    kept = [item.incident_id for item in retained.get("forge").incidents]
+    assert kept == ["acme/forge!1:merge-state-blocked"]
+
+
+def test_lookalike_merge_state_ids_are_not_retired():
+    # Only the EXACT adapter id spellings count: a suffixed lookalike can
+    # identify a distinct post-merge incident and must stay visible.
+    ledger = _ledger(
+        *_chain(
+            TO_MERGED,
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "changeRequestRef": "acme/forge!1",
+            },
+        )
+    )
+    lookalike = _incident(
+        incidentId="acme/forge!1:merge-state-blocked:post-merge",
+        kind="unclassified",
+        severity="degraded",
+        evidenceRef="acme/forge!1",
+        summary="A post-merge regression traced to this change request",
+    )
+    exact = _incident(
+        incidentId="acme/forge!1:merge-state-unstable",
+        kind="unclassified",
+        severity="degraded",
+        evidenceRef="acme/forge!1",
+        summary="Change request mergeability is unstable",
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        incidents=load_incident_document(_incidents(lookalike, exact)),
+    )
+    kept = [item.incident_id for item in snapshot.get("forge").incidents]
+    assert kept == ["acme/forge!1:merge-state-blocked:post-merge"]

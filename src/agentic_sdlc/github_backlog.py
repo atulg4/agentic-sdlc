@@ -499,7 +499,10 @@ def _kind(issue: Mapping[str, Any], labels: frozenset[str], has_children: bool) 
             f"issue {number!r}: sub_issues_summary must be an object",
         )
         assert isinstance(summary, Mapping)
-        raw_total = summary.get("total", 0)
+        # The count must be EXPLICIT: defaulting an absent total to zero
+        # would turn a partial provider payload into affirmative evidence
+        # that the issue has no children.
+        raw_total = summary.get("total")
         _require(
             type(raw_total) is int and raw_total >= 0,
             f"issue {number!r}: sub_issues_summary.total must be a non-negative "

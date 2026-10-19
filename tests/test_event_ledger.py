@@ -713,3 +713,12 @@ def test_the_same_work_unit_can_be_migrated_into_two_isolated_projects() -> None
     assert ledger.projection("alpha", unit_id).state is FactoryState.MERGED
     assert ledger.projection("beta", unit_id).state is FactoryState.MERGED
     assert ledger.aggregate()["totals"]["workUnits"] == 2
+
+
+def test_direct_construction_enforces_stage_state_agreement() -> None:
+    # The loader's check alone would let an appended in-process event project
+    # a contradictory pair the console rejects.
+    with pytest.raises(LedgerError, match="disagrees with state"):
+        _event(1, FactoryState.INTAKE, stage=LifecycleStage.MERGE)
+    # dependency-wait stays the one declared exception.
+    _event(1, FactoryState.APPROVED, stage=LifecycleStage.DEPENDENCY_WAIT)
