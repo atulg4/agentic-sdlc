@@ -580,6 +580,11 @@
             entry = undefined;
           }
           if (generation !== backfillGeneration) return;
+          // A notes delivery can land mid-read and install a NEWER scoped
+          // value (deliveries do not advance backfillGeneration), so a key
+          // that became live is left to the subscription's own data instead
+          // of being overwritten or deleted by this older exact read.
+          if (liveNoteKeys.has(key)) return;
           if (entry?.incidentId) {
             backfilledEntries.set(key, entry);
             state.notes.set(key, entry);
@@ -774,6 +779,20 @@
           const humanGate = unit.state === "approval-pending" || unit.state === "ready-for-human-merge";
           if (unit.awaitsHuman !== humanGate) {
             return `${where} work unit ${unit.workUnitId} awaitsHuman disagrees with its state.`;
+          }
+          // unitRow renders these references as chips, and the producer
+          // redacts any reference embedding URL userinfo, so a pasted or
+          // store-written snapshot cannot re-introduce a credential-bearing
+          // value past the digest check.
+          for (const field of ["issueRef", "changeRequestRef", "runRef"]) {
+            const value = unit[field];
+            if (value === undefined || value === "") continue;
+            if (typeof value !== "string" || value.length > 512) {
+              return `${where} work unit ${unit.workUnitId} ${field} must be a bounded string.`;
+            }
+            if (/:\/\/[^/?#\s]*@/.test(value)) {
+              return `${where} work unit ${unit.workUnitId} ${field} must not embed credentials.`;
+            }
           }
           if (membership === "attention" && (unit.needsAttention !== true || !attentionStates.includes(unit.state))) {
             return `${where} attention lists work unit ${unit.workUnitId} outside the attention states.`;
