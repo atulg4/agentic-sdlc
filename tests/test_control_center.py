@@ -5198,6 +5198,12 @@ def test_the_console_binds_incidents_and_enforces_full_membership():
     # the DELIVERED draft document, never a path derived from its projectId.
     assert '}, 1000, "at");' in html
     assert 'state.db.doc("projectDrafts/" + draft.docId).delete()' in html
+    # Note saves clamp their timestamp past the newest visible note, so a
+    # skewed clock cannot park a fresh note behind the recency cutoff.
+    assert "for (const source of [state.notes, backfilledEntries])" in html
+    assert html.count("newest >= now ? newest + 1000 : now") == 2
+    # A terminated collection subscription is surfaced, never silent.
+    assert 'Live " + collection + " updates stopped' in html
     # A backfill read that resumes after a notes delivery made the key live
     # leaves the subscription's newer data alone.
     assert "if (liveNoteKeys.has(key)) return;" in html
@@ -5799,3 +5805,55 @@ def test_lookalike_merge_state_ids_are_not_retired():
     )
     kept = [item.incident_id for item in snapshot.get("forge").incidents]
     assert kept == ["acme/forge!1:merge-state-blocked:post-merge"]
+
+
+def test_pulls_canonicalize_the_repository_when_issues_are_empty(tmp_path):
+    # An empty issues payload cannot supply the provider spelling; the pulls
+    # payload can, and the export must emit it so references join exactly.
+    from agentic_sdlc.cli import main as cli_main
+
+    issues = tmp_path / "issues.json"
+    issues.write_text("[]", encoding="utf-8")
+    pulls = tmp_path / "pulls.json"
+    pulls.write_text(
+        json.dumps(
+            [
+                {
+                    "number": 1,
+                    "title": "green",
+                    "state": "open",
+                    "draft": False,
+                    "mergeable_state": "clean",
+                    "base": {"repo": {"full_name": "Acme/Forge"}},
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    backlog_output = tmp_path / "backlog.json"
+    incidents_output = tmp_path / "incidents.json"
+    assert (
+        cli_main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--pulls",
+                str(pulls),
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+                "--observed-at",
+                NOW,
+                "--backlog-output",
+                str(backlog_output),
+                "--incidents-output",
+                str(incidents_output),
+            ]
+        )
+        == 0
+    )
+    incidents = json.loads(incidents_output.read_text(encoding="utf-8"))
+    refs = [item["evidenceRef"] for item in incidents["incidents"]]
+    assert refs == ["Acme/Forge!1"]
