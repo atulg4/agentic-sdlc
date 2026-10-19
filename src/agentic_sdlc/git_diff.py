@@ -424,6 +424,27 @@ def collect_commit_diff(repository: str | Path, base: str, head: str = "HEAD") -
     )
 
 
+def default_branch_name(repository: str | Path) -> str:
+    """The branch the repository's ``origin/HEAD`` symref names, or ``""``.
+
+    Set by ``git clone`` (and refreshed with ``git remote set-head origin
+    --auto``), the symref is TARGET-side state: it names the remote's
+    default branch without consulting any committed policy, so base
+    authentication can anchor on it instead of a branch name the candidate
+    — or a stale branch tip's own policy — wrote.
+    """
+    try:
+        out = (
+            _run(["git", "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], repository)
+            .stdout.decode("utf-8", errors="surrogateescape")
+            .strip()
+        )
+    except GitDiffError:
+        return ""
+    prefix = "refs/remotes/origin/"
+    return out[len(prefix) :] if out.startswith(prefix) else ""
+
+
 def collect_series_patch(repository: str | Path, base: str, head: str) -> bytes:
     """Every published change of ``base..head`` as per-commit patches.
 

@@ -258,7 +258,15 @@ visible in the recorded report — and to the interpreter VERSION PROBE,
 which executes whatever `python3`/`python` the gate PATH resolves first,
 on a runner with a repository-local virtualenv a candidate-writable
 program) or the literal `trusted-host` to explicitly
-accept host execution for a candidate the caller already trusts. The clone
+accept host execution for a candidate the caller already trusts. The
+launcher itself resolves under EXECUTABLE TRUST like git does: a bare name
+is never looked up through the (possibly candidate-writable) gate PATH,
+and a writable file is refused, so a planted launcher-named executable
+cannot run on the host before the sandbox exists. The derived DIFF is
+evaluated against the base policy before anything dispatches: a candidate
+touching forbidden paths (the policy file itself included) or exceeding
+the changed-file, line or patch caps is refused outright, exactly as
+`check-diff` would refuse it on the Actions path. The clone
 also mirrors the
 source's remote-tracking and tag refs, since CI checkouts often carry the
 candidate only on `origin/*`, and then disconnects its `origin` remote, so
@@ -273,7 +281,12 @@ separately maintained repository, and the base must equal its current
 `origin/<default branch>` — a ref inside the candidate repository
 (remote-tracking refs included) is mutable by the producing run itself via
 `git update-ref`, so it authenticates nothing, and a caller-chosen later
-ancestor cannot hide already-landed changes from the verified diff. The
+ancestor cannot hide already-landed changes from the verified diff. WHICH
+branch supplies the base comes from a target-side trust anchor — the
+target's `origin/HEAD` symref — never from a committed policy's branch
+name: a stale branch whose tip's own policy names the same old branch
+would otherwise pass a policy-agreement check circularly, and both the
+candidate's and the base's committed policies must agree with the anchor. The
 target must also BE separate, not merely spelled differently: canonical
 object-store identities (the realpath of each repository's common git
 directory) are compared, so the candidate itself, a symlink alias of it, a
@@ -399,7 +412,12 @@ canonical JSON array of the reviewer's findings), whose digest travels
 inside the attestation as `findingsSha256`; `orchestrate review` verifies
 the supplied report against it and records the digest in the attested
 state, so a later packet presenting the genuine signed count with a
-laundered findings list is refused at dispatch. And the verdict EDGES
+laundered findings list is refused at dispatch. REPAIR packets carry the
+findings at the packet level (`priorFindings` in the request, rendered
+into the repair prompt inside the untrusted boundary): the repair agent
+reads the authenticated report it must fix, and the dispatch verifies the
+carried findings against the state's recorded digest exactly like a
+re-review. And the verdict EDGES
 themselves are owned by these actions: under a key, a generic
 `orchestrate --action transition` refuses to take `verifying` or
 `reviewing`/`re-reviewing` into their verdict targets (`reviewing`,
@@ -431,7 +449,16 @@ head and a failed run's envelope cannot seed a second attempt under the
 first's attribution — a retry is a fresh dispatch, and every dispatch
 mints a digested `dispatchNonce`, so even byte-identical content
 re-dispatches under a fresh digest and completion/outcome records bind
-the exact dispatch they attest, not merely its content. And every command that derives
+the exact dispatch they attest, not merely its content. The nonce alone
+cannot survive a REPLACED state document, so every attested dispatch also
+requires `--history` and digests the state's lineage id (`stateId`,
+minted per orchestration lineage): an attested `start-run` accepts only
+envelopes bound to its own lineage, and a recreated state — which mints a
+fresh id — cannot replay old signed envelopes, completions or outcomes to
+a ready-for-merge standing. `dispatch-packet --prompt-output` emits the
+exact rendered prompt whose `promptSha256` the envelope signs, so the
+executor submits the signed model input instead of rebuilding
+undocumented in-memory objects. And every command that derives
 or attests these artifacts (`context-packet`, `dispatch-packet`,
 `orchestrate`, `attest-completion`, `attest-outcome`) runs under STRICT executable trust:
 working-tree `trust_mode` and the `AGENTIC_SDLC_GIT`/`AGENTIC_SDLC_GH`

@@ -1551,6 +1551,9 @@ def test_the_cli_dispatches_through_the_packet_contract(tmp_path, policy_file, v
     authorization = _authorization(tmp_path / "authorized.json", "P1: a bounded change", valid_body)
     key = _key_file(tmp_path)
     artifact = tmp_path / "packet.json"
+    # An attested dispatch binds the orchestration state's lineage, so the
+    # builder path carries the attested history too.
+    history = ["--history", str(_run_history(tmp_path / "history.json"))]
     base = [
         "--config",
         str(repo / "agentic-sdlc.toml"),
@@ -1563,10 +1566,12 @@ def test_the_cli_dispatches_through_the_packet_contract(tmp_path, policy_file, v
     ]
     assert cli_main(["context-packet", *base, "--output", str(artifact)]) == 0
     envelope_path = tmp_path / "envelope.json"
+    prompt_path = tmp_path / "prompt.txt"
     assert (
         cli_main(
             [
                 "dispatch-packet",
+                *history,
                 *base,
                 "--agents",
                 str(agents),
@@ -1578,6 +1583,8 @@ def test_the_cli_dispatches_through_the_packet_contract(tmp_path, policy_file, v
                 str(artifact),
                 "--output",
                 str(envelope_path),
+                "--prompt-output",
+                str(prompt_path),
             ]
         )
         == 0
@@ -1589,6 +1596,10 @@ def test_the_cli_dispatches_through_the_packet_contract(tmp_path, policy_file, v
     assert envelope["contextPackDigest"] == document["packetSha256"]
     assert f"sha256:{document['pack']['packSha256']}" in envelope["inputRefs"]
     assert len(envelope["promptSha256"]) == 64
+    # The EXECUTOR receives the exact rendered prompt the envelope signs:
+    # --prompt-output emits the bytes promptSha256 digests.
+    prompt_bytes = prompt_path.read_text(encoding="utf-8")
+    assert hashlib.sha256(prompt_bytes.encode("utf-8")).hexdigest() == envelope["promptSha256"]
 
     # The roster is repository-owned configuration: a caller-side file
     # outside the candidate repository never supplies agent identities.
@@ -1598,6 +1609,7 @@ def test_the_cli_dispatches_through_the_packet_contract(tmp_path, policy_file, v
         cli_main(
             [
                 "dispatch-packet",
+                *history,
                 *base,
                 "--agents",
                 str(outside),
@@ -1625,6 +1637,7 @@ def test_the_cli_dispatches_through_the_packet_contract(tmp_path, policy_file, v
             cli_main(
                 [
                     "dispatch-packet",
+                    *history,
                     *base,
                     "--agents",
                     str(agents),
@@ -2551,6 +2564,74 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
         )
         assert said in capsys.readouterr().err
 
+    # The sandbox LAUNCHER resolves under executable trust: a writable
+    # planted wrapper, or a bare name resolved through the (possibly
+    # candidate-writable) PATH, would run candidate code on the host before
+    # any sandbox exists.
+    planted_launcher = tmp_path / "sandbox-launcher"
+    planted_launcher.write_text('#!/bin/sh\nexec "$@"\n', encoding="utf-8")
+    planted_launcher.chmod(0o755)
+    for bogus_launcher in (str(planted_launcher), "sandbox-launcher"):
+        capsys.readouterr()
+        assert (
+            cli_main(
+                [
+                    "context-packet",
+                    "--config",
+                    str(repo / "agentic-sdlc.toml"),
+                    "--knowledge",
+                    str(knowledge),
+                    "--request",
+                    str(request),
+                    "--candidate-repository",
+                    str(repo),
+                    "--candidate-base",
+                    base,
+                    "--candidate-head",
+                    head,
+                    "--review-target-repository",
+                    str(target),
+                    "--gate-sandbox",
+                    bogus_launcher,
+                ]
+            )
+            == 2
+        )
+        assert "launcher" in capsys.readouterr().err
+    # A trusted absolute wrapper runs the gates under the prefix.
+    wrapped_packet = tmp_path / "wrapped-packet.json"
+    assert (
+        cli_main(
+            [
+                "context-packet",
+                "--config",
+                str(repo / "agentic-sdlc.toml"),
+                "--knowledge",
+                str(knowledge),
+                "--request",
+                str(request),
+                "--candidate-repository",
+                str(repo),
+                "--candidate-base",
+                base,
+                "--candidate-head",
+                head,
+                "--review-target-repository",
+                str(target),
+                "--gate-sandbox",
+                "/usr/bin/env",
+                "--output",
+                str(wrapped_packet),
+            ]
+        )
+        == 0
+    )
+    wrapped_report = json.loads(wrapped_packet.read_text(encoding="utf-8"))["verification"][
+        "gateReport"
+    ]
+    assert wrapped_report["passed"] is True
+    assert wrapped_report["gates"][0]["command"][0] == "/usr/bin/env"
+
     # The review target must be a SEPARATE repository: the candidate itself,
     # a symlink alias of it, and a worktree sharing its object store are all
     # candidate-mutable however they are spelled.
@@ -2724,14 +2805,12 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
                 str(weakened_packet),
             ]
         )
-        == 0
+        == 2
     )
-    weakened_verification = json.loads(weakened_packet.read_text(encoding="utf-8"))["verification"]
-    # The BASE-committed gate ran; the head's always-passing replacement
-    # ("lying") never did.
-    weakened_report = weakened_verification["gateReport"]
-    assert [gate["name"] for gate in weakened_report["gates"]] == ["test"]
-    assert weakened_report["passed"] is True
+    # The BASE diff policy refuses the candidate outright: the policy file
+    # is baseline-forbidden, so a head that edits it never even reaches the
+    # (base-pinned) gates — two layers deep, the lying gate shapes nothing.
+    assert "forbidden paths changed: agentic-sdlc.toml" in capsys.readouterr().err
 
     # A head that renames the default branch could re-aim base
     # authentication at a stale ref in the review target; the base-committed
@@ -2768,6 +2847,45 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
             }
         ),
         encoding="utf-8",
+    )
+    capsys.readouterr()
+    assert (
+        cli_main(
+            [
+                "context-packet",
+                "--config",
+                str(repo / "agentic-sdlc.toml"),
+                "--knowledge",
+                str(knowledge),
+                "--request",
+                str(pivot_request),
+                "--candidate-repository",
+                str(repo),
+                "--candidate-base",
+                base,
+                "--candidate-head",
+                head3,
+                *derive,
+            ]
+        )
+        == 2
+    )
+    assert "default branch" in capsys.readouterr().err
+    # Even a SELF-CONSISTENT stale branch — its tip's own committed policy
+    # names the same old branch, so a policy-agreement check alone would be
+    # circular — cannot re-aim authentication: the anchor is the target's
+    # origin/HEAD, never a committed branch name.
+    subprocess.run(
+        ["git", "-C", str(target), "fetch", "-q", str(repo), head3],
+        check=True,
+        env=env,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(target), "update-ref", "refs/remotes/origin/release", head3],
+        check=True,
+        env=env,
+        capture_output=True,
     )
     capsys.readouterr()
     assert (
@@ -3140,6 +3258,7 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
         encoding="utf-8",
     )
     weak_packet = tmp_path / "weak-packet.json"
+    capsys.readouterr()
     assert (
         cli_main(
             [
@@ -3161,10 +3280,12 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
                 str(weak_packet),
             ]
         )
-        == 0
+        == 2
     )
-    weak_limits = json.loads(weak_packet.read_text(encoding="utf-8"))["policyLimits"]
-    assert weak_limits["maxDiffLines"] == 100
+    # Two layers refuse the weakened policy: the contract re-pins to the
+    # authenticated base, and before that the BASE diff policy rejects any
+    # candidate that edits the baseline-forbidden policy file at all.
+    assert "forbidden paths changed: agentic-sdlc.toml" in capsys.readouterr().err
 
 
 def test_record_sequences_are_detached_before_admission(registry, policy):
@@ -3291,11 +3412,18 @@ def test_dispatch_packet_enforces_task_policy(tmp_path, policy_file, valid_body,
     assert "requires --attestation-key" in capsys.readouterr().err
     good = _authorization(tmp_path / "authorization.json", "P1: a bounded change", valid_body)
     envelope_path = tmp_path / "envelope.json"
+    # An attested dispatch binds the orchestration state's lineage: without
+    # --history it refuses outright.
+    capsys.readouterr()
+    assert cli_main(["dispatch-packet", *base, "--authorization", str(good)]) == 2
+    assert "requires --history" in capsys.readouterr().err
+    history = ["--history", str(_run_history(tmp_path / "history.json"))]
     assert (
         cli_main(
             [
                 "dispatch-packet",
                 *base,
+                *history,
                 "--authorization",
                 str(good),
                 "--output",
@@ -3510,11 +3638,13 @@ def test_write_capable_dispatch_verifies_repository_evidence(
     (repo / "knowledge.toml").write_text("not the knowledge config\n", encoding="utf-8")
     (repo / "agents.json").write_text("not the roster\n", encoding="utf-8")
     envelope_path = tmp_path / "envelope.json"
+    evidence_history = ["--history", str(_run_history(tmp_path / "evidence-history.json"))]
     assert (
         cli_main(
             [
                 "dispatch-packet",
                 *base,
+                *evidence_history,
                 "--candidate-repository",
                 str(repo),
                 "--output",
@@ -3625,6 +3755,8 @@ def test_repair_dispatch_reads_the_roster_from_the_authenticated_base(
         "--run-kind",
         "repair",
     ]
+    repair_history = _run_history(tmp_path / "repair-history.json")
+    base += ["--history", str(repair_history)]
     capsys.readouterr()
     assert cli_main(["dispatch-packet", *base]) == 2
     assert "requires --review-target-repository" in capsys.readouterr().err
@@ -3649,6 +3781,45 @@ def test_repair_dispatch_reads_the_roster_from_the_authenticated_base(
     # selected the agent, and the envelope digests the repair kind.
     assert envelope["agentId"] == "codex-1"
     assert envelope["runKind"] == "repair"
+
+    # The repair packet carries the AUTHENTICATED findings: when the attested
+    # state records the latest review's report digest, a repair request whose
+    # priorFindings do not hash to it refuses, and the matching report
+    # renders into the repair prompt for the agent to fix.
+    from agentic_sdlc.cli import _findings_digest
+
+    bound_state = json.loads(repair_history.read_text(encoding="utf-8"))
+    bound_state["units"][WORK_REF]["reviewFindingsSha256"] = _findings_digest(
+        ["fix the unbounded retry loop"]
+    )
+    bound_history = tmp_path / "repair-bound-history.json"
+    bound_history.write_text(json.dumps(_attested(bound_state)), encoding="utf-8")
+    bound = list(base)
+    bound[bound.index(str(repair_history))] = str(bound_history)
+    capsys.readouterr()
+    assert cli_main(["dispatch-packet", *bound, "--review-target-repository", str(target)]) == 2
+    assert "do not hash to the findings report" in capsys.readouterr().err
+    found_request = json.loads(request.read_text(encoding="utf-8"))
+    found_request["priorFindings"] = ["fix the unbounded retry loop"]
+    request.write_text(json.dumps(found_request), encoding="utf-8")
+    repair_prompt = tmp_path / "repair-prompt.txt"
+    assert (
+        cli_main(
+            [
+                "dispatch-packet",
+                *bound,
+                "--review-target-repository",
+                str(target),
+                "--prompt-output",
+                str(repair_prompt),
+            ]
+        )
+        == 0
+    )
+    assert "fix the unbounded retry loop" in repair_prompt.read_text(encoding="utf-8")
+    # Restore the findings-free request for the sections below.
+    found_request.pop("priorFindings")
+    request.write_text(json.dumps(found_request), encoding="utf-8")
 
     # The repair head cannot re-aim WHICH base authenticates its contract: a
     # committed default-branch pivot refuses against the base-committed

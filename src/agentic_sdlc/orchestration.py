@@ -13,6 +13,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any
+from uuid import uuid4
 
 from .missions import AgentProfile, MissionRegistry
 
@@ -244,6 +245,12 @@ class Orchestrator:
         self.human_merge_required = True
         self._registry = registry
         self._units: dict[str, _WorkUnit] = {}
+        # One GENERATION identifier per state lineage: dispatch digests it
+        # into every envelope it signs, and an attested start-run accepts
+        # only envelopes bound to this exact lineage — a recreated state
+        # mints a fresh id, so old signed envelopes, completions and
+        # outcomes cannot replay into it.
+        self.state_id = uuid4().hex
 
     # -- unit management ---------------------------------------------------
 
@@ -766,6 +773,7 @@ class Orchestrator:
         return {
             "schemaVersion": 1,
             "lifecycleVersion": LIFECYCLE_VERSION,
+            "stateId": self.state_id,
             "maxRepairCycles": self.max_repair_cycles,
             "humanMergeRequired": True,
             "units": {unit_id: unit.as_dict() for unit_id, unit in sorted(self._units.items())},
@@ -781,6 +789,9 @@ class Orchestrator:
             max_repair_cycles=int(document.get("maxRepairCycles", 2)),
             registry=registry,
         )
+        # The stored lineage id is PRESERVED, "" included: a legacy state
+        # without one must read as legacy, never silently gain a fresh id.
+        engine.state_id = str(document.get("stateId", ""))
         units = document.get("units", {})
         if not isinstance(units, Mapping):
             raise OrchestrationError("units must be a mapping")

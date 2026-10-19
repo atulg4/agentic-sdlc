@@ -697,6 +697,7 @@ def create_dispatch_envelope(
     packet_role: str = "",
     run_kind: str = "",
     dispatch_nonce: str = "",
+    state_id: str = "",
 ) -> dict[str, Any]:
     """Pin one dispatch to mission version, adapter, model, and prompt digest.
 
@@ -751,6 +752,12 @@ def create_dispatch_envelope(
         # completion/outcome records (which bind envelopeSha256) bind the
         # exact dispatch, not merely its content.
         body["dispatchNonce"] = dispatch_nonce
+    if state_id:
+        # The orchestration state GENERATION this dispatch was issued
+        # against: an attested start-run accepts only envelopes bound to its
+        # own lineage, so a recreated state cannot replay old signed
+        # envelopes (and the completions and outcomes bound to them).
+        body["stateId"] = state_id
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
     body["envelopeSha256"] = _sha256_text(canonical)
     return body

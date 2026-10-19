@@ -34,6 +34,7 @@ from .context_builder import (
     build_context_packet,
     dispatch_envelope_for_packet,
     mission_role,
+    render_packet_for_prompt,
     verification_from_dict,
 )
 from .dashboard_efficiency import build_infrastructure_blocker_panel
@@ -54,6 +55,7 @@ from .git_diff import (
     collect_git_diff,
     collect_series_patch,
     committed_path,
+    default_branch_name,
     derivation_tree,
     read_committed_file,
     repository_identity,
@@ -146,6 +148,9 @@ from .trusted_exec import GH_OVERRIDE_ENV as _GH_OVERRIDE_ENV
 from .trusted_exec import (
     STRICT,
     TRUST_MODES,
+    UntrustedExecutableError,
+    candidate_reason,
+    resolve_trusted,
     use_gate_trust,
     use_trust_mode,
 )
@@ -916,6 +921,34 @@ def _require_separate_target(args: argparse.Namespace) -> None:
         )
 
 
+def _anchor_branch(args: argparse.Namespace, policy) -> str:
+    """The review base's branch name, from a TARGET-SIDE trust anchor.
+
+    A committed policy's ``default_branch`` is candidate-written (or stale-
+    tip-written) text: selecting the base ref by it is CIRCULAR, since a
+    stale branch tip's own policy names the same old branch and the
+    agreement check then passes against weaker definitions. The target's
+    ``origin/HEAD`` symref names the remote's default branch without
+    consulting any committed policy; the policies must then AGREE with it.
+    """
+    anchor = default_branch_name(args.review_target_repository)
+    if not anchor:
+        raise ContextBuilderError(
+            "the review target repository declares no origin/HEAD default "
+            "branch; run `git remote set-head origin --auto` in it so base "
+            "authentication anchors on target-side state, never on a "
+            "committed policy's branch name"
+        )
+    if policy.default_branch != anchor:
+        raise ContextBuilderError(
+            "the candidate changes the policy's default branch away from the "
+            "review target's own default; that re-aims base authentication, "
+            "so land the configuration change through the human-controlled "
+            "path first"
+        )
+    return anchor
+
+
 def _derived_verification(
     args: argparse.Namespace, request: dict, policy: ProjectPolicy
 ) -> VerificationEvidence:
@@ -949,20 +982,19 @@ def _derived_verification(
             "authenticates nothing"
         )
     _require_separate_target(args)
+    anchor_branch = _anchor_branch(args, policy)
     try:
-        expected_base = resolve_commit(
-            args.review_target_repository, f"origin/{policy.default_branch}"
-        )
+        expected_base = resolve_commit(args.review_target_repository, f"origin/{anchor_branch}")
     except GitDiffError as error:
         raise ContextBuilderError(
             "the review target repository has no "
-            f"origin/{policy.default_branch}; fetch the authoritative review "
+            f"origin/{anchor_branch}; fetch the authoritative review "
             "target before deriving verification"
         ) from error
     if base != expected_base:
         raise ContextBuilderError(
             "--candidate-base must be the current authoritative review target "
-            f"(origin/{policy.default_branch} in the review target repository "
+            f"(origin/{anchor_branch} in the review target repository "
             f"is {expected_base})"
         )
     # Gate definitions come from the AUTHENTICATED BASE, never the head: the
@@ -982,11 +1014,11 @@ def _derived_verification(
             "review base; derived gates run only repository-owned, "
             "base-trusted definitions"
         ) from error
-    # The branch name that authenticated the base is itself policy read at
-    # the candidate HEAD: a head that renames the default branch could re-aim
-    # the resolution at a stale origin/<other> ref in the review target, so
-    # the base-committed policy must agree on the branch.
-    if load_policy_bytes(base_config).default_branch != policy.default_branch:
+    # The anchor already outranks every committed branch name; the
+    # base-committed policy must still AGREE with it, so a configuration
+    # drift between the target's default branch and the policy is a
+    # controlled error, never a silently re-aimed authentication.
+    if load_policy_bytes(base_config).default_branch != anchor_branch:
         raise ContextBuilderError(
             "the candidate head changes the policy's default branch; that "
             "re-aims base authentication, so land the configuration change "
@@ -1016,7 +1048,47 @@ def _derived_verification(
             raise ContextBuilderError(
                 "--gate-sandbox must name a non-empty wrapper command, or the literal trusted-host"
             )
+        # The LAUNCHER itself must be trusted: run_gates executes it under
+        # the gate PATH, whose first entries on a CI runner can be a
+        # candidate-writable virtualenv, so a bare launcher name — or a
+        # writable file — would run candidate code on the host before any
+        # sandbox exists. The first argv element resolves exactly like git
+        # does under strict trust.
+        launcher = sandbox_prefix[0]
+        try:
+            if os.path.isabs(launcher):
+                reason = (
+                    candidate_reason(launcher)
+                    if os.path.lexists(launcher)
+                    else "the file does not exist"
+                )
+                if reason:
+                    raise ContextBuilderError(
+                        f"--gate-sandbox names an untrusted launcher: {reason}"
+                    )
+                resolved_launcher = os.path.realpath(launcher)
+            else:
+                resolved_launcher = resolve_trusted(launcher, (), "")
+        except UntrustedExecutableError as error:
+            raise ContextBuilderError(f"--gate-sandbox launcher is not trusted: {error}") from None
+        sandbox_prefix = (resolved_launcher, *sandbox_prefix[1:])
     snapshot = collect_commit_diff(args.candidate_repository, base, head)
+    # The BASE diff policy governs what may even reach review: a candidate
+    # touching forbidden paths or exceeding the changed-file, line or patch
+    # caps must not receive a signed reviewer dispatch just because its
+    # gates pass — check-diff would refuse the same change on the Actions
+    # path.
+    diff_decision = evaluate_diff(
+        snapshot.paths,
+        snapshot.added_lines,
+        snapshot.deleted_lines,
+        policy,
+        patch_bytes=len(snapshot.patch),
+    )
+    if not diff_decision.allowed:
+        raise ContextBuilderError(
+            "the derived diff violates the base policy: " + "; ".join(diff_decision.reasons)
+        )
     # The reviewer reads the SERIES, not only its end state: a commit that
     # adds content a later commit removes leaves the endpoint tree diff
     # empty while a push of the head still publishes the blob, so the
@@ -1393,20 +1465,19 @@ def _build_packet_from_request(
                     "authenticated base, never the candidate's own head"
                 )
             _require_separate_target(args)
+            anchor_branch = _anchor_branch(args, policy)
             try:
-                base_pin = resolve_commit(
-                    args.review_target_repository, f"origin/{policy.default_branch}"
-                )
+                base_pin = resolve_commit(args.review_target_repository, f"origin/{anchor_branch}")
             except GitDiffError as error:
                 raise ContextBuilderError(
                     "the review target repository has no "
-                    f"origin/{policy.default_branch}; fetch the authoritative "
+                    f"origin/{anchor_branch}; fetch the authoritative "
                     "base before dispatching against it"
                 ) from error
             base_policy = load_policy_bytes(
                 _committed_configuration(args, base_pin, args.config, "--config")
             )
-            if base_policy.default_branch != policy.default_branch:
+            if base_policy.default_branch != anchor_branch:
                 raise ContextBuilderError(
                     "the candidate changes the policy's default branch; that "
                     "re-aims base authentication, so land the configuration "
@@ -1543,6 +1614,17 @@ def _build_packet_from_request(
                 + " records — retrieve them through the trusted pipeline, not "
                 "request JSON"
             )
+    packet_findings: tuple[str, ...] = ()
+    if getattr(args, "run_kind", None) == "repair":
+        # The repair agent's channel for WHAT must be fixed: the findings
+        # render in the packet and dispatch verifies them against the
+        # attested state's recorded review digest.
+        raw_findings = request.get("priorFindings", [])
+        if not isinstance(raw_findings, list) or not all(
+            isinstance(item, str) for item in raw_findings
+        ):
+            raise ContextBuilderError("packet request priorFindings must be an array of strings")
+        packet_findings = tuple(raw_findings)
     packet = build_context_packet(
         mission,
         task,
@@ -1554,6 +1636,7 @@ def _build_packet_from_request(
         budget_bytes=request.get("budgetBytes", DEFAULT_PACKET_BYTES),
         retrieval_failures=tuple(failures),
         repository_revision=repository_revision,
+        prior_findings=packet_findings,
     )
     return registry, mission, packet, policy
 
@@ -1684,6 +1767,7 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
     history: dict[str, list[str]] = {}
     producing_agents: set[str] = set()
     unit_runs: tuple = ()
+    history_state_id = ""
     if args.history:
         # The history is the ORCHESTRATOR STATE, not a bare mission→agent
         # map: a caller-authored map could record "" (or any other agent) for
@@ -1698,6 +1782,7 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
         # mark from the key the trusted ``orchestrate`` runs signed it with.
         _verify_attested_input(args, document, "run history", "orchestrate --attestation-key")
         engine = Orchestrator.from_dict(document)
+        history_state_id = engine.state_id
         try:
             unit = engine.get(packet.work_ref)
         except OrchestrationError as error:
@@ -1711,11 +1796,12 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
         # not hash to it is carrying a laundered report alongside the
         # genuine signed count, so the dispatch refuses.
         recorded_findings = getattr(unit, "review_findings_sha256", "")
-        if (
-            recorded_findings
-            and packet.verification is not None
-            and _findings_digest(packet.verification.prior_findings) != recorded_findings
-        ):
+        carried_findings = (
+            packet.verification.prior_findings
+            if packet.verification is not None
+            else packet.prior_findings
+        )
+        if recorded_findings and _findings_digest(carried_findings) != recorded_findings:
             raise MissionError(
                 "the packet's priorFindings do not hash to the findings "
                 "report the attested state records for this unit's latest "
@@ -1762,6 +1848,18 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
                 "dispatches bind to the most recent producer, never a stale "
                 "earlier head"
             )
+    # An ATTESTED dispatch binds the orchestration state's lineage: without
+    # --history (or against a legacy state with no stateId) the envelope
+    # could not be tied to a generation, and a recreated state would accept
+    # old signed envelopes, completions and outcomes as fresh.
+    signing_key = _resolve_attestation_key(args)
+    if signing_key is not None and not history_state_id:
+        raise ContextBuilderError(
+            "an attested dispatch requires --history naming a state with a "
+            "lineage id (stateId): the envelope digests it so a recreated "
+            "state cannot replay old signed dispatches; re-create legacy "
+            "state with the current orchestrate CLI"
+        )
     # Roster order defines fallbacks: an eligible agent whose declared
     # context window cannot fit the packet is skipped for the next eligible
     # one instead of blocking a dispatch a fallback could carry.
@@ -1787,6 +1885,7 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
                 # content, and completion/outcome records bind the exact
                 # dispatch they attest.
                 dispatch_nonce=secrets.token_hex(16),
+                state_id=history_state_id,
             )
             break
         except ContextBuilderError as error:
@@ -1797,12 +1896,17 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
                 raise ContextBuilderError(
                     f"{error}; no other eligible agent declares a sufficient context window"
                 ) from error
-    signing_key = _resolve_attestation_key(args)
     if signing_key is not None:
         # The envelope seeds the attested run history: `orchestrate
         # start-run` under the same key accepts only envelopes a trusted
         # dispatch signed, so run attribution can never be hand-authored.
         envelope[_ATTESTATION_FIELD] = _attest_document(envelope, signing_key)
+    if getattr(args, "prompt_output", None):
+        # The envelope signs promptSha256; the EXECUTOR needs the exact
+        # rendered prompt those bytes digest, so dispatch emits it as a
+        # bound artifact instead of leaving the executor to rebuild
+        # undocumented in-memory objects.
+        Path(args.prompt_output).write_text(render_packet_for_prompt(packet), encoding="utf-8")
     _write(envelope, args.output)
     return 0
 
@@ -1965,6 +2069,17 @@ def _orchestrate(args: argparse.Namespace) -> int:
         envelope = json.loads(Path(args.envelope).read_text(encoding="utf-8"))
         if key is not None:
             _require_attested_envelope(envelope, key, unit=args.unit, kind=args.kind)
+            # The envelope must bind THIS state lineage: dispatch digests
+            # the attested state's stateId, so an envelope signed against an
+            # earlier (or recreated) state — along with the completions and
+            # outcomes bound to its digest — cannot replay here.
+            if not engine.state_id or envelope.get("stateId") != engine.state_id:
+                raise OrchestrationError(
+                    "the dispatch envelope does not bind this orchestration "
+                    "state's lineage id; a recreated state cannot replay old "
+                    "signed dispatches — re-dispatch the packet against the "
+                    "current attested state"
+                )
             # One digest identifies ONE recorded run, with NO retry
             # exception: a FAILED review's envelope reused in re-reviewing
             # would still hand the reviewer the pre-repair packet and head
@@ -3227,6 +3342,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dispatch_packet.add_argument("--authorization-max-age-seconds", type=int, default=900)
     dispatch_packet.add_argument("--packet")
+    dispatch_packet.add_argument(
+        "--prompt-output",
+        help="write the exact rendered prompt the envelope's promptSha256 "
+        "digests, so the executor submits the signed model input",
+    )
     dispatch_packet.add_argument("--input-ref", action="append", default=[])
     dispatch_packet.add_argument("--output")
     dispatch_packet.set_defaults(handler=_dispatch_packet)

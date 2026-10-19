@@ -819,6 +819,9 @@ def test_orchestrate_attests_only_runs_a_trusted_dispatch_produced(tmp_path: Pat
             )
             == 0
         )
+    # A trusted dispatch digests the attested state's lineage id, so the
+    # crafted envelopes bind it exactly as dispatch-packet would.
+    state_id = json.loads(state.read_text(encoding="utf-8"))["stateId"]
     body = {
         "schemaVersion": 1,
         "missionId": "implementation-worker",
@@ -833,6 +836,7 @@ def test_orchestrate_attests_only_runs_a_trusted_dispatch_produced(tmp_path: Pat
         "promptSha256": "0" * 64,
         "packetRole": "builder",
         "runKind": "implementation",
+        "stateId": state_id,
     }
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
     envelope = {**body, "envelopeSha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest()}
@@ -874,6 +878,9 @@ def test_orchestrate_attests_only_runs_a_trusted_dispatch_produced(tmp_path: Pat
     # repair run, which would bypass the fresh repair dispatch.
     repair_start = [entry if entry != "implementation" else "repair" for entry in start]
     assert main([*repair_start, _envelope_file("replay-kind.json", signed)]) == 2
+    # A genuinely signed envelope from ANOTHER state lineage (a recreated
+    # state) cannot replay here.
+    assert main([*start, _envelope_file("other-state.json", _signed_for(stateId="f" * 32))]) == 2
     assert main([*start, _envelope_file("signed.json", signed)]) == 0
     # One digest identifies one dispatch: the recorded envelope cannot seed a
     # second run (a reused review envelope would otherwise report on the
