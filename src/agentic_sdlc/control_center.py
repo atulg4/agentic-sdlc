@@ -1238,6 +1238,10 @@ class ProjectView:
     environments: tuple[str, ...] = ()
     state_counts: Mapping[str, int] = field(default_factory=dict)
     stage_counts: Mapping[str, int] = field(default_factory=dict)
+    #: Units whose STAGE is dependency-wait, counted per state: excluded from
+    #: the active list (nothing executes while a dependency holds), and the
+    #: console reconciles active membership against byState minus these.
+    dependency_wait_counts: Mapping[str, int] = field(default_factory=dict)
     active: tuple[WorkUnitStatus, ...] = ()
     attention: tuple[WorkUnitStatus, ...] = ()
     backlog: tuple[BacklogNode, ...] = ()
@@ -1294,6 +1298,7 @@ class ProjectView:
                 "blockers": self.blocker_count,
                 "byState": dict(sorted(self.state_counts.items())),
                 "byStage": dict(sorted(self.stage_counts.items())),
+                "dependencyWaitByState": dict(sorted(self.dependency_wait_counts.items())),
             },
             "active": [item.as_dict() for item in self.active],
             "attention": [item.as_dict() for item in self.attention],
@@ -1398,11 +1403,24 @@ def _provider_agrees(
     return provider in declared
 
 
+def _positively_identified(
+    item: BacklogItem,
+    status: WorkUnitStatus,
+    repository_providers: Mapping[str, set[str]],
+) -> bool:
+    """Whether registry evidence proves the status belongs to ITEM's provider."""
+    if not item.source_provider or not status.repository:
+        return False
+    declared = repository_providers.get(status.repository.lower())
+    return declared == {item.source_provider}
+
+
 def _resolve_state(
     item: BacklogItem,
     statuses: Mapping[str, WorkUnitStatus],
     by_issue_ref: Mapping[str, WorkUnitStatus],
     repository_providers: Mapping[str, set[str]],
+    contested_refs: frozenset[str] = frozenset(),
 ) -> tuple[str, str, WorkUnitStatus | None]:
     """Resolve a backlog item's state, naming the basis and never inventing one.
 
@@ -1429,7 +1447,17 @@ def _resolve_state(
         if status is not None and _provider_agrees(
             item.source_provider, status, repository_providers
         ):
-            return status.state.value, STATE_BASIS_LEDGER, status
+            # A reference carried by items of SEVERAL source providers is
+            # ambiguous whatever the registry says is missing: one
+            # providerless ledger status must not attach to both trees, so a
+            # contested reference joins only on POSITIVE registry proof that
+            # the status belongs to this item's provider.
+            if item.issue_ref in contested_refs and not _positively_identified(
+                item, status, repository_providers
+            ):
+                pass
+            else:
+                return status.state.value, STATE_BASIS_LEDGER, status
     if item.declared_state:
         return item.declared_state, STATE_BASIS_DECLARED, None
     return "unknown", STATE_BASIS_UNKNOWN, None
@@ -1464,6 +1492,15 @@ def _index_by_issue_ref(
     return index, warnings
 
 
+def _contested_issue_refs(items: Sequence[BacklogItem]) -> frozenset[str]:
+    """Issue references carried by items of more than one source provider."""
+    providers_by_ref: dict[str, set[str]] = {}
+    for item in items:
+        if item.issue_ref:
+            providers_by_ref.setdefault(item.issue_ref, set()).add(item.source_provider)
+    return frozenset(ref for ref, providers in providers_by_ref.items() if len(providers) > 1)
+
+
 def _build_backlog_tree(
     items: Sequence[BacklogItem],
     statuses: Mapping[str, WorkUnitStatus],
@@ -1475,6 +1512,7 @@ def _build_backlog_tree(
     # Identity — and therefore every parent join — is provider-scoped: a
     # document's parentId names an item of its OWN provider, never a
     # same-spelled id another provider's adapter emitted.
+    contested = _contested_issue_refs(items)
     present = {(item.source_provider, item.item_id) for item in items}
     children: dict[tuple[str, str], list[BacklogItem]] = {}
     roots: list[BacklogItem] = []
@@ -1497,7 +1535,9 @@ def _build_backlog_tree(
         roots.append(item)
 
     def node_for(item: BacklogItem) -> BacklogNode:
-        state, basis, status = _resolve_state(item, statuses, by_issue_ref, repository_providers)
+        state, basis, status = _resolve_state(
+            item, statuses, by_issue_ref, repository_providers, contested
+        )
         scoped = (item.source_provider, item.item_id)
         return BacklogNode(
             item=item,
@@ -1832,7 +1872,9 @@ def build_control_center_snapshot(
             known_items.setdefault(item.item_id, set()).add(item.source_provider)
         item_status: dict[tuple[str, str], WorkUnitStatus] = {}
         for item in items:
-            _, basis, status = _resolve_state(item, statuses, by_issue_ref, repository_providers)
+            _, basis, status = _resolve_state(
+                item, statuses, by_issue_ref, repository_providers, _contested_issue_refs(items)
+            )
             if basis == STATE_BASIS_LEDGER and status is not None:
                 item_status[(item.source_provider, item.item_id)] = status
 
@@ -2036,11 +2078,21 @@ def build_control_center_snapshot(
             stage_counts[status.stage.value] = stage_counts.get(status.stage.value, 0) + 1
 
         ordered = tuple(statuses[key] for key in sorted(statuses))
+        # A dependency-wait STAGE means nothing executes until the upstream
+        # dependency finishes, whatever durable state the unit holds: such a
+        # unit is not running now and must not read as project activity.
+        dependency_wait_counts: dict[str, int] = {}
+        for status in ordered:
+            if status.stage is LifecycleStage.DEPENDENCY_WAIT:
+                dependency_wait_counts[status.state.value] = (
+                    dependency_wait_counts.get(status.state.value, 0) + 1
+                )
         active = tuple(
             status
             for status in ordered
             if status.state in EXECUTING_STATES
             and not status.needs_attention
+            and status.stage is not LifecycleStage.DEPENDENCY_WAIT
             and (status.state not in REVIEW_GATE_STATES or status.activity)
         )
         attention = tuple(status for status in ordered if status.needs_attention)
@@ -2053,6 +2105,7 @@ def build_control_center_snapshot(
                 project_id=project_id,
                 registered=registered,
                 state_counts=state_counts,
+                dependency_wait_counts=dependency_wait_counts,
                 stage_counts=stage_counts,
                 active=active,
                 attention=attention,

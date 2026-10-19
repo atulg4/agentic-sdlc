@@ -5231,6 +5231,15 @@ def test_the_console_binds_incidents_and_enforces_full_membership():
     assert 'incident.sourceProvider === "github" && match' in html
     # A recovered feed clears its own failure banner on the next delivery.
     assert "if (state.feedErrors.delete(collection)) render();" in html
+    # Parent placement and disclosure state are provider-scoped like every
+    # other identity, and dependency waits never read as running.
+    assert "const [node, depth, placedUnder, placedProvider] = stack.pop();" in html
+    assert "sits under another provider's parent." in html
+    assert "function openKey(projectId, node)" in html
+    assert "treeNode(projectId, kid)" in html
+    assert "during a dependency wait." in html
+    assert "dependencyWaitByState" in html
+    assert "(project.counts.byState[key] || 0) - waiting" in html
     # Every formerly live key is exact-read verified, cached or not.
     assert ".filter((key) => !live.has(key));" in html
     # A live note that was never backfilled is seeded into the cache before
@@ -6277,3 +6286,75 @@ def test_providerless_exact_matches_still_respect_ambiguity():
     )
     kept = [item.incident_id for item in snapshot.get("forge").incidents]
     assert kept == ["acme/forge#1:untriaged"]
+
+
+def test_dependency_waits_are_not_running_now():
+    # A dependency-wait stage means nothing executes, whatever durable state
+    # the unit holds: it is excluded from active and counted separately so
+    # the console can still reconcile exact membership.
+    ledger = _ledger(
+        *_chain(
+            TO_IMPLEMENTING,
+            stage="dependency-wait",
+            workUnit={"projectId": "forge", "workUnitId": "wu-1", "repository": "acme/forge"},
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        incidents=load_incident_document(_incidents()),
+    )
+    view = snapshot.get("forge")
+    assert view.active == ()
+    assert view.dependency_wait_counts == {"implementing": 1}
+    document = snapshot.as_dict()
+    counts = document["projects"][0]["counts"]
+    assert counts["dependencyWaitByState"] == {"implementing": 1}
+    assert counts["byState"]["implementing"] == 1
+
+
+def test_contested_issue_references_stay_unresolved():
+    # Items of two providers share an issue reference and the ledger status
+    # carries no repository: nothing identifies whose unit it is, so neither
+    # tree adopts the ledger state.
+    ledger = _ledger(
+        *_chain(
+            TO_IMPLEMENTING,
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "issueRef": "acme/forge#1",
+            },
+        )
+    )
+    github_items = load_backlog_document(
+        {
+            "schemaVersion": BACKLOG_SCHEMA_VERSION,
+            "source": "github",
+            "items": [
+                _backlog(title="GitHub task", issueRef="acme/forge#1", declaredState="specified")
+            ],
+        }
+    )
+    gitlab_items = load_backlog_document(
+        {
+            "schemaVersion": BACKLOG_SCHEMA_VERSION,
+            "source": "gitlab",
+            "items": [
+                _backlog(title="GitLab task", issueRef="acme/forge#1", declaredState="blocked")
+            ],
+        }
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        backlog=tuple(github_items) + tuple(gitlab_items),
+        incidents=load_incident_document(_incidents()),
+    )
+    bases = {node.item.title: node.state_basis for node in snapshot.get("forge").backlog}
+    assert bases == {
+        "GitHub task": "state declared by the backlog source",
+        "GitLab task": "state declared by the backlog source",
+    }
