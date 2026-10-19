@@ -1562,3 +1562,51 @@ def test_github_backlog_rejects_mixed_output_destinations(tmp_path: Path, capsys
     assert result == 2
     assert "mixed destinations" in capsys.readouterr().err
     assert not incidents_output.exists()
+
+
+def test_github_backlog_failing_requires_an_incident_destination(tmp_path, capsys):
+    import json
+
+    from agentic_sdlc.cli import main as cli_main
+
+    issues = tmp_path / "issues.json"
+    issues.write_text(json.dumps([]), encoding="utf-8")
+    pulls = tmp_path / "pulls.json"
+    pulls.write_text(
+        json.dumps(
+            [
+                {
+                    "number": 7,
+                    "title": "A change",
+                    "state": "open",
+                    "draft": False,
+                    "mergeable_state": "dirty",
+                    "base": {"repo": {"full_name": "acme/forge"}},
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        cli_main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--pulls",
+                str(pulls),
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+                "--observed-at",
+                "2026-10-12T10:30:00Z",
+                "--failing",
+                "7=test",
+                "--backlog-output",
+                str(tmp_path / "backlog.json"),
+            ]
+        )
+        == 2
+    )
+    assert "--failing requires --incidents-output" in capsys.readouterr().err

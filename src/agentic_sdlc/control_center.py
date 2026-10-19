@@ -1839,15 +1839,18 @@ def build_control_center_snapshot(
         def _item_status_for(
             incident: Incident, *, item_status=item_status, known_items=known_items
         ) -> WorkUnitStatus | None:
-            exact = item_status.get((incident.source_provider, incident.backlog_item_id))
-            if exact is not None:
-                return exact
             # Ambiguity is judged over EVERY item carrying the id, not only
             # the ledger-backed ones: when the id exists under more than one
             # provider, one provider's ledger evidence must not retire the
-            # other provider's incident.
+            # other provider's incident. The exact-match shortcut is for
+            # provider-QUALIFIED incidents alone — a providerless incident
+            # matching a providerless item is still ambiguous whenever any
+            # other provider carries the same id.
             providers = known_items.get(incident.backlog_item_id, set())
             if incident.source_provider:
+                exact = item_status.get((incident.source_provider, incident.backlog_item_id))
+                if exact is not None:
+                    return exact
                 if providers == {""}:
                     return item_status.get(("", incident.backlog_item_id))
                 return None

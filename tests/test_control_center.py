@@ -5159,6 +5159,18 @@ def test_the_console_checks_membership_and_mirrors_its_writes():
     assert "|| entry.projectId !== projectId" in html
     # A stored note that declares a provider attaches only to that provider.
     assert "|| (entry.sourceProvider && entry.sourceProvider !== provider)" in html
+    # Provider-scoped keys carry three components, parsed in full before a
+    # fetched record is validated against them.
+    assert '[keyProject, keyProvider, keyIncident] = key.split("\\u0000")' in html
+    assert '(entry.sourceProvider || "") === (keyProvider || "")' in html
+    # Legacy providerless fallbacks attach only to unambiguous identities,
+    # and the caches are pruned to the adopted snapshot.
+    assert "if (!entry && soleProvider) {" in html
+    assert "identityProviders.get(identity)?.size === 1" in html
+    assert (
+        "if (!liveIdentities.has(key)) { backfilledEntries.delete(key); state.notes.delete(key); }"
+        in html
+    )
     # generatedAt is required and must parse as a timestamp.
     assert "generatedAt must be an RFC 3339 timestamp." in html
     # Every backlog node carries its children array.
@@ -6216,6 +6228,52 @@ def test_legacy_incident_ambiguity_spans_all_providers():
         projections=ledger.projections(),
         backlog=tuple(github_items) + tuple(gitlab_items),
         incidents=load_incident_document(legacy),
+    )
+    kept = [item.incident_id for item in snapshot.get("forge").incidents]
+    assert kept == ["acme/forge#1:untriaged"]
+
+
+def test_providerless_exact_matches_still_respect_ambiguity():
+    # A providerless legacy incident matching a providerless legacy item is
+    # STILL ambiguous when another provider carries the same id: the legacy
+    # item's ledger evidence must not retire the incident.
+    ledger = _ledger(
+        *_chain(
+            TO_IMPLEMENTING,
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "issueRef": "acme/forge#1",
+            },
+        )
+    )
+    legacy_items = load_backlog_document(
+        _document(_backlog(title="Legacy task", issueRef="acme/forge#1"))
+    )
+    github_items = load_backlog_document(
+        {
+            "schemaVersion": BACKLOG_SCHEMA_VERSION,
+            "source": "github",
+            "items": [_backlog(title="GitHub task", declaredState="blocked")],
+        }
+    )
+    legacy_incident = {
+        "schemaVersion": INCIDENT_SCHEMA_VERSION,
+        "incidents": [
+            _incident(
+                incidentId="acme/forge#1:untriaged",
+                kind="triage-needed",
+                severity="advisory",
+                backlogItemId="acme/forge#1",
+            )
+        ],
+    }
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        backlog=tuple(legacy_items) + tuple(github_items),
+        incidents=load_incident_document(legacy_incident),
     )
     kept = [item.incident_id for item in snapshot.get("forge").incidents]
     assert kept == ["acme/forge#1:untriaged"]
