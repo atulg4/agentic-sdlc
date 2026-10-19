@@ -1535,3 +1535,30 @@ def test_control_center_rejects_issues_that_are_not_an_array(tmp_path):
         )
         == 2
     )
+
+
+def test_github_backlog_rejects_mixed_output_destinations(tmp_path: Path, capsys) -> None:
+    # A stdout member of a grouped export cannot be staged or rolled back, so
+    # a failure after the file member was replaced would leave a mismatched
+    # set; mixed destinations are refused up front.
+    issues = tmp_path / "issues.json"
+    issues.write_text("[]", encoding="utf-8")
+    incidents_output = tmp_path / "incidents.json"
+    result = main(
+        [
+            "github-backlog",
+            "--issues",
+            str(issues),
+            "--project-id",
+            "forge",
+            "--repository",
+            "acme/forge",
+            "--observed-at",
+            "2026-10-11T21:30:00Z",
+            "--incidents-output",
+            str(incidents_output),
+        ]
+    )
+    assert result == 2
+    assert "mixed destinations" in capsys.readouterr().err
+    assert not incidents_output.exists()

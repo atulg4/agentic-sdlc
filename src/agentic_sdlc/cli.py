@@ -181,6 +181,16 @@ def _write_group(documents: list[tuple[Any, str | None]]) -> None:
     failure restores the destinations already replaced, so a failure never
     leaves the set describing two different exports."""
 
+    outputs = [output for _, output in documents]
+    if any(outputs) and not all(outputs):
+        # A stdout member cannot be staged or rolled back: were its write to
+        # fail after the file members were already replaced (their backups
+        # gone), the set on disk would describe two different exports.
+        raise OSError(
+            "grouped outputs must all go to files or all to stdout; "
+            "mixed destinations cannot be written atomically"
+        )
+
     destinations = {Path(output).resolve() for _, output in documents if output}
     taken: set[Path] = set()
 

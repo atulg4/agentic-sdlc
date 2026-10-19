@@ -139,7 +139,7 @@ _STAGE_FOR = {
     "implementing": "implementation",
     "verifying": "deterministic-verification",
     "reviewing": "independent-review",
-    "ready-for-human-merge": "independent-review",
+    "ready-for-human-merge": "merge",
     "blocked": "blocked",
     "merged": "merge",
     "live": "live",
@@ -5170,6 +5170,21 @@ def test_the_console_binds_incidents_and_enforces_full_membership():
     assert 'for (const field of ["issueRef", "changeRequestRef", "runRef"])' in html
     assert "${field} must be a bounded string." in html
     assert "${field} must not embed credentials." in html
+    # Incident and backlog references carry the same bounded no-userinfo rule.
+    assert 'for (const field of ["evidenceRef", "backlogItemId"])' in html
+    assert 'for (const key of ["itemId", "issueRef", "parentId"])' in html
+    assert "${key} must not embed credentials." in html
+    # Active membership requires the flag to be exactly false, and every
+    # visible unit's stage must agree with its state (dependency-wait is the
+    # one declared exception).
+    assert "unit.needsAttention !== false" in html
+    assert "stage disagrees with its state." in html
+    assert '"deployment-verifying": "deployment-verification"' in html
+    # A ledger-basis backlog status binds to THIS item's unit.
+    assert "status names another work unit." in html
+    assert "status is not joined by its issue reference." in html
+    # Every formerly live key is exact-read verified, cached or not.
+    assert ".filter((key) => !live.has(key));" in html
     # A backfill read that resumes after a notes delivery made the key live
     # leaves the subscription's newer data alone.
     assert "if (liveNoteKeys.has(key)) return;" in html
@@ -5508,3 +5523,156 @@ def test_named_incidents_retire_on_historical_merge_proof():
     assert [item.incident_id for item in snapshot.get("forge").incidents] == [
         "acme/forge!3:merge-state-blocked"
     ]
+
+
+def test_credential_bearing_merge_references_are_never_retained():
+    # The historical set outlives the current reference's replacement and is
+    # serialized by project-state, so a credential-bearing reference in
+    # effect at the merge is never recorded into it.
+    ledger = _ledger(
+        *_chain(
+            TO_MERGED,
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "changeRequestRef": "https://token@github.com/acme/forge/pull/1",
+            },
+        )
+    )
+    projection = ledger.projections()[0]
+    assert projection.merged_change_request_refs == ()
+    assert projection.as_dict()["durable"]["mergedChangeRequestRefs"] == []
+
+
+def test_merge_proof_survives_a_lifecycle_restart():
+    # merged -> blocked -> triaged restarts the lifecycle, but restarting a
+    # work unit cannot unmerge the change request it already merged: the
+    # reference-bound proof retires the stale incident anyway.
+    ledger = _ledger(
+        *_chain(
+            TO_MERGED,
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "changeRequestRef": "acme/forge!1",
+            },
+        ),
+        _event(
+            eventId="e-block",
+            idempotencyKey="k-block",
+            state="blocked",
+            stage="blocked",
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "changeRequestRef": "acme/forge!1",
+            },
+            reason="post-merge regression found in production",
+        ),
+        _event(
+            eventId="e-restart",
+            idempotencyKey="k-restart",
+            state="triaged",
+            stage="intake",
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "changeRequestRef": "acme/forge!1",
+            },
+        ),
+    )
+    stale = _incident(
+        incidentId="acme/forge!1:merge-state-blocked",
+        kind="unclassified",
+        severity="degraded",
+        evidenceRef="acme/forge!1",
+        summary="The merged change request still reports blocked",
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        incidents=load_incident_document(_incidents(stale)),
+    )
+    assert [item.incident_id for item in snapshot.get("forge").incidents] == []
+
+
+def test_merge_retirement_is_provider_qualified():
+    # A merged GitLab unit carrying the same reference string must not
+    # retire a GitHub incident: references are only unique per provider.
+    gitlab_registry = load_project_registry(
+        {
+            "schemaVersion": 1,
+            "projects": [
+                {
+                    "projectId": "forge",
+                    "displayName": "Forge",
+                    "group": "platform",
+                    "defaultBranch": "main",
+                    "repositories": [
+                        {"provider": "gitlab", "identifier": "acme/forge", "role": "primary"}
+                    ],
+                    "environments": [{"name": "production", "kind": "production"}],
+                    "capabilities": ["planning", "implementation"],
+                }
+            ],
+        }
+    )
+    ledger = _ledger(
+        *_chain(
+            TO_MERGED,
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "changeRequestRef": "acme/forge!1",
+                "repository": "acme/forge",
+            },
+        )
+    )
+    stale = _incident(
+        incidentId="acme/forge!1:merge-state-blocked",
+        kind="unclassified",
+        severity="degraded",
+        evidenceRef="acme/forge!1",
+        summary="The change request reports blocked",
+    )
+    foreign = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=gitlab_registry,
+        projections=ledger.projections(),
+        incidents=load_incident_document(_incidents(stale)),
+    )
+    kept = [item.incident_id for item in foreign.get("forge").incidents]
+    assert kept == ["acme/forge!1:merge-state-blocked"]
+    # Under an agreeing provider the same proof retires the incident.
+    agreeing = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        incidents=load_incident_document(_incidents(stale)),
+    )
+    assert [item.incident_id for item in agreeing.get("forge").incidents] == []
+
+
+def test_overlong_references_are_withheld():
+    # The console bounds every rendered reference at 512 characters, so the
+    # producer withholds longer values instead of emitting a snapshot its
+    # own viewer rejects.
+    long_ref = "acme/forge#" + "9" * 510
+    ledger = _ledger(
+        *_chain(
+            TO_IMPLEMENTING,
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "issueRef": long_ref,
+            },
+        )
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW, registry=REGISTRY, projections=ledger.projections()
+    )
+    view = snapshot.get("forge")
+    assert [unit.issue_ref for unit in view.active] == [""]
+    assert long_ref not in json.dumps(snapshot.as_dict())
+    assert any("longer than 512 characters" in warning for warning in view.warnings)
