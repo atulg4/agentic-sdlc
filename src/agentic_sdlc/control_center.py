@@ -1244,6 +1244,11 @@ class ProjectView:
     dependency_wait_counts: Mapping[str, int] = field(default_factory=dict)
     active: tuple[WorkUnitStatus, ...] = ()
     attention: tuple[WorkUnitStatus, ...] = ()
+    #: Units whose stage is dependency-wait and that need no attention:
+    #: excluded from active (nothing executes while the dependency holds) but
+    #: SURFACED here — a project held entirely by upstream dependencies must
+    #: never read as idle with no unit in flight and no explanation.
+    waiting: tuple[WorkUnitStatus, ...] = ()
     backlog: tuple[BacklogNode, ...] = ()
     incidents: tuple[Incident, ...] = ()
     warnings: tuple[str, ...] = ()
@@ -1302,6 +1307,7 @@ class ProjectView:
             },
             "active": [item.as_dict() for item in self.active],
             "attention": [item.as_dict() for item in self.attention],
+            "waiting": [item.as_dict() for item in self.waiting],
             "backlog": [node.as_dict() for node in self.backlog],
             "incidents": [item.as_dict() for item in self.incidents],
             "warnings": list(self.warnings),
@@ -1377,6 +1383,8 @@ def _provider_agrees(
     provider: str,
     status: WorkUnitStatus,
     repository_providers: Mapping[str, set[str]],
+    *,
+    reference: str = "",
 ) -> bool:
     """Whether a document's declared provider and a unit's repository agree.
 
@@ -1386,12 +1394,21 @@ def _provider_agrees(
     provider the registry declares for the unit's repository; an unknown
     provider on either side, or a repository the registry does not declare,
     keeps the match — disagreement is proven, never guessed (and the
-    foreign-reference warnings already name undeclared data).
+    foreign-reference warnings already name undeclared data). A status that
+    OMITS its repository is not thereby in agreement with every provider:
+    the provider-scoped ``reference`` being joined names a repository too,
+    and a registry declaring that repository for other providers only is
+    positive disagreement.
     """
 
-    if not provider or not status.repository:
+    if not provider:
         return True
-    declared = repository_providers.get(status.repository.lower())
+    repository = status.repository
+    if not repository and reference:
+        repository = re.split(r"[#!]", reference, maxsplit=1)[0].strip()
+    if not repository:
+        return True
+    declared = repository_providers.get(repository.lower())
     if not declared:
         return True
     if len(declared) > 1:
@@ -1445,7 +1462,7 @@ def _resolve_state(
     if item.issue_ref:
         status = by_issue_ref.get(item.issue_ref)
         if status is not None and _provider_agrees(
-            item.source_provider, status, repository_providers
+            item.source_provider, status, repository_providers, reference=item.issue_ref
         ):
             # A reference carried by items of SEVERAL source providers is
             # ambiguous whatever the registry says is missing: one
@@ -1954,7 +1971,12 @@ def build_control_center_snapshot(
                     named = statuses.get(incident.work_unit_id)
                     merged = (
                         named is not None
-                        and _provider_agrees(incident.source_provider, named, repository_providers)
+                        and _provider_agrees(
+                            incident.source_provider,
+                            named,
+                            repository_providers,
+                            reference=incident.evidence_ref,
+                        )
                         and _merge_proven(named, incident.evidence_ref)
                     )
                 else:
@@ -1964,7 +1986,12 @@ def build_control_center_snapshot(
                     carriers = [
                         s
                         for s in by_change_request.get(incident.evidence_ref, [])
-                        if _provider_agrees(incident.source_provider, s, repository_providers)
+                        if _provider_agrees(
+                            incident.source_provider,
+                            s,
+                            repository_providers,
+                            reference=incident.evidence_ref,
+                        )
                     ]
                     merged = bool(carriers) and all(
                         _merge_proven(s, incident.evidence_ref) for s in carriers
@@ -2100,6 +2127,15 @@ def build_control_center_snapshot(
             and (status.state not in REVIEW_GATE_STATES or status.activity)
         )
         attention = tuple(status for status in ordered if status.needs_attention)
+        # Dependency-held units are neither running nor parked at a human
+        # gate, but they are the reason a project sits still: surfaced on
+        # their own rail so the project never reads as idle with no unit in
+        # flight and no explanation.
+        waiting = tuple(
+            status
+            for status in ordered
+            if status.stage is LifecycleStage.DEPENDENCY_WAIT and not status.needs_attention
+        )
 
         fields: dict[str, Any] = {"display_name": project_id}
         if registered:
@@ -2113,6 +2149,7 @@ def build_control_center_snapshot(
                 stage_counts=stage_counts,
                 active=active,
                 attention=attention,
+                waiting=waiting,
                 backlog=tree,
                 incidents=project_incidents,
                 warnings=_bounded_warnings(view_warnings),

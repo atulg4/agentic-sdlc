@@ -2146,6 +2146,7 @@
       "repositories": [
         "github:atulg4/agentic-sdlc"
       ],
+      "waiting": [],
       "warnings": []
     },
     {
@@ -2179,6 +2180,7 @@
       "repositories": [
         "github:atulg4/MarketingMaestro"
       ],
+      "waiting": [],
       "warnings": []
     },
     {
@@ -2216,11 +2218,12 @@
       "repositories": [
         "github:atulg4/marketmaestro"
       ],
+      "waiting": [],
       "warnings": []
     }
   ],
   "schemaVersion": 1,
-  "snapshotSha256": "b95e682a8153f8e9ea86d922c6f8cda539c8405d4efda58beaab2afe0e92e4ab",
+  "snapshotSha256": "29ae6b008c53a528a0a36461187021316522688f0d0f6e8af8a2445bdf7a2758",
   "sources": [
     "registry:examples/control-center/project-registry.json",
     "backlog:examples/control-center/backlog.json",

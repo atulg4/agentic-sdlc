@@ -218,6 +218,7 @@
     "needs-attention": { cls: "warn", text: "needs attention" },
     degraded:     { cls: "warn", text: "degraded" },
     running:      { cls: "ok",   text: "running" },
+    waiting:      { cls: "line", text: "waiting on dependencies" },
     idle:         { cls: "line", text: "idle" },
     "no-data":    { cls: "line", text: "no data" },
     unregistered: { cls: "warn", text: "unregistered" },
@@ -558,6 +559,7 @@
     const incidents = project.incidents || [];
     const active = project.active || [];
     const attention = project.attention || [];
+    const waiting = project.waiting || [];
     const blockers = incidents.filter((incident) => incident.severity === "blocker").length;
     let backlogItems = 0;
     const stack = [...(project.backlog || [])];
@@ -580,6 +582,9 @@
       attention.length ? "needs-attention" :
       incidents.length ? "degraded" :
       active.length ? "running" :
+      // A project held entirely by upstream dependencies is WAITING, never
+      // idle: units are in flight, just not executing.
+      waiting.length ? "waiting" :
       (workUnits || backlogItems) ? "idle" : "no-data";
     project.counts = {
       ...serialized,
@@ -587,6 +592,7 @@
       backlogItems,
       active: active.length,
       attention: attention.length,
+      waiting: waiting.length,
       incidents: incidents.length,
       blockers,
     };
@@ -795,7 +801,7 @@
     // must be rejected in constant-ish work, not after freezing the viewer.
     // The budgets mirror the producer's (5000 backlog items, 2000 incidents
     // per document).
-    const BUDGETS = { backlog: 5000, active: 5000, attention: 5000, incidents: 2000, warnings: 5000, repositories: 500, capabilities: 100, environments: 100 };
+    const BUDGETS = { backlog: 5000, active: 5000, attention: 5000, waiting: 5000, incidents: 2000, warnings: 5000, repositories: 500, capabilities: 100, environments: 100 };
     if (value.projects.length > 500) return "The snapshot holds more than 500 projects.";
     const seenProjects = new Set();
     const seenIncidents = new Set();
@@ -815,7 +821,7 @@
       if (seenProjects.has(project.projectId)) return `Duplicate projectId: ${project.projectId}.`;
       seenProjects.add(project.projectId);
       const where = `project ${project.projectId}`;
-      for (const key of ["backlog", "active", "attention", "incidents", "warnings", "repositories", "capabilities", "environments"]) {
+      for (const key of ["backlog", "active", "attention", "waiting", "incidents", "warnings", "repositories", "capabilities", "environments"]) {
         // The producer always emits every collection, so absence is evidence
         // of tampering, never an empty set: a writer deleting incidents must
         // not read as a healthy project.
@@ -863,34 +869,39 @@
       // The producer's shared per-project budget: it rejects more than 5000
       // work units, so a byState summing past that is never producer output.
       if (stateTotal > 5000) return `${where}.counts.byState sums past the 5000-unit budget.`;
-      // byStage is the stage half of the same census: every unit carries
-      // exactly one stage and one state, so the stage keys are closed, the
-      // two totals agree, and the dependency-wait exemptions must sum to
-      // EXACTLY the dependency-wait stage count — a re-signed store document
-      // cannot park running implementing units behind inflated exemptions
-      // while byStage still says implementation.
+      // byStage is fully DERIVED: the ledger pairs every state with one
+      // canonical stage (dependency-wait is the declared exception), so the
+      // expected census is computable from byState and the dependency-wait
+      // exemptions, and byStage must equal it EXACTLY — states omitted from
+      // the visible lists carry no freely reassignable stage mass either.
       if (!isObj(project.counts.byStage)) return `${where}.counts.byStage must be an object.`;
-      const lifecycleStages = ["intake", "specification", "planning", "dependency-wait", "dispatch", "implementation", "deterministic-verification", "independent-review", "repair", "re-review", "merge", "deploy", "deployment-verification", "live", "rollback", "blocked", "failed", "cancelled", "superseded"];
-      let stageTotal = 0;
       for (const key of Object.keys(project.counts.byStage)) {
-        if (!lifecycleStages.includes(key)) return `${where}.counts.byStage names an unknown stage: ${key}.`;
         const count = project.counts.byStage[key];
         if (!Number.isInteger(count) || count < 0) {
           return `${where}.counts.byStage.${key} must be a non-negative integer.`;
         }
-        stageTotal += count;
       }
-      if (stageTotal !== stateTotal) {
-        return `${where}.counts.byStage disagrees with byState on the unit total.`;
+      const canonicalStage = { intake: "intake", triaged: "intake", specified: "specification", planned: "planning", "approval-pending": "planning", approved: "planning", dispatched: "dispatch", implementing: "implementation", verifying: "deterministic-verification", reviewing: "independent-review", "repair-needed": "repair", repairing: "repair", "re-reviewing": "re-review", "ready-for-human-merge": "merge", merged: "merge", deploying: "deploy", "deployment-verifying": "deployment-verification", live: "live", "rolling-back": "rollback", "rolled-back": "rollback", blocked: "blocked", failed: "failed", cancelled: "cancelled", superseded: "superseded" };
+      const expectedByStage = {};
+      let waitingTotal = 0;
+      for (const key of Object.keys(waitingByState || {})) waitingTotal += waitingByState[key];
+      for (const key of states) {
+        const remaining = project.counts.byState[key] - ((waitingByState || {})[key] || 0);
+        if (remaining > 0) {
+          const stage = canonicalStage[key];
+          expectedByStage[stage] = (expectedByStage[stage] || 0) + remaining;
+        }
       }
-      let exempted = 0;
-      for (const key of Object.keys(waitingByState || {})) exempted += waitingByState[key];
-      if (exempted !== (project.counts.byStage["dependency-wait"] || 0)) {
-        return `${where}.counts.dependencyWaitByState must sum to the dependency-wait stage count.`;
+      if (waitingTotal > 0) expectedByStage["dependency-wait"] = waitingTotal;
+      const stageKeys = new Set([...Object.keys(project.counts.byStage), ...Object.keys(expectedByStage)]);
+      for (const key of stageKeys) {
+        if ((project.counts.byStage[key] || 0) !== (expectedByStage[key] || 0)) {
+          return `${where}.counts.byStage disagrees with the canonical stage census.`;
+        }
       }
-      // active and attention are disjoint subsets of the same status map, so
-      // together they can never exceed the validated unit total.
-      if ((project.active || []).length + (project.attention || []).length > stateTotal) {
+      // active, attention, and waiting are disjoint subsets of the same
+      // status map, so together they can never exceed the validated total.
+      if ((project.active || []).length + (project.attention || []).length + (project.waiting || []).length > stateTotal) {
         return `${where} lists more visible work units than its state counts hold.`;
       }
       const unitIds = new Set();
@@ -918,8 +929,9 @@
       // implementing unit from active while the counts declare running work.
       const activeByState = {};
       const attentionByState = {};
-      const visibleByStage = {};
-      for (const [membership, list] of [["active", project.active || []], ["attention", project.attention || []]]) {
+      const waitingListByState = {};
+      const attentionWaitByState = {};
+      for (const [membership, list] of [["active", project.active || []], ["attention", project.attention || []], ["waiting", project.waiting || []]]) {
         for (const unit of list) {
           if (!isObj(unit)) return `${where} has a work unit that is not an object.`;
           // active and attention are disjoint views of one status map, so a
@@ -951,6 +963,16 @@
           if (membership === "attention" && (unit.needsAttention !== true || !attentionStates.includes(unit.state))) {
             return `${where} attention lists work unit ${unit.workUnitId} outside the attention states.`;
           }
+          if (membership === "attention" && unit.stage === "dependency-wait") {
+            attentionWaitByState[unit.state] = (attentionWaitByState[unit.state] || 0) + 1;
+          }
+          if (membership === "waiting") {
+            // The waiting rail holds exactly the dependency-held units that
+            // need no attention: they are the reason a project sits still.
+            if (unit.needsAttention !== false || unit.stage !== "dependency-wait") {
+              return `${where} waiting lists work unit ${unit.workUnitId} outside a dependency wait.`;
+            }
+          }
           if (membership === "active") {
             // Exactly false: a truthy "false" string would pass a !== true
             // check here yet still render warning styling in unitRow.
@@ -972,18 +994,19 @@
           if (unit.stage !== stageForState[unit.state] && unit.stage !== "dependency-wait") {
             return `${where} work unit ${unit.workUnitId} stage disagrees with its state.`;
           }
-          const tally = membership === "active" ? activeByState : attentionByState;
+          const tally = membership === "active" ? activeByState : membership === "attention" ? attentionByState : waitingListByState;
           tally[unit.state] = (tally[unit.state] || 0) + 1;
-          visibleByStage[unit.stage] = (visibleByStage[unit.stage] || 0) + 1;
         }
       }
-      // The stage census must COVER the visible units, not merely match the
-      // aggregate total: a rewrite pairing byState.implementing with
-      // byStage.merge while an active unit still says implementation would
-      // pass the sum check yet describe units the document does not hold.
-      for (const key of Object.keys(visibleByStage)) {
-        if ((project.counts.byStage[key] || 0) < visibleByStage[key]) {
-          return `${where}.counts.byStage holds fewer ${key} units than are visibly listed.`;
+      // Every dependency-wait exemption is a LISTED unit: the waiting rail
+      // plus dependency-waiting attention units must equal the serialized
+      // exemptions exactly, so a rewrite can neither hide a held unit from
+      // view nor invent exemptions for units the document does not show.
+      const waitKeys = new Set([...Object.keys(waitingListByState), ...Object.keys(attentionWaitByState), ...Object.keys(waitingByState || {})]);
+      for (const key of waitKeys) {
+        const listed = (waitingListByState[key] || 0) + (attentionWaitByState[key] || 0);
+        if (listed !== ((waitingByState || {})[key] || 0)) {
+          return `${where} must list every dependency-waiting unit its counts declare.`;
         }
       }
       // Reconcile both lists against the validated state counts: every unit
@@ -1343,6 +1366,8 @@
     ));
 
     nodes.push(nowRunningCard(project));
+    const held = waitingCard(project);
+    if (held) nodes.push(held);
     nodes.push(attentionCard(project));
     nodes.push(backlogCard(project));
     if ((project.incidents || []).length) {
@@ -1361,10 +1386,23 @@
 
   function nowRunningCard(project) {
     const active = project.active || [];
+    const waiting = (project.waiting || []).length;
     return el("div", { class: "card" },
       el("h3", { text: `Running now (${active.length})` }),
       active.length ? active.map((unit) => unitRow(unit)) :
-        el("p", { class: "small muted", text: "No work unit is in flight. Either nothing is dispatched, or the lifecycle ledger has no events for this project yet." }),
+        el("p", { class: "small muted", text: waiting
+          ? `Nothing is executing right now: ${waiting} unit${waiting === 1 ? " is" : "s are"} held by upstream dependencies (see below).`
+          : "No work unit is in flight. Either nothing is dispatched, or the lifecycle ledger has no events for this project yet." }),
+    );
+  }
+
+  function waitingCard(project) {
+    const items = project.waiting || [];
+    if (!items.length) return null;
+    return el("div", { class: "card" },
+      el("h3", { text: `Waiting on dependencies (${items.length})` }),
+      el("p", { class: "tiny muted", style: "margin:0 0 4px", text: "Nothing executes for these units until their upstream dependency finishes: they are held, not idle." }),
+      items.map((unit) => unitRow(unit)),
     );
   }
 
