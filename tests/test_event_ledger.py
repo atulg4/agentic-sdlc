@@ -165,6 +165,7 @@ def test_future_schema_versions_fail_closed() -> None:
         (lambda doc: doc.update(surprise=1), "unknown keys"),
         (lambda doc: doc.update(apiToken="x"), "must not carry credentials or secrets"),
         (lambda doc: doc.update(stage="teleport"), "unknown stage"),
+        (lambda doc: doc.update(stage="merge"), "disagrees with state"),
         (lambda doc: doc.update(state="orbiting"), "unknown state"),
         (lambda doc: doc.update(occurredAt="yesterday"), "must be an RFC 3339 timestamp"),
         (lambda doc: doc.update(eventId=""), "eventId is required"),

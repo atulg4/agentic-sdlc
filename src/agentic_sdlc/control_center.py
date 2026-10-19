@@ -201,31 +201,16 @@ _LEDGER_RETIREMENT: Mapping[str, frozenset[FactoryState]] = {
     "awaiting-human-approval": APPROVAL_PROVEN_STATES,
 }
 
-#: States that prove a change request was merged: ``merged`` itself and every
-#: state only reachable after it. A rollback does not un-merge the change
-#: request, so the rollback states still carry the proof.
-MERGE_PROVEN_STATES = frozenset(
-    {
-        FactoryState.MERGED,
-        FactoryState.DEPLOYING,
-        FactoryState.DEPLOYMENT_VERIFYING,
-        FactoryState.LIVE,
-        FactoryState.ROLLING_BACK,
-        FactoryState.ROLLED_BACK,
-    }
-)
-
 
 def _merge_proven(status: WorkUnitStatus, reference: str) -> bool:
     """Whether the ledger proves THIS change request merged.
 
-    A later event can replace the unit's changeRequestRef, so historical
-    merge states alone are not proof: the reference must have been in effect
-    when a merge-proven state was entered.
+    Membership in the reference-bound set IS the proof: the ledger records a
+    reference there only while a merge-evident state is entered with it in
+    effect, and a later lifecycle restart (merged, blocked, triaged) cannot
+    unmerge the request, so no separate state check applies.
     """
 
-    if not (status.state in MERGE_PROVEN_STATES or status.states_seen & MERGE_PROVEN_STATES):
-        return False
     return reference in status.merged_change_request_refs
 
 
@@ -1361,28 +1346,28 @@ class ControlCenterSnapshot:
         return payload
 
 
-def _join_provider_agrees(
-    item: BacklogItem,
+def _provider_agrees(
+    provider: str,
     status: WorkUnitStatus,
     repository_providers: Mapping[str, set[str]],
 ) -> bool:
-    """Whether the issue-reference join's providers agree.
+    """Whether a document's declared provider and a unit's repository agree.
 
-    The join is exact-string, and tracker references are only unique within
-    one provider: a GitHub-exported ``acme/forge#1`` must not display a
-    GitLab unit's ledger progress. The item's declared provider must agree
-    with a provider the registry declares for the unit's repository; an
-    unknown provider on either side, or a repository the registry does not
-    declare, keeps the join — disagreement is proven, never guessed (and the
+    References are exact strings only unique within one tracker provider: a
+    GitHub-exported ``acme/forge#1`` must not display — or be retired by — a
+    GitLab unit's ledger history. The declared provider must agree with a
+    provider the registry declares for the unit's repository; an unknown
+    provider on either side, or a repository the registry does not declare,
+    keeps the match — disagreement is proven, never guessed (and the
     foreign-reference warnings already name undeclared data).
     """
 
-    if not item.source_provider or not status.repository:
+    if not provider or not status.repository:
         return True
     declared = repository_providers.get(status.repository.lower())
     if not declared:
         return True
-    return item.source_provider in declared
+    return provider in declared
 
 
 def _resolve_state(
@@ -1413,7 +1398,9 @@ def _resolve_state(
         return "unknown", STATE_BASIS_UNKNOWN, None
     if item.issue_ref:
         status = by_issue_ref.get(item.issue_ref)
-        if status is not None and _join_provider_agrees(item, status, repository_providers):
+        if status is not None and _provider_agrees(
+            item.source_provider, status, repository_providers
+        ):
             return status.state.value, STATE_BASIS_LEDGER, status
     if item.declared_state:
         return item.declared_state, STATE_BASIS_DECLARED, None
@@ -1640,6 +1627,7 @@ def build_control_center_snapshot(
         # because its nodes capture the status objects they join.
         malformed_repositories: set[str] = set()
         credential_references = 0
+        overlong_references = 0
         for unit_id, status in list(statuses.items()):
             name = status.repository
             if name and not _REPOSITORY_IDENTIFIER.fullmatch(name):
@@ -1651,6 +1639,12 @@ def build_control_center_snapshot(
                 if value and _CREDENTIAL_REFERENCE.search(value):
                     redactions[field_name] = ""
                     credential_references += 1
+                elif value and len(value) > 512:
+                    # The console bounds every rendered reference at 512
+                    # characters, so the producer withholds overlong values
+                    # rather than emitting a snapshot its own viewer rejects.
+                    redactions[field_name] = ""
+                    overlong_references += 1
             if redactions:
                 status = replace(status, **redactions)
             statuses[unit_id] = status
@@ -1682,6 +1676,12 @@ def build_control_center_snapshot(
                 f"project {project_id} ledger data carries {credential_references} "
                 "reference(s) embedding URL credentials; the values are withheld - "
                 "strip the userinfo from the ledger references"
+            )
+        if overlong_references:
+            view_warnings.append(
+                f"project {project_id} ledger data carries {overlong_references} "
+                "reference(s) longer than 512 characters; the values are withheld - "
+                "shorten the ledger references"
             )
 
         if not registered:
@@ -1801,7 +1801,14 @@ def build_control_center_snapshot(
                     named = statuses.get(incident.work_unit_id)
                     merged = named is not None and _merge_proven(named, incident.evidence_ref)
                 else:
-                    carriers = by_change_request.get(incident.evidence_ref, [])
+                    # Carriers are provider-qualified like the issue join: a
+                    # merged GitLab unit carrying the same reference string
+                    # must not retire a GitHub incident, and vice versa.
+                    carriers = [
+                        s
+                        for s in by_change_request.get(incident.evidence_ref, [])
+                        if _provider_agrees(incident.source_provider, s, repository_providers)
+                    ]
                     merged = bool(carriers) and all(
                         _merge_proven(s, incident.evidence_ref) for s in carriers
                     )

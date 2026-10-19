@@ -410,11 +410,12 @@
       for (const key of retryNoteKeys) if (live.has(key)) retryNoteKeys.delete(key);
       // A key the previous delivery carried but this one does not was either
       // deleted or merely EVICTED from the bounded window; only an exact read
-      // can tell, so vanished cached keys are verified rather than dropped.
-      // Keys whose last verification FAILED stay eligible through the retry
-      // set even after liveNoteKeys stops carrying them.
+      // can tell, so EVERY formerly live key is verified rather than dropped,
+      // cached or not — a live note that was never backfilled must not vanish
+      // on eviction. Keys whose last verification FAILED stay eligible
+      // through the retry set even after liveNoteKeys stops carrying them.
       const vanished = Array.from(new Set([...liveNoteKeys, ...retryNoteKeys]))
-        .filter((key) => !live.has(key) && backfilledEntries.has(key));
+        .filter((key) => !live.has(key));
       for (let start = 0; start < vanished.length; start += 10) {
         await Promise.all(vanished.slice(start, start + 10).map(async (key) => {
           try {
@@ -760,6 +761,17 @@
       // needsAttention derives from the state alone (human gates, blocked,
       // failed), so the flag is validated against the state, never trusted.
       const attentionStates = ["approval-pending", "ready-for-human-merge", "blocked", "failed"];
+      // The ledger pairs every state with one canonical stage (dependency-wait
+      // is the declared exception), and unitRow renders stage beside state, so
+      // a snapshot pairing implementing with "merge" is never producer output.
+      const stageForState = {
+        "implementing": "implementation", "verifying": "deterministic-verification",
+        "reviewing": "independent-review", "repairing": "repair",
+        "re-reviewing": "re-review", "deploying": "deploy",
+        "deployment-verifying": "deployment-verification", "rolling-back": "rollback",
+        "approval-pending": "planning", "ready-for-human-merge": "merge",
+        "blocked": "blocked", "failed": "failed",
+      };
       // Both lists are reconciled per state against byState below, so a
       // rewrite can neither drop a blocked unit from attention nor hide an
       // implementing unit from active while the counts declare running work.
@@ -798,7 +810,9 @@
             return `${where} attention lists work unit ${unit.workUnitId} outside the attention states.`;
           }
           if (membership === "active") {
-            if (unit.needsAttention === true || !executing.includes(unit.state)) {
+            // Exactly false: a truthy "false" string would pass a !== true
+            // check here yet still render warning styling in unitRow.
+            if (unit.needsAttention !== false || !executing.includes(unit.state)) {
               return `${where} active lists work unit ${unit.workUnitId} outside the executing, no-attention states.`;
             }
             // The producer excludes review gates without recorded activity,
@@ -807,6 +821,9 @@
               && !(typeof unit.activity === "string" && unit.activity)) {
               return `${where} active lists review-gate work unit ${unit.workUnitId} without recorded activity.`;
             }
+          }
+          if (unit.stage !== stageForState[unit.state] && unit.stage !== "dependency-wait") {
+            return `${where} work unit ${unit.workUnitId} stage disagrees with its state.`;
           }
           const tally = membership === "active" ? activeByState : attentionByState;
           tally[unit.state] = (tally[unit.state] || 0) + 1;
@@ -856,6 +873,18 @@
           && !realInstant(incident.observedAt)) {
           return `${where} incident ${incident.incidentId} observedAt must be a real RFC 3339 instant.`;
         }
+        // evidenceNode renders these references, so a digest-consistent
+        // snapshot must not carry a credential-bearing or unbounded value.
+        for (const field of ["evidenceRef", "backlogItemId"]) {
+          const value = incident[field];
+          if (value === undefined || value === "") continue;
+          if (typeof value !== "string" || value.length > 512) {
+            return `${where} incident ${incident.incidentId} ${field} must be a bounded string.`;
+          }
+          if (/:\/\/[^/?#\s]*@/.test(value)) {
+            return `${where} incident ${incident.incidentId} ${field} must not embed credentials.`;
+          }
+        }
         const problem = arrayField(incident, "remediations", `${where} incident`, 16);
         if (problem) return problem;
         for (const action of incident.remediations || []) {
@@ -873,8 +902,16 @@
         const itemKey = project.projectId + "\u0000" + node.itemId;
         if (seenItems.has(itemKey)) return `Duplicate backlog itemId in ${where}: ${node.itemId}.`;
         seenItems.add(itemKey);
-        for (const key of ["itemId", "kind", "state", "stateBasis", "url", "issueRef", "parentId", "declaredState"]) {
+        for (const key of ["itemId", "kind", "state", "stateBasis", "url", "issueRef", "parentId", "declaredState", "workUnitId"]) {
           if (node[key] !== undefined && typeof node[key] !== "string") return `${where} backlog node field ${key} must be a string.`;
+        }
+        // treeNode renders these references verbatim, so they carry the same
+        // bounded no-userinfo rule as unit and incident references.
+        for (const key of ["itemId", "issueRef", "parentId"]) {
+          const value = node[key];
+          if (!value) continue;
+          if (value.length > 512) return `${where} backlog node ${node.itemId} ${key} must be at most 512 characters.`;
+          if (/:\/\/[^/?#\s]*@/.test(value)) return `${where} backlog node ${node.itemId} ${key} must not embed credentials.`;
         }
         if (node.url && !/^https:\/\//.test(node.url)) return `${where} backlog node ${node.itemId || ""} url must be https.`;
         // Mirror the producer: userinfo in a rendered href would expose the
@@ -897,6 +934,15 @@
         if (node.stateBasis === "state projected from the lifecycle ledger") {
           if (!isObj(node.status) || node.status.state !== node.state) return `${where} backlog node ${node.itemId} state disagrees with its ledger status.`;
           if (!factoryStates.includes(node.state)) return `${where} backlog node ${node.itemId} names an unknown ledger state.`;
+          // The embedded status must be THIS item's unit: an explicit
+          // workUnitId binds by unit id, otherwise the issue-reference join
+          // must match, so a rewrite can never present another unit's state
+          // as this item's evidence.
+          if (node.workUnitId) {
+            if (node.status.workUnitId !== node.workUnitId) return `${where} backlog node ${node.itemId} status names another work unit.`;
+          } else if (!node.issueRef || node.status.issueRef !== node.issueRef) {
+            return `${where} backlog node ${node.itemId} status is not joined by its issue reference.`;
+          }
         } else if (node.stateBasis === "state declared by the backlog source") {
           if (!node.state || node.state !== node.declaredState) return `${where} backlog node ${node.itemId} state disagrees with its declared state.`;
           if (!factoryStates.includes(node.state)) return `${where} backlog node ${node.itemId} names an unknown declared state.`;

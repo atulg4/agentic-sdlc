@@ -557,6 +557,12 @@ def load_lifecycle_event(document: Any) -> LifecycleEvent:
         state = FactoryState(state_value)
     except ValueError as error:
         raise LedgerError(f"{label}: unknown state: {state_value}") from error
+    # Stage and state travel together: every state has one canonical stage,
+    # and dependency-wait is the one declared exception (a stage, not a
+    # state, carried while the unit holds its current state). Any other pair
+    # would tell an operator work is in a phase its state contradicts.
+    if stage is not STAGE_FOR_STATE[state] and stage is not LifecycleStage.DEPENDENCY_WAIT:
+        raise LedgerError(f"{label}: stage {stage.value} disagrees with state {state_value}")
     occurred_at = _timestamp(
         _text(entry, "occurredAt", label, required=True), f"{label}: occurredAt"
     )
@@ -669,6 +675,10 @@ class WorkUnitProjection:
 #: Post-merge states: entering one proves the unit's change request merged.
 #: The reference in effect at that moment is recorded, so merge proof binds
 #: to the change request it actually covered.
+#: Any URL userinfo (user:password@ or token@): the same rule the Control
+#: Center applies to current references before rendering them.
+_CREDENTIAL_REFERENCE = re.compile(r"://[^/?#\s]*@")
+
 _MERGE_EVIDENT_STATES = frozenset(
     {
         FactoryState.MERGED,
@@ -771,9 +781,15 @@ def _fold(events: Sequence[LifecycleEvent]) -> WorkUnitProjection:
             accumulator.blocked_reason = event.reason if event.state is FactoryState.BLOCKED else ""
             accumulator.state = event.state
             if event.state in _MERGE_EVIDENT_STATES and accumulator.references.change_request_ref:
-                accumulator.merged_change_request_refs.add(
-                    accumulator.references.change_request_ref
-                )
+                reference = accumulator.references.change_request_ref
+                # A credential-bearing reference is never RETAINED: the
+                # historical set outlives the current reference's replacement
+                # and is serialized by project-state, which would bypass the
+                # Control Center's redaction of current references — and
+                # proof bound to a malformed reference proves nothing an
+                # incident may legitimately cite.
+                if not _CREDENTIAL_REFERENCE.search(reference):
+                    accumulator.merged_change_request_refs.add(reference)
             # A durable state change retires the previous ephemeral activity.
             accumulator.activity = ""
             accumulator.activity_at = ""
