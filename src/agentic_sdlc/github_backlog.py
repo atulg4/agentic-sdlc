@@ -621,6 +621,30 @@ def backlog_document_from_issues(
         + ", ".join(f"#{child}" for child in missing_children)
         + "; export the children too, or narrow --sub-issues",
     )
+    # A parent's own declared count is proof of how many children exist: a
+    # listing that maps FEWER (an unpaginated sub-issue export) would render
+    # the omitted children as roots or drop them with a partial issues file,
+    # so a listed parent whose explicit sub_issues_summary.total exceeds its
+    # mapped children fails closed. More mapped than declared is a lagging
+    # summary, not a truncation, and parents with no supplied listing stay
+    # unchecked - the PARENT=path form deliberately narrows which parents
+    # are exported.
+    mapped_children: dict[int, int] = {}
+    for parent in links.values():
+        mapped_children[parent] = mapped_children.get(parent, 0) + 1
+    by_number = {_record_number(issue, "issue"): issue for issue in rows}
+    truncated = []
+    for parent, count in sorted(mapped_children.items()):
+        summary = by_number.get(parent, {}).get("sub_issues_summary")
+        total = summary.get("total") if isinstance(summary, Mapping) else None
+        if type(total) is int and total > count:
+            truncated.append(f"#{parent} declares {total} sub-issue(s) but only {count} are listed")
+    _require(
+        not truncated,
+        "sub-issue listings are missing children their parents declare: "
+        + "; ".join(truncated)
+        + "; paginate each sub-issue listing fully and refresh the issues export",
+    )
     parent_of_children = {parent for parent in links.values() if parent in numbers}
 
     items: list[dict[str, Any]] = []

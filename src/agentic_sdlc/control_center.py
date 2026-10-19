@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import urllib.parse
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -131,6 +132,34 @@ _CREDENTIAL_REFERENCE = re.compile(r"://[^/?#\s]*@")
 #: (``?access=ghp_...``) carries no URL userinfo yet IS the secret, and the
 #: snapshot republishes URLs as clickable links.
 _TOKEN_SHAPED = re.compile(r"gh[pousr]_|github_pat_|glpat-", re.IGNORECASE)
+
+
+def _carries_credential_token(value: str) -> bool:
+    """A token-shaped credential anywhere in the value, percent-encoding
+    peeled first: ``?access=ghp%5FSECRET`` and ``?access=%67hp_SECRET``
+    decode to the shapes a raw scan would miss. The peel is bounded, so a
+    deeply nested encoding costs constant work and the final layer is still
+    scanned."""
+    decoded = value
+    for _ in range(3):
+        if _TOKEN_SHAPED.search(decoded):
+            return True
+        peeled = urllib.parse.unquote(decoded)
+        if peeled == decoded:
+            break
+        decoded = peeled
+    return _TOKEN_SHAPED.search(decoded) is not None
+
+
+def _utf16_units(value: str) -> int:
+    """The console's ``value.length``: UTF-16 code units, not code points.
+
+    Python's ``len`` counts astral characters once where JavaScript counts
+    two, so a producer bound measured in code points could emit a snapshot
+    the bundled console rejects."""
+    return len(value) + sum(1 for character in value if ord(character) > 0xFFFF)
+
+
 _TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})")
 _SECRET_KEY = re.compile(
     r"credential|secret|token|password|passphrase|api_?key|authorization|bearer|private_?key",
@@ -814,10 +843,11 @@ def _load_backlog_item(raw: Any, index: int) -> BacklogItem:
             f"{label}.url must not embed credentials; strip the URL userinfo",
         )
         # Userinfo is not the only carrier: a token-shaped credential in the
-        # query string or fragment is the secret itself, and the value is
-        # withheld from the error exactly because it carries one.
+        # query string or fragment — percent-encoded or not — is the secret
+        # itself, and the value is withheld from the error exactly because
+        # it carries one.
         _require(
-            not _TOKEN_SHAPED.search(url),
+            not _carries_credential_token(url),
             f"{label}.url carries a token-shaped credential (value withheld); "
             "strip the token from the URL",
         )
@@ -1807,13 +1837,20 @@ def build_control_center_snapshot(
             redactions: dict[str, str] = {}
             for field_name in ("issue_ref", "change_request_ref", "run_ref"):
                 value = getattr(status, field_name)
-                if value and _CREDENTIAL_REFERENCE.search(value):
+                # Userinfo AND token shapes: a ledger reference like
+                # runRef=https://ci.example/run?access=ghp_... carries the
+                # secret in its query string, with no userinfo to catch.
+                if value and (
+                    _CREDENTIAL_REFERENCE.search(value) or _carries_credential_token(value)
+                ):
                     redactions[field_name] = ""
                     credential_references += 1
-                elif value and len(value) > 512:
+                elif value and _utf16_units(value) > 512:
                     # The console bounds every rendered reference at 512
-                    # characters, so the producer withholds overlong values
-                    # rather than emitting a snapshot its own viewer rejects.
+                    # UTF-16 code units (JavaScript's value.length), so the
+                    # producer measures in the SAME units and withholds
+                    # overlong values rather than emitting a snapshot its
+                    # own viewer rejects.
                     redactions[field_name] = ""
                     overlong_references += 1
             if redactions:

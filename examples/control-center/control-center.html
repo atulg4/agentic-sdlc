@@ -802,6 +802,21 @@
     // store would crash every viewer, so every shape a renderer touches is
     // checked before the document is adopted or persisted.
     const isObj = (entry) => entry !== null && typeof entry === "object" && !Array.isArray(entry);
+    // Token-shaped credentials hide in query strings and fragments with no
+    // userinfo to catch, and percent-encoding (%67hp_, ghp%5F) defeats a raw
+    // scan: bounded peeling decodes each layer before scanning, mirroring
+    // the producer's _carries_credential_token.
+    const tokenShaped = (raw) => {
+      let decoded = String(raw);
+      for (let pass = 0; pass < 3; pass += 1) {
+        if (/gh[pousr]_|github_pat_|glpat-/i.test(decoded)) return true;
+        let peeled;
+        try { peeled = decodeURIComponent(decoded); } catch { break; }
+        if (peeled === decoded) break;
+        decoded = peeled;
+      }
+      return /gh[pousr]_|github_pat_|glpat-/i.test(decoded);
+    };
     if (!isObj(value)) return "That is not a snapshot document.";
     if (value.schemaVersion !== SCHEMA) return `Unsupported snapshot schemaVersion: ${value.schemaVersion}. This page renders version ${SCHEMA}.`;
     if (!Array.isArray(value.projects)) return "The snapshot has no projects array.";
@@ -965,7 +980,7 @@
             if (typeof value !== "string" || value.length > 512) {
               return `${where} work unit ${unit.workUnitId} ${field} must be a bounded string.`;
             }
-            if (/:\/\/[^/?#\s]*@/.test(value)) {
+            if (/:\/\/[^/?#\s]*@/.test(value) || tokenShaped(value)) {
               return `${where} work unit ${unit.workUnitId} ${field} must not embed credentials.`;
             }
           }
@@ -1084,7 +1099,7 @@
           if (typeof value !== "string" || value.length > 512) {
             return `${where} incident ${incident.incidentId} ${field} must be a bounded string.`;
           }
-          if (/:\/\/[^/?#\s]*@/.test(value)) {
+          if (/:\/\/[^/?#\s]*@/.test(value) || tokenShaped(value)) {
             return `${where} incident ${incident.incidentId} ${field} must not embed credentials.`;
           }
         }
@@ -1128,15 +1143,22 @@
           const value = node[key];
           if (!value) continue;
           if (value.length > 512) return `${where} backlog node ${node.itemId} ${key} must be at most 512 characters.`;
-          if (/:\/\/[^/?#\s]*@/.test(value)) return `${where} backlog node ${node.itemId} ${key} must not embed credentials.`;
+          if (/:\/\/[^/?#\s]*@/.test(value) || tokenShaped(value)) return `${where} backlog node ${node.itemId} ${key} must not embed credentials.`;
         }
         if (node.url && !/^https:\/\//.test(node.url)) return `${where} backlog node ${node.itemId || ""} url must be https.`;
         // Mirror the producer: userinfo in a rendered href would expose the
         // credential to every viewer and send it during navigation.
         if (node.url && /:\/\/[^/?#\s]*@/.test(node.url)) return `${where} backlog node ${node.itemId || ""} url must not embed credentials.`;
         // Userinfo is not the only carrier: a token-shaped credential in the
-        // query string or fragment is the secret itself, rendered clickable.
-        if (node.url && /gh[pousr]_|github_pat_|glpat-/i.test(node.url)) return `${where} backlog node ${node.itemId || ""} url carries a token-shaped credential.`;
+        // query string or fragment — percent-encoded or not — is the secret
+        // itself, rendered clickable.
+        if (node.url && tokenShaped(node.url)) return `${where} backlog node ${node.itemId || ""} url carries a token-shaped credential.`;
+        // The renderer tests parentMissing by TRUTHINESS for the badge, so a
+        // digest-consistent rewrite carrying "false" (a truthy string) would
+        // pass the strict-true placement checks yet display the badge.
+        if (node.parentMissing !== undefined && typeof node.parentMissing !== "boolean") {
+          return `${where} backlog node ${node.itemId} parentMissing must be a boolean.`;
+        }
         // Placement must agree with the serialized parent link: the renderer
         // follows the nested arrays, so a child moved under another parent
         // would display a hierarchy no producer could build.
@@ -1178,7 +1200,7 @@
             if (typeof value !== "string" || value.length > 512) {
               return `${where} backlog node ${node.itemId} status ${field} must be a bounded string.`;
             }
-            if (/:\/\/[^/?#\s]*@/.test(value)) {
+            if (/:\/\/[^/?#\s]*@/.test(value) || tokenShaped(value)) {
               return `${where} backlog node ${node.itemId} status ${field} must not embed credentials.`;
             }
           }
