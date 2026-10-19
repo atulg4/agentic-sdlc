@@ -363,18 +363,23 @@ class LifecycleEvent:
     schema_version: int = EVENT_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
+        # Accepting a valid STRING is not enough: StrEnum equality lets it
+        # validate here while serialization (`self.stage.value`) and the
+        # projection's identity checks still expect enum members, so both
+        # fields are coerced to their members before anything else reads
+        # them. FactoryState/LifecycleStage raise for unknown values.
+        object.__setattr__(self, "stage", LifecycleStage(self.stage))
+        object.__setattr__(self, "state", FactoryState(self.state))
         # Stage and state travel together on EVERY construction path, direct
         # appends included: the document loader's check alone would let an
         # in-process event project a contradictory pair the console rejects.
-        # Equality, not identity: StrEnum members compare equal to their
-        # string values, so a string-typed field still validates.
         if (
-            self.stage != STAGE_FOR_STATE[FactoryState(self.state)]
-            and self.stage != LifecycleStage.DEPENDENCY_WAIT
+            self.stage is not STAGE_FOR_STATE[self.state]
+            and self.stage is not LifecycleStage.DEPENDENCY_WAIT
         ):
             raise LedgerError(
-                f"event {self.event_id}: stage {LifecycleStage(self.stage).value} "
-                f"disagrees with state {FactoryState(self.state).value}"
+                f"event {self.event_id}: stage {self.stage.value} "
+                f"disagrees with state {self.state.value}"
             )
 
     @property

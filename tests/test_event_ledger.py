@@ -722,3 +722,16 @@ def test_direct_construction_enforces_stage_state_agreement() -> None:
         _event(1, FactoryState.INTAKE, stage=LifecycleStage.MERGE)
     # dependency-wait stays the one declared exception.
     _event(1, FactoryState.APPROVED, stage=LifecycleStage.DEPENDENCY_WAIT)
+
+
+def test_direct_construction_coerces_string_stage_and_state():
+    # StrEnum equality lets a valid string pass the agreement check, but
+    # serialization and projection identity checks need the members: both
+    # fields are coerced at construction.
+    from dataclasses import replace
+
+    event = _event(1, FactoryState.INTAKE)
+    direct = replace(event, stage="intake", state="intake")
+    assert direct.stage is LifecycleStage.INTAKE
+    assert direct.state is FactoryState.INTAKE
+    assert direct.as_dict()["stage"] == "intake"

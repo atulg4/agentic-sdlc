@@ -5131,8 +5131,8 @@ def test_the_console_scopes_notes_and_bounds_its_work():
 
     html = Path("examples/control-center/control-center.html").read_text(encoding="utf-8")
     # Note identity carries the project, with a legacy-id fallback on reads.
-    assert "function noteKey(projectId, incidentId)" in html
-    assert "noteKey(incident.projectId, incident.incidentId)" in html
+    assert "function noteKey(projectId, provider, incidentId)" in html
+    assert "noteKey(incident.projectId, incident.sourceProvider, incident.incidentId)" in html
     # Backfilled notes survive subscription deliveries and are bounded.
     assert "for (const [key, entry] of backfilledEntries)" in html
     assert "if (wanted.length >= 200) break outer;" in html
@@ -5155,7 +5155,10 @@ def test_the_console_checks_membership_and_mirrors_its_writes():
     assert "state.notes.set(key, entry);" in html
     # Exact reads (legacy fallback included) only accept a record naming the
     # requested project and incident.
-    assert "entry.incidentId !== incidentId || entry.projectId !== projectId" in html
+    assert "entry.incidentId !== incidentId" in html
+    assert "|| entry.projectId !== projectId" in html
+    # A stored note that declares a provider attaches only to that provider.
+    assert "|| (entry.sourceProvider && entry.sourceProvider !== provider)" in html
     # generatedAt is required and must parse as a timestamp.
     assert "generatedAt must be an RFC 3339 timestamp." in html
     # Every backlog node carries its children array.
@@ -5315,7 +5318,10 @@ def test_the_console_pins_state_vocabulary_and_note_freshness():
     assert "new Set([...liveNoteKeys, ...retryNoteKeys])" in html
     assert "for (const key of retryNoteKeys) if (live.has(key)) retryNoteKeys.delete(key);" in html
     # Exact reads attach only records naming this project and incident.
-    assert "entry.incidentId !== incidentId || entry.projectId !== projectId" in html
+    assert "entry.incidentId !== incidentId" in html
+    assert "|| entry.projectId !== projectId" in html
+    # A stored note that declares a provider attaches only to that provider.
+    assert "|| (entry.sourceProvider && entry.sourceProvider !== provider)" in html
 
 
 def test_the_console_validates_backlog_provenance_and_scoped_liveness():
@@ -6134,3 +6140,82 @@ def test_same_path_providers_coexist_in_one_project():
     document = snapshot.as_dict()
     serialized = json.dumps(document)
     assert '"sourceProvider": "gitlab"' in serialized
+
+
+def test_credential_bearing_project_identifiers_fail_closed():
+    # A ledger project identifier is serialized as a project key, display
+    # name and warning text, so one embedding URL userinfo refuses the build
+    # with the value withheld.
+    # The registry-checked ledger would refuse the unregistered project, so
+    # the hostile projection comes through a permissive (registry-less)
+    # ledger — exactly the configuration the snapshot must still defend.
+    ledger = EventLedger()
+    for event in _chain(
+        TO_IMPLEMENTING,
+        work_unit="wu-1",
+        workUnit={
+            "projectId": "https://x:hunter2@host/project",
+            "workUnitId": "wu-1",
+        },
+    ):
+        event["workUnit"]["projectId"] = "https://x:hunter2@host/project"
+        ledger.append(load_lifecycle_event(event))
+    with pytest.raises(ControlCenterError, match="project identifier embeds URL userinfo") as err:
+        build_control_center_snapshot(
+            generated_at=NOW,
+            registry=REGISTRY,
+            projections=ledger.projections(),
+            incidents=load_incident_document(_incidents()),
+        )
+    assert "hunter2" not in str(err.value)
+
+
+def test_legacy_incident_ambiguity_spans_all_providers():
+    # A provider-less legacy incident whose item id exists under BOTH
+    # providers never joins, even when only one provider's item carries
+    # ledger evidence: one provider's approval must not retire the other
+    # provider's blocker.
+    ledger = _ledger(
+        *_chain(
+            TO_IMPLEMENTING,
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "issueRef": "acme/forge#1",
+            },
+        )
+    )
+    github_items = load_backlog_document(
+        {
+            "schemaVersion": BACKLOG_SCHEMA_VERSION,
+            "source": "github",
+            "items": [_backlog(title="GitHub task", issueRef="acme/forge#1")],
+        }
+    )
+    gitlab_items = load_backlog_document(
+        {
+            "schemaVersion": BACKLOG_SCHEMA_VERSION,
+            "source": "gitlab",
+            "items": [_backlog(title="GitLab task", declaredState="blocked")],
+        }
+    )
+    legacy = {
+        "schemaVersion": INCIDENT_SCHEMA_VERSION,
+        "incidents": [
+            _incident(
+                incidentId="acme/forge#1:untriaged",
+                kind="triage-needed",
+                severity="advisory",
+                backlogItemId="acme/forge#1",
+            )
+        ],
+    }
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        backlog=tuple(github_items) + tuple(gitlab_items),
+        incidents=load_incident_document(legacy),
+    )
+    kept = [item.incident_id for item in snapshot.get("forge").incidents]
+    assert kept == ["acme/forge#1:untriaged"]
