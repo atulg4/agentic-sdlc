@@ -440,10 +440,13 @@
             // or delete what the newer delivery just verified.
             if (delivery !== notesDelivery) return;
             const entry = snap?.data?.();
-            const separator = key.indexOf("\u0000");
-            const keyProject = key.slice(0, separator);
-            const keyIncident = key.slice(separator + 1);
-            if (entry && entry.incidentId === keyIncident && entry.projectId === keyProject) {
+            // Keys carry three components (project, provider, incident):
+            // splitting at the first separator alone would compare the
+            // incident id against "provider\0incident" and delete every
+            // provider-scoped cached note its exact read just verified.
+            const [keyProject, keyProvider, keyIncident] = key.split("\u0000");
+            if (entry && entry.incidentId === keyIncident && entry.projectId === keyProject
+              && (entry.sourceProvider || "") === (keyProvider || "")) {
               backfilledEntries.set(key, entry);
             } else {
               backfilledEntries.delete(key);
@@ -611,6 +614,30 @@
     // observed as edited or deleted.
     const generation = ++backfillGeneration;
     const attempted = new Set();
+    // A providerless legacy note may attach only when the identity is
+    // unambiguous in THIS snapshot: with GitHub and GitLab incidents sharing
+    // a project and incident id, one pre-migration acknowledgement must not
+    // appear on both cards.
+    const identityProviders = new Map();
+    const liveIdentities = new Set();
+    for (const project of document_.projects || []) {
+      for (const incident of project.incidents || []) {
+        if (!incident.incidentId) continue;
+        liveIdentities.add(noteKey(project.projectId, incident.sourceProvider, incident.incidentId));
+        const identity = (project.projectId || "") + "\u0000" + incident.incidentId;
+        if (!identityProviders.has(identity)) identityProviders.set(identity, new Set());
+        identityProviders.get(identity).add(incident.sourceProvider || "");
+      }
+    }
+    // The caches are bounded by the ADOPTED snapshot: a long-lived console
+    // observing many disjoint snapshots must not accumulate every note it
+    // ever read (a reappearing incident is simply exact-read again).
+    for (const key of [...backfilledEntries.keys()]) {
+      if (!liveIdentities.has(key)) { backfilledEntries.delete(key); state.notes.delete(key); }
+    }
+    for (const key of [...retryNoteKeys]) {
+      if (!liveIdentities.has(key)) retryNoteKeys.delete(key);
+    }
     let found = 0;
     for (;;) {
     if (generation !== backfillGeneration) return;
@@ -619,26 +646,31 @@
       for (const incident of project.incidents || []) {
         const key = noteKey(project.projectId, incident.sourceProvider, incident.incidentId);
         if (!incident.incidentId || liveNoteKeys.has(key) || attempted.has(key)) continue;
-        wanted.push([key, project.projectId, incident.sourceProvider || "", incident.incidentId]);
+        const identity = (project.projectId || "") + "\u0000" + incident.incidentId;
+        const soleProvider = identityProviders.get(identity)?.size === 1;
+        wanted.push([key, project.projectId, incident.sourceProvider || "", incident.incidentId, soleProvider]);
         if (wanted.length >= 200) break outer;
       }
     }
     if (!wanted.length) break;
     for (let start = 0; start < wanted.length; start += 10) {
-      await Promise.all(wanted.slice(start, start + 10).map(async ([key, projectId, provider, incidentId]) => {
+      await Promise.all(wanted.slice(start, start + 10).map(async ([key, projectId, provider, incidentId, soleProvider]) => {
         attempted.add(key);
         try {
           let snap = await state.db.doc("notes/" + (await docId(key))).get();
           let entry = snap?.data?.();
-          if (!entry) {
+          if (!entry && soleProvider) {
             // Notes recorded before keys were provider-scoped live at the
-            // project-scoped key, and older ones at the incident id alone.
+            // project-scoped key, and older ones at the incident id alone —
+            // read ONLY when this snapshot holds a single provider for the
+            // identity, or one legacy acknowledgement would attach to both
+            // providers' cards.
             snap = await state.db.doc(
               "notes/" + (await docId(projectId + "\u0000" + incidentId)),
             ).get();
             entry = snap?.data?.();
           }
-          if (!entry) {
+          if (!entry && soleProvider) {
             snap = await state.db.doc("notes/" + (await docId(incidentId))).get();
             entry = snap?.data?.();
           }
