@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 import random
@@ -102,13 +103,50 @@ def _authorization(path, title: str, body: str, **overrides):
             },
         },
         "stable": {"updatedAt": "2026-10-12T10:00:00Z", "attempts": 1},
+        # Freshly checked: dispatch refuses stale authorization.
+        "checkedAt": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
     }
     document.update(overrides)
     path.write_text(json.dumps(document), encoding="utf-8")
     return path
 
 
-def _run_history(path, agent_id="builder-agent", work_ref=WORK_REF):
+def _candidate_fixture(tmp_path, policy_file, extra_knowledge=""):
+    """A committed candidate repository: every dispatch pins its config."""
+    import subprocess
+
+    repo = tmp_path / "candidate-config"
+    repo.mkdir()
+    env = {
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.com",
+        "HOME": str(tmp_path),
+        "PATH": "/usr/bin:/bin",
+    }
+
+    def git(*argv):
+        subprocess.run(["git", "-C", str(repo), *argv], check=True, env=env, capture_output=True)
+
+    git("init", "-q", "-b", "main")
+    (repo / "agentic-sdlc.toml").write_text(
+        policy_file.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (repo / "knowledge.toml").write_text(KNOWLEDGE_TOML + extra_knowledge + "\n", encoding="utf-8")
+    git("add", "agentic-sdlc.toml", "knowledge.toml")
+    git("commit", "-q", "-m", "config")
+    pin = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        env=env,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return repo, git, pin
+
+
+def _run_history(path, agent_id="builder-agent", work_ref=WORK_REF, commit_sha=""):
     """Orchestrator state recording an implementation run of the work item."""
     from agentic_sdlc.orchestration import Orchestrator
 
@@ -142,6 +180,15 @@ def _run_history(path, agent_id="builder-agent", work_ref=WORK_REF):
         event_key="evt-run",
         timestamp="2026-10-12T09:10:00Z",
     )
+    if commit_sha:
+        run = engine.get(work_ref).runs[0]
+        engine.finish_run(
+            work_ref,
+            run.run_id,
+            result="succeeded",
+            timestamp="2026-10-12T09:20:00Z",
+            commit_sha=commit_sha,
+        )
     path.write_text(json.dumps(engine.as_dict()), encoding="utf-8")
     return path
 
@@ -1415,8 +1462,8 @@ def test_nonprintable_retrieval_failures_are_escaped(registry, policy):
 def test_the_cli_dispatches_through_the_packet_contract(tmp_path, policy_file, valid_body):
     from agentic_sdlc.cli import main as cli_main
 
-    knowledge = tmp_path / "knowledge.toml"
-    knowledge.write_text(KNOWLEDGE_TOML + "\n", encoding="utf-8")
+    repo, _git, pin = _candidate_fixture(tmp_path, policy_file)
+    knowledge = repo / "knowledge.toml"
     request = tmp_path / "request.json"
     request.write_text(
         json.dumps(
@@ -1434,10 +1481,12 @@ def test_the_cli_dispatches_through_the_packet_contract(tmp_path, policy_file, v
                         "implementation-approved",
                     ],
                 },
-                # Repository evidence would (rightly) demand the trusted
-                # candidate tree; this test exercises the packet contract
-                # itself, so the packet carries no records.
+                # Repository evidence would (rightly) demand readback; this
+                # test exercises the packet contract itself, so the packet
+                # carries no records — the dispatch still pins all of its
+                # configuration at the trusted revision.
                 "records": [],
+                "repositoryRevision": pin,
             }
         ),
         encoding="utf-8",
@@ -1461,7 +1510,16 @@ def test_the_cli_dispatches_through_the_packet_contract(tmp_path, policy_file, v
     )
     authorization = _authorization(tmp_path / "authorized.json", "P1: a bounded change", valid_body)
     artifact = tmp_path / "packet.json"
-    base = ["--config", str(policy_file), "--knowledge", str(knowledge), "--request", str(request)]
+    base = [
+        "--config",
+        str(repo / "agentic-sdlc.toml"),
+        "--knowledge",
+        str(knowledge),
+        "--request",
+        str(request),
+        "--candidate-repository",
+        str(repo),
+    ]
     assert cli_main(["context-packet", *base, "--output", str(artifact)]) == 0
     envelope_path = tmp_path / "envelope.json"
     assert (
@@ -1934,6 +1992,9 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
         capture_output=True,
         text=True,
     ).stdout.strip()
+    # The base is authenticated against the review target: origin/main in
+    # the candidate repository IS the base commit.
+    git("update-ref", "refs/remotes/origin/main", base)
     (repo / "a.txt").write_text("one\ntwo\n", encoding="utf-8")
     git("commit", "-q", "-am", "head")
     head = subprocess.run(
@@ -2009,7 +2070,7 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
     # run history naming who performed each mission the review must be
     # independent of, so an empty default can never let the roster's first
     # agent review its own work.
-    history_file = _run_history(tmp_path / "history.json")
+    history_file = _run_history(tmp_path / "history.json", commit_sha=head)
 
     # A derived artifact dispatches: durations are zeroed at derivation, so
     # the whole-document comparison is exact.
@@ -2081,6 +2142,7 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
     from agentic_sdlc.orchestration import Orchestrator
 
     other_unit = _run_history(tmp_path / "other-history.json", work_ref="example/project#999")
+    unanchored = _run_history(tmp_path / "unanchored-history.json")
     runless = Orchestrator()
     runless.create_unit(WORK_REF, event_key="evt-0", timestamp="2026-10-12T09:00:00Z")
     runless_file = tmp_path / "runless-history.json"
@@ -2089,6 +2151,9 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
         ([], "reviewer dispatch requires --history"),
         (["--history", str(other_unit)], "records no work unit"),
         (["--history", str(runless_file)], "reviewer dispatch requires --history"),
+        # A genuine but OLDER state (no producing run recording this head)
+        # must not supply the exclusions for this candidate.
+        (["--history", str(unanchored)], "records no producing run for candidate head"),
     ):
         assert (
             cli_main(
@@ -2243,6 +2308,33 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
     (repo / "ignored.txt").unlink()
     git("checkout", "--", "a.txt")
 
+    # The base is AUTHENTICATED: a caller-chosen base that is not the
+    # current review target refuses derivation.
+    git("update-ref", "refs/remotes/origin/main", head)
+    capsys.readouterr()
+    assert (
+        cli_main(
+            [
+                "context-packet",
+                "--config",
+                str(repo / "agentic-sdlc.toml"),
+                "--knowledge",
+                str(knowledge),
+                "--request",
+                str(request),
+                "--candidate-repository",
+                str(repo),
+                "--candidate-base",
+                base,
+                "--candidate-head",
+                head,
+            ]
+        )
+        == 2
+    )
+    assert "authoritative review target" in capsys.readouterr().err
+    git("update-ref", "refs/remotes/origin/main", base)
+
     # The dispatch path never accepts request JSON as pipeline evidence.
     tainted = tmp_path / "tainted.json"
     tainted.write_text(
@@ -2316,8 +2408,8 @@ def test_dispatch_packet_enforces_task_policy(tmp_path, policy_file, valid_body,
     # envelope just because it came in as a packet.
     from agentic_sdlc.cli import main as cli_main
 
-    knowledge = tmp_path / "knowledge.toml"
-    knowledge.write_text(KNOWLEDGE_TOML + "\n", encoding="utf-8")
+    repo, _git, pin = _candidate_fixture(tmp_path, policy_file)
+    knowledge = repo / "knowledge.toml"
     request = tmp_path / "request.json"
     request.write_text(
         json.dumps(
@@ -2326,6 +2418,7 @@ def test_dispatch_packet_enforces_task_policy(tmp_path, policy_file, valid_body,
                 "workRef": WORK_REF,
                 "task": {"title": "P1: a bounded change", "body": valid_body},
                 "records": [],
+                "repositoryRevision": pin,
             }
         ),
         encoding="utf-8",
@@ -2349,13 +2442,15 @@ def test_dispatch_packet_enforces_task_policy(tmp_path, policy_file, valid_body,
     )
     base = [
         "--config",
-        str(policy_file),
+        str(repo / "agentic-sdlc.toml"),
         "--knowledge",
         str(knowledge),
         "--request",
         str(request),
         "--agents",
         str(agents),
+        "--candidate-repository",
+        str(repo),
     ]
     assert cli_main(["dispatch-packet", *base]) == 2
     assert "dispatch blocked by task policy" in capsys.readouterr().err
@@ -2378,6 +2473,7 @@ def test_dispatch_packet_enforces_task_policy(tmp_path, policy_file, valid_body,
                     ],
                 },
                 "records": [],
+                "repositoryRevision": pin,
             }
         ),
         encoding="utf-8",
@@ -2399,6 +2495,10 @@ def test_dispatch_packet_enforces_task_policy(tmp_path, policy_file, valid_body,
         # ready, authorized and stable — but the verdict proves writers
         # applied only "harmless", not the policy approval set.
         {"authorization": {"authorized": True, "labelers": {"harmless": "maintainer"}}},
+        # A stale (or undated) result can authorize work the current issue
+        # state no longer permits.
+        {"checkedAt": "2026-10-12T10:00:00+00:00"},
+        {"checkedAt": None},
     ):
         bad = _authorization(
             tmp_path / "authorization.json", "P1: a bounded change", valid_body, **broken
@@ -2676,17 +2776,16 @@ def test_dispatch_refuses_unattested_evidence(tmp_path, policy_file, valid_body,
     # on the dispatch path.
     from agentic_sdlc.cli import main as cli_main
 
-    knowledge = tmp_path / "knowledge.toml"
-    knowledge.write_text(
-        KNOWLEDGE_TOML
-        + "\n\n[[source]]\n"
-        + 'id = "tracker"\n'
-        + 'type = "github-issues"\n'
-        + 'provider = "github"\n'
-        + 'locator = "https://github.com/example/project/issues"\n'
-        + 'scope = "example/project"\n',
-        encoding="utf-8",
+    tracker_source = (
+        "\n\n[[source]]\n"
+        'id = "tracker"\n'
+        'type = "github-issues"\n'
+        'provider = "github"\n'
+        'locator = "https://github.com/example/project/issues"\n'
+        'scope = "example/project"'
     )
+    repo, _git, pin = _candidate_fixture(tmp_path, policy_file, extra_knowledge=tracker_source)
+    knowledge = repo / "knowledge.toml"
     record = _record(
         source_id="tracker",
         source_type="github-issues",
@@ -2710,6 +2809,7 @@ def test_dispatch_refuses_unattested_evidence(tmp_path, policy_file, valid_body,
                     ],
                 },
                 "records": [record],
+                "repositoryRevision": pin,
             }
         ),
         encoding="utf-8",
@@ -2740,7 +2840,7 @@ def test_dispatch_refuses_unattested_evidence(tmp_path, policy_file, valid_body,
             [
                 "dispatch-packet",
                 "--config",
-                str(policy_file),
+                str(repo / "agentic-sdlc.toml"),
                 "--knowledge",
                 str(knowledge),
                 "--request",
@@ -2749,6 +2849,8 @@ def test_dispatch_refuses_unattested_evidence(tmp_path, policy_file, valid_body,
                 str(agents),
                 "--authorization",
                 str(authorization),
+                "--candidate-repository",
+                str(repo),
             ]
         )
         == 2

@@ -121,6 +121,16 @@ def test_derivation_tree_materializes_the_committed_content(tmp_path: Path) -> N
             text=True,
         )
         assert cloned_config.returncode != 0
+        # The remote is disconnected: a gate (or candidate code a gate runs)
+        # must not be able to push to or edit the caller's real repository.
+        url = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=tree,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert url == "/var/empty/agentic-sdlc-derivation-disconnected"
     # The tree is removed afterwards and the caller's own state is untouched.
     assert not kept.exists()
     assert (repo / "a.txt").read_text(encoding="utf-8") == "uncommitted\n"

@@ -514,6 +514,23 @@ def derivation_tree(repository: str | Path, rev: str) -> Iterator[Path]:
             str(tree),
             "fetch",
         )
+        # The clone's origin URL names the caller's real Git directory: a
+        # gate — or candidate code a gate runs — could push refs or edit that
+        # repository through it. The refs are mirrored already, so the remote
+        # is repointed at an inert, non-writable location.
+        _exec(
+            [
+                program,
+                "-C",
+                str(tree),
+                "remote",
+                "set-url",
+                "origin",
+                "/var/empty/agentic-sdlc-derivation-disconnected",
+            ],
+            str(tree),
+            "remote",
+        )
         _exec(
             [
                 program,

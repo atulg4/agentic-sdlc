@@ -1099,7 +1099,14 @@ def build_context_packet(
             record = replace(record, anchors=tuple(record.anchors), links=tuple(record.links))
         source = sources.get(record.source_id)
         if source is None:
-            raise ContextBuilderError(f"evidence cites an undeclared source: {record.source_id}")
+            # The id is request-controlled text headed for stderr and CI
+            # logs: a token-shaped value is withheld like every other echo.
+            shown = (
+                record.source_id
+                if not secret_like_text(record.source_id) and record.source_id.isprintable()
+                else "(value withheld)"
+            )
+            raise ContextBuilderError(f"evidence cites an undeclared source: {shown}")
         try:
             authorize_source(source, mission)
         except KnowledgeError as error:

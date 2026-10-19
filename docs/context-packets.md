@@ -244,11 +244,19 @@ revision variables rebound (`GITHUB_SHA` to the candidate head,
 cleared), so an Actions-style gate can neither read the caller's checkout
 nor test the ambient workflow's revision. The clone also mirrors the
 source's remote-tracking and tag refs, since CI checkouts often carry the
-candidate only on `origin/*`. The PACKET configuration — the policy AND the
+candidate only on `origin/*`, and then disconnects its `origin` remote, so
+a gate — or candidate code a gate runs — cannot push to or edit the
+caller's real repository. The `--candidate-base` is authenticated against
+the review target: it must be the current `origin/<default branch>` of the
+candidate repository, so a caller-chosen later ancestor cannot hide
+already-landed changes from the verified diff. The PACKET configuration — the policy AND the
 mission registry and knowledge sources — is read from the same committed
-tree on every candidate path (paths judged lexically, never through
-symlinks), so an uncommitted caller-side edit to any of those files shapes
-nothing. The derivation also reads every
+tree on every candidate path (paths judged lexically with relative values
+repository-relative, never through symlinks), so an uncommitted caller-side
+edit to any of those files shapes nothing — and EVERY dispatch pins it:
+`dispatch-packet` requires `--candidate-repository` (builders pin the
+full-SHA `repositoryRevision`, reviewers the candidate head) even when the
+request carries no records. The derivation also reads every
 pinned repository
 record's payload back from the candidate tree through the adapter's own
 sanitization — a fabricated payload with a self-consistent hash is
@@ -273,8 +281,10 @@ Write-capable dispatches also re-run the task policy
 (`evaluate_task(..., "implement")`) and require `--authorization`: the
 `check-request --authorize-labels` result, which must be ready, authorized
 and stable, must name this exact project, work item, and content digest,
-and whose verdict must cover exactly the policy's implementation, ready,
-and human-review labels — label names spelled into caller-supplied request
+must be FRESH (`checkedAt` within `--authorization-max-age-seconds`,
+default 900, since labels, dependencies, and pull requests all move after
+a check), and whose verdict must cover exactly the policy's implementation,
+ready, and human-review labels — label names spelled into caller-supplied request
 JSON are not approval evidence, and neither is a verdict narrowed to a
 caller-selected label. Reviewer dispatches require `--history`: the
 ORCHESTRATOR STATE document, replayed through the orchestrator's own
@@ -283,7 +293,9 @@ identity) define the independence exclusions — EVERY agent that performed a
 producing mission is excluded, not only the last assignee, and producing
 status comes from each run's persisted `implementation`/`repair` kind, so a
 mission later removed or rewritten cannot launder its agents back into
-review eligibility. A
+review eligibility. The state must also be the history of THIS candidate:
+some producing run must record the candidate head as its `commit_sha`, or
+an older genuine state would omit the agent who produced the head. A
 caller-authored mission→agent map is not authoritative, and a state
 recording no producing run for any mission the review is independent of
 refuses dispatch.

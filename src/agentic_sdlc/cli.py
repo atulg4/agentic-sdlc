@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import datetime
 import hashlib
 import json
 import math
@@ -717,6 +718,10 @@ def _check_request(args: argparse.Namespace) -> int:
             f"UNSTABLE: #{args.issue} changed during each of {CHECK_REQUEST_ATTEMPTS} checks "
             f"({', '.join(moved)}); not concluding"
         )
+    # When the judgement was made, for consumers that must refuse stale
+    # authorization: labels, dependencies, and pull requests all move after
+    # a check, so the result's age is part of what it attests.
+    result["checkedAt"] = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
     _write(result, args.output)
     _status(message)
     return code
@@ -837,7 +842,11 @@ def _candidate_rel(args: argparse.Namespace, value: str, flag: str) -> Path:
     the committed object at that exact path is what gets read.
     """
     repo_root = Path(os.path.abspath(args.candidate_repository))
-    candidate = Path(os.path.abspath(value))
+    # A RELATIVE value is repository-relative by contract — a central
+    # orchestrator addressing another checkout by path must not have its
+    # config resolved against the process working directory.
+    joined = value if os.path.isabs(value) else os.path.join(repo_root, value)
+    candidate = Path(os.path.normpath(joined))
     try:
         return candidate.relative_to(repo_root)
     except ValueError:
@@ -862,7 +871,9 @@ def _committed_configuration(args: argparse.Namespace, pinned: str, value: str, 
         ) from error
 
 
-def _derived_verification(args: argparse.Namespace, request: dict) -> VerificationEvidence:
+def _derived_verification(
+    args: argparse.Namespace, request: dict, policy: ProjectPolicy
+) -> VerificationEvidence:
     """Reviewer verification DERIVED from the candidate repository itself.
 
     The diff summary comes from ``collect_commit_diff`` over the resolved
@@ -876,6 +887,21 @@ def _derived_verification(args: argparse.Namespace, request: dict) -> Verificati
         )
     base = resolve_commit(args.candidate_repository, args.candidate_base)
     head = resolve_commit(args.candidate_repository, args.candidate_head)
+    # The base is AUTHENTICATED, never merely resolvable: a caller-chosen
+    # later ancestor would hide already-landed changes from the verified
+    # diff while still presenting it as trusted verification of the head.
+    try:
+        expected_base = resolve_commit(args.candidate_repository, f"origin/{policy.default_branch}")
+    except GitDiffError as error:
+        raise ContextBuilderError(
+            f"the candidate repository has no origin/{policy.default_branch}; "
+            "fetch the authoritative review target before deriving verification"
+        ) from error
+    if base != expected_base:
+        raise ContextBuilderError(
+            "--candidate-base must be the current authoritative review target "
+            f"(origin/{policy.default_branch} is {expected_base})"
+        )
     snapshot = collect_commit_diff(args.candidate_repository, base, head)
     # Gate definitions are repository-owned: reading --config from the
     # caller's checkout would let an uncommitted edit replace the real test
@@ -1000,6 +1026,27 @@ def _check_dispatch_authorization(args: argparse.Namespace, policy, packet) -> N
             "the authorization result was taken for different request content; "
             "re-run check-request --authorize-labels against the current title "
             "and body"
+        )
+    # A stale but genuine result can authorize work the CURRENT issue state
+    # no longer permits (a removed label, a reopened dependency, a fresh
+    # pull request), so the result must be recent.
+    checked_at = document.get("checkedAt")
+    try:
+        checked = datetime.datetime.fromisoformat(str(checked_at))
+    except (TypeError, ValueError):
+        checked = None
+    if checked is None or checked.tzinfo is None:
+        raise ContextBuilderError(
+            "the authorization result records no checkedAt instant; re-run "
+            "check-request --authorize-labels with the current CLI"
+        )
+    age = (datetime.datetime.now(datetime.UTC) - checked).total_seconds()
+    if age < 0 or age > args.authorization_max_age_seconds:
+        raise ContextBuilderError(
+            "the authorization result is older than "
+            f"{args.authorization_max_age_seconds} seconds (or from the "
+            "future); re-run check-request --authorize-labels and dispatch "
+            "promptly"
         )
 
 
@@ -1132,7 +1179,7 @@ def _build_packet_from_request(
                 "derives it from the candidate repository"
             )
         if role == "reviewer":
-            verification = _derived_verification(args, request)
+            verification = _derived_verification(args, request, policy)
             pin = verification.head_sha
         else:
             # Builders and testers must not receive verification evidence,
@@ -1166,16 +1213,16 @@ def _build_packet_from_request(
                 "--candidate-head instead of request verification"
             )
         verification = verification_from_dict(request["verification"])
-    elif trusted_verification_only and any(
-        record.source_type == "git-repository" for record in records
-    ):
-        # A record's self-declared content hash proves nothing about any
-        # TREE: without readback a write-capable dispatch would hand the
-        # implementation agent attacker-chosen source under a self-consistent
-        # citation, so repository evidence never dispatches unverified.
+    elif trusted_verification_only:
+        # Every dispatch pins its configuration, evidence or not: a request
+        # with no records would otherwise read policy, missions, and
+        # knowledge from the mutable working tree, and a repository record's
+        # self-declared content hash proves nothing about any tree without
+        # readback.
         raise ContextBuilderError(
-            "dispatch with repository evidence requires --candidate-repository "
-            "so every pinned payload is read back from the trusted tree"
+            "dispatch-packet requires --candidate-repository: every dispatch "
+            "pins repository-owned configuration at the trusted revision, and "
+            "pinned payloads are read back from it"
         )
     if trusted_verification_only:
         # Only repository evidence has a trusted readback today: every other
@@ -1264,6 +1311,7 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
     agents = load_agents(json.loads(Path(args.agents).read_text(encoding="utf-8")))
     history: dict[str, list[str]] = {}
     producing_agents: set[str] = set()
+    unit_runs: tuple = ()
     if args.history:
         # The history is the ORCHESTRATOR STATE, not a bare mission→agent
         # map: a caller-authored map could record "" (or any other agent) for
@@ -1280,7 +1328,8 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
                 f"the run history records no work unit {packet.work_ref}; pass "
                 "the orchestrator state that dispatched this work item"
             ) from error
-        for run in unit.runs:
+        unit_runs = tuple(unit.runs)
+        for run in unit_runs:
             # EVERY agent that performed the mission is excluded, not only
             # the last assignee: a work item can carry several runs of one
             # producing mission by different agents.
@@ -1304,6 +1353,20 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
                 "reviewer dispatch requires --history: the orchestrator state "
                 "recording the producing runs of this work item (none of the "
                 "missions this review is independent of has a recorded run)"
+            )
+        # The state must be the history of THIS candidate: a genuine but
+        # older state from before a repair would omit the agent who produced
+        # the head, so some producing run must record the candidate head as
+        # the commit it produced.
+        head_sha = packet.verification.head_sha if packet.verification else ""
+        if not any(
+            run.kind in ("implementation", "repair") and run.commit_sha == head_sha
+            for run in unit_runs
+        ):
+            raise MissionError(
+                "the run history records no producing run for candidate head "
+                f"{head_sha}; finish the producing run with its commit_sha so "
+                "review exclusions bind to the candidate under review"
             )
     # Roster order defines fallbacks: an eligible agent whose declared
     # context window cannot fit the packet is skipped for the next eligible
@@ -2351,6 +2414,7 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch_packet.add_argument("--agents", required=True)
     dispatch_packet.add_argument("--history")
     dispatch_packet.add_argument("--authorization")
+    dispatch_packet.add_argument("--authorization-max-age-seconds", type=int, default=900)
     dispatch_packet.add_argument("--packet")
     dispatch_packet.add_argument("--input-ref", action="append", default=[])
     dispatch_packet.add_argument("--output")
