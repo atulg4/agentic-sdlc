@@ -836,6 +836,16 @@
       // pinned: deleting it must not read as an empty ledger.
       if (!isObj(project.counts)) return `${where}.counts must be an object.`;
       if (!isObj(project.counts.byState)) return `${where}.counts.byState must be an object.`;
+      const waitingByState = project.counts.dependencyWaitByState;
+      if (waitingByState !== undefined) {
+        if (!isObj(waitingByState)) return `${where}.counts.dependencyWaitByState must be an object.`;
+        for (const key of Object.keys(waitingByState)) {
+          const value = waitingByState[key];
+          if (!Number.isInteger(value) || value < 0 || value > (project.counts.byState[key] || 0)) {
+            return `${where}.counts.dependencyWaitByState.${key} must fit within its state count.`;
+          }
+        }
+      }
       const states = Object.keys(project.counts.byState);
       if (states.length > 64) return `${where}.counts.byState holds more than 64 states.`;
       // The producer's FactoryState enum is closed: an unknown key would sit
@@ -921,6 +931,11 @@
             if (unit.needsAttention !== false || !executing.includes(unit.state)) {
               return `${where} active lists work unit ${unit.workUnitId} outside the executing, no-attention states.`;
             }
+            // Nothing executes during a dependency wait: the producer never
+            // lists such a unit as running now.
+            if (unit.stage === "dependency-wait") {
+              return `${where} active lists work unit ${unit.workUnitId} during a dependency wait.`;
+            }
             // The producer excludes review gates without recorded activity,
             // so an activity-less reviewing unit is never producer output.
             if ((unit.state === "reviewing" || unit.state === "re-reviewing")
@@ -940,7 +955,8 @@
       // gates may be fewer (activity-less ones are excluded), and every
       // attention-state unit must appear in attention.
       for (const key of ["implementing", "verifying", "repairing", "deploying", "deployment-verifying", "rolling-back"]) {
-        if ((activeByState[key] || 0) !== (project.counts.byState[key] || 0)) {
+        const waiting = (project.counts.dependencyWaitByState || {})[key] || 0;
+        if ((activeByState[key] || 0) !== (project.counts.byState[key] || 0) - waiting) {
           return `${where} active must list every unit its ${key} count holds.`;
         }
       }
@@ -1007,7 +1023,7 @@
       const stack = (project.backlog || []).map((entry) => [entry, 1, null]);
       let visited = 0;
       while (stack.length) {
-        const [node, depth, placedUnder] = stack.pop();
+        const [node, depth, placedUnder, placedProvider] = stack.pop();
         if (depth > 32) return `${where} backlog nests deeper than 32 levels.`;
         if (!isObj(node) || typeof node.title !== "string") return `${where} has a malformed backlog node.`;
         if (typeof node.itemId !== "string" || !node.itemId) return `${where} has a backlog node without a string itemId.`;
@@ -1037,6 +1053,10 @@
           if (!node.parentId && node.parentMissing === true) return `${where} backlog root ${node.itemId} is flagged parent-missing without a parent.`;
         } else {
           if (node.parentId !== placedUnder) return `${where} backlog node ${node.itemId} sits under ${placedUnder} but names another parent.`;
+          // Parent joins are provider-scoped in the producer: a child nested
+          // under a same-spelled parent from ANOTHER provider is a hierarchy
+          // no producer could build.
+          if ((node.sourceProvider || "") !== placedProvider) return `${where} backlog node ${node.itemId} sits under another provider's parent.`;
           if (node.parentMissing === true) return `${where} backlog node ${node.itemId} is flagged parent-missing while placed under its parent.`;
         }
         // State provenance is a closed contract: the kind vocabulary, the
@@ -1087,7 +1107,7 @@
         // The producer's combined per-project budget counts EVERY node, so
         // the traversal holds nested nodes to the same 5000-item limit.
         if (visited > 5000) return `${where} backlog holds more than 5000 nodes or is cyclic.`;
-        for (const child of node.children || []) stack.push([child, depth + 1, node.itemId]);
+        for (const child of node.children || []) stack.push([child, depth + 1, node.itemId, node.sourceProvider || ""]);
       }
       totalItems += visited;
       totalIncidents += project.incidents.length;
@@ -1351,14 +1371,20 @@
   }
 
   /* ---------- backlog tree ---------- */
+  function openKey(projectId, node) {
+    // Disclosure is keyed by the node's FULL identity: same-spelled items
+    // from two providers (or two projects) must not share expansion state.
+    return (projectId || "") + "\u0000" + (node.sourceProvider || "") + "\u0000" + (node.itemId || "");
+  }
+
   function backlogCard(project) {
     const roots = project.backlog || [];
     const card = el("div", { class: "card" },
       el("div", { class: "between" },
         el("h3", { text: `Epics, stories and tasks (${project.counts?.backlogItems ?? 0})` }),
         roots.length ? el("div", { class: "row" },
-          el("button", { class: "btn sm", type: "button", on: { click: () => { expandAll(roots, true); render(); } } }, "Expand all"),
-          el("button", { class: "btn sm", type: "button", on: { click: () => { expandAll(roots, false); render(); } } }, "Collapse"),
+          el("button", { class: "btn sm", type: "button", on: { click: () => { expandAll(project.projectId, roots, true); render(); } } }, "Expand all"),
+          el("button", { class: "btn sm", type: "button", on: { click: () => { expandAll(project.projectId, roots, false); render(); } } }, "Collapse"),
         ) : null,
       ),
     );
@@ -1366,26 +1392,28 @@
       card.append(el("p", { class: "small muted", text: "No backlog has been exported for this project yet." }));
       return card;
     }
-    card.append(el("ul", { class: "tree" }, roots.map((node) => treeNode(node))));
+    card.append(el("ul", { class: "tree" }, roots.map((node) => treeNode(project.projectId, node))));
     return card;
   }
 
-  function expandAll(nodes, open) {
+  function expandAll(projectId, nodes, open) {
     for (const node of nodes) {
-      if (open) state.open.add(node.itemId); else state.open.delete(node.itemId);
-      expandAll(node.children || [], open);
+      const key = openKey(projectId, node);
+      if (open) state.open.add(key); else state.open.delete(key);
+      expandAll(projectId, node.children || [], open);
     }
   }
 
-  function treeNode(node) {
+  function treeNode(projectId, node) {
     const kids = node.children || [];
-    const isOpen = state.open.has(node.itemId);
+    const key = openKey(projectId, node);
+    const isOpen = state.open.has(key);
     const unknown = node.stateBasis && node.stateBasis.startsWith("state unknown");
     const head = el("div", { class: "node-head" },
       kids.length ? el("button", {
         class: "twist", type: "button", "aria-expanded": isOpen ? "true" : "false",
         "aria-label": isOpen ? "Collapse" : "Expand",
-        on: { click: () => { if (isOpen) state.open.delete(node.itemId); else state.open.add(node.itemId); render(); } },
+        on: { click: () => { if (isOpen) state.open.delete(key); else state.open.add(key); render(); } },
       }, isOpen ? "▾" : "▸") : el("span", { class: "twist muted", text: KIND_ICON[node.kind] || "·" }),
       el("div", { class: "node-title" },
         node.url
@@ -1402,7 +1430,7 @@
       ),
     );
     const item = el("li", { class: "node" }, head);
-    if (kids.length && isOpen) item.append(el("ul", null, kids.map((kid) => treeNode(kid))));
+    if (kids.length && isOpen) item.append(el("ul", null, kids.map((kid) => treeNode(projectId, kid))));
     return item;
   }
 

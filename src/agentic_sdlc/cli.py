@@ -1293,13 +1293,14 @@ def _github_backlog(args: argparse.Namespace) -> int:
         and Path(args.incidents_output).resolve() == Path(args.backlog_output or "").resolve()
     ):
         raise ControlCenterError("--backlog-output and --incidents-output name the same file")
-    if args.failing and not args.incidents_output:
-        # Classified failing checks land in the incident document alone: an
+    if (args.pulls or args.failing) and not args.incidents_output:
+        # Classified change-request blockers (merge conflicts, behind
+        # branches, failing checks) land in the incident document alone: an
         # export that validated them and then silently dropped the document
-        # would leave the CI blockers absent from the next snapshot.
+        # would leave those blockers absent from the next snapshot.
         raise ControlCenterError(
-            "--failing requires --incidents-output; the classified failing "
-            "checks have no destination without the incident document"
+            "--pulls and --failing classify change-request incidents, so they "
+            "require --incidents-output"
         )
     sub_issue_paths = [
         entry.partition("=")[2]

@@ -1609,4 +1609,4 @@ def test_github_backlog_failing_requires_an_incident_destination(tmp_path, capsy
         )
         == 2
     )
-    assert "--failing requires --incidents-output" in capsys.readouterr().err
+    assert "require --incidents-output" in capsys.readouterr().err

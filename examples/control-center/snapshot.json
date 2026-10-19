@@ -1108,6 +1108,7 @@
         "blockers": 7,
         "byStage": {},
         "byState": {},
+        "dependencyWaitByState": {},
         "incidents": 34,
         "workUnits": 0
       },
@@ -2163,6 +2164,7 @@
         "blockers": 0,
         "byStage": {},
         "byState": {},
+        "dependencyWaitByState": {},
         "incidents": 0,
         "workUnits": 0
       },
@@ -2197,6 +2199,7 @@
         "blockers": 0,
         "byStage": {},
         "byState": {},
+        "dependencyWaitByState": {},
         "incidents": 0,
         "workUnits": 0
       },
@@ -2217,7 +2220,7 @@
     }
   ],
   "schemaVersion": 1,
-  "snapshotSha256": "42b621b0f0cd4614f43f515f5cc19625448745295b81604a092376fb25e4a778",
+  "snapshotSha256": "b95e682a8153f8e9ea86d922c6f8cda539c8405d4efda58beaab2afe0e92e4ab",
   "sources": [
     "registry:examples/control-center/project-registry.json",
     "backlog:examples/control-center/backlog.json",
