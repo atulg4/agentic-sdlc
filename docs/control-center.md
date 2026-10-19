@@ -139,6 +139,16 @@ the generated workflows fire on; the adapter then evaluates those names.
 Without it, the platform defaults (`agent-ready`, `human-review-required`,
 `implementation-approved`) apply. The spec labels are platform-fixed.
 
+A computed incident always needs a destination: the export refuses without
+`--incidents-output` whenever `--pulls`/`--failing` request change-request
+classification OR the issues payload itself yields incidents (an untriaged
+open issue, an approved issue missing its dispatch labels) — silently
+dropping the generated incident document would leave those blockers absent
+from the next snapshot. Rejected URL values (a malformed `repository_url`,
+`html_url` or `parent_issue_url`) are withheld from error messages when they
+carry userinfo or token-shaped text, since those messages reach stderr and
+CI logs.
+
 A change request without a mergeability verdict in its payload is never
 reported as "ready and waiting": unknown is not a state, so feed the command
 detail payloads, not the list response. `--sub-issues` prefers the

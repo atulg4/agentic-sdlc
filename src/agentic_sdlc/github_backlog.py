@@ -52,6 +52,29 @@ def _require(condition: bool, message: str) -> None:
 _PARENT_URL = re.compile(r"/issues/(\d+)/?$")
 _PARENT_REPOSITORY = re.compile(r"^https://api\.github\.com/repos/([^/\s]+/[^/\s]+)/issues/\d+/?$")
 _REPOSITORY_URL = re.compile(r"^https://api\.github\.com/repos/([^/\s]+/[^/\s]+)/?$")
+#: Rejected URL values can carry what a URL may carry: userinfo before the
+#: host (https://user:secret@...), token-shaped query text, control
+#: characters. Rejection messages reach stderr and typically CI logs, so a
+#: value showing any of those is withheld from the error rather than echoed.
+_SECRETISH_TEXT = re.compile(
+    r"credential|secret|token|password|passphrase|api_?key|authorization|bearer|private_?key",
+    re.IGNORECASE,
+)
+
+
+def _shown_url(url: str) -> str:
+    """A rejected URL value as a controlled error may show it."""
+    cleaned = url.strip()
+    if (
+        "@" in cleaned
+        or len(cleaned) > 200
+        or not cleaned.isprintable()
+        or _SECRETISH_TEXT.search(cleaned)
+    ):
+        return "(withheld: the rejected value is not echoed into errors)"
+    return cleaned
+
+
 #: A GitHub issue's own web address, exactly: the exported link must identify
 #: the validated repository and number, never an arbitrary https destination.
 #: Pull records never reach the backlog, so /pull/ is NOT accepted: an issue
@@ -112,7 +135,7 @@ def _issue_repository(issue: Mapping[str, Any], repository: str) -> str:
     match = _REPOSITORY_URL.search(url)
     _require(
         match is not None,
-        f"issue {number!r}: repository_url is not a recognized repository URL: {url}",
+        f"issue {number!r}: repository_url is not a recognized repository URL: {_shown_url(url)}",
     )
     assert match is not None
     name = match.group(1)
@@ -619,13 +642,15 @@ def backlog_document_from_issues(
             match = _ISSUE_URL.fullmatch(url.strip())
             _require(
                 match is not None,
-                f"issue {number!r}: html_url is not a recognized GitHub issue URL: {url}",
+                f"issue {number!r}: html_url is not a recognized GitHub issue "
+                f"URL: {_shown_url(url)}",
             )
             assert match is not None
             _require(
                 match.group("name").lower() == repository.lower()
                 and int(match.group("number")) == number,
-                f"issue {number!r}: html_url does not identify {repository}#{number}: {url}",
+                f"issue {number!r}: html_url does not identify "
+                f"{repository}#{number}: {_shown_url(url)}",
             )
             item["url"] = url.strip()
         updated = issue.get("updated_at")
@@ -984,7 +1009,7 @@ def parent_links(
                 _require(
                     _PARENT_REPOSITORY.search(url) is not None,
                     f"sub-issue record {number}: parent_issue_url is not a "
-                    f"recognized GitHub issue URL: {url}",
+                    f"recognized GitHub issue URL: {_shown_url(url)}",
                 )
                 match = _PARENT_URL.search(url)
                 if match is not None and int(match.group(1)) > 0:

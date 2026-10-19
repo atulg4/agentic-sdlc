@@ -1302,6 +1302,18 @@ def _github_backlog(args: argparse.Namespace) -> int:
             "--pulls and --failing classify change-request incidents, so they "
             "require --incidents-output"
         )
+    if any(groups) and not args.incidents_output:
+        # Issue-level incidents (an approved issue missing its dispatch
+        # labels, say) are generated from --issues alone: computing them and
+        # silently dropping the document would leave those blockers absent
+        # from the next snapshot exactly like a dropped change-request
+        # classification, so a nonempty incident group always needs a
+        # destination.
+        raise ControlCenterError(
+            "the issues payload yields incidents, so this export requires "
+            "--incidents-output; without it the generated incident document "
+            "would be dropped"
+        )
     sub_issue_paths = [
         entry.partition("=")[2]
         if "=" in entry and entry.partition("=")[0].strip().isdigit()

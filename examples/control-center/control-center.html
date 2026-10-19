@@ -863,6 +863,31 @@
       // The producer's shared per-project budget: it rejects more than 5000
       // work units, so a byState summing past that is never producer output.
       if (stateTotal > 5000) return `${where}.counts.byState sums past the 5000-unit budget.`;
+      // byStage is the stage half of the same census: every unit carries
+      // exactly one stage and one state, so the stage keys are closed, the
+      // two totals agree, and the dependency-wait exemptions must sum to
+      // EXACTLY the dependency-wait stage count — a re-signed store document
+      // cannot park running implementing units behind inflated exemptions
+      // while byStage still says implementation.
+      if (!isObj(project.counts.byStage)) return `${where}.counts.byStage must be an object.`;
+      const lifecycleStages = ["intake", "specification", "planning", "dependency-wait", "dispatch", "implementation", "deterministic-verification", "independent-review", "repair", "re-review", "merge", "deploy", "deployment-verification", "live", "rollback", "blocked", "failed", "cancelled", "superseded"];
+      let stageTotal = 0;
+      for (const key of Object.keys(project.counts.byStage)) {
+        if (!lifecycleStages.includes(key)) return `${where}.counts.byStage names an unknown stage: ${key}.`;
+        const count = project.counts.byStage[key];
+        if (!Number.isInteger(count) || count < 0) {
+          return `${where}.counts.byStage.${key} must be a non-negative integer.`;
+        }
+        stageTotal += count;
+      }
+      if (stageTotal !== stateTotal) {
+        return `${where}.counts.byStage disagrees with byState on the unit total.`;
+      }
+      let exempted = 0;
+      for (const key of Object.keys(waitingByState || {})) exempted += waitingByState[key];
+      if (exempted !== (project.counts.byStage["dependency-wait"] || 0)) {
+        return `${where}.counts.dependencyWaitByState must sum to the dependency-wait stage count.`;
+      }
       // active and attention are disjoint subsets of the same status map, so
       // together they can never exceed the validated unit total.
       if ((project.active || []).length + (project.attention || []).length > stateTotal) {
