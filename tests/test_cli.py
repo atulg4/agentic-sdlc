@@ -828,6 +828,7 @@ def test_orchestrate_attests_only_runs_a_trusted_dispatch_produced(tmp_path: Pat
         "inputRefs": [],
         "promptSha256": "0" * 64,
         "packetRole": "builder",
+        "runKind": "implementation",
     }
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
     envelope = {**body, "envelopeSha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest()}
@@ -865,6 +866,10 @@ def test_orchestrate_attests_only_runs_a_trusted_dispatch_produced(tmp_path: Pat
     assert main([*start, _envelope_file("relabeled.json", {**signed, "agentId": "x"})]) == 2
     assert main([*start, _envelope_file("replayed.json", _signed_for(workRef="43"))]) == 2
     assert main([*start, _envelope_file("reviewer.json", _signed_for(packetRole="reviewer"))]) == 2
+    # The EXACT kind is digested: an implementation envelope cannot seed a
+    # repair run, which would bypass the fresh repair dispatch.
+    repair_start = [entry if entry != "implementation" else "repair" for entry in start]
+    assert main([*repair_start, _envelope_file("replay-kind.json", signed)]) == 2
     assert main([*start, _envelope_file("signed.json", signed)]) == 0
 
     # The finished run's commit needs COMPLETION PROVENANCE: the execution
@@ -914,6 +919,8 @@ def test_orchestrate_attests_only_runs_a_trusted_dispatch_produced(tmp_path: Pat
         "42",
         "--run-id",
         run_id,
+        "--envelope-sha256",
+        signed["envelopeSha256"],
         "--commit-repository",
         str(repo),
         "--attestation-key",
@@ -953,6 +960,14 @@ def test_orchestrate_attests_only_runs_a_trusted_dispatch_produced(tmp_path: Pat
     unsigned_completion = tmp_path / "unsigned-completion.json"
     unsigned_completion.write_text(json.dumps(tampered_completion), encoding="utf-8")
     assert main([*finish, "--completion", str(unsigned_completion)]) == 2
+    # Run IDs restart when state is recreated: a genuine completion bound to
+    # ANOTHER dispatch's envelope digest must not finish this run.
+    stale = json.loads(completion.read_text(encoding="utf-8"))
+    stale["envelopeSha256"] = "e" * 64
+    stale["attestation"] = _sign(stale, secret)
+    stale_file = tmp_path / "stale-completion.json"
+    stale_file.write_text(json.dumps(stale), encoding="utf-8")
+    assert main([*finish, "--completion", str(stale_file)]) == 2
     assert main([*finish, "--completion", str(completion)]) == 0
 
 

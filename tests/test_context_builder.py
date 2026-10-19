@@ -2733,6 +2733,69 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
     assert "default branch" in capsys.readouterr().err
     git("reset", "-q", "--hard", head)
 
+    # The reviewer roster reads from the AUTHENTICATED BASE: a candidate
+    # commit replacing the roster at the head shapes nothing — here the
+    # planted head roster is not even valid JSON, and dispatch still selects
+    # from the base-committed roster.
+    (repo / "reviewers.json").write_text("not the roster\n", encoding="utf-8")
+    git("add", "reviewers.json")
+    git("commit", "-q", "-m", "plant a roster")
+    head_r = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        env=env,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    planted_request = tmp_path / "planted-roster-request.json"
+    planted_request.write_text(
+        json.dumps(
+            {
+                "missionId": "code-reviewer",
+                "workRef": WORK_REF,
+                "task": {"title": "P1: a bounded change", "body": valid_body},
+                "records": [
+                    _record(external_id=f"src/scheduler.py@{head_r}", revision=head_r).as_dict()
+                ],
+                "repositoryRevision": head_r,
+            }
+        ),
+        encoding="utf-8",
+    )
+    history_r = _run_history(tmp_path / "history-r.json", commit_sha=head_r)
+    envelope_r = tmp_path / "envelope-r.json"
+    assert (
+        cli_main(
+            [
+                "dispatch-packet",
+                "--config",
+                str(repo / "agentic-sdlc.toml"),
+                "--knowledge",
+                str(knowledge),
+                "--request",
+                str(planted_request),
+                "--candidate-repository",
+                str(repo),
+                "--candidate-base",
+                base,
+                "--candidate-head",
+                head_r,
+                *derive,
+                "--agents",
+                str(agents_roster),
+                "--history",
+                str(history_r),
+                "--attestation-key",
+                str(key),
+                "--output",
+                str(envelope_r),
+            ]
+        )
+        == 0
+    )
+    assert json.loads(envelope_r.read_text(encoding="utf-8"))["agentId"] == "roomy-reviewer"
+    git("reset", "-q", "--hard", head)
+
     # The dispatch path never accepts request JSON as pipeline evidence.
     tainted = tmp_path / "tainted.json"
     tainted.write_text(

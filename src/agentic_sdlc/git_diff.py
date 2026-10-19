@@ -441,6 +441,12 @@ def collect_series_patch(repository: str | Path, base: str, head: str) -> bytes:
         [
             "git",
             "log",
+            # The repository's own config is the candidate's to write:
+            # `log.showSignature` would make this log VERIFY signed commits
+            # by executing the configured `gpg.program` — a
+            # candidate-controlled executable — before any gate sandbox is
+            # entered, so signature rendering is disabled outright.
+            "--no-show-signature",
             "--no-ext-diff",
             "--no-textconv",
             "--binary",

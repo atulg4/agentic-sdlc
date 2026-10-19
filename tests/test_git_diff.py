@@ -138,6 +138,68 @@ def test_derivation_tree_materializes_the_committed_content(tmp_path: Path) -> N
     assert (repo / "a.txt").read_text(encoding="utf-8") == "uncommitted\n"
 
 
+def test_series_patch_disables_signature_helpers(tmp_path: Path) -> None:
+    # The repository's own config is the candidate's to write: with
+    # log.showSignature enabled and gpg.program pointing at a
+    # candidate-controlled executable, a bare `git log` would EXECUTE that
+    # program to verify signed commits. The series patch disables signature
+    # rendering outright.
+    from agentic_sdlc.git_diff import collect_series_patch
+
+    repo = tmp_path / "signing"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    marker = tmp_path / "verifier-ran"
+    fake = tmp_path / "fake-gpg"
+    fake.write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        "*--verify*)\n"
+        f'  : > "{marker}"\n'
+        '  echo "[GNUPG:] GOODSIG FAKEFAKEFAKEFAKE fake"\n'
+        "  exit 0\n"
+        "  ;;\n"
+        "*)\n"
+        '  printf "[GNUPG:] SIG_CREATED D\\n" >&2\n'
+        '  printf -- "-----BEGIN PGP SIGNATURE-----\\nfake\\n-----END PGP SIGNATURE-----\\n"\n'
+        "  exit 0\n"
+        "  ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    # The ambient environment may default gpg.format to ssh; the attack (and
+    # the fake) go through the openpgp verifier.
+    _git(repo, "config", "gpg.format", "openpgp")
+    _git(repo, "config", "gpg.program", str(fake))
+    _git(repo, "config", "log.showSignature", "true")
+    (repo / "a.txt").write_text("one\n", encoding="utf-8")
+    _git(repo, "add", "--", ".")
+    _git(repo, "commit", "-qm", "base")
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    (repo / "a.txt").write_text("one\ntwo\n", encoding="utf-8")
+    _git(repo, "commit", "-S", "-qam", "signed head")
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    # The fake wiring works: a bare signed log DOES run the helper.
+    subprocess.run(
+        ["git", "log", "-1", "--show-signature"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    assert marker.exists()
+    marker.unlink()
+    patch = collect_series_patch(repo, base, head)
+    assert b"+two" in patch
+    assert not marker.exists()
+
+
 def test_derivation_tree_pins_caller_supplied_refs(tmp_path: Path) -> None:
     # The source's remote-tracking refs are source-mutable: a caller that
     # authenticated a commit elsewhere pins the tree's ref to that exact

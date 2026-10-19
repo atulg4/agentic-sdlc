@@ -1505,12 +1505,16 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
     # producing agent under a fresh agentId to evade the history exclusions,
     # or route authorized write work to an undeclared executor — and the
     # resulting envelope would then be SIGNED as a trusted dispatch. It is
-    # read from the committed tree at the packet's pinned revision.
+    # read from the committed tree at the packet's pinned revision — except
+    # for REVIEWER dispatches, whose pin is the untrusted candidate head: a
+    # producer could commit a roster aliasing itself under a fresh reviewer
+    # agentId there, so reviewer identities come from the AUTHENTICATED BASE.
+    roster_pin = packet.repository_revision
+    if mission_role(mission) == "reviewer" and packet.verification is not None:
+        roster_pin = packet.verification.base_sha
     agents = load_agents(
         json.loads(
-            _committed_configuration(
-                args, packet.repository_revision, args.agents, "--agents"
-            ).decode("utf-8")
+            _committed_configuration(args, roster_pin, args.agents, "--agents").decode("utf-8")
         )
     )
     history: dict[str, list[str]] = {}
@@ -1582,6 +1586,18 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
     # one instead of blocking a dispatch a fallback could carry.
     roster = list(agents)
     reviewer = mission_role(mission) == "reviewer"
+    # The envelope digests the EXACT lifecycle kind it may seed, not just the
+    # role's category: an implementation envelope replayed as a repair run
+    # would bypass the fresh repair dispatch with its current authorization,
+    # revision, and prompt.
+    role = mission_role(mission)
+    canonical_kind = {"builder": "implementation", "tester": "verification", "reviewer": "review"}
+    run_kind = getattr(args, "run_kind", None) or canonical_kind[role]
+    if run_kind not in _ROLE_RUN_KINDS[role]:
+        raise ContextBuilderError(
+            f"--run-kind {run_kind} is not a {role} run; builders dispatch "
+            "implementation or repair, testers verification, reviewers review"
+        )
     while True:
         agent = registry.select_agent(
             mission.mission_id,
@@ -1591,7 +1607,7 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
         )
         try:
             envelope = dispatch_envelope_for_packet(
-                packet, mission, agent, input_refs=tuple(args.input_ref)
+                packet, mission, agent, input_refs=tuple(args.input_ref), run_kind=run_kind
             )
             break
         except ContextBuilderError as error:
@@ -1698,6 +1714,15 @@ def _require_attested_envelope(envelope, key: bytes, *, unit: str, kind: str) ->
             f"{envelope.get('packetRole')!r} does not permit a {kind} run; an "
             "attested run records only the kind its dispatch declared"
         )
+    # EXACT kind, not just the role's category: a builder's implementation
+    # envelope replayed as a repair run would bypass the fresh repair
+    # dispatch with its current authorization, revision, and prompt.
+    if envelope.get("runKind") != kind:
+        raise OrchestrationError(
+            f"the dispatch envelope declares run kind "
+            f"{envelope.get('runKind')!r}, not {kind}; an attested run "
+            "records exactly the kind its dispatch digested"
+        )
 
 
 def _orchestrate(args: argparse.Namespace) -> int:
@@ -1792,6 +1817,20 @@ def _orchestrate(args: argparse.Namespace) -> int:
                     "and commit; regenerate it with attest-completion for the "
                     "run that produced the commit"
                 )
+            # Run IDs RESTART at run-001 when state is recreated, so (unit,
+            # runId) does not identify a run across histories: the completion
+            # must bind the dispatch envelope's digest, which the run record
+            # carries from its attested start.
+            records = {run.run_id: run for run in engine.get(args.unit).runs}
+            record = records.get(args.run_id)
+            if record is None:
+                raise OrchestrationError(f"work unit {args.unit} records no run {args.run_id}")
+            if completion.get("envelopeSha256") != record.envelope_sha256:
+                raise OrchestrationError(
+                    "the completion record binds a different dispatch "
+                    "envelope than the run being finished; regenerate it with "
+                    "attest-completion for this run's envelope"
+                )
         engine.finish_run(
             args.unit,
             args.run_id,
@@ -1838,11 +1877,18 @@ def _attest_completion(args: argparse.Namespace) -> int:
         raise OrchestrationError(
             "--commit-sha must be the full object name of a commit in --commit-repository"
         )
+    if not re.fullmatch(r"[0-9a-f]{64}", args.envelope_sha256 or ""):
+        raise OrchestrationError(
+            "--envelope-sha256 must be the dispatched envelope's 64-hex digest: "
+            "run IDs restart when state is recreated, so the envelope digest is "
+            "the run's identity across histories"
+        )
     document = {
         "schemaVersion": 1,
         "unit": args.unit,
         "runId": args.run_id,
         "commitSha": args.commit_sha,
+        "envelopeSha256": args.envelope_sha256,
         "recordedAt": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
     }
     document[_ATTESTATION_FIELD] = _attest_document(document, key)
@@ -2794,6 +2840,12 @@ def build_parser() -> argparse.ArgumentParser:
         "the literal trusted-host to accept host execution",
     )
     dispatch_packet.add_argument("--agents", required=True)
+    dispatch_packet.add_argument(
+        "--run-kind",
+        choices=("implementation", "repair", "verification", "review"),
+        help="the exact lifecycle kind this dispatch seeds (digested into the "
+        "envelope); defaults to the mission role's canonical kind",
+    )
     dispatch_packet.add_argument("--history")
     dispatch_packet.add_argument("--authorization")
     dispatch_packet.add_argument(
@@ -2873,6 +2925,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--commit-repository",
         required=True,
         help="the trusted checkout the finished run's commit must exist in",
+    )
+    attest_completion.add_argument(
+        "--envelope-sha256",
+        required=True,
+        help="the dispatched envelope's digest: run IDs restart when state is "
+        "recreated, so this is the run's identity across histories",
     )
     attest_completion.add_argument("--attestation-key", required=True)
     attest_completion.add_argument("--output")

@@ -1518,6 +1518,7 @@ def dispatch_envelope_for_packet(
     agent: AgentProfile,
     *,
     input_refs: Sequence[str] = (),
+    run_kind: str = "",
 ) -> dict[str, Any]:
     """Pin one dispatch to the packet: its digest becomes ``contextPackDigest``.
 
@@ -1597,8 +1598,8 @@ def dispatch_envelope_for_packet(
             *((f"revision:{packet.repository_revision}",) if packet.repository_revision else ()),
         ),
         context_pack_digest=packet.packet_sha256,
-        # The role travels in the digested body, so an attested orchestrate
-        # run can refuse this envelope under any kind its role does not
-        # permit.
+        # The role and exact kind travel in the digested body, so an attested
+        # orchestrate run can refuse this envelope under any other kind.
         packet_role=packet.role,
+        run_kind=run_kind,
     )

@@ -695,6 +695,7 @@ def create_dispatch_envelope(
     input_refs: Sequence[str] = (),
     context_pack_digest: str | None = None,
     packet_role: str = "",
+    run_kind: str = "",
 ) -> dict[str, Any]:
     """Pin one dispatch to mission version, adapter, model, and prompt digest.
 
@@ -732,6 +733,12 @@ def create_dispatch_envelope(
         # non-producing run record. Inside the body BEFORE the digest, so
         # both the envelope digest and the attestation cover it.
         body["packetRole"] = packet_role
+    if run_kind:
+        # The EXACT lifecycle kind this dispatch seeds, not just the role's
+        # category: an implementation envelope replayed as a repair run would
+        # bypass the fresh repair dispatch with its current authorization and
+        # revision, so an attested orchestrate run requires equality.
+        body["runKind"] = run_kind
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
     body["envelopeSha256"] = _sha256_text(canonical)
     return body
