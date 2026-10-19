@@ -187,8 +187,13 @@ def _candidate_fixture(tmp_path, policy_file, extra_knowledge="", agents=None):
     return repo, git, pin
 
 
-def _run_history(path, agent_id="builder-agent", work_ref=WORK_REF, commit_sha=""):
-    """Orchestrator state recording an implementation run of the work item."""
+def _run_history(path, agent_id="builder-agent", work_ref=WORK_REF, commit_sha="", findings=None):
+    """Orchestrator state recording an implementation run of the work item.
+
+    ``findings`` records the latest review's canonical findings digest, as
+    ``orchestrate review`` would: a packet carrying priorFindings dispatches
+    only against a state that attests the same report.
+    """
     from agentic_sdlc.orchestration import Orchestrator
 
     engine = Orchestrator()
@@ -230,6 +235,10 @@ def _run_history(path, agent_id="builder-agent", work_ref=WORK_REF, commit_sha="
             timestamp="2026-10-12T09:20:00Z",
             commit_sha=commit_sha,
         )
+    if findings is not None:
+        from agentic_sdlc.cli import _findings_digest
+
+        engine.get(work_ref).review_findings_sha256 = _findings_digest(findings)
     path.write_text(json.dumps(_attested(engine.as_dict())), encoding="utf-8")
     return path
 
@@ -2209,7 +2218,11 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
     # run history naming who performed each mission the review must be
     # independent of, so an empty default can never let the roster's first
     # agent review its own work.
-    history_file = _run_history(tmp_path / "history.json", commit_sha=head)
+    history_file = _run_history(
+        tmp_path / "history.json",
+        commit_sha=head,
+        findings=["Round one flagged an unbounded retry loop."],
+    )
 
     # A derived artifact dispatches: durations are zeroed at derivation, so
     # the whole-document comparison is exact. The roster was committed at the
@@ -2261,9 +2274,17 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
     from agentic_sdlc.orchestration import Orchestrator
 
     other_unit = _run_history(tmp_path / "other-history.json", work_ref="example/project#999")
-    unanchored = _run_history(tmp_path / "unanchored-history.json")
+    unanchored = _run_history(
+        tmp_path / "unanchored-history.json",
+        findings=["Round one flagged an unbounded retry loop."],
+    )
     runless = Orchestrator()
     runless.create_unit(WORK_REF, event_key="evt-0", timestamp="2026-10-12T09:00:00Z")
+    from agentic_sdlc.cli import _findings_digest as _digest_of
+
+    runless.get(WORK_REF).review_findings_sha256 = _digest_of(
+        ["Round one flagged an unbounded retry loop."]
+    )
     runless_file = tmp_path / "runless-history.json"
     runless_file.write_text(json.dumps(_attested(runless.as_dict())), encoding="utf-8")
     for history_args, said in (
@@ -2631,6 +2652,40 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
     ]
     assert wrapped_report["passed"] is True
     assert wrapped_report["gates"][0]["command"][0] == "/usr/bin/env"
+    # A bare launcher NAME resolves against the root-only system locations
+    # first — strict trust never consults PATH as root, so without them the
+    # documented bare form would be unusable on root-based runners — and the
+    # RESOLVED absolute path is what the gates record.
+    bare_packet = tmp_path / "bare-packet.json"
+    assert (
+        cli_main(
+            [
+                "context-packet",
+                "--config",
+                str(repo / "agentic-sdlc.toml"),
+                "--knowledge",
+                str(knowledge),
+                "--request",
+                str(request),
+                "--candidate-repository",
+                str(repo),
+                "--candidate-base",
+                base,
+                "--candidate-head",
+                head,
+                "--review-target-repository",
+                str(target),
+                "--gate-sandbox",
+                "env",
+                "--output",
+                str(bare_packet),
+            ]
+        )
+        == 0
+    )
+    bare_report = json.loads(bare_packet.read_text(encoding="utf-8"))["verification"]["gateReport"]
+    assert bare_report["passed"] is True
+    assert bare_report["gates"][0]["command"][0] in ("/usr/bin/env", "/bin/env")
 
     # The review target must be a SEPARATE repository: the candidate itself,
     # a symlink alias of it, and a worktree sharing its object store are all
@@ -2750,6 +2805,60 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
     )
     assert "must be a separate repository" in capsys.readouterr().err
     shutil.rmtree(inner)
+
+    # The size caps read the SERIES, not only its end state: an intermediate
+    # commit publishing an oversized patch that a later commit shrinks back
+    # is still published by a push of the head, so the derived diff is
+    # policed with the historical counters exactly as check-diff polices it.
+    (repo / "bulk.txt").write_text("line\n" * 200, encoding="utf-8")
+    git("add", "bulk.txt")
+    git("commit", "-q", "-m", "publish an oversized patch")
+    git("rm", "-q", "bulk.txt")
+    git("commit", "-q", "-m", "shrink the endpoint back")
+    head_s = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        env=env,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    oversized_request = tmp_path / "oversized-request.json"
+    oversized_request.write_text(
+        json.dumps(
+            {
+                "missionId": "code-reviewer",
+                "workRef": WORK_REF,
+                "task": {"title": "P1: a bounded change", "body": valid_body},
+                "records": [],
+                "repositoryRevision": head_s,
+            }
+        ),
+        encoding="utf-8",
+    )
+    capsys.readouterr()
+    assert (
+        cli_main(
+            [
+                "context-packet",
+                "--config",
+                str(repo / "agentic-sdlc.toml"),
+                "--knowledge",
+                str(knowledge),
+                "--request",
+                str(oversized_request),
+                "--candidate-repository",
+                str(repo),
+                "--candidate-base",
+                base,
+                "--candidate-head",
+                head_s,
+                *derive,
+            ]
+        )
+        == 2
+    )
+    assert "diff-line cap exceeded" in capsys.readouterr().err
+    git("reset", "-q", "--hard", head)
 
     # Gates run under the configuration committed at the AUTHENTICATED BASE:
     # a candidate commit that replaces the configured gates with an
@@ -3129,6 +3238,11 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
         timestamp="2026-10-12T09:24:00Z",
         commit_sha="9" * 40,
     )
+    from agentic_sdlc.cli import _findings_digest
+
+    stale_engine.get(WORK_REF).review_findings_sha256 = _findings_digest(
+        ["Round one flagged an unbounded retry loop."]
+    )
     stale_history = tmp_path / "stale-history.json"
     stale_history.write_text(json.dumps(_attested(stale_engine.as_dict())), encoding="utf-8")
     capsys.readouterr()
@@ -3169,6 +3283,16 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
     matching_history = tmp_path / "matching-history.json"
     matching_history.write_text(json.dumps(_attested(matching_state)), encoding="utf-8")
     assert cli_main([*dispatch_at_head, "--history", str(matching_history)]) == 0
+    # With NO recorded report digest the carried findings are caller-authored
+    # — no reviewer ever attested them — so the dispatch refuses rather than
+    # rendering a fabricated report into the prompt.
+    digestless_state = json.loads(history_file.read_text(encoding="utf-8"))
+    digestless_state["units"][WORK_REF].pop("reviewFindingsSha256", None)
+    digestless_history = tmp_path / "digestless-history.json"
+    digestless_history.write_text(json.dumps(_attested(digestless_state)), encoding="utf-8")
+    capsys.readouterr()
+    assert cli_main([*dispatch_at_head, "--history", str(digestless_history)]) == 2
+    assert "records no findings report" in capsys.readouterr().err
 
     # Reviews follow a PASSING verification: a head that breaks the
     # base-committed gate derives evidence for audit but refuses dispatch.
@@ -3817,6 +3941,12 @@ def test_repair_dispatch_reads_the_roster_from_the_authenticated_base(
         == 0
     )
     assert "fix the unbounded retry loop" in repair_prompt.read_text(encoding="utf-8")
+    # Against a state with NO recorded report digest — a repair after a
+    # deterministic verification failure, where no reviewer ever attested —
+    # the same carried findings are caller-authored and refuse.
+    capsys.readouterr()
+    assert cli_main(["dispatch-packet", *base, "--review-target-repository", str(target)]) == 2
+    assert "records no findings report" in capsys.readouterr().err
     # Restore the findings-free request for the sections below.
     found_request.pop("priorFindings")
     request.write_text(json.dumps(found_request), encoding="utf-8")

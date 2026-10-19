@@ -1577,6 +1577,7 @@ def dispatch_envelope_for_packet(
     run_kind: str = "",
     dispatch_nonce: str = "",
     state_id: str = "",
+    unit_state_sha256: str = "",
 ) -> dict[str, Any]:
     """Pin one dispatch to the packet: its digest becomes ``contextPackDigest``.
 
@@ -1662,4 +1663,5 @@ def dispatch_envelope_for_packet(
         run_kind=run_kind,
         dispatch_nonce=dispatch_nonce,
         state_id=state_id,
+        unit_state_sha256=unit_state_sha256,
     )

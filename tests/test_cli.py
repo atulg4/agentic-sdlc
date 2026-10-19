@@ -819,9 +819,18 @@ def test_orchestrate_attests_only_runs_a_trusted_dispatch_produced(tmp_path: Pat
             )
             == 0
         )
-    # A trusted dispatch digests the attested state's lineage id, so the
-    # crafted envelopes bind it exactly as dispatch-packet would.
+    # A trusted dispatch digests the attested state's lineage id AND the
+    # work unit's exact snapshot, so the crafted envelopes bind both exactly
+    # as dispatch-packet would.
     state_id = json.loads(state.read_text(encoding="utf-8"))["stateId"]
+
+    def _unit_snapshot_sha256() -> str:
+        document = json.loads(state.read_text(encoding="utf-8"))
+        canonical = json.dumps(
+            document["units"]["42"], sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
     body = {
         "schemaVersion": 1,
         "missionId": "implementation-worker",
@@ -837,6 +846,7 @@ def test_orchestrate_attests_only_runs_a_trusted_dispatch_produced(tmp_path: Pat
         "packetRole": "builder",
         "runKind": "implementation",
         "stateId": state_id,
+        "unitStateSha256": _unit_snapshot_sha256(),
     }
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
     envelope = {**body, "envelopeSha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest()}
@@ -881,6 +891,16 @@ def test_orchestrate_attests_only_runs_a_trusted_dispatch_produced(tmp_path: Pat
     # A genuinely signed envelope from ANOTHER state lineage (a recreated
     # state) cannot replay here.
     assert main([*start, _envelope_file("other-state.json", _signed_for(stateId="f" * 32))]) == 2
+    # A genuinely signed envelope bound to a STALE snapshot of this same
+    # lineage (the unit's digest before it advanced) cannot start a run
+    # against the current state: the lineage id alone never changes, so
+    # only the unit-snapshot binding stops a replay from a retained copy.
+    capsys.readouterr()
+    assert (
+        main([*start, _envelope_file("stale-unit.json", _signed_for(unitStateSha256="e" * 64))])
+        == 2
+    )
+    assert "current state snapshot" in capsys.readouterr().err
     assert main([*start, _envelope_file("signed.json", signed)]) == 0
     # One digest identifies one dispatch: the recorded envelope cannot seed a
     # second run (a reused review envelope would otherwise report on the
@@ -1088,11 +1108,14 @@ def test_orchestrate_attests_only_runs_a_trusted_dispatch_produced(tmp_path: Pat
     # The unit is now reviewing: start the review run from a reviewer-signed
     # dispatch, then the review transition needs its own signed outcome bound
     # to that run's envelope, run id and findings count.
+    # A review dispatch happens against the ADVANCED state, so its envelope
+    # binds the unit's current snapshot, not the implementation-time one.
     review_envelope = _signed_for(
         missionId="code-reviewer",
         agentId="reviewer-agent",
         packetRole="reviewer",
         runKind="review",
+        unitStateSha256=_unit_snapshot_sha256(),
     )
     review_start = [
         *base,

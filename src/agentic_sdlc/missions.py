@@ -698,6 +698,7 @@ def create_dispatch_envelope(
     run_kind: str = "",
     dispatch_nonce: str = "",
     state_id: str = "",
+    unit_state_sha256: str = "",
 ) -> dict[str, Any]:
     """Pin one dispatch to mission version, adapter, model, and prompt digest.
 
@@ -758,6 +759,13 @@ def create_dispatch_envelope(
         # own lineage, so a recreated state cannot replay old signed
         # envelopes (and the completions and outcomes bound to them).
         body["stateId"] = state_id
+    if unit_state_sha256:
+        # The dispatching snapshot of the WORK UNIT itself: the lineage id
+        # stays constant as the state advances, so an attested start-run also
+        # requires the unit's snapshot digest to match the current state —
+        # a stale snapshot of the same lineage cannot seed a run against the
+        # advanced unit.
+        body["unitStateSha256"] = unit_state_sha256
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
     body["envelopeSha256"] = _sha256_text(canonical)
     return body

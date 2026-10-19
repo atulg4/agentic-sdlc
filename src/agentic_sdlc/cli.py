@@ -949,6 +949,12 @@ def _anchor_branch(args: argparse.Namespace, policy) -> str:
     return anchor
 
 
+#: Where a system --gate-sandbox launcher lives, in preference order: strict
+#: trust never consults PATH as root, so a bare launcher name resolves against
+#: these root-only locations instead of being unresolvable on root runners.
+_LAUNCHER_SYSTEM_DIRS = ("/usr/bin", "/bin", "/usr/local/bin", "/usr/sbin", "/sbin")
+
+
 def _derived_verification(
     args: argparse.Namespace, request: dict, policy: ProjectPolicy
 ) -> VerificationEvidence:
@@ -1068,7 +1074,15 @@ def _derived_verification(
                     )
                 resolved_launcher = os.path.realpath(launcher)
             else:
-                resolved_launcher = resolve_trusted(launcher, (), "")
+                # Strict trust never searches PATH as root, so a bare
+                # launcher name needs explicit system candidates — the
+                # locations only root can replace — or root-based container
+                # runners could never resolve the documented bare form.
+                resolved_launcher = resolve_trusted(
+                    launcher,
+                    tuple(os.path.join(directory, launcher) for directory in _LAUNCHER_SYSTEM_DIRS),
+                    "",
+                )
         except UntrustedExecutableError as error:
             raise ContextBuilderError(f"--gate-sandbox launcher is not trusted: {error}") from None
         sandbox_prefix = (resolved_launcher, *sandbox_prefix[1:])
@@ -1077,13 +1091,17 @@ def _derived_verification(
     # touching forbidden paths or exceeding the changed-file, line or patch
     # caps must not receive a signed reviewer dispatch just because its
     # gates pass — check-diff would refuse the same change on the Actions
-    # path.
+    # path. The size caps read the HISTORICAL counters, exactly like
+    # check-diff: an intermediate commit that publishes an oversized patch
+    # which a later commit shrinks back is still published by a push of the
+    # head, so the endpoint counts alone would accept a series check-diff
+    # rejects.
     diff_decision = evaluate_diff(
         snapshot.paths,
-        snapshot.added_lines,
-        snapshot.deleted_lines,
+        snapshot.cap_added_lines,
+        snapshot.cap_deleted_lines,
         policy,
-        patch_bytes=len(snapshot.patch),
+        patch_bytes=snapshot.cap_patch_bytes,
     )
     if not diff_decision.allowed:
         raise ContextBuilderError(
@@ -1768,6 +1786,7 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
     producing_agents: set[str] = set()
     unit_runs: tuple = ()
     history_state_id = ""
+    history_unit_sha256 = ""
     if args.history:
         # The history is the ORCHESTRATOR STATE, not a bare mission→agent
         # map: a caller-authored map could record "" (or any other agent) for
@@ -1791,6 +1810,12 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
                 "the orchestrator state that dispatched this work item"
             ) from error
         unit_runs = tuple(unit.runs)
+        # The envelope binds this unit's EXACT snapshot, not only the state
+        # lineage: the lineage id never changes as the state advances, so a
+        # stale (but genuinely attested) earlier snapshot could otherwise
+        # derive a review envelope for a superseded producer that the current
+        # state would still accept.
+        history_unit_sha256 = _unit_state_digest(unit)
         # The attested state records the latest review's canonical findings
         # digest: a re-review packet whose caller-supplied priorFindings do
         # not hash to it is carrying a laundered report alongside the
@@ -1801,11 +1826,22 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
             if packet.verification is not None
             else packet.prior_findings
         )
-        if recorded_findings and _findings_digest(carried_findings) != recorded_findings:
+        if recorded_findings:
+            if _findings_digest(carried_findings) != recorded_findings:
+                raise MissionError(
+                    "the packet's priorFindings do not hash to the findings "
+                    "report the attested state records for this unit's latest "
+                    "review; carry the reviewer's actual findings"
+                )
+        elif carried_findings:
+            # No recorded digest means NO reviewer ever attested a report
+            # for this unit — an initial review, or a repair after a
+            # deterministic verification failure — so any carried findings
+            # are caller-authored, never a reviewer's.
             raise MissionError(
-                "the packet's priorFindings do not hash to the findings "
-                "report the attested state records for this unit's latest "
-                "review; carry the reviewer's actual findings"
+                "the packet carries priorFindings but the attested state "
+                "records no findings report for this unit; only a report a "
+                "recorded review attested may seed a dispatch"
             )
         for run in unit_runs:
             # EVERY agent that performed the mission is excluded, not only
@@ -1886,6 +1922,7 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
                 # dispatch they attest.
                 dispatch_nonce=secrets.token_hex(16),
                 state_id=history_state_id,
+                unit_state_sha256=history_unit_sha256,
             )
             break
         except ContextBuilderError as error:
@@ -2093,6 +2130,20 @@ def _orchestrate(args: argparse.Namespace) -> int:
                     f"unit {args.unit} ({replayed[0].run_id}); every run "
                     "records a fresh dispatch, so re-dispatch the packet to "
                     "obtain a new envelope"
+                )
+            # The lineage id alone never changes as the state advances: a
+            # genuine OLDER snapshot of this same lineage — retained from
+            # before a repair — could derive a fresh envelope whose
+            # latest-producer check passed against the stale unit, so the
+            # envelope must also bind the unit's snapshot exactly as this
+            # state records it now.
+            if envelope.get("unitStateSha256") != _unit_state_digest(engine.get(args.unit)):
+                raise OrchestrationError(
+                    "the dispatch envelope does not bind this work unit's "
+                    "current state snapshot: the unit advanced since the "
+                    "dispatching snapshot (or the envelope was derived from a "
+                    "stale copy of this lineage) — re-dispatch the packet "
+                    "against the current attested state"
                 )
         engine.start_run(
             args.unit,
@@ -2307,6 +2358,21 @@ def _findings_report_digest(path: str, *, expected_count: int | None = None) -> 
 
 def _findings_digest(findings) -> str:
     canonical = json.dumps(list(findings), separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _unit_state_digest(unit) -> str:
+    """The canonical digest of ONE work unit's serialized state.
+
+    Dispatch embeds it in the envelope and an attested start-run requires
+    equality against the unit as the CURRENT state records it: the lineage id
+    alone never changes as the state advances, so a genuine older snapshot of
+    the same lineage could otherwise re-derive an envelope for a superseded
+    producer and start it against the advanced state.
+    """
+    canonical = json.dumps(
+        unit.as_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
