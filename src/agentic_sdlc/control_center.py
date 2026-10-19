@@ -1641,6 +1641,16 @@ def build_control_center_snapshot(
         credential_references = 0
         overlong_references = 0
         for unit_id, status in list(statuses.items()):
+            # A work-unit identifier is identity, not a reference: redacting
+            # it would break every join keyed on it, so an identifier that
+            # embeds URL userinfo fails the build closed instead of being
+            # serialized into statuses, the shared store, and copied
+            # snapshots. The value itself is withheld from the error.
+            _require(
+                not _CREDENTIAL_REFERENCE.search(unit_id),
+                "a work unit identifier embeds URL userinfo (value withheld); "
+                "rename the unit in the lifecycle ledger",
+            )
             name = status.repository
             if name and not _REPOSITORY_IDENTIFIER.fullmatch(name):
                 malformed_repositories.add(name)
@@ -1810,8 +1820,16 @@ def build_control_center_snapshot(
                     # reference need not still be CURRENT: a unit that merged
                     # this request and was later re-pointed retires the
                     # incident exactly as the unnamed join would.
+                    # Provider-qualified like the anonymous join below: the
+                    # textual reference is only unique within one provider,
+                    # so a same-spelled unit registered for another provider
+                    # must not retire this incident on its merge history.
                     named = statuses.get(incident.work_unit_id)
-                    merged = named is not None and _merge_proven(named, incident.evidence_ref)
+                    merged = (
+                        named is not None
+                        and _provider_agrees(incident.source_provider, named, repository_providers)
+                        and _merge_proven(named, incident.evidence_ref)
+                    )
                 else:
                     # Carriers are provider-qualified like the issue join: a
                     # merged GitLab unit carrying the same reference string

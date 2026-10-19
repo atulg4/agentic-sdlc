@@ -5231,6 +5231,12 @@ def test_the_console_binds_incidents_and_enforces_full_membership():
     # stored timestamp cannot overflow the Date range and break every save.
     assert html.count("parsed <= ceiling") == 2
     assert "for (const draft of state.drafts)" in html
+    # The recency windows exclude rows beyond the same one-day ceiling the
+    # save clamps enforce, and the ceiling tracks the clock: far-future store
+    # rows cannot occupy the bounded feed while fresh saves land outside it.
+    assert '.where(recencyField, "<=", ceiling).orderBy(recencyField, "desc")' in html
+    assert "const ceiling = new Date(Date.now() + 86_400_000).toISOString();" in html
+    assert "}, 3_600_000);" in html
     # A backfill read that resumes after a notes delivery made the key live
     # leaves the subscription's newer data alone.
     assert "if (liveNoteKeys.has(key)) return;" in html
@@ -5698,6 +5704,67 @@ def test_merge_retirement_is_provider_qualified():
         incidents=load_incident_document(_incidents(stale)),
     )
     assert [item.incident_id for item in agreeing.get("forge").incidents] == []
+
+    # An incident NAMING the unit is judged on that unit's own history — but
+    # under the same provider qualification: GitLab merge history must not
+    # retire a GitHub blocker that merely shares the textual reference.
+    named = _incident(
+        incidentId="acme/forge!1:merge-state-blocked",
+        kind="unclassified",
+        severity="degraded",
+        evidenceRef="acme/forge!1",
+        workUnitId="wu-1",
+        summary="The change request reports blocked",
+    )
+    named_foreign = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=gitlab_registry,
+        projections=ledger.projections(),
+        incidents=load_incident_document(_incidents(named)),
+    )
+    assert [item.incident_id for item in named_foreign.get("forge").incidents] == [
+        "acme/forge!1:merge-state-blocked"
+    ]
+    named_agreeing = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        incidents=load_incident_document(_incidents(named)),
+    )
+    assert [item.incident_id for item in named_agreeing.get("forge").incidents] == []
+
+
+def test_credential_bearing_unit_identifiers_fail_closed():
+    # A work-unit identifier is identity, not a reference: it cannot be
+    # redacted without breaking every join, so one embedding URL userinfo
+    # refuses the build — and the error withholds the value.
+    ledger = _ledger(
+        *_chain(
+            TO_IMPLEMENTING,
+            work_unit="https://x:hunter2@host/unit",
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "https://x:hunter2@host/unit",
+                "repository": "acme/forge",
+            },
+        )
+    )
+    with pytest.raises(ControlCenterError, match="work unit identifier embeds URL userinfo"):
+        build_control_center_snapshot(
+            generated_at=NOW,
+            registry=REGISTRY,
+            projections=ledger.projections(),
+            incidents=load_incident_document(_incidents()),
+        )
+    try:
+        build_control_center_snapshot(
+            generated_at=NOW,
+            registry=REGISTRY,
+            projections=ledger.projections(),
+            incidents=load_incident_document(_incidents()),
+        )
+    except ControlCenterError as error:
+        assert "hunter2" not in str(error)
 
 
 def test_overlong_references_are_withheld():
