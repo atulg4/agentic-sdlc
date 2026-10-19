@@ -4973,6 +4973,23 @@ def test_credential_bearing_inputs_are_rejected_at_load():
         )
     with pytest.raises(ControlCenterError, match="evidenceRef must not embed credentials"):
         load_incident_document(_incidents(_incident(evidenceRef="https://token@ci.example/run/9")))
+    # Userinfo is not the only carrier: a token-shaped credential in the
+    # query string or fragment is the secret itself, and the rejection
+    # withholds the value instead of echoing it into stderr.
+    with pytest.raises(ControlCenterError) as token_error:
+        load_backlog_document(
+            _document(
+                _backlog(
+                    itemId="acme/forge#7",
+                    url=(
+                        "https://tracker.example/issue/1"
+                        "?access=ghp_0123456789abcdefghij0123456789abcdef"
+                    ),
+                )
+            )
+        )
+    assert "token-shaped credential" in str(token_error.value)
+    assert "ghp_" not in str(token_error.value)
 
 
 def test_a_malformed_pull_request_marker_is_rejected():
@@ -5371,6 +5388,11 @@ def test_the_console_pins_state_vocabulary_and_note_freshness():
     assert "|| entry.projectId !== projectId" in html
     # A stored note that declares a provider attaches only to that provider.
     assert "|| (entry.sourceProvider && entry.sourceProvider !== provider)" in html
+    # Viewer-writable store rows bypass the snapshot's identity checks, so
+    # each identity component is validated delimiter-free before it may feed
+    # noteKey; a NUL-bearing projectId cannot collide with another key.
+    assert "const identity = [entry.projectId, entry.sourceProvider, entry.incidentId];" in html
+    assert 'typeof part === "string" && !part.includes("\\u0000")' in html
 
 
 def test_the_console_validates_backlog_provenance_and_scoped_liveness():
@@ -5382,8 +5404,15 @@ def test_the_console_validates_backlog_provenance_and_scoped_liveness():
     # Placement must agree with the serialized parent link.
     assert "sits under ${placedUnder} but names another parent" in html
     assert "names a parent without a parent-missing flag" in html
-    # Rendered backlog URLs must not embed credentials.
+    # Rendered backlog URLs must not embed credentials — neither userinfo
+    # nor a token-shaped credential in the query string or fragment.
     assert "url must not embed credentials" in html
+    assert "url carries a token-shaped credential" in html
+    # Every node names its containing project, exactly as the producer
+    # groups them, so a digest-consistent rewrite cannot move work between
+    # projects; projectId is string-validated with the other node fields.
+    assert "names another project." in html
+    assert '"sourceProvider", "projectId"' in html
     # Declared-basis states belong to the closed vocabulary too.
     assert "names an unknown declared state" in html
     # State provenance is a closed, reconciled contract.
@@ -5796,6 +5825,90 @@ def test_merge_retirement_is_provider_qualified():
         incidents=load_incident_document(_incidents(named)),
     )
     assert [item.incident_id for item in named_agreeing.get("forge").incidents] == []
+
+
+def test_historical_merge_proof_is_bound_to_the_references_repository():
+    # The unit merged acme/old!1 and was later re-pointed at a repository
+    # another provider owns: the reference's OWN repository decides the
+    # provider qualification, so the historical GitLab proof never retires a
+    # GitHub incident for acme/old!1 — and after the reverse move the
+    # GitHub-proven merge still retires it although the unit points away.
+    def _two_repo_registry(old_provider):
+        return load_project_registry(
+            {
+                "schemaVersion": 1,
+                "projects": [
+                    {
+                        "projectId": "forge",
+                        "displayName": "Forge",
+                        "group": "platform",
+                        "defaultBranch": "main",
+                        "repositories": [
+                            {
+                                "provider": old_provider,
+                                "identifier": "acme/old",
+                                "role": "primary",
+                            },
+                            {
+                                "provider": "github",
+                                "identifier": "acme/forge",
+                                "role": "secondary",
+                            },
+                        ],
+                        "environments": [{"name": "production", "kind": "production"}],
+                        "capabilities": ["planning", "implementation"],
+                    }
+                ],
+            }
+        )
+
+    swap = _event(
+        eventId="e-swap",
+        idempotencyKey="k-swap",
+        state="merged",
+        stage="merge",
+        workUnit={
+            "projectId": "forge",
+            "workUnitId": "wu-1",
+            "changeRequestRef": "acme/forge!2",
+            "repository": "acme/forge",
+        },
+        activity="re-pointed at a follow-up change request",
+    )
+    ledger = _ledger(
+        *_chain(
+            TO_MERGED,
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "changeRequestRef": "acme/old!1",
+                "repository": "acme/old",
+            },
+        ),
+        swap,
+    )
+    stale = _incident(
+        incidentId="acme/old!1:merge-state-blocked",
+        kind="unclassified",
+        severity="degraded",
+        evidenceRef="acme/old!1",
+        summary="The merged change request still reports blocked",
+    )
+    foreign = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=_two_repo_registry("gitlab"),
+        projections=ledger.projections(),
+        incidents=load_incident_document(_incidents(stale)),
+    )
+    kept = [item.incident_id for item in foreign.get("forge").incidents]
+    assert kept == ["acme/old!1:merge-state-blocked"]
+    agreeing = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=_two_repo_registry("github"),
+        projections=ledger.projections(),
+        incidents=load_incident_document(_incidents(stale)),
+    )
+    assert [item.incident_id for item in agreeing.get("forge").incidents] == []
 
 
 def test_credential_bearing_unit_identifiers_fail_closed():
@@ -6449,6 +6562,42 @@ def test_a_repositoryless_status_never_joins_a_conflicting_provider():
         incidents=load_incident_document(_incidents()),
     )
     assert [node.state_basis for node in freeform.get("forge").backlog] == [
+        "state projected from the lifecycle ledger"
+    ]
+    # The suffix the loader permits for INCIDENT ids does not make a
+    # reference canonical: acme/forge#1:ticket is noncanonical too, so it
+    # supplies no registry evidence and the exact join is not refused.
+    suffixed_ledger = _ledger(
+        *_chain(
+            TO_IMPLEMENTING,
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "issueRef": "acme/forge#1:ticket",
+            },
+        )
+    )
+    suffixed_items = load_backlog_document(
+        {
+            "schemaVersion": BACKLOG_SCHEMA_VERSION,
+            "source": "github",
+            "items": [
+                _backlog(
+                    title="Suffixed task",
+                    issueRef="acme/forge#1:ticket",
+                    declaredState="specified",
+                )
+            ],
+        }
+    )
+    suffixed = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=gitlab_registry,
+        projections=suffixed_ledger.projections(),
+        backlog=tuple(suffixed_items),
+        incidents=load_incident_document(_incidents()),
+    )
+    assert [node.state_basis for node in suffixed.get("forge").backlog] == [
         "state projected from the lifecycle ledger"
     ]
 
