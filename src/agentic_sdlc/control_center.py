@@ -30,7 +30,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import urllib.parse
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -43,6 +42,7 @@ from .event_ledger import (
     LifecycleStage,
     WorkUnitProjection,
 )
+from .event_ledger import carries_credential_token as _carries_credential_token
 from .project_registry import (
     EMPTY_PROJECT_REGISTRY,
     SCM_PROVIDERS,
@@ -127,30 +127,12 @@ _REPOSITORY_IDENTIFIER = re.compile(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+")
 #: userinfo before the host carries a credential the snapshot must never
 #: republish - tokens are commonly supplied username-only.
 _CREDENTIAL_REFERENCE = re.compile(r"://[^/?#\s]*@")
+
+
 #: Real provider token SHAPES (GitHub ghp_/gho_/ghu_/ghs_/ghr_/github_pat_,
 #: GitLab glpat-): a credential supplied as a query parameter or fragment
 #: (``?access=ghp_...``) carries no URL userinfo yet IS the secret, and the
 #: snapshot republishes URLs as clickable links.
-_TOKEN_SHAPED = re.compile(r"gh[pousr]_|github_pat_|glpat-", re.IGNORECASE)
-
-
-def _carries_credential_token(value: str) -> bool:
-    """A token-shaped credential anywhere in the value, percent-encoding
-    peeled first: ``?access=ghp%5FSECRET`` and ``?access=%67hp_SECRET``
-    decode to the shapes a raw scan would miss. The peel is bounded, so a
-    deeply nested encoding costs constant work and the final layer is still
-    scanned."""
-    decoded = value
-    for _ in range(3):
-        if _TOKEN_SHAPED.search(decoded):
-            return True
-        peeled = urllib.parse.unquote(decoded)
-        if peeled == decoded:
-            break
-        decoded = peeled
-    return _TOKEN_SHAPED.search(decoded) is not None
-
-
 def _utf16_units(value: str) -> int:
     """The console's ``value.length``: UTF-16 code units, not code points.
 
@@ -391,8 +373,11 @@ def _text(entry: Mapping[str, Any], key: str, label: str, *, required: bool = Fa
     assert isinstance(raw, str)
     value = raw.strip()
     _require(not required or value, f"{label}.{key} is required")
+    # Measured in the console's own units (JavaScript's value.length counts
+    # UTF-16 code units): astral characters count twice, so the producer can
+    # never emit a field its bundled viewer rejects as overlong.
     _require(
-        len(value) <= MAX_TEXT_LENGTH,
+        _utf16_units(value) <= MAX_TEXT_LENGTH,
         f"{label}.{key} must be at most {MAX_TEXT_LENGTH} characters",
     )
     return value

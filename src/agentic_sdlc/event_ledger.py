@@ -26,6 +26,7 @@ transition history is byte-identical to the orchestrator's own
 from __future__ import annotations
 
 import re
+import urllib.parse
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from enum import StrEnum
@@ -698,6 +699,23 @@ class WorkUnitProjection:
 #: Any URL userinfo (user:password@ or token@): the same rule the Control
 #: Center applies to current references before rendering them.
 _CREDENTIAL_REFERENCE = re.compile(r"://[^/?#\s]*@")
+#: Real provider token SHAPES; the canonical scan the Control Center reuses.
+_TOKEN_SHAPED = re.compile(r"gh[pousr]_|github_pat_|glpat-", re.IGNORECASE)
+
+
+def carries_credential_token(value: str) -> bool:
+    """A token-shaped credential anywhere in the value, percent-encoding
+    peeled first: ``?x=ghp%5FSECRET`` and ``?x=%67hp_SECRET`` decode to the
+    shapes a raw scan would miss. Bounded, with the final layer scanned."""
+    decoded = value
+    for _ in range(3):
+        if _TOKEN_SHAPED.search(decoded):
+            return True
+        peeled = urllib.parse.unquote(decoded)
+        if peeled == decoded:
+            break
+        decoded = peeled
+    return _TOKEN_SHAPED.search(decoded) is not None
 
 
 @dataclass
@@ -801,8 +819,12 @@ def _fold(events: Sequence[LifecycleEvent]) -> WorkUnitProjection:
                 # and is serialized by project-state, which would bypass the
                 # Control Center's redaction of current references — and
                 # proof bound to a malformed reference proves nothing an
-                # incident may legitimately cite.
-                if not _CREDENTIAL_REFERENCE.search(reference):
+                # incident may legitimately cite. Token SHAPES in a query
+                # string or fragment (percent-encoded or not) are credentials
+                # with no userinfo to catch, so they are screened too.
+                if not _CREDENTIAL_REFERENCE.search(reference) and not carries_credential_token(
+                    reference
+                ):
                     accumulator.merged_change_request_refs.add(reference)
             # A durable state change retires the previous ephemeral activity.
             accumulator.activity = ""

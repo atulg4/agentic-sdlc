@@ -5497,6 +5497,17 @@ def test_the_console_validates_backlog_provenance_and_scoped_liveness():
     # await and re-enables in finally, so two overlapping loads cannot adopt
     # out of order on a path with no delivery-generation check.
     assert "if (button.disabled) return;" in html
+    # ONE adoption generation across the live subscription and manual loads:
+    # whichever validation finishes under a stale generation is discarded.
+    assert "let snapshotAdoptions = 0;" in html
+    assert "const adoption = ++snapshotAdoptions;" in html
+    assert "const delivery = ++snapshotAdoptions;" in html
+    assert html.count("adoption !== snapshotAdoptions") == 2
+    # A dead snapshot listener warns through feedErrors, which a later
+    # manual load cannot erase; the store limit measures ENCODED bytes.
+    assert 'state.feedErrors.set("snapshot", "Live snapshot updates stopped ("' in html
+    assert "new TextEncoder().encode(JSON.stringify(parsed)).length" in html
+
     # parentMissing renders by truthiness, so a digest-consistent rewrite
     # carrying the string "false" must be rejected as non-boolean.
     assert "parentMissing must be a boolean." in html
@@ -5512,6 +5523,15 @@ def test_the_console_validates_backlog_provenance_and_scoped_liveness():
     assert "state disagrees with its declared state" in html
     assert "names an unknown state basis" in html
     assert "carries a status without ledger provenance" in html
+
+
+def test_text_bounds_measure_utf16_units():
+    # The console enforces MAX_TEXT_LENGTH with value.length (UTF-16 units),
+    # so the producer must measure the same way: 300 astral characters are
+    # 600 UTF-16 units and must be refused even though len() reads 300.
+    with pytest.raises(ControlCenterError, match="at most 512 characters"):
+        load_incident_document(_incidents(_incident(summary="\U0001f600" * 300)))
+    load_incident_document(_incidents(_incident(summary="\U0001f600" * 256)))
 
 
 def test_historical_merge_references_still_retire_their_incidents():
@@ -5779,6 +5799,29 @@ def test_credential_bearing_merge_references_are_never_retained():
     projection = ledger.projections()[0]
     assert projection.merged_change_request_refs == ()
     assert projection.as_dict()["durable"]["mergedChangeRequestRefs"] == []
+    # Userinfo is not the only carrier: a token SHAPE in a query string or
+    # fragment — percent-encoded or not — is the secret itself, and the
+    # historical set must never retain it either.
+    for sneaky in (
+        "https://example.test/pull/1?x=ghp_0123456789abcdefghij",
+        "https://example.test/pull/1?x=ghp%5F0123456789abcdefghij",
+        "https://example.test/pull/1?x=%67hp_0123456789abcdefghij",
+    ):
+        tokened = _ledger(
+            *_chain(
+                TO_MERGED,
+                workUnit={
+                    "projectId": "forge",
+                    "workUnitId": "wu-1",
+                    "changeRequestRef": sneaky,
+                },
+            )
+        )
+        tokened_projection = tokened.projections()[0]
+        # The CURRENT reference is the snapshot builder's to redact; the
+        # historical set, which outlives that redaction, retains nothing.
+        assert tokened_projection.merged_change_request_refs == ()
+        assert tokened_projection.as_dict()["durable"]["mergedChangeRequestRefs"] == []
 
 
 def test_merge_proof_survives_a_lifecycle_restart():
@@ -6775,6 +6818,21 @@ def test_mismatch_errors_withhold_credentialed_identities():
         )
     assert "TOPSECRET" not in str(parent_error.value)
     assert "withheld" in str(parent_error.value)
+    # Percent-encoding must not smuggle a token into the echoed error: the
+    # scan peels valid escapes before deciding a rejected URL is safe to
+    # show, so ghp%5F... and %67hp_... are withheld like their raw shapes.
+    for sneaky in (
+        "https://api.github.com/repos/acme/forge/issues/9?x=ghp%5F0123456789abcdefghij",
+        "https://api.github.com/repos/acme/forge/issues/9?x=%67hp_0123456789abcdefghij",
+    ):
+        with pytest.raises(ControlCenterError) as encoded_error:
+            backlog_document_from_issues(
+                [_issue(7, "ok") | {"html_url": sneaky}],
+                project_id="forge",
+                repository="acme/forge",
+            )
+        assert "0123456789abcdefghij" not in str(encoded_error.value)
+        assert "withheld" in str(encoded_error.value)
 
 
 def test_contested_issue_references_stay_unresolved():

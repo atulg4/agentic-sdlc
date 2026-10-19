@@ -240,6 +240,10 @@
     // so its banner must survive adoption.
     feedErrors: new Map(),
   };
+  // One adoption generation across BOTH snapshot paths (live deliveries and
+  // manual loads): whichever validation finishes under a stale generation is
+  // discarded, so an older document can never adopt after a newer one.
+  let snapshotAdoptions = 0;
 
   /* ---------- tiny DOM helper: text is always set as text ---------- */
   function el(tag, props, ...kids) {
@@ -350,11 +354,13 @@
       // A live subscription, not a one-shot get: a snapshot replaced by
       // another operator must reach every open view. Each delivery passes
       // the same structural AND digest verification as a pasted document,
-      // because the store itself is writable by other viewers.
-      let deliveries = 0;
+      // because the store itself is writable by other viewers. The
+      // adoption generation is SHARED with the manual-load path, so a slow
+      // pasted document can never adopt after a newer live delivery (or
+      // vice versa).
       state.db.doc("snapshots/current").onSnapshot(
         async (snap) => {
-          const delivery = ++deliveries;
+          const delivery = ++snapshotAdoptions;
           if (!snap?.exists) {
             // A deleted snapshot is a delivery too: it clears the view and
             // supersedes any older digest verification still in flight. The
@@ -369,7 +375,7 @@
           }
           const body = snap.data() || {};
           const problem = validateSnapshot(body.document) || await digestMismatch(body.document);
-          if (delivery !== deliveries) return; // a newer delivery superseded this one
+          if (delivery !== snapshotAdoptions) return; // a newer adoption superseded this one
           if (problem) { state.error = problem; render(); return; }
           adoptSnapshot(body.document, body.loadedAt, body.loadedBy);
           render();
@@ -377,12 +383,15 @@
         (error) => {
           // A terminated subscription must be visible: the last snapshot
           // stays rendered, but operators are told updates stopped rather
-          // than left acting on stale data that still looks live. Bumping
-          // the counter also invalidates any digest verification still in
-          // flight, so a pending delivery cannot adopt and clear this error.
-          deliveries += 1;
-          state.error = "Live snapshot updates stopped (" + describe(error)
-            + "). Showing the last loaded snapshot; reload the page to reconnect.";
+          // than left acting on stale data that still looks live. Kept in
+          // feedErrors — never state.error — so a later MANUAL load cannot
+          // erase the warning while the listener stays dead. Bumping the
+          // generation also invalidates any digest verification still in
+          // flight, so a pending delivery cannot adopt past this error.
+          snapshotAdoptions += 1;
+          state.feedErrors.set("snapshot", "Live snapshot updates stopped ("
+            + describe(error)
+            + "). Showing the last loaded snapshot; reload the page to reconnect.");
           render();
         },
       );
@@ -2170,12 +2179,22 @@
             let parsed;
             try { parsed = JSON.parse(area.value); }
             catch (error) { result.append(el("div", { class: "banner bad", text: "That is not valid JSON: " + describe(error) })); return; }
+            // The shared generation orders this load against LIVE deliveries
+            // too: a pasted document whose validation finishes after a newer
+            // delivery adopted must not put the older view back.
+            const adoption = ++snapshotAdoptions;
             const problem = validateSnapshot(parsed) || await digestMismatch(parsed);
+            if (adoption !== snapshotAdoptions) {
+              result.append(el("div", { class: "banner", text: "A newer snapshot arrived while this one was being verified; it was not loaded." }));
+              return;
+            }
             if (problem) { result.append(el("div", { class: "banner bad", text: problem })); return; }
             const at = new Date().toISOString();
             let saveProblem = "";
             if (state.db) {
-              const bytes = JSON.stringify(parsed).length;
+              // ENCODED bytes, not UTF-16 units: the store's document limit
+              // is a byte limit, and CJK-heavy text doubles past .length.
+              const bytes = new TextEncoder().encode(JSON.stringify(parsed)).length;
               if (bytes > 240000) {
                 saveProblem = `Loaded in this view only: at ${Math.round(bytes / 1024)} KiB the snapshot exceeds the shared store's 256 KiB document limit, so it was not saved for other viewers. Narrow it with --project-id to share it.`;
               } else {
@@ -2185,6 +2204,13 @@
                   saveProblem = "Loaded in this view only — saving it for everyone failed: " + describe(error);
                 }
               }
+            }
+            // Re-checked after the save await: a live delivery that adopted
+            // meanwhile outranks this load (the write above, if it happened,
+            // arrives as its own ordered delivery).
+            if (adoption !== snapshotAdoptions) {
+              result.append(el("div", { class: "banner", text: "A newer snapshot arrived while this one was being saved; the newer one stays in view." }));
+              return;
             }
             adoptSnapshot(parsed, at, state.viewer?.id || "");
             state.error = saveProblem;
