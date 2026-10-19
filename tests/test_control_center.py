@@ -2704,6 +2704,10 @@ def test_the_config_must_belong_to_the_exported_repository(tmp_path):
                 "acme/forge",
                 "--backlog-output",
                 str(tmp_path / "backlog.json"),
+                # The bare open issue below yields an untriaged advisory, and
+                # a computed incident always needs a destination.
+                "--incidents-output",
+                str(tmp_path / "incidents.json"),
             ]
         )
 
@@ -3294,6 +3298,10 @@ def test_the_payload_spelling_canonicalizes_the_repository(tmp_path):
                 "acme/forge",
                 "--backlog-output",
                 str(backlog_out),
+                # The bare open issue yields an untriaged advisory, and a
+                # computed incident always needs a destination.
+                "--incidents-output",
+                str(tmp_path / "incidents.json"),
             ]
         )
         == 0
@@ -5240,6 +5248,13 @@ def test_the_console_binds_incidents_and_enforces_full_membership():
     assert "during a dependency wait." in html
     assert "dependencyWaitByState" in html
     assert "(project.counts.byState[key] || 0) - waiting" in html
+    # The dependency-wait exemptions reconcile against the stage census: a
+    # re-signed store document cannot park running implementing units behind
+    # inflated exemptions while byStage still says implementation.
+    assert "counts.byStage must be an object." in html
+    assert "counts.byStage names an unknown stage" in html
+    assert "byStage disagrees with byState on the unit total." in html
+    assert "must sum to the dependency-wait stage count." in html
     # Every formerly live key is exact-read verified, cached or not.
     assert ".filter((key) => !live.has(key));" in html
     # A live note that was never backfilled is seeded into the cache before

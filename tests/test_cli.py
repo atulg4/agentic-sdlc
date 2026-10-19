@@ -1610,3 +1610,99 @@ def test_github_backlog_failing_requires_an_incident_destination(tmp_path, capsy
         == 2
     )
     assert "require --incidents-output" in capsys.readouterr().err
+
+
+def test_github_backlog_issue_incidents_require_a_destination(tmp_path, capsys):
+    # Issue-level incidents are generated from --issues alone: an export
+    # computing a nonempty incident group without --incidents-output would
+    # silently drop the blockers, so it refuses instead.
+    import json
+
+    from agentic_sdlc.cli import main as cli_main
+
+    issues = tmp_path / "issues.json"
+    issues.write_text(
+        json.dumps(
+            [
+                {
+                    "number": 11,
+                    "title": "Approved but undispatchable",
+                    "state": "open",
+                    "repository_url": "https://api.github.com/repos/acme/forge",
+                    # Approved for implementation with neither dispatch label:
+                    # exactly the approved-without-dispatch-labels incident.
+                    "labels": [{"name": "implementation-approved"}],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    argv = [
+        "github-backlog",
+        "--issues",
+        str(issues),
+        "--project-id",
+        "forge",
+        "--repository",
+        "acme/forge",
+        "--observed-at",
+        "2026-10-12T10:30:00Z",
+        "--backlog-output",
+        str(tmp_path / "backlog.json"),
+    ]
+    assert cli_main(argv) == 2
+    err = capsys.readouterr().err
+    assert "requires --incidents-output" in err
+    assert "would be dropped" in err
+    # With the destination the same export succeeds and keeps the incident.
+    assert cli_main([*argv, "--incidents-output", str(tmp_path / "incidents.json")]) == 0
+    incidents = json.loads((tmp_path / "incidents.json").read_text(encoding="utf-8"))
+    assert any(
+        entry["incidentId"].endswith("approved-without-dispatch-labels")
+        for entry in incidents["incidents"]
+    )
+
+
+def test_github_backlog_withholds_credentialed_urls_from_errors(tmp_path, capsys):
+    # Rejection messages reach stderr and CI logs: a malformed URL embedding
+    # userinfo must not echo the credential.
+    import json
+
+    from agentic_sdlc.cli import main as cli_main
+
+    issues = tmp_path / "issues.json"
+    issues.write_text(
+        json.dumps(
+            [
+                {
+                    "number": 11,
+                    "title": "A task",
+                    "state": "open",
+                    "repository_url": "https://user:hunter2secret@api.github.com/repos/acme/forge",
+                    "labels": [],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        cli_main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+                "--observed-at",
+                "2026-10-12T10:30:00Z",
+                "--backlog-output",
+                str(tmp_path / "backlog.json"),
+            ]
+        )
+        == 2
+    )
+    err = capsys.readouterr().err
+    assert "hunter2secret" not in err
+    assert "withheld" in err
