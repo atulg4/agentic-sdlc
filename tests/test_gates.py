@@ -358,6 +358,30 @@ def test_gates_run_under_the_command_prefix(tmp_path: Path) -> None:
         run_gates(config, tmp_path, command_prefix=("env", ""))
 
 
+def test_the_interpreter_probe_runs_under_the_command_prefix(tmp_path: Path) -> None:
+    # The version probe EXECUTES whatever interpreter the gate PATH resolves
+    # first — on a runner with a repository-local virtualenv, a
+    # candidate-writable program — so it runs under the same isolation
+    # wrapper the gates themselves do.
+    from agentic_sdlc.gates import gate_python_version
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    script = bin_dir / "python3"
+    script.write_text(
+        '#!/bin/sh\ntest "$SANDBOX_MARK" = "1" || exit 7\necho 3.12.7\n', encoding="utf-8"
+    )
+    script.chmod(0o755)
+    environment = {"PATH": f"{bin_dir}:/usr/bin:/bin"}
+    with pytest.raises(GateError, match="did not report a Python version"):
+        gate_python_version(environment, tmp_path)
+    found, version = gate_python_version(
+        environment, tmp_path, command_prefix=("env", "SANDBOX_MARK=1")
+    )
+    assert found == str(script)
+    assert version == "3.12.7"
+
+
 def test_gates_rebind_revision_variables(tmp_path: Path, monkeypatch) -> None:
     # An isolated derivation rebinds the standard revision variables: the
     # ambient workflow's SHA and refs describe the caller's checkout.

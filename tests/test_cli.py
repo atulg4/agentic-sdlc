@@ -743,9 +743,13 @@ def test_packet_commands_run_under_strict_executable_trust(tmp_path: Path, monke
     # warning instead of trusting a candidate-planted program.
     from agentic_sdlc.cli import GATE_COMMANDS
 
-    assert {"context-packet", "dispatch-packet", "orchestrate", "attest-completion"} <= (
-        GATE_COMMANDS
-    )
+    assert {
+        "context-packet",
+        "dispatch-packet",
+        "orchestrate",
+        "attest-completion",
+        "attest-outcome",
+    } <= GATE_COMMANDS
     monkeypatch.setenv("AGENTIC_SDLC_GIT", str(tmp_path / "planted-git"))
     state = tmp_path / "state.json"
     assert (
@@ -975,6 +979,166 @@ def test_orchestrate_attests_only_runs_a_trusted_dispatch_produced(tmp_path: Pat
     stale_file.write_text(json.dumps(stale), encoding="utf-8")
     assert main([*finish, "--completion", str(stale_file)]) == 2
     assert main([*finish, "--completion", str(completion)]) == 0
+
+    # VERIFICATION and REVIEW verdicts are caller input too: under a key each
+    # transition requires the attest-outcome record the judging harness
+    # signed, bound to the judged run's dispatch envelope.
+    assert (
+        main(
+            [
+                *base,
+                "--action",
+                "transition",
+                "--event-key",
+                "evt-verifying",
+                "--to",
+                "verifying",
+                "--timestamp",
+                stamp,
+                "--actor",
+                "operator",
+                "--actor-kind",
+                "human",
+            ]
+        )
+        == 0
+    )
+    verify = [
+        *base,
+        "--action",
+        "verification",
+        "--result",
+        "succeeded",
+        "--event-key",
+        "evt-verdict",
+        "--timestamp",
+        stamp,
+    ]
+    capsys.readouterr()
+    assert main(verify) == 2
+    assert "requires --outcome" in capsys.readouterr().err
+    outcome = tmp_path / "outcome.json"
+    assert (
+        main(
+            [
+                "attest-outcome",
+                "--unit",
+                "42",
+                "--kind",
+                "verification",
+                "--result",
+                "succeeded",
+                "--envelope-sha256",
+                signed["envelopeSha256"],
+                "--attestation-key",
+                str(key_file),
+                "--output",
+                str(outcome),
+            ]
+        )
+        == 0
+    )
+
+    def _reissued(path_name: str, **changed) -> str:
+        document = {**json.loads(outcome.read_text(encoding="utf-8")), **changed}
+        del document["attestation"]
+        document["attestation"] = _attest_document(document, secret)
+        path = tmp_path / path_name
+        path.write_text(json.dumps(document), encoding="utf-8")
+        return str(path)
+
+    # A verdict signed over another envelope — or over the opposite result —
+    # must not drive this transition.
+    assert main([*verify, "--outcome", _reissued("other-env.json", envelopeSha256="e" * 64)]) == 2
+    assert main([*verify, "--outcome", _reissued("other-result.json", result="failed")]) == 2
+    assert main([*verify, "--outcome", str(outcome)]) == 0
+
+    # The unit is now reviewing: start the review run from a reviewer-signed
+    # dispatch, then the review transition needs its own signed outcome bound
+    # to that run's envelope, run id and findings count.
+    review_envelope = _signed_for(
+        missionId="code-reviewer",
+        agentId="reviewer-agent",
+        packetRole="reviewer",
+        runKind="review",
+    )
+    review_start = [
+        *base,
+        "--action",
+        "start-run",
+        "--kind",
+        "review",
+        "--event-key",
+        "evt-review-run",
+        "--timestamp",
+        stamp,
+        "--envelope",
+        _envelope_file("review-envelope.json", review_envelope),
+    ]
+    assert main(review_start) == 0
+    review = [
+        *base,
+        "--action",
+        "review",
+        "--run-id",
+        "42:run-002",
+        "--findings",
+        "0",
+        "--event-key",
+        "evt-review",
+        "--timestamp",
+        stamp,
+    ]
+    capsys.readouterr()
+    assert main(review) == 2
+    assert "requires --outcome" in capsys.readouterr().err
+    review_outcome = tmp_path / "review-outcome.json"
+    assert (
+        main(
+            [
+                "attest-outcome",
+                "--unit",
+                "42",
+                "--kind",
+                "review",
+                "--result",
+                "succeeded",
+                "--findings",
+                "0",
+                "--run-id",
+                "42:run-002",
+                "--envelope-sha256",
+                review_envelope["envelopeSha256"],
+                "--attestation-key",
+                str(key_file),
+                "--output",
+                str(review_outcome),
+            ]
+        )
+        == 0
+    )
+
+    def _review_reissued(path_name: str, **changed) -> str:
+        document = {**json.loads(review_outcome.read_text(encoding="utf-8")), **changed}
+        del document["attestation"]
+        document["attestation"] = _attest_document(document, secret)
+        path = tmp_path / path_name
+        path.write_text(json.dumps(document), encoding="utf-8")
+        return str(path)
+
+    # A review signed for another run, another findings count, or another
+    # envelope must not advance this unit; a verification outcome cannot be
+    # replayed as a review either.
+    for bogus in (
+        _review_reissued("review-run.json", runId="42:run-001"),
+        _review_reissued("review-count.json", findings=3),
+        _review_reissued("review-env.json", envelopeSha256=signed["envelopeSha256"]),
+        str(outcome),
+    ):
+        assert main([*review, "--outcome", bogus]) == 2
+    assert main([*review, "--outcome", str(review_outcome)]) == 0
+    document = json.loads(state.read_text(encoding="utf-8"))
+    assert document["units"]["42"]["state"] == "ready-for-human-merge"
 
 
 def test_orchestrate_attests_state_under_a_key(tmp_path: Path) -> None:

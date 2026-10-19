@@ -119,7 +119,10 @@ GATE_PYTHON_NAMES = ("python3", "python")
 
 
 def gate_python_version(
-    environment: dict[str, str], root: Path, name: str = "python3"
+    environment: dict[str, str],
+    root: Path,
+    name: str = "python3",
+    command_prefix: Sequence[str] = (),
 ) -> tuple[str, str]:
     """(path, `X.Y.Z`) of the `name` interpreter the gates run: the first on the gate
     environment's PATH, asked for its version in that same environment. GateError when there is
@@ -129,7 +132,11 @@ def gate_python_version(
         raise GateError(f"no {name} on the verification gates' PATH")
     try:
         probe = subprocess.run(
-            [found, "-I", "-c", _VERSION_PROBE],
+            # The probe EXECUTES whatever interpreter the gate PATH resolves
+            # first — on a runner with a repository-local virtualenv, a
+            # candidate-writable program — so it runs under the same
+            # isolation wrapper the gates themselves do.
+            [*command_prefix, found, "-I", "-c", _VERSION_PROBE],
             cwd=root,
             env=environment,
             capture_output=True,
@@ -147,7 +154,10 @@ def gate_python_version(
 
 
 def check_gate_python(
-    python_version: str | None, environment: dict[str, str], root: Path
+    python_version: str | None,
+    environment: dict[str, str],
+    root: Path,
+    command_prefix: Sequence[str] = (),
 ) -> str | None:
     """A warning (never a failure) when an interpreter the gates may run -- `python3` or
     `python`, each the first on the gate PATH -- is not the policy's `[ci] python_version`
@@ -161,7 +171,9 @@ def check_gate_python(
     errors: list[str] = []
     for name in GATE_PYTHON_NAMES:
         try:
-            found.append(gate_python_version(environment, root, name))
+            found.append(
+                gate_python_version(environment, root, name, command_prefix=command_prefix)
+            )
         except GateError as error:
             if shutil.which(name, path=environment.get("PATH", os.defpath)):
                 errors.append(str(error))  # present but unreadable: say so
@@ -273,7 +285,9 @@ def run_gates(
             environment.pop(name, None)
         else:
             environment[name] = value
-    warning = check_gate_python(python_version, environment, root)
+    warning = check_gate_python(
+        python_version, environment, root, command_prefix=tuple(command_prefix or ())
+    )
     if warning:
         print(f"::warning::{warning}", file=sys.stderr, flush=True)
     for name in names:

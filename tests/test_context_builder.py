@@ -2612,6 +2612,46 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
     )
     assert "must be a separate repository" in capsys.readouterr().err
 
+    # ...and a TARGET nested inside the candidate's own tree: the candidate's
+    # commits and working-tree writes land under that root, so such a target
+    # is candidate-writable however genuine its clone looks.
+    import shutil
+
+    inner = repo / "inner-target"
+    subprocess.run(
+        ["git", "clone", "--quiet", str(repo), str(inner)],
+        check=True,
+        env=env,
+        capture_output=True,
+    )
+    capsys.readouterr()
+    assert (
+        cli_main(
+            [
+                "context-packet",
+                "--config",
+                str(repo / "agentic-sdlc.toml"),
+                "--knowledge",
+                str(knowledge),
+                "--request",
+                str(request),
+                "--candidate-repository",
+                str(repo),
+                "--candidate-base",
+                base,
+                "--candidate-head",
+                head,
+                "--review-target-repository",
+                str(inner),
+                "--gate-sandbox",
+                "trusted-host",
+            ]
+        )
+        == 2
+    )
+    assert "must be a separate repository" in capsys.readouterr().err
+    shutil.rmtree(inner)
+
     # Gates run under the configuration committed at the AUTHENTICATED BASE:
     # a candidate commit that replaces the configured gates with an
     # always-passing command never records a passing report under its own
@@ -2982,6 +3022,24 @@ def test_dispatch_packet_enforces_task_policy(tmp_path, policy_file, valid_body,
         == 0
     )
     assert json.loads(envelope_path.read_text(encoding="utf-8"))["agentId"] == "codex-1"
+    # The freshness ceiling only NARROWS: a caller holding a stale signed
+    # result must not widen the window to restore the replay checkedAt
+    # exists to prevent.
+    capsys.readouterr()
+    assert (
+        cli_main(
+            [
+                "dispatch-packet",
+                *base,
+                "--authorization",
+                str(good),
+                "--authorization-max-age-seconds",
+                "901",
+            ]
+        )
+        == 2
+    )
+    assert "never widen" in capsys.readouterr().err
 
 
 def test_write_capable_dispatch_verifies_repository_evidence(
@@ -3308,6 +3366,36 @@ def test_repair_dispatch_reads_the_roster_from_the_authenticated_base(
     # selected the agent, and the envelope digests the repair kind.
     assert envelope["agentId"] == "codex-1"
     assert envelope["runKind"] == "repair"
+
+    # The repair head cannot re-aim WHICH base authenticates its contract: a
+    # committed default-branch pivot refuses against the base-committed
+    # policy even when the pivoted ref exists in the target.
+    subprocess.run(
+        ["git", "-C", str(target), "update-ref", "refs/remotes/origin/release", _pin],
+        check=True,
+        env=env,
+        capture_output=True,
+    )
+    (repo / "agentic-sdlc.toml").write_text(
+        (repo / "agentic-sdlc.toml")
+        .read_text(encoding="utf-8")
+        .replace('default_branch = "main"', 'default_branch = "release"'),
+        encoding="utf-8",
+    )
+    git("commit", "-q", "-am", "pivot the default branch")
+    pivot_head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        env=env,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    pivot_request = json.loads(request.read_text(encoding="utf-8"))
+    pivot_request["repositoryRevision"] = pivot_head
+    request.write_text(json.dumps(pivot_request), encoding="utf-8")
+    capsys.readouterr()
+    assert cli_main(["dispatch-packet", *base, "--review-target-repository", str(target)]) == 2
+    assert "changes the policy's default branch" in capsys.readouterr().err
 
 
 def test_patch_boundary_markers_are_escaped_never_stripped(registry, policy):

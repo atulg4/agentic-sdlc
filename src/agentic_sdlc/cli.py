@@ -902,6 +902,11 @@ def _require_separate_target(args: argparse.Namespace) -> None:
         # candidate-mutable again.
         or candidate_root == target_root
         or candidate_root.startswith(target_root + os.sep)
+        # ...and the target's WORKTREE must not sit under the candidate
+        # either: a linked worktree of an otherwise separate repository
+        # placed beneath the candidate keeps its common directory elsewhere,
+        # yet candidate code can run git inside it and move the shared refs.
+        or target_root.startswith(candidate_root + os.sep)
     ):
         raise ContextBuilderError(
             "--review-target-repository must be a separate repository: the "
@@ -1216,7 +1221,14 @@ def _check_dispatch_authorization(args: argparse.Namespace, policy, packet) -> N
         )
     # A stale but genuine result can authorize work the CURRENT issue state
     # no longer permits (a removed label, a reopened dependency, a fresh
-    # pull request), so the result must be recent.
+    # pull request), so the result must be recent — and the ceiling can be
+    # NARROWED, never widened: a caller holding a stale signed result must
+    # not restore the replay checkedAt exists to prevent.
+    if args.authorization_max_age_seconds > 900:
+        raise ContextBuilderError(
+            "--authorization-max-age-seconds can narrow the freshness "
+            "ceiling, never widen it: values above 900 are refused"
+        )
     checked_at = document.get("checkedAt")
     try:
         checked = datetime.datetime.fromisoformat(str(checked_at))
@@ -1310,6 +1322,44 @@ def _build_packet_from_request(
             )
         pinned = resolve_commit(args.candidate_repository, pin_source)
         policy = load_policy_bytes(_committed_configuration(args, pinned, args.config, "--config"))
+        if getattr(args, "run_kind", None) == "repair":
+            # The repair candidate's pinned HEAD is the failed
+            # implementation's own commits: a widened repair mission or
+            # weakened policy committed there must not shape a write-capable
+            # repair envelope, and the head-controlled default branch must
+            # not choose which ref supplies the base either, so the WHOLE
+            # contract re-pins to the authenticated base (the base-committed
+            # policy must agree on the branch name that located it).
+            if not getattr(args, "review_target_repository", None):
+                raise ContextBuilderError(
+                    "--run-kind repair requires --review-target-repository: "
+                    "the repair contract (policy, missions, knowledge, "
+                    "roster) loads from the authenticated base, never the "
+                    "failed candidate's own head"
+                )
+            _require_separate_target(args)
+            try:
+                base_pin = resolve_commit(
+                    args.review_target_repository, f"origin/{policy.default_branch}"
+                )
+            except GitDiffError as error:
+                raise ContextBuilderError(
+                    "the review target repository has no "
+                    f"origin/{policy.default_branch}; fetch the authoritative "
+                    "base before dispatching a repair"
+                ) from error
+            base_policy = load_policy_bytes(
+                _committed_configuration(args, base_pin, args.config, "--config")
+            )
+            if base_policy.default_branch != policy.default_branch:
+                raise ContextBuilderError(
+                    "the repair candidate changes the policy's default "
+                    "branch; that re-aims base authentication, so land the "
+                    "configuration change through the human-controlled path "
+                    "before repairing against it"
+                )
+            policy = base_policy
+            pinned = base_pin
         # The mission registry and knowledge sources are the same
         # human-reviewed, baseline-forbidden configuration the policy is: an
         # uncommitted edit must not widen a consumer mission or a source's
@@ -1800,17 +1850,13 @@ def _orchestrate(args: argparse.Namespace) -> int:
         envelope = json.loads(Path(args.envelope).read_text(encoding="utf-8"))
         if key is not None:
             _require_attested_envelope(envelope, key, unit=args.unit, kind=args.kind)
-            # One digest identifies ONE dispatch: a review envelope reused
-            # after a repair would report on the pre-repair packet and head
-            # while record_review advances the repaired unit toward merge.
-            # Only a FAILED run's envelope may seed a retry — the re-dispatch
-            # of the same content is byte-identical by construction.
+            # One digest identifies ONE recorded run, with NO retry
+            # exception: a FAILED review's envelope reused in re-reviewing
+            # would still hand the reviewer the pre-repair packet and head
+            # while record_review advances the repaired unit, so every
+            # previously recorded digest refuses and a retry re-dispatches.
             digest = envelope.get("envelopeSha256")
-            replayed = [
-                run
-                for run in engine.get(args.unit).runs
-                if run.envelope_sha256 == digest and run.result != "failed"
-            ]
+            replayed = [run for run in engine.get(args.unit).runs if run.envelope_sha256 == digest]
             if replayed:
                 raise OrchestrationError(
                     "this dispatch envelope was already recorded for work "
@@ -1884,6 +1930,28 @@ def _orchestrate(args: argparse.Namespace) -> int:
             commit_sha=args.commit_sha,
         )
     elif args.action == "verification":
+        # "--result succeeded" is caller input: under a key, the recorded
+        # verdict must be the one the verifier harness signed for the code
+        # actually judged — the unit's latest producing run's envelope.
+        if key is not None:
+            outcome = _require_signed_outcome(args, key, kind="verification")
+            if outcome.get("result") != args.result:
+                raise OrchestrationError(
+                    "the outcome record attests a different verification "
+                    "result than the transition claims; record the result the "
+                    "verifier harness actually signed"
+                )
+            produced = [
+                run
+                for run in engine.get(args.unit).runs
+                if run.kind in ("implementation", "repair")
+            ]
+            if not produced or outcome.get("envelopeSha256") != produced[-1].envelope_sha256:
+                raise OrchestrationError(
+                    "the outcome record does not bind the unit's latest "
+                    "producing run's dispatch envelope; a verification verdict "
+                    "counts only for the code it actually judged"
+                )
         engine.record_verification(
             args.unit,
             passed=args.result == "succeeded",
@@ -1891,6 +1959,23 @@ def _orchestrate(args: argparse.Namespace) -> int:
             timestamp=args.timestamp,
         )
     elif args.action == "review":
+        # "--findings 0" is caller input: under a key, the recorded count
+        # must be the one the reviewer harness signed for this exact run.
+        if key is not None:
+            outcome = _require_signed_outcome(args, key, kind="review")
+            if outcome.get("runId") != args.run_id or outcome.get("findings") != args.findings:
+                raise OrchestrationError(
+                    "the outcome record does not bind this run and findings "
+                    "count; record the review the reviewer harness actually "
+                    "signed"
+                )
+            reviewed = {run.run_id: run for run in engine.get(args.unit).runs}.get(args.run_id)
+            if reviewed is None or outcome.get("envelopeSha256") != reviewed.envelope_sha256:
+                raise OrchestrationError(
+                    "the outcome record binds a different dispatch envelope "
+                    "than the run being reviewed; regenerate it with "
+                    "attest-outcome for this run's envelope"
+                )
         engine.record_review(
             args.unit,
             args.run_id,
@@ -1904,6 +1989,60 @@ def _orchestrate(args: argparse.Namespace) -> int:
     _write(state_document, str(state_path))
     if args.status_output:
         Path(args.status_output).write_text(engine.status_document(args.unit), encoding="utf-8")
+    return 0
+
+
+def _require_signed_outcome(args: argparse.Namespace, key: bytes, *, kind: str) -> dict:
+    """An attested state records only outcomes a trusted harness signed.
+
+    ``--result succeeded`` and ``--findings 0`` are otherwise raw CLI inputs:
+    an invoker could mark failed gates as passing, or report zero findings
+    with no reviewer artifact, and the resulting state would carry a genuine
+    HMAC. The verifier or reviewer harness — the key-holding component that
+    actually observed the outcome — signs it with ``attest-outcome``.
+    """
+    if not getattr(args, "outcome", None):
+        raise OrchestrationError(
+            f"an attested {kind} transition requires --outcome: the "
+            "attest-outcome record the verifier or reviewer harness signed "
+            "for this run"
+        )
+    outcome = json.loads(Path(args.outcome).read_text(encoding="utf-8"))
+    mark = outcome.get(_ATTESTATION_FIELD) if isinstance(outcome, dict) else None
+    if not isinstance(mark, str) or not hmac.compare_digest(mark, _attest_document(outcome, key)):
+        raise OrchestrationError(
+            "the outcome record carries no valid attestation under "
+            "--attestation-key; produce it with attest-outcome and the same key"
+        )
+    if outcome.get("kind") != kind or outcome.get("unit") != args.unit:
+        raise OrchestrationError(
+            "the outcome record does not bind this unit and transition kind; "
+            "regenerate it with attest-outcome"
+        )
+    return outcome
+
+
+def _attest_outcome(args: argparse.Namespace) -> int:
+    """Record a verification or review OUTCOME, signed by the harness that
+    observed it, bound to the dispatched envelope it judged."""
+    key = _attestation_key_bytes(args.attestation_key)
+    if not re.fullmatch(r"[0-9a-f]{64}", args.envelope_sha256 or ""):
+        raise OrchestrationError(
+            "--envelope-sha256 must be the judged run's dispatched envelope "
+            "digest (64 hex characters)"
+        )
+    document = {
+        "schemaVersion": 1,
+        "unit": args.unit,
+        "kind": args.kind,
+        "result": args.result,
+        "findings": args.findings,
+        "runId": args.run_id,
+        "envelopeSha256": args.envelope_sha256,
+        "recordedAt": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
+    }
+    document[_ATTESTATION_FIELD] = _attest_document(document, key)
+    _write(document, args.output)
     return 0
 
 
@@ -2954,6 +3093,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="with --attestation-key and --commit-sha: the attest-completion "
         "record binding this unit, run and commit",
     )
+    orchestrate.add_argument(
+        "--outcome",
+        help="with --attestation-key on verification/review: the "
+        "attest-outcome record the verifier or reviewer harness signed for "
+        "the judged run",
+    )
     orchestrate.add_argument("--max-repair-cycles", type=int, default=2)
     orchestrate.add_argument("--status-output")
     orchestrate.add_argument(
@@ -2980,6 +3125,22 @@ def build_parser() -> argparse.ArgumentParser:
     attest_completion.add_argument("--attestation-key", required=True)
     attest_completion.add_argument("--output")
     attest_completion.set_defaults(handler=_attest_completion)
+
+    attest_outcome = commands.add_parser("attest-outcome")
+    attest_outcome.add_argument("--unit", required=True)
+    attest_outcome.add_argument("--kind", choices=("verification", "review"), required=True)
+    attest_outcome.add_argument("--result", choices=("succeeded", "failed"), required=True)
+    attest_outcome.add_argument("--findings", type=int, default=0)
+    attest_outcome.add_argument("--run-id", default="")
+    attest_outcome.add_argument(
+        "--envelope-sha256",
+        required=True,
+        help="the judged run's dispatched envelope digest: the verdict counts "
+        "only for the code that run actually produced",
+    )
+    attest_outcome.add_argument("--attestation-key", required=True)
+    attest_outcome.add_argument("--output")
+    attest_outcome.set_defaults(handler=_attest_outcome)
     orchestrate.set_defaults(handler=_orchestrate)
 
     registry = commands.add_parser("validate-registry")
@@ -3353,6 +3514,7 @@ GATE_COMMANDS = frozenset(
         "dispatch-packet",
         "orchestrate",
         "attest-completion",
+        "attest-outcome",
     }
 )
 

@@ -254,7 +254,10 @@ candidate-controlled COMMANDS — run bare they execute as the caller's OS
 user, and a disposable clone restricts nothing outside itself —
 `--gate-sandbox` is required: either an isolation wrapper command prefix
 (a container or sandbox launcher, prepended to every gate's argv and
-visible in the recorded report) or the literal `trusted-host` to explicitly
+visible in the recorded report — and to the interpreter VERSION PROBE,
+which executes whatever `python3`/`python` the gate PATH resolves first,
+on a runner with a repository-local virtualenv a candidate-writable
+program) or the literal `trusted-host` to explicitly
 accept host execution for a candidate the caller already trusts. The clone
 also mirrors the
 source's remote-tracking and tag refs, since CI checkouts often carry the
@@ -331,7 +334,9 @@ Write-capable dispatches also re-run the task policy
 `check-request --authorize-labels` result, which must be ready, authorized
 and stable, must name this exact project, work item, and content digest,
 must be FRESH (`checkedAt` within `--authorization-max-age-seconds`,
-default 900, since labels, dependencies, and pull requests all move after
+default 900 — a ceiling the flag can only NARROW, never widen, so a caller
+holding a stale signed result cannot restore the replay `checkedAt` exists
+to prevent — since labels, dependencies, and pull requests all move after
 a check), and whose verdict must cover exactly the policy's implementation,
 ready, and human-review labels — label names spelled into caller-supplied request
 JSON are not approval evidence, and neither is a verdict narrowed to a
@@ -365,7 +370,15 @@ run completion — mere existence of a commit proves nothing about which run
 produced it, and because run IDs restart when state is recreated, the
 envelope digest is verified against the finished run's recorded
 `envelopeSha256` so a genuine completion from an old history cannot finish
-a recreated run. The agent roster is repository-owned configuration exactly
+a recreated run. Attested VERIFICATION and REVIEW transitions require
+`--outcome` the same way: `--result succeeded` and `--findings 0` are
+otherwise raw CLI inputs an invoker could assert over failed gates or an
+unread diff, so the `attest-outcome` record (unit, kind, result, findings,
+run and the judged envelope's digest, signed by the verifier or reviewer
+harness that observed the outcome) must match the transition's arguments
+and bind the judged run's recorded `envelopeSha256` — the latest producing
+run's for a verification, the named review run's for a review — so a
+verdict always attaches to the exact dispatched code it judged. The agent roster is repository-owned configuration exactly
 like the policy: `dispatch-packet` reads `--agents` from the committed
 candidate tree at the packet's pinned revision — and for REVIEWER
 dispatches, whose pin is the untrusted candidate head, from the
@@ -376,13 +389,19 @@ authorized work to an undeclared executor. REPAIR dispatches
 (`--run-kind repair`) have the same exposure from the other side: the
 repair candidate's pinned HEAD is the failed implementation's own commits,
 so they require `--review-target-repository` (same separation checks) and
-load the roster at its `origin/<default branch>` too. And one envelope
-digest seeds at most ONE recorded run: an attested `start-run` refuses an
-envelope whose digest the unit already recorded (unless every such run
-failed, since a retry re-dispatches byte-identical content), so a
-pre-repair review envelope can never report on the repaired head. And every command that derives
+re-pin the WHOLE contract — policy, mission registry, knowledge sources,
+and roster — to its `origin/<default branch>`, with the base-committed
+policy required to agree on the branch name that located it, so a widened
+repair mission or weakened policy committed at the failed head shapes
+nothing. And one envelope
+digest seeds at most ONE recorded run, with no exception for failed runs:
+an attested `start-run` refuses an envelope whose digest the unit already
+recorded, so a pre-repair review envelope can never report on the repaired
+head and a failed run's envelope cannot seed a second attempt under the
+first's attribution — a retry is a fresh dispatch, whose moved revision or
+refreshed authorization gives it a fresh digest. And every command that derives
 or attests these artifacts (`context-packet`, `dispatch-packet`,
-`orchestrate`, `attest-completion`) runs under STRICT executable trust:
+`orchestrate`, `attest-completion`, `attest-outcome`) runs under STRICT executable trust:
 working-tree `trust_mode` and the `AGENTIC_SDLC_GIT`/`AGENTIC_SDLC_GH`
 overrides are ignored, so a candidate-planted git cannot fabricate the
 commits and identities the artifacts are signed over. Reviewer dispatches require `--history`: the
