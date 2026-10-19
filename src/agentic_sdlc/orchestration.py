@@ -13,6 +13,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any
+from uuid import uuid4
 
 from .missions import AgentProfile, MissionRegistry
 
@@ -199,6 +200,10 @@ class _WorkUnit:
         self.repair_count = 0
         self.superseded_by = ""
         self.created_at = created_at
+        # The latest review's canonical findings-report digest: repair and
+        # re-review consumers verify their supplied findings against it, so
+        # the signed count can never travel with a laundered report.
+        self.review_findings_sha256 = ""
         self.transitions: list[TransitionRecord] = []
         self.runs: list[AgentRunRecord] = []
         self.event_keys: set[str] = set()
@@ -212,6 +217,7 @@ class _WorkUnit:
             "repairCount": self.repair_count,
             "supersededBy": self.superseded_by,
             "createdAt": self.created_at,
+            "reviewFindingsSha256": self.review_findings_sha256,
             "transitions": [item.as_dict() for item in self.transitions],
             "runs": [item.as_dict() for item in self.runs],
             "eventKeys": sorted(self.event_keys),
@@ -239,6 +245,12 @@ class Orchestrator:
         self.human_merge_required = True
         self._registry = registry
         self._units: dict[str, _WorkUnit] = {}
+        # One GENERATION identifier per state lineage: dispatch digests it
+        # into every envelope it signs, and an attested start-run accepts
+        # only envelopes bound to this exact lineage — a recreated state
+        # mints a fresh id, so old signed envelopes, completions and
+        # outcomes cannot replay into it.
+        self.state_id = uuid4().hex
 
     # -- unit management ---------------------------------------------------
 
@@ -648,8 +660,15 @@ class Orchestrator:
         findings: int,
         event_key: str,
         timestamp: str,
+        findings_sha256: str = "",
     ) -> _WorkUnit:
-        """Apply an independent review outcome with bounded repair routing."""
+        """Apply an independent review outcome with bounded repair routing.
+
+        ``findings_sha256`` is the canonical findings-report digest the
+        review's attestation binds; it is recorded on the unit so repair and
+        re-review dispatches can verify the report they are fed is the one
+        the reviewer actually produced.
+        """
         unit = self.get(unit_id)
         if event_key in unit.event_keys:
             return unit
@@ -667,6 +686,7 @@ class Orchestrator:
             f"review {run_id} predates repair cycle {unit.repair_count}; every repair "
             "requires a fresh independent review",
         )
+        unit.review_findings_sha256 = findings_sha256
         if findings == 0:
             return self.transition(
                 unit_id,
@@ -753,6 +773,7 @@ class Orchestrator:
         return {
             "schemaVersion": 1,
             "lifecycleVersion": LIFECYCLE_VERSION,
+            "stateId": self.state_id,
             "maxRepairCycles": self.max_repair_cycles,
             "humanMergeRequired": True,
             "units": {unit_id: unit.as_dict() for unit_id, unit in sorted(self._units.items())},
@@ -768,6 +789,9 @@ class Orchestrator:
             max_repair_cycles=int(document.get("maxRepairCycles", 2)),
             registry=registry,
         )
+        # The stored lineage id is PRESERVED, "" included: a legacy state
+        # without one must read as legacy, never silently gain a fresh id.
+        engine.state_id = str(document.get("stateId", ""))
         units = document.get("units", {})
         if not isinstance(units, Mapping):
             raise OrchestrationError("units must be a mapping")
@@ -781,6 +805,7 @@ class Orchestrator:
             unit.state = WorkUnitState(raw.get("state", "intake"))
             unit.repair_count = int(raw.get("repairCount", 0))
             unit.superseded_by = str(raw.get("supersededBy", ""))
+            unit.review_findings_sha256 = str(raw.get("reviewFindingsSha256", ""))
             unit.event_keys = set(raw.get("eventKeys", ()))
             unit.transitions = [
                 TransitionRecord(

@@ -36,6 +36,7 @@ __all__ = [
     "check_adapter_conformance",
     "load_sources",
     "pack_invalidation_reasons",
+    "record_from_dict",
     "render_evidence_for_prompt",
     "resolve_anchor",
 ]
@@ -185,11 +186,55 @@ class EvidenceRecord:
         }
 
 
+#: Payloads matching any of these are treated as credential material
+#: everywhere a packet string can reach a sink (key blocks, provider token
+#: shapes, quoted literal assignments) — the one scan shared by the packet
+#: layer and this module's own error text.
+SECRET_PATTERNS = (
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"\bgh[oprsu]_[A-Za-z0-9]{20,}"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"\bxox[a-z]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
+    re.compile(
+        r"(?i)\b(?:api[_-]?key|secret|token|password|passwd|credential)s?\b"
+        r"\s*[:=]\s*[\"\'][^\"\'\s]{8,}[\"\']"
+    ),
+)
+
+
+def secret_like_text(value: str) -> bool:
+    """Secret-like raw OR after boundary-marker removal.
+
+    Sanitization strips marker text to a fixpoint, so a credential split by
+    an embedded boundary marker would be reconstructed exactly where the text
+    reaches the model; both representations are scanned wherever either can
+    reach a sink.
+    """
+    return any(pattern.search(value) for pattern in SECRET_PATTERNS) or any(
+        pattern.search(sanitize_payload(value)) for pattern in SECRET_PATTERNS
+    )
+
+
+#: The only shape an unknown-enum error echoes back: anything else — a
+#: credential-shaped value, a newline, a terminal escape — is withheld, since
+#: these errors print to stderr and CI logs. Character shape alone is not
+#: enough: an identifier-shaped provider token is scanned like any payload.
+_TAME_ENUM = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+def _shown_enum(value: str) -> str:
+    if _TAME_ENUM.fullmatch(value) and not secret_like_text(value):
+        return value
+    return "(value withheld: not a plain identifier)"
+
+
 def _validate_record(record: EvidenceRecord) -> None:
     if not _SOURCE_ID.fullmatch(record.source_id):
         raise KnowledgeError("evidence source_id is invalid")
     if record.source_type not in SOURCE_TYPES:
-        raise KnowledgeError(f"evidence source_type is unknown: {record.source_type}")
+        raise KnowledgeError(f"evidence source_type is unknown: {_shown_enum(record.source_type)}")
     if not record.external_id.strip():
         raise KnowledgeError("evidence external_id is required")
     if not record.locator.strip():
@@ -201,14 +246,100 @@ def _validate_record(record: EvidenceRecord) -> None:
     if not record.revision.strip():
         raise KnowledgeError("evidence revision is required")
     if record.classification not in CLASSIFICATIONS:
-        raise KnowledgeError(f"evidence classification is unknown: {record.classification}")
+        raise KnowledgeError(
+            f"evidence classification is unknown: {_shown_enum(record.classification)}"
+        )
     if record.freshness not in FRESHNESS_STATES:
-        raise KnowledgeError(f"evidence freshness is unknown: {record.freshness}")
+        raise KnowledgeError(f"evidence freshness is unknown: {_shown_enum(record.freshness)}")
     if len(record.payload.encode("utf-8")) > MAX_PAYLOAD_BYTES:
         raise KnowledgeError("evidence payload exceeds the payload byte limit")
     for link in record.links:
         if link.kind not in LINK_KINDS:
-            raise KnowledgeError(f"evidence link kind is unknown: {link.kind}")
+            raise KnowledgeError(f"evidence link kind is unknown: {_shown_enum(link.kind)}")
+
+
+def record_from_dict(document: Mapping[str, Any]) -> EvidenceRecord:
+    """Rebuild one evidence record from its ``as_dict`` document, fully validated.
+
+    The inverse of :meth:`EvidenceRecord.as_dict`, for evidence that crossed a
+    file or process boundary. The payload hash is re-verified, so a document
+    whose content was altered in transit is rejected rather than trusted.
+    """
+    if not isinstance(document, Mapping):
+        raise KnowledgeError("evidence record must be an object")
+
+    def _text(key: str, default: str = "") -> str:
+        value = document.get(key, default)
+        if not isinstance(value, str):
+            raise KnowledgeError(f"evidence record field {key} must be a string")
+        return _utf8(value, key)
+
+    def _utf8(value: str, label: str) -> str:
+        # A surrogate-escaped string (a non-UTF-8 Git filename, say) would
+        # pass every shape check here only to raise an uncaught
+        # UnicodeEncodeError when the packet is rendered or serialized, so
+        # it fails closed with the remedy instead.
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise KnowledgeError(
+                f"evidence record field {label} is not UTF-8 encodable; "
+                "re-encode or rename it at the source"
+            ) from error
+        return value
+
+    anchors = document.get("anchors", [])
+    if (
+        not isinstance(anchors, Sequence)
+        or isinstance(anchors, str)
+        or not all(isinstance(item, str) for item in anchors)
+    ):
+        raise KnowledgeError("evidence record anchors must be an array of strings")
+    for item in anchors:
+        _utf8(item, "anchors")
+    raw_links = document.get("links", [])
+    if not isinstance(raw_links, Sequence) or isinstance(raw_links, str):
+        raise KnowledgeError("evidence record links must be an array of objects")
+    links = []
+    for entry in raw_links:
+        if (
+            not isinstance(entry, Mapping)
+            or not isinstance(entry.get("kind"), str)
+            or not isinstance(entry.get("target"), str)
+        ):
+            raise KnowledgeError("evidence record links must be objects with kind and target")
+        links.append(
+            EvidenceLink(
+                kind=_utf8(entry["kind"], "links.kind"),
+                target_evidence_id=_utf8(entry["target"], "links.target"),
+            )
+        )
+    record = EvidenceRecord(
+        source_id=_text("sourceId"),
+        source_type=_text("sourceType"),
+        external_id=_text("externalId"),
+        locator=_text("locator"),
+        scope=_text("scope"),
+        content_sha256=_text("contentSha256"),
+        revision=_text("revision"),
+        payload=_text("payload"),
+        classification=_text("classification", "internal"),
+        author=_text("author"),
+        created_at=_text("createdAt"),
+        updated_at=_text("updatedAt"),
+        retrieved_at=_text("retrievedAt"),
+        freshness=_text("freshness", "unknown"),
+        anchors=tuple(anchors),
+        links=tuple(links),
+    )
+    _validate_record(record)
+    # Every declared anchor must resolve against the reconstructed payload:
+    # a persisted record with a malformed or out-of-range anchor would
+    # otherwise ship inside a "fully validated" packet only to fail when a
+    # consumer resolves the citation.
+    for anchor in record.anchors:
+        resolve_anchor(record, anchor)
+    return record
 
 
 def sanitize_payload(text: str) -> str:
@@ -253,7 +384,11 @@ def resolve_anchor(record: EvidenceRecord, anchor: str) -> str:
         raise KnowledgeError(f"anchor must use L<start>-L<end> form: {anchor}")
     start, end = int(match.group(1)), int(match.group(2))
     lines = record.payload.splitlines()
-    if start < 1 or end < start or end > len(lines):
+    # The adapters emit L1-L1 for an EMPTY payload (max(line_count, 1)), so
+    # that single notional line resolves — to its empty content — and
+    # adapter-generated empty-file records round-trip through their
+    # documents instead of failing validation.
+    if start < 1 or end < start or end > max(len(lines), 1):
         raise KnowledgeError(f"anchor is out of range for the payload: {anchor}")
     return "\n".join(lines[start - 1 : end])
 
@@ -262,6 +397,15 @@ def load_sources(path: str | Path) -> tuple[KnowledgeSource, ...]:
     """Load declared knowledge sources from protected configuration."""
     with Path(path).open("rb") as handle:
         document = tomllib.load(handle)
+    return sources_from_document(document)
+
+
+def load_sources_bytes(data: bytes) -> tuple[KnowledgeSource, ...]:
+    """Load declared knowledge sources from committed configuration bytes."""
+    return sources_from_document(tomllib.loads(data.decode("utf-8")))
+
+
+def sources_from_document(document: dict[str, Any]) -> tuple[KnowledgeSource, ...]:
     if document.get("version") != 1:
         raise KnowledgeError("knowledge configuration version must be 1")
     entries = document.get("source", [])

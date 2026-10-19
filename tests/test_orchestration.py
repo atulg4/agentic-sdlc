@@ -166,6 +166,25 @@ def test_passing_review_does_not_trigger_repair() -> None:
     assert unit.repair_count == 0
 
 
+def test_record_review_stores_the_findings_report_digest() -> None:
+    # The canonical findings-report digest rides the unit and ROUND-TRIPS
+    # through serialization, so repair and re-review consumers can verify
+    # the report they are fed against the attested state.
+    engine = Orchestrator(max_repair_cycles=2)
+    review_id = _advance_to_reviewing(engine, "u1")
+    engine.record_review(
+        "u1",
+        review_id,
+        findings=2,
+        event_key="review-1",
+        timestamp=T,
+        findings_sha256="d" * 64,
+    )
+    assert engine.get("u1").review_findings_sha256 == "d" * 64
+    restored = Orchestrator.from_dict(engine.as_dict())
+    assert restored.get("u1").review_findings_sha256 == "d" * 64
+
+
 def test_repair_exhaustion_escalates_instead_of_looping() -> None:
     engine = Orchestrator(max_repair_cycles=1)
     review_id = _advance_to_reviewing(engine, "u1")
