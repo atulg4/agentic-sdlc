@@ -126,6 +126,9 @@ def _packet(registry, policy, mission_id="implementation-worker", **overrides):
     }
     if mission_id == "code-reviewer":
         values["verification"] = _verification()
+        # Reviewer repository evidence is pinned to the verified head.
+        values["repository_revision"] = HEAD
+        values["records"] = (_record(external_id=f"src/scheduler.py@{HEAD}", revision=HEAD),)
     values.update(overrides)
     return build_context_packet(registry.get(mission_id), TASK, policy, **values)
 
@@ -580,8 +583,10 @@ def test_high_risk_reviewers_keep_the_knowledge_fail_closed_rule(registry, polic
             TASK,
             policy,
             work_ref=WORK_REF,
-            repository_revision="abc123",
-            records=(_record(freshness="stale"),),
+            repository_revision=HEAD,
+            records=(
+                _record(external_id=f"src/scheduler.py@{HEAD}", revision=HEAD, freshness="stale"),
+            ),
             sources={"repo-main": _source()},
             verification=_verification(),
         )
@@ -865,8 +870,8 @@ def test_unreadable_source_failures_do_not_block_the_pack(registry, policy):
         TASK,
         policy,
         work_ref=WORK_REF,
-        repository_revision="abc123",
-        records=(_record(),),
+        repository_revision=HEAD,
+        records=(_record(external_id=f"src/scheduler.py@{HEAD}", revision=HEAD),),
         sources=sources,
         verification=_verification(),
         retrieval_failures=("builder-notes: timeout",),
@@ -1008,8 +1013,8 @@ def test_high_risk_failure_errors_never_echo_credentials(registry, policy):
             TASK,
             policy,
             work_ref=WORK_REF,
-            repository_revision="abc123",
-            records=(_record(),),
+            repository_revision=HEAD,
+            records=(_record(external_id=f"src/scheduler.py@{HEAD}", revision=HEAD),),
             sources={"repo-main": _source(), "flaky-docs": _source("flaky-docs")},
             verification=_verification(),
             retrieval_failures=(leak,),
@@ -1365,10 +1370,122 @@ def test_the_cli_dispatches_through_the_packet_contract(tmp_path, policy_file, v
     assert len(envelope["promptSha256"]) == 64
 
     # A packet artifact that does not match the rebuilt packet must not
-    # dispatch.
-    tampered = {**document, "packetSha256": "0" * 64}
-    artifact.write_text(json.dumps(tampered), encoding="utf-8")
-    assert (
-        cli_main(["dispatch-packet", *base, "--agents", str(agents), "--packet", str(artifact)])
-        == 2
+    # dispatch — including one whose CONTENT was edited while its digest
+    # field was left untouched.
+    for tampered in (
+        {**document, "packetSha256": "0" * 64},
+        {**document, "budgetBytes": document["budgetBytes"] - 1},
+    ):
+        artifact.write_text(json.dumps(tampered), encoding="utf-8")
+        assert (
+            cli_main(["dispatch-packet", *base, "--agents", str(agents), "--packet", str(artifact)])
+            == 2
+        )
+
+
+def test_secret_like_paths_never_reach_exclusion_text(registry, policy):
+    token = "ghp_0123456789abcdefghij0123456789abcdef"
+    forbidden = _record(external_id=f".env.{token}@abc123", payload="A=1\n")
+    packet = _packet(registry, policy, records=(forbidden, _record()))
+    # The record is excluded, but the token-shaped filename is withheld from
+    # the serialized exclusion note.
+    assert any("forbidden path excluded" in note for note in packet.exclusions)
+    assert "ghp_" not in json.dumps(packet.as_dict())
+    # The blocking error for required evidence echoes exclusions; it must not
+    # echo the token either.
+    with pytest.raises(ValueError) as excinfo:
+        _packet(
+            registry,
+            policy,
+            records=(forbidden,),
+            sources={"repo-main": _source(required=True)},
+        )
+    assert "ghp_" not in str(excinfo.value)
+    # The read-scope exclusion is redacted the same way.
+    narrow = _mission(read_paths=("docs/**",))
+    scoped = build_context_packet(
+        narrow,
+        TASK,
+        policy,
+        work_ref=WORK_REF,
+        repository_revision="abc123",
+        records=(
+            _record(external_id=f"src/{token}.py@abc123", payload="# x\n"),
+            _record(external_id="docs/notes.md@abc123", payload="# notes\n"),
+        ),
+        sources={"repo-main": _source()},
     )
+    assert any("outside mission read paths excluded" in note for note in scoped.exclusions)
+    assert "ghp_" not in json.dumps(scoped.as_dict())
+
+
+def test_reviewer_pins_bind_to_the_verified_head(registry, policy):
+    # Source from commit X beside the exact diff for head H would let the
+    # reviewer judge code the candidate never contained.
+    with pytest.raises(ContextBuilderError, match="pinned to the verified candidate head"):
+        _packet(
+            registry,
+            policy,
+            mission_id="code-reviewer",
+            records=(_record(),),
+            repository_revision="abc123",
+        )
+
+
+def test_the_stored_policy_limits_are_recursively_immutable(registry, policy):
+    packet = _packet(registry, policy)
+    # The limits render OUTSIDE the untrusted boundary, so they are frozen
+    # like the gate report once validated.
+    with pytest.raises(TypeError):
+        packet.policy_limits["maxTokens"] = 0
+    with pytest.raises(AttributeError):
+        packet.policy_limits["forbiddenPaths"].append("injected/**")
+    # Serialization still emits plain, detached JSON data.
+    emitted = packet.as_dict()["policyLimits"]
+    emitted["forbiddenPaths"].clear()
+    assert packet.policy_limits["forbiddenPaths"]
+
+
+def test_gate_reports_carrying_credentials_fail_closed():
+    # The report renders beneath the trusted-pipeline heading outside any
+    # untrusted boundary, so it fails closed on the same token shapes as
+    # task fields and prior findings.
+    with pytest.raises(ContextBuilderError, match="redact the gate command"):
+        _verification(
+            gate_report={
+                "passed": True,
+                "gates": [
+                    _gate(
+                        command=[
+                            "bash",
+                            "-c",
+                            "echo ghp_0123456789abcdefghij0123456789abcdef",
+                        ]
+                    )
+                ],
+            }
+        )
+
+
+def test_work_refs_bind_to_the_configured_project(registry, policy):
+    # The packet must not attribute this project's policy and evidence to
+    # another project's work item (the harness manifest enforces the same).
+    for foreign in ("other/project#42", "example/project#0", "example/project"):
+        with pytest.raises(ContextBuilderError, match="within the configured project"):
+            _packet(registry, policy, work_ref=foreign)
+
+
+def test_empty_file_records_round_trip():
+    # The repository adapter emits L1-L1 for an empty file; its single
+    # notional line resolves to empty content, so adapter-generated records
+    # survive their own serialization.
+    from agentic_sdlc.knowledge import resolve_anchor
+
+    empty = _record(external_id="docs/empty.md@abc123", payload="")
+    assert empty.anchors == ("L1-L1",)
+    assert record_from_dict(empty.as_dict()) == empty
+    assert resolve_anchor(empty, "L1-L1") == ""
+    # Anything past the notional line is still out of range.
+    broken = {**empty.as_dict(), "anchors": ["L1-L2"]}
+    with pytest.raises(ValueError, match="out of range"):
+        record_from_dict(broken)

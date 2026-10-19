@@ -893,7 +893,10 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
     registry, mission, packet = _build_packet_from_request(args)
     if args.packet:
         artifact = json.loads(Path(args.packet).read_text(encoding="utf-8"))
-        if not isinstance(artifact, dict) or artifact.get("packetSha256") != packet.packet_sha256:
+        # The WHOLE document is compared, never just its digest field: an
+        # artifact whose content was edited while packetSha256 was left
+        # untouched must not read as matching.
+        if artifact != packet.as_dict():
             raise ContextBuilderError(
                 "the packet artifact does not match the packet rebuilt from the "
                 "request; rebuild the packet before dispatching"

@@ -43,9 +43,14 @@ never review its own writes. Missions with neither capability set
   emits, top level and per entry — a nonempty gates array whose entries each
   carry name, command, exitCode, durationSeconds and a boolean verdict, with
   an agreeing aggregate), and prior findings, which fail closed when they
-  carry secret-like content. The validated gate report is detached from the
-  caller's object and stored recursively immutable, so it cannot be edited
-  in place after validation. Changed paths render inside an untrusted
+  carry secret-like content — as does a gate report whose command or name
+  quotes a credential, since the report renders beneath the trusted-pipeline
+  heading. The validated gate report is detached from the caller's object
+  and stored recursively immutable, so it cannot be edited in place after
+  validation; the packet's policy limits are frozen the same way. For
+  reviewer packets the pinned `repository_revision` must equal the verified
+  candidate head, so the reviewer never reads source from one tree while
+  judging the exact diff of another. Changed paths render inside an untrusted
   boundary — filenames are patch data the patch author controls — with
   angle brackets escaped in their JSON form, so a filename spelling a
   boundary marker reaches the reviewer exactly instead of being stripped.
@@ -112,7 +117,13 @@ reason — naming the source or evidence and the remedy — when:
   payloads, so it fails closed on the same token shapes,
 - repository evidence is packed without a pinned `repository_revision`, or a
   repository record was retrieved at a different revision — all repository
-  evidence must come from one trusted pinned tree, never a mix of commits.
+  evidence must come from one trusted pinned tree, never a mix of commits,
+- `work_ref` does not identify a request within the configured project
+  (`projectId#N`, the same binding the harness manifest enforces).
+
+Exclusion notes are serialized by `as_dict` and echoed in blocking errors,
+so a forbidden or out-of-scope filename that is itself token-shaped is
+withheld from the exclusion text rather than quoted.
 
 A required source the mission may not read — its `permitted_missions` or the
 mission's explicit `knowledge_sources` exclude it — is not demanded of that
@@ -173,6 +184,6 @@ the budget checks all run again — selects the agent (`--history` works as in
 `dispatch-mission`), and emits the envelope via `dispatch_envelope_for_packet`
 with `contextPackDigest` bound to the packet digest and the rendered packet
 as the dispatched prompt. With `--packet`, the previously written packet
-artifact must match the rebuilt packet's digest, so a stale or tampered
-artifact never dispatches. The plain `dispatch-mission` command remains for
+artifact must equal the rebuilt packet's whole document — never just its
+digest field — so a stale or tampered artifact never dispatches. The plain `dispatch-mission` command remains for
 non-factory missions whose prompt is not packet-built.

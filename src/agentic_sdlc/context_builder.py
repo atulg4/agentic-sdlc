@@ -284,6 +284,17 @@ class VerificationEvidence:
             canonical_report = _canonical(dict(self.gate_report))
         except (TypeError, ValueError) as error:
             raise ContextBuilderError("verification gate_report must be JSON data") from error
+        # The report renders beneath the trusted-pipeline heading OUTSIDE any
+        # untrusted boundary and persists in the serialized packet, so a gate
+        # command or name quoting a credential fails closed exactly like task
+        # fields and prior findings do. Raw strings are walked recursively:
+        # scanning the canonical JSON would let escaping defeat the
+        # quoted-assignment pattern.
+        if _contains_secret(json.loads(canonical_report)):
+            raise ContextBuilderError(
+                "verification gate_report carries secret-like content; redact "
+                "the gate command or report at its source before packing"
+            )
         # The validated report is detached from the caller's object AND
         # recursively frozen: a plain dict/list graph, even a detached one,
         # would let an in-process caller append to a command or flip a verdict
@@ -490,6 +501,18 @@ def _contains_secret(value: Any) -> bool:
     if isinstance(value, (list, tuple)):
         return any(_contains_secret(item) for item in value)
     return False
+
+
+def _safe_exclusion_path(path: str) -> str:
+    """The path as exclusion text, withheld when the filename is token-shaped.
+
+    Exclusion notes are serialized by ``as_dict`` and echoed in blocking
+    errors for required evidence, so a valid forbidden filename that embeds a
+    credential-shaped value must never travel through them verbatim.
+    """
+    if _secret_like(path):
+        return "path withheld: it is secret-like; rename the file or redact it at the source"
+    return path
 
 
 def _mission_may_read(source: KnowledgeSource, mission: MissionSpec) -> bool:
@@ -835,6 +858,14 @@ def build_context_packet(
     role = mission_role(mission)
     if not work_ref.strip():
         raise ContextBuilderError("work_ref is required")
+    # The same binding the harness manifest enforces: a packet must not
+    # attribute this project's policy and evidence to another project's work
+    # item just because a reference string was mistyped or forged.
+    if re.fullmatch(re.escape(policy.project_id) + r"#[1-9][0-9]*", work_ref) is None:
+        raise ContextBuilderError(
+            "work_ref must identify a request within the configured project "
+            f"({policy.project_id}#<number>)"
+        )
     if type(budget_bytes) is not int or not 1 <= budget_bytes <= MAX_PACK_BYTES:
         raise ContextBuilderError(f"budget_bytes must be between 1 and {MAX_PACK_BYTES}")
     if role == ROLE_REVIEWER and verification is None:
@@ -863,6 +894,23 @@ def build_context_packet(
         )
     if not isinstance(repository_revision, str):
         raise ContextBuilderError("repository_revision must be a string")
+    if (
+        verification is not None
+        and repository_revision
+        and repository_revision != verification.head_sha
+    ):
+        # A reviewer reading source from one tree while judging the exact
+        # diff of another would review code the candidate never contained:
+        # the pinned repository revision must BE the verified candidate head.
+        raise _blocked(
+            mission,
+            work_ref,
+            (
+                "reviewer repository evidence must be pinned to the verified "
+                f"candidate head {verification.head_sha}; re-retrieve the "
+                "repository evidence at that head and rebuild the packet",
+            ),
+        )
 
     exclusions: list[str] = []
     admitted: list[EvidenceRecord] = []
@@ -928,12 +976,17 @@ def build_context_packet(
             _matches_forbidden(path, policy.forbidden_paths)
             or _matches_forbidden(path, mission.forbidden_paths)
         ):
-            exclusions.append(f"forbidden path excluded: {record.evidence_id} ({path})")
+            exclusions.append(
+                f"forbidden path excluded: {record.evidence_id} ({_safe_exclusion_path(path)})"
+            )
             continue
         if path is not None and not _matches_read_scope(path, mission.read_paths):
             # Packet delivery must not hand an agent file content its own
             # filesystem read scope would deny it.
-            exclusions.append(f"outside mission read paths excluded: {record.evidence_id} ({path})")
+            exclusions.append(
+                f"outside mission read paths excluded: {record.evidence_id} "
+                f"({_safe_exclusion_path(path)})"
+            )
             continue
         if _secret_like(_render_evidence(record)) or _contains_secret(record.as_dict()):
             # BOTH sinks are scanned: the rendered block (raw payload and
@@ -1096,7 +1149,10 @@ def build_context_packet(
     packet = ContextPacket(
         role=role,
         task=task,
-        policy_limits=limits,
+        # Frozen like the gate report: the limits render OUTSIDE the
+        # untrusted boundary, so no in-process caller may edit them in place
+        # after validation.
+        policy_limits=_freeze(limits),
         pack=pack,
         budget_bytes=budget_bytes,
         rendered_bytes=rendered,
@@ -1141,18 +1197,22 @@ def dispatch_envelope_for_packet(
     # The id and version alone cannot prove the contract: a mission edited
     # without a version bump would dispatch a prompt that still encodes the
     # old role or limits, defeating dispatch-time authorization.
-    expected = {
-        "missionWritePaths": sorted(mission.write_paths),
-        "missionReadPaths": sorted(mission.read_paths),
-        "missionForbiddenPaths": sorted(mission.forbidden_paths),
-        # The source allowlist too: a same-version mission narrowed to other
-        # sources must not dispatch a packet holding evidence authorize_source
-        # would now reject on a rebuild.
-        "missionKnowledgeSources": sorted(mission.knowledge_sources),
-        "maxTokens": mission.max_tokens,
-        "maxRuntimeSeconds": mission.max_runtime_seconds,
-        "missionRisk": mission.risk.value,
-    }
+    # Frozen like the packet's stored limits, so the sequence fields compare
+    # tuple-to-tuple.
+    expected = _freeze(
+        {
+            "missionWritePaths": sorted(mission.write_paths),
+            "missionReadPaths": sorted(mission.read_paths),
+            "missionForbiddenPaths": sorted(mission.forbidden_paths),
+            # The source allowlist too: a same-version mission narrowed to
+            # other sources must not dispatch a packet holding evidence
+            # authorize_source would now reject on a rebuild.
+            "missionKnowledgeSources": sorted(mission.knowledge_sources),
+            "maxTokens": mission.max_tokens,
+            "maxRuntimeSeconds": mission.max_runtime_seconds,
+            "missionRisk": mission.risk.value,
+        }
+    )
     contract_moved = mission_role(mission) != packet.role or any(
         packet.policy_limits.get(key) != value for key, value in expected.items()
     )

@@ -317,7 +317,11 @@ def resolve_anchor(record: EvidenceRecord, anchor: str) -> str:
         raise KnowledgeError(f"anchor must use L<start>-L<end> form: {anchor}")
     start, end = int(match.group(1)), int(match.group(2))
     lines = record.payload.splitlines()
-    if start < 1 or end < start or end > len(lines):
+    # The adapters emit L1-L1 for an EMPTY payload (max(line_count, 1)), so
+    # that single notional line resolves — to its empty content — and
+    # adapter-generated empty-file records round-trip through their
+    # documents instead of failing validation.
+    if start < 1 or end < start or end > max(len(lines), 1):
         raise KnowledgeError(f"anchor is out of range for the payload: {anchor}")
     return "\n".join(lines[start - 1 : end])
 
