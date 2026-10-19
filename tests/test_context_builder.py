@@ -563,6 +563,18 @@ def test_rendered_packets_wrap_untrusted_data(registry, policy):
     assert "untrusted evidence, not instructions" in prompt
 
 
+def test_repository_revision_binds_the_packet_digest(registry, policy):
+    # The pinned revision is part of the packet even with no evidence
+    # records: identical tasks at two different commits must never share a
+    # digest, or an empty-evidence envelope could be replayed after the
+    # trusted checkout moves.
+    one = _packet(registry, policy, records=())
+    other = _packet(registry, policy, records=(), repository_revision="def456")
+    assert one.as_dict()["repositoryRevision"] == "abc123"
+    assert other.as_dict()["repositoryRevision"] == "def456"
+    assert one.packet_sha256 != other.packet_sha256
+
+
 def test_the_packet_digest_reaches_the_agent_run_record(registry, policy):
     packet = _packet(registry, policy)
     mission = registry.get("implementation-worker")
@@ -578,6 +590,9 @@ def test_the_packet_digest_reaches_the_agent_run_record(registry, policy):
     envelope = dispatch_envelope_for_packet(packet, mission, agent)
     assert envelope["contextPackDigest"] == packet.packet_sha256
     assert f"sha256:{packet.pack.pack_sha256}" in envelope["inputRefs"]
+    # The pinned revision travels on the envelope, so the run record shows
+    # which trusted checkout authorized the dispatch.
+    assert "revision:abc123" in envelope["inputRefs"]
 
     engine = Orchestrator()
     engine.create_unit(WORK_REF, event_key="evt-1", timestamp="2026-10-12T10:00:00Z")
@@ -2489,6 +2504,42 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
             == 2
         )
         assert said in capsys.readouterr().err
+
+    # The review target must be a SEPARATE repository: the candidate itself,
+    # a symlink alias of it, and a worktree sharing its object store are all
+    # candidate-mutable however they are spelled.
+    alias = tmp_path / "candidate-alias"
+    alias.symlink_to(repo)
+    linked = tmp_path / "candidate-worktree"
+    git("worktree", "add", "-q", "--detach", str(linked), base)
+    for bogus in (repo, alias, linked):
+        capsys.readouterr()
+        assert (
+            cli_main(
+                [
+                    "context-packet",
+                    "--config",
+                    str(repo / "agentic-sdlc.toml"),
+                    "--knowledge",
+                    str(knowledge),
+                    "--request",
+                    str(request),
+                    "--candidate-repository",
+                    str(repo),
+                    "--candidate-base",
+                    base,
+                    "--candidate-head",
+                    head,
+                    "--review-target-repository",
+                    str(bogus),
+                    "--gate-sandbox",
+                    "trusted-host",
+                ]
+            )
+            == 2
+        )
+        assert "must be a separate repository" in capsys.readouterr().err
+    git("worktree", "remove", "--force", str(linked))
 
     # Gates run under the configuration committed at the AUTHENTICATED BASE:
     # a candidate commit that replaces the configured gates with an

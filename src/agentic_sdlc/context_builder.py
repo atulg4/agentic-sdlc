@@ -466,6 +466,12 @@ class ContextPacket:
     selection: tuple[str, ...] = ()
     exclusions: tuple[str, ...] = ()
     coverage: Mapping[str, Any] = field(default_factory=dict)
+    #: The trusted checkout revision the packet was pinned at. Carried and
+    #: digested even with no evidence records: identical tasks at two
+    #: different commits must never share a digest, or an empty-evidence
+    #: envelope could be replayed after the checkout moves with no record of
+    #: which revision was authorized.
+    repository_revision: str = ""
 
     @property
     def mission_id(self) -> str:
@@ -502,6 +508,7 @@ class ContextPacket:
             "selection": sorted(self.selection),
             "exclusions": sorted(self.exclusions),
             "budgetBytes": self.budget_bytes,
+            "repositoryRevision": self.repository_revision,
         }
         return _sha256_text(_canonical(stable))
 
@@ -522,6 +529,7 @@ class ContextPacket:
             "exclusions": sorted(self.exclusions),
             "budgetBytes": self.budget_bytes,
             "renderedBytes": self.rendered_bytes,
+            "repositoryRevision": self.repository_revision,
             "pack": self.pack.as_dict(),
         }
 
@@ -1443,6 +1451,7 @@ def build_context_packet(
             selection=tuple(selection),
             exclusions=tuple(exclusions),
             coverage=dict(pack.coverage),
+            repository_revision=repository_revision,
         )
         final_bytes = len(render_packet_for_prompt(packet).encode("utf-8"))
         if final_bytes <= token_budget_bytes and final_bytes <= budget_bytes:
@@ -1563,6 +1572,13 @@ def dispatch_envelope_for_packet(
         agent,
         work_ref=packet.work_ref,
         prompt=prompt,
-        input_refs=(*input_refs, f"sha256:{packet.pack.pack_sha256}"),
+        input_refs=(
+            *input_refs,
+            f"sha256:{packet.pack.pack_sha256}",
+            # The pinned revision travels on the envelope too, so the run
+            # record shows which trusted checkout authorized the dispatch
+            # even when the packet carries no evidence records.
+            *((f"revision:{packet.repository_revision}",) if packet.repository_revision else ()),
+        ),
         context_pack_digest=packet.packet_sha256,
     )

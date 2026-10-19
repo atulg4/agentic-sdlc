@@ -737,6 +737,152 @@ def test_orchestrate_cli_round_trips_state(tmp_path: Path) -> None:
     assert main([*base, "--action", "transition", "--event-key", "evt-3", "--to", "merged"]) == 2
 
 
+def test_orchestrate_attests_only_runs_a_trusted_dispatch_produced(tmp_path: Path) -> None:
+    # An attested state records only dispatch-signed envelopes: a
+    # hand-authored envelope — or a signed one whose agent was re-labeled —
+    # must not seed run attribution, and a finished run's commit must exist
+    # in the trusted checkout before the state attests it.
+    import hashlib
+    import subprocess
+
+    from agentic_sdlc.cli import _attest_document
+
+    secret = b"an-attestation-secret-of-at-least-32-bytes"
+    key_file = tmp_path / "attestation.key"
+    key_file.write_bytes(secret)
+    state = tmp_path / "state.json"
+    base = [
+        "orchestrate",
+        "--state",
+        str(state),
+        "--unit",
+        "42",
+        "--attestation-key",
+        str(key_file),
+    ]
+    stamp = "2026-08-06T12:00:00Z"
+    assert main([*base, "--action", "create", "--event-key", "evt-0", "--timestamp", stamp]) == 0
+    for index, to in enumerate(("triaged", "specified", "planned", "approved", "dispatched"), 1):
+        assert (
+            main(
+                [
+                    *base,
+                    "--action",
+                    "transition",
+                    "--event-key",
+                    f"evt-{index}",
+                    "--to",
+                    to,
+                    "--timestamp",
+                    stamp,
+                    "--actor",
+                    "operator",
+                    "--actor-kind",
+                    "human",
+                ]
+            )
+            == 0
+        )
+    body = {
+        "schemaVersion": 1,
+        "missionId": "implementation-worker",
+        "missionVersion": "1.0.0",
+        "agentId": "builder-agent",
+        "adapter": "claude-code",
+        "adapterVersion": "1.0.0",
+        "provider": "anthropic",
+        "model": "claude-sonnet-5-5",
+        "workRef": "42",
+        "inputRefs": [],
+        "promptSha256": "0" * 64,
+    }
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    envelope = {**body, "envelopeSha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest()}
+    signed = {**envelope, "attestation": _attest_document(envelope, secret)}
+    unsigned_file = tmp_path / "unsigned-envelope.json"
+    unsigned_file.write_text(json.dumps(envelope), encoding="utf-8")
+    relabeled_file = tmp_path / "relabeled-envelope.json"
+    relabeled_file.write_text(json.dumps({**signed, "agentId": "innocent"}), encoding="utf-8")
+    signed_file = tmp_path / "signed-envelope.json"
+    signed_file.write_text(json.dumps(signed), encoding="utf-8")
+    start = [
+        *base,
+        "--action",
+        "start-run",
+        "--kind",
+        "implementation",
+        "--event-key",
+        "evt-run",
+        "--timestamp",
+        stamp,
+        "--envelope",
+    ]
+    assert main([*start, str(unsigned_file)]) == 2
+    assert main([*start, str(relabeled_file)]) == 2
+    assert main([*start, str(signed_file)]) == 0
+
+    # The finished run's commit must exist in the trusted checkout.
+    repo = tmp_path / "trusted-checkout"
+    repo.mkdir()
+    env = {
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.com",
+        "HOME": str(tmp_path),
+        "PATH": "/usr/bin:/bin",
+    }
+    subprocess.run(
+        ["git", "-C", str(repo), "init", "-q", "-b", "main"],
+        check=True,
+        env=env,
+        capture_output=True,
+    )
+    (repo / "a.txt").write_text("one\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "a.txt"], check=True, env=env, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-q", "-m", "work"],
+        check=True,
+        env=env,
+        capture_output=True,
+    )
+    commit = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        env=env,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    run_id = "42:run-001"
+    finish = [
+        *base,
+        "--action",
+        "finish-run",
+        "--run-id",
+        run_id,
+        "--result",
+        "succeeded",
+        "--timestamp",
+        stamp,
+    ]
+    assert main([*finish, "--commit-sha", commit]) == 2
+    assert (
+        main(
+            [
+                *finish,
+                "--commit-sha",
+                "f" * 40,
+                "--commit-repository",
+                str(repo),
+            ]
+        )
+        == 2
+    )
+    assert main([*finish, "--commit-sha", commit, "--commit-repository", str(repo)]) == 0
+
+
 def test_orchestrate_attests_state_under_a_key(tmp_path: Path) -> None:
     # With --attestation-key the written state carries an HMAC mark over
     # everything else in it (what dispatch-packet --history verifies), the

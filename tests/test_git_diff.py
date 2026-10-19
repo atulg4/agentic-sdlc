@@ -3,6 +3,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from agentic_sdlc.git_diff import collect_git_diff
 
 
@@ -134,6 +136,51 @@ def test_derivation_tree_materializes_the_committed_content(tmp_path: Path) -> N
     # The tree is removed afterwards and the caller's own state is untouched.
     assert not kept.exists()
     assert (repo / "a.txt").read_text(encoding="utf-8") == "uncommitted\n"
+
+
+def test_derivation_tree_pins_caller_supplied_refs(tmp_path: Path) -> None:
+    # The source's remote-tracking refs are source-mutable: a caller that
+    # authenticated a commit elsewhere pins the tree's ref to that exact
+    # value, overriding whatever the mirror imported — and malformed pins
+    # fail closed.
+    from agentic_sdlc.git_diff import GitDiffError, derivation_tree
+
+    repo = tmp_path / "pinned"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    (repo / "a.txt").write_text("one\n", encoding="utf-8")
+    _git(repo, "add", "--", ".")
+    _git(repo, "commit", "-qm", "base")
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    (repo / "a.txt").write_text("one\ntwo\n", encoding="utf-8")
+    _git(repo, "commit", "-qam", "head")
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    # The producer moved its own remote-tracking ref to the head: a gate
+    # diffing origin/main...HEAD would see an empty diff under that value.
+    _git(repo, "update-ref", "refs/remotes/origin/main", head)
+
+    with derivation_tree(repo, head, pin_refs={"refs/remotes/origin/main": base}) as tree:
+        resolved = subprocess.run(
+            ["git", "rev-parse", "origin/main"],
+            cwd=tree,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert resolved == base
+
+    for bad in ({"HEAD": base}, {"refs/remotes/origin/main": "not-a-commit"}):
+        with (
+            pytest.raises(GitDiffError, match="pinned refs"),
+            derivation_tree(repo, head, pin_refs=bad),
+        ):
+            raise AssertionError("the pinned derivation must not yield")
 
 
 def test_derivation_tree_mirrors_remote_tracking_refs(tmp_path: Path) -> None:

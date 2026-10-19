@@ -54,6 +54,7 @@ from .git_diff import (
     committed_path,
     derivation_tree,
     read_committed_file,
+    repository_identity,
     resolve_commit,
 )
 from .infra_recovery import (
@@ -911,6 +912,23 @@ def _derived_verification(
             "inside the candidate repository is candidate-mutable and "
             "authenticates nothing"
         )
+    # A flag is a caller declaration; identity is not. The target must be a
+    # SEPARATE object store: the candidate itself, a symlink alias of it, a
+    # worktree sharing its store, or a repository inside the candidate's own
+    # tree is candidate-mutable, and its refs would authenticate nothing.
+    candidate_root = os.path.realpath(args.candidate_repository)
+    target_identity = repository_identity(args.review_target_repository)
+    if (
+        target_identity == repository_identity(args.candidate_repository)
+        or target_identity == candidate_root
+        or target_identity.startswith(candidate_root + os.sep)
+    ):
+        raise ContextBuilderError(
+            "--review-target-repository must be a separate repository: the "
+            "candidate itself, a symlink alias, a worktree sharing its object "
+            "store, or a repository inside the candidate tree is "
+            "candidate-mutable and authenticates nothing"
+        )
     try:
         expected_base = resolve_commit(
             args.review_target_repository, f"origin/{policy.default_branch}"
@@ -986,7 +1004,16 @@ def _derived_verification(
     # disposable tree materialized from the object database at the candidate
     # head (no checkout, so no local smudge filter or hook runs), observing
     # exactly the committed content and leaving the caller's state untouched.
-    with derivation_tree(args.candidate_repository, head) as tree:
+    # The tree's own origin/<default branch> is PINNED to the authenticated
+    # base: the mirror would otherwise import the candidate's value for that
+    # ref, and a gate diffing `origin/$GITHUB_BASE_REF...HEAD` against a
+    # candidate-moved ref could see an empty diff while the packet's
+    # separately computed diff is not.
+    with derivation_tree(
+        args.candidate_repository,
+        head,
+        pin_refs={f"refs/remotes/origin/{policy.default_branch}": base},
+    ) as tree:
         gate_config = tree.parent / "gate-config-at-base.toml"
         gate_config.write_bytes(base_config)
         report = run_gates(
@@ -1547,6 +1574,13 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
                 raise ContextBuilderError(
                     f"{error}; no other eligible agent declares a sufficient context window"
                 ) from error
+    if getattr(args, "attestation_key", None):
+        # The envelope seeds the attested run history: `orchestrate
+        # start-run` under the same key accepts only envelopes a trusted
+        # dispatch signed, so run attribution can never be hand-authored.
+        envelope[_ATTESTATION_FIELD] = _attest_document(
+            envelope, _attestation_key_bytes(args.attestation_key)
+        )
     _write(envelope, args.output)
     return 0
 
@@ -1581,6 +1615,35 @@ def _route_executor(args: argparse.Namespace) -> int:
     decision = route_executor(request, executors, policy)
     _write(decision.as_dict(), args.output)
     return 0 if decision.selected_executor_id else 2
+
+
+def _require_attested_envelope(envelope, key: bytes) -> None:
+    """An attested state records only runs a trusted dispatch produced.
+
+    The envelope names the run's agent and mission — exactly what review
+    exclusions are later derived from — so a hand-authored envelope must not
+    seed the state: its attestation must verify under the shared key, and its
+    self-digest must match its content so a signed envelope cannot be
+    re-labeled either.
+    """
+    mark = envelope.get(_ATTESTATION_FIELD) if isinstance(envelope, Mapping) else None
+    if not isinstance(mark, str) or not hmac.compare_digest(mark, _attest_document(envelope, key)):
+        raise OrchestrationError(
+            "the dispatch envelope carries no valid attestation under "
+            "--attestation-key; produce it with dispatch-packet "
+            "--attestation-key and the same key"
+        )
+    body = {
+        name: value
+        for name, value in envelope.items()
+        if name not in (_ATTESTATION_FIELD, "envelopeSha256")
+    }
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    if hashlib.sha256(canonical.encode("utf-8")).hexdigest() != envelope.get("envelopeSha256"):
+        raise OrchestrationError(
+            "the dispatch envelope's envelopeSha256 does not match its "
+            "content; regenerate the envelope with dispatch-packet"
+        )
 
 
 def _orchestrate(args: argparse.Namespace) -> int:
@@ -1629,6 +1692,8 @@ def _orchestrate(args: argparse.Namespace) -> int:
         )
     elif args.action == "start-run":
         envelope = json.loads(Path(args.envelope).read_text(encoding="utf-8"))
+        if key is not None:
+            _require_attested_envelope(envelope, key)
         engine.start_run(
             args.unit,
             args.kind,
@@ -1637,6 +1702,20 @@ def _orchestrate(args: argparse.Namespace) -> int:
             timestamp=args.timestamp,
         )
     elif args.action == "finish-run":
+        # A completion value is caller input: in an attested pipeline the
+        # recorded commit must at least BE a commit of the trusted checkout —
+        # a SHA that exists nowhere must never anchor review exclusions.
+        if key is not None and args.commit_sha:
+            if not args.commit_repository:
+                raise OrchestrationError(
+                    "an attested finish-run with --commit-sha requires "
+                    "--commit-repository: the commit must exist in the "
+                    "trusted checkout before the state attests it"
+                )
+            if resolve_commit(args.commit_repository, args.commit_sha) != args.commit_sha:
+                raise OrchestrationError(
+                    "--commit-sha must be the full object name of a commit in --commit-repository"
+                )
         engine.finish_run(
             args.unit,
             args.run_id,
@@ -2670,6 +2749,11 @@ def build_parser() -> argparse.ArgumentParser:
     orchestrate.add_argument("--result", choices=("succeeded", "failed"))
     orchestrate.add_argument("--findings", type=int, default=0)
     orchestrate.add_argument("--commit-sha", default="")
+    orchestrate.add_argument(
+        "--commit-repository",
+        help="with --attestation-key and --commit-sha: the trusted checkout "
+        "the finished run's commit must exist in",
+    )
     orchestrate.add_argument("--max-repair-cycles", type=int, default=2)
     orchestrate.add_argument("--status-output")
     orchestrate.add_argument(

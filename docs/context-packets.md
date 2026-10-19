@@ -260,13 +260,22 @@ also mirrors the
 source's remote-tracking and tag refs, since CI checkouts often carry the
 candidate only on `origin/*`, and then disconnects its `origin` remote, so
 a gate — or candidate code a gate runs — cannot push to or edit the
-caller's real repository. The `--candidate-base` is authenticated OUTSIDE
+caller's real repository, and its `origin/<default branch>` ref is PINNED
+to the authenticated base rather than imported from the candidate — a
+producer that moved its own remote-tracking ref to the head could otherwise
+show a repository-aware gate an empty `origin/$GITHUB_BASE_REF...HEAD`
+diff. The `--candidate-base` is authenticated OUTSIDE
 the candidate repository: `--review-target-repository` names the caller's
 separately maintained repository, and the base must equal its current
 `origin/<default branch>` — a ref inside the candidate repository
 (remote-tracking refs included) is mutable by the producing run itself via
 `git update-ref`, so it authenticates nothing, and a caller-chosen later
-ancestor cannot hide already-landed changes from the verified diff. The PACKET configuration — the policy AND the
+ancestor cannot hide already-landed changes from the verified diff. The
+target must also BE separate, not merely spelled differently: canonical
+object-store identities (the realpath of each repository's common git
+directory) are compared, so the candidate itself, a symlink alias of it, a
+worktree sharing its store, or a repository nested inside the candidate's
+tree all refuse. The PACKET configuration — the policy AND the
 mission registry and knowledge sources — is read from the same committed
 tree on every candidate path (paths judged lexically with relative values
 repository-relative, never through symlinks), so an uncommitted caller-side
@@ -301,6 +310,12 @@ write-capable envelope under stale, possibly weaker configuration and
 source — and every pinned record is read back
 from it the same way, so a write-capable dispatch can never hand the
 implementation agent fabricated source under a self-consistent citation.
+The pinned revision is also BOUND into the packet itself — serialized as
+`repositoryRevision`, covered by `packetSha256`, and carried on the
+envelope as a `revision:<sha>` input reference — even when the request has
+no evidence records, so identical tasks at two different commits never
+share a digest and an empty-evidence envelope cannot be replayed after the
+checkout moves.
 Write-capable dispatches also re-run the task policy
 (`evaluate_task(..., "implement")`) and require `--authorization`: the
 `check-request --authorize-labels` result, which must be ready, authorized
@@ -318,7 +333,14 @@ each document's canonical JSON. `check-request --attestation-key` signs
 its result and `orchestrate --attestation-key` signs the state it writes
 (verifying existing state on read, so an out-of-band edit is refused at
 the next step); the secret never travels in the artifacts, so reading one
-confers no ability to mint one. Reviewer dispatches require `--history`: the
+confers no ability to mint one. The attested state also authenticates its
+INPUTS before signing: `dispatch-packet --attestation-key` signs the
+envelope it emits, `orchestrate start-run` under the key accepts only an
+envelope whose mark verifies and whose `envelopeSha256` matches its content
+(so run attribution — agent and mission identity — can neither be
+hand-authored nor re-labeled on a signed envelope), and an attested
+`finish-run` with `--commit-sha` requires `--commit-repository`, where the
+commit must exist, before the state attests it. Reviewer dispatches require `--history`: the
 ORCHESTRATOR STATE document, verified against the attestation key and
 replayed through the orchestrator's own
 validation, whose recorded runs for this work item (mission and agent

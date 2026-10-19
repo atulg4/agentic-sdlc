@@ -7,7 +7,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -453,8 +453,27 @@ def resolve_commit(repository: str | Path, rev: str) -> str:
     return commit
 
 
+def repository_identity(repository: str | Path) -> str:
+    """The canonical identity of the repository's object store.
+
+    The realpath of its COMMON git directory: one repository, every worktree
+    linked to it, and every symlink alias of either all share this identity,
+    so two paths with equal identities are the same mutable store however
+    they are spelled."""
+    root = _bind(repository)
+    out = (
+        _run(["git", "rev-parse", "--git-common-dir"], root)
+        .stdout.decode("utf-8", errors="surrogateescape")
+        .strip()
+    )
+    common = out if os.path.isabs(out) else os.path.join(root.top, out)
+    return os.path.realpath(common)
+
+
 @contextmanager
-def derivation_tree(repository: str | Path, rev: str) -> Iterator[Path]:
+def derivation_tree(
+    repository: str | Path, rev: str, *, pin_refs: Mapping[str, str] | None = None
+) -> Iterator[Path]:
     """A disposable checkout of commit `rev` under pristine configuration.
 
     For callers about to RUN programs against a commit (gate commands): the
@@ -514,6 +533,28 @@ def derivation_tree(repository: str | Path, rev: str) -> Iterator[Path]:
             str(tree),
             "fetch",
         )
+        # Caller-pinned refs OVERRIDE what the mirror carried: the source's
+        # own remote-tracking refs are source-mutable, so a caller that has
+        # authenticated a commit elsewhere (the review base) pins the tree's
+        # ref to that exact value rather than trusting the imported one.
+        for ref_name, value in sorted((pin_refs or {}).items()):
+            if not ref_name.startswith("refs/") or not _OBJECT_NAME.fullmatch(value):
+                raise GitDiffError("pinned refs must map refs/* names to full commit object names")
+            _exec(
+                [
+                    program,
+                    "-C",
+                    str(tree),
+                    "--no-replace-objects",
+                    "-c",
+                    "core.fsmonitor=false",
+                    "update-ref",
+                    ref_name,
+                    value,
+                ],
+                str(tree),
+                "update-ref",
+            )
         # The clone's origin URL names the caller's real Git directory: a
         # gate — or candidate code a gate runs — could push refs or edit that
         # repository through it. The refs are mirrored already, so the remote
