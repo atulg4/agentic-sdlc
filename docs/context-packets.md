@@ -207,11 +207,20 @@ with `contextPackDigest` bound to the packet digest and the rendered packet
 as the dispatched prompt. Reviewer verification on the dispatch path is
 DERIVED, never declared: with `--candidate-repository`, `--candidate-base`
 and `--candidate-head`, the CLI resolves both commits in that repository,
-computes the diff summary with `collect_commit_diff`, and runs the gates
-itself (`run_gates`), so request JSON can never impersonate pipeline
-evidence — `dispatch-packet` refuses a request-supplied `verification`
-object outright, and `context-packet` accepts the same flags (request
-`priorFindings` carries prior review findings on the derived path). An
+requires the checkout to BE the resolved head with a clean working tree
+(gates execute the checkout, not the object database), computes the diff
+summary with `collect_commit_diff`, runs the gates itself (`run_gates`),
+and reads every pinned repository record's payload back from the candidate
+tree — a fabricated payload with a self-consistent hash is rejected. Request
+JSON can never impersonate pipeline evidence: `dispatch-packet` refuses a
+request-supplied `verification` object outright, and `context-packet`
+accepts the same flags (request `priorFindings` carries prior review
+findings on the derived path). The `--packet` comparison is
+timing-insensitive — a derived rebuild reruns the gates, whose wall-clock
+durations differ — while the digest-field equality still applies to
+deterministic rebuilds. When the selected agent's declared window cannot
+fit the packet, dispatch falls back through the roster order to the next
+eligible agent. An
 agent that declares `contextWindowTokens` is also checked at dispatch: the
 rendered prompt plus the output reserve must fit its window, not only the
 mission budget. With `--packet`, the previously written packet

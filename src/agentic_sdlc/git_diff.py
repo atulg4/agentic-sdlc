@@ -444,6 +444,21 @@ def resolve_commit(repository: str | Path, rev: str) -> str:
     return commit
 
 
+def checked_out_state(repository: str | Path) -> tuple[str, bool]:
+    """The commit HEAD names and whether the working tree and index match it.
+
+    For callers about to RUN programs inside the checkout (gate commands):
+    the object-database readers here never see uncommitted edits, but a
+    subprocess does, so such a caller must know the checkout is exactly one
+    committed tree."""
+    root = _bind(repository)
+    head = _run(["git", "rev-parse", "--verify", "HEAD^{commit}"], root).stdout.decode().strip()
+    if not _OBJECT_NAME.fullmatch(head):
+        raise GitDiffError("HEAD does not name a commit")
+    status = _run(["git", "status", "--porcelain"], root).stdout
+    return head, not status.strip()
+
+
 def read_committed_file(
     repository: str | Path, rev: str, path: str, label: str | None = None
 ) -> bytes:

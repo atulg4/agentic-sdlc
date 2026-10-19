@@ -45,6 +45,7 @@ from .executors import (
 from .gates import GateError, run_gates, write_report
 from .git_diff import (
     GitDiffError,
+    checked_out_state,
     collect_commit_diff,
     collect_git_diff,
     committed_path,
@@ -828,6 +829,15 @@ def _derived_verification(args: argparse.Namespace, request: dict) -> Verificati
         )
     base = resolve_commit(args.candidate_repository, args.candidate_base)
     head = resolve_commit(args.candidate_repository, args.candidate_head)
+    # run_gates executes the CHECKOUT, while collect_commit_diff reads the
+    # object database: a dirty tree or another checked-out revision would
+    # bind gate results for different code to the candidate head.
+    checked_out, clean = checked_out_state(args.candidate_repository)
+    if checked_out != head or not clean:
+        raise ContextBuilderError(
+            "the candidate repository must be checked out exactly at "
+            "--candidate-head with a clean working tree before gates run"
+        )
     snapshot = collect_commit_diff(args.candidate_repository, base, head)
     report = run_gates(args.config, args.candidate_repository)
     findings = request.get("priorFindings", [])
@@ -894,6 +904,31 @@ def _build_packet_from_request(
                 "derives it from the candidate repository"
             )
         verification = _derived_verification(args, request)
+        # The record's self-declared content hash proves nothing about the
+        # TREE: a fabricated payload with a recomputed hash would hand the
+        # reviewer attacker-chosen source beside a genuine diff and gate
+        # report, so every pinned repository payload is read back from the
+        # candidate head itself.
+        for record in records:
+            if record.source_type != "git-repository":
+                continue
+            if record.revision != verification.head_sha:
+                continue  # the builder rejects off-pin records itself
+            suffix = "@" + record.revision
+            if not record.external_id.endswith(suffix):
+                continue  # the builder rejects the malformed shape itself
+            path = record.external_id[: -len(suffix)]
+            committed = read_committed_file(
+                args.candidate_repository,
+                verification.head_sha,
+                path,
+                label="--candidate-head",
+            )
+            if committed != record.payload.encode("utf-8"):
+                raise ContextBuilderError(
+                    f"repository evidence for {path} does not match the pinned "
+                    "candidate tree; re-retrieve it from the candidate head"
+                )
     elif request.get("verification") is not None:
         if trusted_verification_only:
             # Schema-valid request JSON is not pipeline evidence: a dispatch
@@ -951,7 +986,33 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
         def _encoded(document: object) -> str:
             return json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
-        if _encoded(artifact) != _encoded(packet.as_dict()):
+        def _comparable(document: Any) -> Any:
+            # A derived rebuild reruns the gates, and wall-clock durations
+            # differ run to run: the comparison is timing-insensitive (the
+            # verdicts and every other field still compare), with the digest
+            # fields that bind those timings dropped alongside.
+            projection = json.loads(_encoded(document))
+            if not isinstance(projection, dict):
+                return projection
+            projection.pop("packetSha256", None)
+            projection.pop("renderedBytes", None)
+            verification_entry = projection.get("verification")
+            if isinstance(verification_entry, dict):
+                report = verification_entry.get("gateReport")
+                if isinstance(report, dict):
+                    for gate in report.get("gates") or []:
+                        if isinstance(gate, dict):
+                            gate.pop("durationSeconds", None)
+            return projection
+
+        if _encoded(_comparable(artifact)) != _encoded(_comparable(packet.as_dict())):
+            raise ContextBuilderError(
+                "the packet artifact does not match the packet rebuilt from the "
+                "request; rebuild the packet before dispatching"
+            )
+        if not args.candidate_repository and artifact.get("packetSha256") != packet.packet_sha256:
+            # Without derived gates the rebuild is deterministic, so the
+            # digest field itself must match too.
             raise ContextBuilderError(
                 "the packet artifact does not match the packet rebuilt from the "
                 "request; rebuild the packet before dispatching"
@@ -965,10 +1026,25 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
         ):
             raise MissionError("history must map mission IDs to agent IDs")
         history = raw
-    agent = registry.select_agent(mission.mission_id, agents, history=history)
-    envelope = dispatch_envelope_for_packet(
-        packet, mission, agent, input_refs=tuple(args.input_ref)
-    )
+    # Roster order defines fallbacks: an eligible agent whose declared
+    # context window cannot fit the packet is skipped for the next eligible
+    # one instead of blocking a dispatch a fallback could carry.
+    roster = list(agents)
+    while True:
+        agent = registry.select_agent(mission.mission_id, tuple(roster), history=history)
+        try:
+            envelope = dispatch_envelope_for_packet(
+                packet, mission, agent, input_refs=tuple(args.input_ref)
+            )
+            break
+        except ContextBuilderError as error:
+            if "context window" not in str(error):
+                raise
+            roster = [entry for entry in roster if entry.agent_id != agent.agent_id]
+            if not roster:
+                raise ContextBuilderError(
+                    f"{error}; no other eligible agent declares a sufficient context window"
+                ) from error
     _write(envelope, args.output)
     return 0
 

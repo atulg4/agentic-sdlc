@@ -1021,6 +1021,16 @@ def build_context_packet(
     admitted: list[EvidenceRecord] = []
     seen_evidence: dict[str, EvidenceRecord] = {}
     for record in records:
+        # Frozen dataclasses accept mutable lists at runtime, and neither the
+        # evidence id nor the packet digest binds anchors or links: the
+        # admitted record is detached first, so a caller's retained list
+        # cannot gain a credential-bearing link or anchor past the scan.
+        if isinstance(record.anchors, (str, bytes)):
+            raise ContextBuilderError(
+                "evidence anchors must be a sequence of strings, not a single string"
+            )
+        if not isinstance(record.anchors, tuple) or not isinstance(record.links, tuple):
+            record = replace(record, anchors=tuple(record.anchors), links=tuple(record.links))
         source = sources.get(record.source_id)
         if source is None:
             raise ContextBuilderError(f"evidence cites an undeclared source: {record.source_id}")

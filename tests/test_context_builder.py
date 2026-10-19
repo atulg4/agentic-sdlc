@@ -1741,7 +1741,13 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
 
     git("init", "-q", "-b", "main")
     (repo / "a.txt").write_text("one\n", encoding="utf-8")
-    git("add", "a.txt")
+    # The evidence record below cites this file at the candidate head, and
+    # the derived path reads the payload back from the pinned tree.
+    (repo / "src").mkdir()
+    (repo / "src" / "scheduler.py").write_text(
+        "class Scheduler:\n    retries = 2\n", encoding="utf-8"
+    )
+    git("add", "a.txt", "src/scheduler.py")
     git("commit", "-q", "-m", "base")
     base = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "HEAD"],
@@ -1811,6 +1817,132 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
     assert verification["gateReport"] == {"passed": False, "gates": []}
     assert verification["priorFindings"] == ["Round one flagged an unbounded retry loop."]
 
+    # A derived artifact dispatches: the comparison is timing-insensitive
+    # and the digest-field equality applies only to deterministic rebuilds.
+    agents_roster = tmp_path / "reviewers.json"
+    agents_roster.write_text(
+        json.dumps(
+            [
+                {
+                    "agentId": "tiny-reviewer",
+                    "adapter": "claude",
+                    "adapterVersion": "1.0.0",
+                    "provider": "anthropic",
+                    "model": "claude-haiku-5-5",
+                    "capabilities": ["review-code"],
+                    "contextWindowTokens": 300,
+                },
+                {
+                    "agentId": "roomy-reviewer",
+                    "adapter": "claude",
+                    "adapterVersion": "1.0.0",
+                    "provider": "anthropic",
+                    "model": "claude-opus-5",
+                    "capabilities": ["review-code"],
+                    "contextWindowTokens": 4000000,
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+    envelope_path = tmp_path / "envelope.json"
+    assert (
+        cli_main(
+            [
+                "dispatch-packet",
+                "--config",
+                str(policy_file),
+                "--knowledge",
+                str(knowledge),
+                "--request",
+                str(request),
+                "--candidate-repository",
+                str(repo),
+                "--candidate-base",
+                base,
+                "--candidate-head",
+                head,
+                "--agents",
+                str(agents_roster),
+                "--packet",
+                str(output),
+                "--output",
+                str(envelope_path),
+            ]
+        )
+        == 0
+    )
+    envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
+    # Roster order defines fallbacks: the too-small window is skipped for
+    # the next eligible agent instead of blocking the dispatch.
+    assert envelope["agentId"] == "roomy-reviewer"
+
+    # A fabricated payload with a self-consistent hash is read back from the
+    # pinned tree and rejected.
+    forged = tmp_path / "forged.json"
+    forged.write_text(
+        json.dumps(
+            {
+                "missionId": "code-reviewer",
+                "workRef": WORK_REF,
+                "task": {"title": "P1: a bounded change", "body": valid_body},
+                "records": [
+                    _record(
+                        external_id=f"src/scheduler.py@{head}",
+                        revision=head,
+                        payload="class Scheduler:\n    retries = 999\n",
+                    ).as_dict()
+                ],
+                "repositoryRevision": head,
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        cli_main(
+            [
+                "context-packet",
+                "--config",
+                str(policy_file),
+                "--knowledge",
+                str(knowledge),
+                "--request",
+                str(forged),
+                "--candidate-repository",
+                str(repo),
+                "--candidate-base",
+                base,
+                "--candidate-head",
+                head,
+            ]
+        )
+        == 2
+    )
+
+    # A dirty checkout must not run gates bound to the candidate head.
+    (repo / "a.txt").write_text("one\ntwo\nthree uncommitted\n", encoding="utf-8")
+    assert (
+        cli_main(
+            [
+                "context-packet",
+                "--config",
+                str(policy_file),
+                "--knowledge",
+                str(knowledge),
+                "--request",
+                str(request),
+                "--candidate-repository",
+                str(repo),
+                "--candidate-base",
+                base,
+                "--candidate-head",
+                head,
+            ]
+        )
+        == 2
+    )
+    git("checkout", "--", "a.txt")
+
     # The dispatch path never accepts request JSON as pipeline evidence.
     tainted = tmp_path / "tainted.json"
     tainted.write_text(
@@ -1857,3 +1989,23 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
         )
         == 2
     )
+
+
+def test_record_sequences_are_detached_before_admission(registry, policy):
+    from agentic_sdlc.knowledge import EvidenceLink
+
+    anchors = ["L1-L2"]
+    links = [EvidenceLink(kind="relates-to", target_evidence_id="ev-feedbeef")]
+    record = _record(anchors=anchors, links=links)
+    packet = _packet(registry, policy, records=(record,))
+    # Mutating the caller's retained lists after admission reaches nothing:
+    # neither digest binds anchors or links, so the packet detaches them.
+    anchors.append("L1-L1")
+    links.append(EvidenceLink(kind="cites", target_evidence_id="ghp_" + "a" * 36))
+    stored = packet.pack.records[0]
+    assert stored.anchors == ("L1-L2",)
+    assert len(stored.links) == 1
+    assert "ghp_" not in json.dumps(packet.as_dict())
+    # A scalar string is rejected, never shredded.
+    with pytest.raises(ContextBuilderError, match="not a single string"):
+        _packet(registry, policy, records=(_record(anchors="L1-L2"),))
