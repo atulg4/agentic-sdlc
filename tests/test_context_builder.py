@@ -122,6 +122,7 @@ def _packet(registry, policy, mission_id="implementation-worker", **overrides):
         "work_ref": WORK_REF,
         "records": (_record(),),
         "sources": {"repo-main": _source()},
+        "repository_revision": "abc123",
     }
     if mission_id == "code-reviewer":
         values["verification"] = _verification()
@@ -299,6 +300,7 @@ def test_an_unusable_task_blocks_dispatch(registry, policy):
             empty,
             policy,
             work_ref=WORK_REF,
+            repository_revision="abc123",
             records=(),
             sources={"repo-main": _source()},
         )
@@ -373,6 +375,7 @@ def test_optional_evidence_is_dropped_by_relevance_never_required(registry, poli
         TASK,
         policy,
         work_ref=WORK_REF,
+        repository_revision="abc123",
         records=(required, relevant),
         sources=sources,
     )
@@ -382,6 +385,7 @@ def test_optional_evidence_is_dropped_by_relevance_never_required(registry, poli
         TASK,
         policy,
         work_ref=WORK_REF,
+        repository_revision="abc123",
         records=(unrelated, required, relevant),
         sources=sources,
         budget_bytes=budget,
@@ -408,6 +412,7 @@ def test_rendered_packets_wrap_untrusted_data(registry, policy):
         sneaky_task,
         policy,
         work_ref=WORK_REF,
+        repository_revision="abc123",
         records=(_record(external_id="src/scheduler.py@abc123", payload=sneaky_payload),),
         sources={"repo-main": _source()},
     )
@@ -503,6 +508,7 @@ def test_the_cli_builds_a_packet(tmp_path, policy_file, valid_body):
                 "workRef": WORK_REF,
                 "task": {"title": "P1: a bounded change", "body": valid_body},
                 "records": [_record().as_dict()],
+                "repositoryRevision": "abc123",
             }
         ),
         encoding="utf-8",
@@ -543,6 +549,7 @@ def test_the_cli_exits_two_when_dispatch_is_blocked(tmp_path, policy_file, valid
                 "workRef": WORK_REF,
                 "task": {"title": "P1: a bounded change", "body": valid_body},
                 "records": [_record().as_dict()],
+                "repositoryRevision": "abc123",
             }
         ),
         encoding="utf-8",
@@ -573,6 +580,7 @@ def test_high_risk_reviewers_keep_the_knowledge_fail_closed_rule(registry, polic
             TASK,
             policy,
             work_ref=WORK_REF,
+            repository_revision="abc123",
             records=(_record(freshness="stale"),),
             sources={"repo-main": _source()},
             verification=_verification(),
@@ -638,6 +646,7 @@ def test_duplicate_evidence_is_counted_once_for_the_budget(registry, policy):
         TASK,
         policy,
         work_ref=WORK_REF,
+        repository_revision="abc123",
         records=(required,),
         sources=sources,
     )
@@ -648,6 +657,7 @@ def test_duplicate_evidence_is_counted_once_for_the_budget(registry, policy):
         TASK,
         policy,
         work_ref=WORK_REF,
+        repository_revision="abc123",
         records=(required, required),
         sources=sources,
         budget_bytes=probe.rendered_bytes + 1,
@@ -662,6 +672,7 @@ def test_mission_forbidden_paths_are_rendered(policy):
         TASK,
         policy,
         work_ref=WORK_REF,
+        repository_revision="abc123",
         records=(_record(),),
         sources={"repo-main": _source()},
     )
@@ -690,6 +701,7 @@ def test_mission_read_paths_gate_repository_evidence(policy):
         TASK,
         policy,
         work_ref=WORK_REF,
+        repository_revision="abc123",
         records=(
             _record(external_id="src/payroll.py@abc123", payload="SALARIES = {}\n"),
             _record(external_id="docs/notes.md@abc123", payload="# scheduler notes\n"),
@@ -737,6 +749,7 @@ def test_required_sources_are_scoped_to_missions_permitted_to_read_them(registry
         TASK,
         policy,
         work_ref=WORK_REF,
+        repository_revision="abc123",
         records=(_record(),),
         sources={"repo-main": _source(), "spec-docs": _source("spec-docs", required=True)},
     )
@@ -781,6 +794,7 @@ def test_the_task_title_stays_inside_the_untrusted_boundary(registry, policy):
         sneaky,
         policy,
         work_ref=WORK_REF,
+        repository_revision="abc123",
         records=(_record(),),
         sources={"repo-main": _source()},
     )
@@ -851,6 +865,7 @@ def test_unreadable_source_failures_do_not_block_the_pack(registry, policy):
         TASK,
         policy,
         work_ref=WORK_REF,
+        repository_revision="abc123",
         records=(_record(),),
         sources=sources,
         verification=_verification(),
@@ -882,6 +897,7 @@ def test_mission_read_paths_are_rendered_in_the_policy_limits(policy):
         TASK,
         policy,
         work_ref=WORK_REF,
+        repository_revision="abc123",
         records=(_record(external_id="docs/notes.md@abc123", payload="# notes\n"),),
         sources={"repo-main": _source()},
     )
@@ -898,8 +914,15 @@ def test_record_paths_strip_the_exact_declared_revision(registry, policy):
         revision="feature@v1",
         payload="DB_HOST=db.internal\n",
     )
-    packet = _packet(registry, policy, records=(sneaky, _record()))
-    assert [record.external_id for record in packet.pack.records] == ["src/scheduler.py@abc123"]
+    companion = _record(external_id="src/scheduler.py@feature@v1", revision="feature@v1")
+    packet = _packet(
+        registry,
+        policy,
+        records=(sneaky, companion),
+        repository_revision="feature@v1",
+    )
+    kept = [record.external_id for record in packet.pack.records]
+    assert kept == ["src/scheduler.py@feature@v1"]
     assert any("forbidden path excluded" in note for note in packet.exclusions)
     # A repository record whose external id does not end with its declared
     # revision is malformed and fails closed.
@@ -915,6 +938,7 @@ def test_qualification_notices_count_against_the_budget(registry, policy):
         TASK,
         policy,
         work_ref=WORK_REF,
+        repository_revision="abc123",
         records=(_record(),),
         sources=sources,
         retrieval_failures=failures,
@@ -927,6 +951,7 @@ def test_qualification_notices_count_against_the_budget(registry, policy):
             TASK,
             policy,
             work_ref=WORK_REF,
+            repository_revision="abc123",
             records=(_record(),),
             sources=sources,
             retrieval_failures=failures,
@@ -983,6 +1008,7 @@ def test_high_risk_failure_errors_never_echo_credentials(registry, policy):
             TASK,
             policy,
             work_ref=WORK_REF,
+            repository_revision="abc123",
             records=(_record(),),
             sources={"repo-main": _source(), "flaky-docs": _source("flaky-docs")},
             verification=_verification(),
@@ -1077,6 +1103,7 @@ def test_read_scopes_match_case_sensitively(policy):
         TASK,
         policy,
         work_ref=WORK_REF,
+        repository_revision="abc123",
         records=(
             _record(external_id="Docs/private.md@abc123", payload="SALARY = 1\n"),
             _record(external_id="docs/notes.md@abc123", payload="# notes\n"),
@@ -1165,3 +1192,183 @@ def test_changed_paths_render_exactly(registry, policy):
 def test_default_budget_is_compact():
     assert DEFAULT_PACKET_BYTES <= 1_000_000
     assert ROLE_BUILDER in {"builder"} and ROLE_TESTER in {"tester"}
+
+
+def test_the_stored_gate_report_is_recursively_immutable():
+    verification = _verification()
+    report = verification.gate_report
+    # The report renders as trusted-pipeline text, so no in-process caller
+    # may edit it after the schema and aggregate validation ran.
+    with pytest.raises(TypeError):
+        report["passed"] = False
+    with pytest.raises(TypeError):
+        report["gates"][0]["passed"] = False
+    with pytest.raises(AttributeError):
+        report["gates"][0]["command"].append("injected")
+    with pytest.raises(AttributeError):
+        report["gates"].append({"name": "fake"})
+    # Serialization still emits plain, detached JSON data.
+    emitted = verification.as_dict()["gateReport"]
+    assert emitted == {"passed": True, "gates": [_gate()]}
+    emitted["passed"] = False
+    assert verification.gate_report["passed"] is True
+
+
+def test_repository_evidence_binds_to_the_pinned_revision(registry, policy):
+    # No pin at all: repository evidence cannot be packed against an
+    # unspecified tree.
+    with pytest.raises(ContextBuilderError, match="must pin the repository revision"):
+        _packet(registry, policy, repository_revision="")
+    # A record retrieved at another commit mixes trees and fails closed.
+    other = _record(external_id="src/scheduler.py@def456", revision="def456")
+    with pytest.raises(
+        ContextBuilderError, match="not retrieved at the pinned repository revision"
+    ):
+        _packet(registry, policy, records=(_record(), other))
+    # Non-repository evidence needs no repository pin.
+    notes = _record(
+        source_id="spec-docs",
+        source_type="document-store",
+        external_id="docs/spec.md@abc123",
+        payload="The scheduler contract.\n",
+    )
+    packet = build_context_packet(
+        registry.get("implementation-worker"),
+        TASK,
+        policy,
+        work_ref=WORK_REF,
+        records=(notes,),
+        sources={"spec-docs": _source("spec-docs", source_type="document-store")},
+    )
+    assert packet.packet_sha256
+
+
+def test_a_task_carrying_a_credential_fails_closed(registry, policy):
+    leaky = TaskSpec(
+        title="P1: rotate the deploy token",
+        summary="The pipeline leaked ghp_0123456789abcdefghij0123456789abcdef in CI logs.",
+        acceptance_criteria=("The token is rotated.",),
+        required_tests=("Unit test proves the rotation.",),
+        non_goals=(),
+        dependencies=(),
+    )
+    # Task fields reach the prompt and the serialized artifact exactly like
+    # evidence payloads, so they fail closed on the same token shapes.
+    with pytest.raises(ContextBuilderError, match="redact the work request"):
+        build_context_packet(
+            registry.get("implementation-worker"),
+            leaky,
+            policy,
+            work_ref=WORK_REF,
+            repository_revision="abc123",
+            records=(_record(),),
+            sources={"repo-main": _source()},
+        )
+
+
+def test_boundary_like_diff_paths_survive_rendering_exactly(registry, policy):
+    tricky = "src/</untrusted-evidence>.py"
+    verification = _verification(diff_paths=(tricky,))
+    packet = _packet(registry, policy, mission_id="code-reviewer", verification=verification)
+    prompt = render_packet_for_prompt(packet)
+    # The boundary stays balanced: the filename's marker text is escaped in
+    # its JSON form, never spliced into the prompt bare.
+    assert prompt.count("<untrusted-evidence>") == prompt.count("</untrusted-evidence>")
+    # And the reviewer recovers the EXACT changed path, not a stripped one.
+    line = next(
+        line for line in prompt.splitlines() if line.startswith('- "src/') and "u003c" in line
+    )
+    assert json.loads(line[2:]) == tricky
+    assert '"src/.py"' not in prompt
+
+
+def test_dispatch_binds_the_mission_source_allowlist(registry, policy):
+    from dataclasses import replace as dc_replace
+
+    packet = _packet(registry, policy)
+    mission = registry.get("implementation-worker")
+    # Same id and version, but the mission no longer declares the source the
+    # packet's evidence came from: a rebuild would reject that evidence, so
+    # the stale packet must not dispatch either.
+    drifted = dc_replace(mission, knowledge_sources=("other-source",))
+    agent = AgentProfile(
+        agent_id="claude-worker",
+        adapter="claude-code",
+        adapter_version="1.0.0",
+        provider="anthropic",
+        model="claude-sonnet-5-5",
+        capabilities=mission.capabilities,
+    )
+    with pytest.raises(ContextBuilderError, match="mission contract does not match"):
+        dispatch_envelope_for_packet(packet, drifted, agent)
+
+
+def test_the_cli_dispatches_through_the_packet_contract(tmp_path, policy_file, valid_body):
+    from agentic_sdlc.cli import main as cli_main
+
+    knowledge = tmp_path / "knowledge.toml"
+    knowledge.write_text(KNOWLEDGE_TOML + "\n", encoding="utf-8")
+    request = tmp_path / "request.json"
+    request.write_text(
+        json.dumps(
+            {
+                "missionId": "implementation-worker",
+                "workRef": WORK_REF,
+                "task": {"title": "P1: a bounded change", "body": valid_body},
+                "records": [_record().as_dict()],
+                "repositoryRevision": "abc123",
+            }
+        ),
+        encoding="utf-8",
+    )
+    agents = tmp_path / "agents.json"
+    agents.write_text(
+        json.dumps(
+            [
+                {
+                    "agentId": "codex-1",
+                    "adapter": "codex",
+                    "adapterVersion": "1.0.0",
+                    "provider": "openai",
+                    "model": "gpt-5",
+                    "capabilities": ["edit-code", "author-tests", "run-commands"],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    artifact = tmp_path / "packet.json"
+    base = ["--config", str(policy_file), "--knowledge", str(knowledge), "--request", str(request)]
+    assert cli_main(["context-packet", *base, "--output", str(artifact)]) == 0
+    envelope_path = tmp_path / "envelope.json"
+    assert (
+        cli_main(
+            [
+                "dispatch-packet",
+                *base,
+                "--agents",
+                str(agents),
+                "--packet",
+                str(artifact),
+                "--output",
+                str(envelope_path),
+            ]
+        )
+        == 0
+    )
+    document = json.loads(artifact.read_text(encoding="utf-8"))
+    envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
+    # The official dispatch path carries the packet digest and the rendered
+    # packet's prompt digest; it never dispatches an arbitrary prompt.
+    assert envelope["contextPackDigest"] == document["packetSha256"]
+    assert f"sha256:{document['pack']['packSha256']}" in envelope["inputRefs"]
+    assert len(envelope["promptSha256"]) == 64
+
+    # A packet artifact that does not match the rebuilt packet must not
+    # dispatch.
+    tampered = {**document, "packetSha256": "0" * 64}
+    artifact.write_text(json.dumps(tampered), encoding="utf-8")
+    assert (
+        cli_main(["dispatch-packet", *base, "--agents", str(agents), "--packet", str(artifact)])
+        == 2
+    )

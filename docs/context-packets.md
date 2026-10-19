@@ -43,9 +43,14 @@ never review its own writes. Missions with neither capability set
   emits, top level and per entry — a nonempty gates array whose entries each
   carry name, command, exitCode, durationSeconds and a boolean verdict, with
   an agreeing aggregate), and prior findings, which fail closed when they
-  carry secret-like content. Changed paths render inside an untrusted
-  boundary — filenames are patch data the patch author controls. Builders
-  and testers must not receive it; reviews start from fresh context.
+  carry secret-like content. The validated gate report is detached from the
+  caller's object and stored recursively immutable, so it cannot be edited
+  in place after validation. Changed paths render inside an untrusted
+  boundary — filenames are patch data the patch author controls — with
+  angle brackets escaped in their JSON form, so a filename spelling a
+  boundary marker reaches the reviewer exactly instead of being stripped.
+  Builders and testers must not receive it; reviews start from fresh
+  context.
 
 ## Budgeting and ordering
 
@@ -102,7 +107,12 @@ reason — naming the source or evidence and the remedy — when:
 - a reviewer packet lacks verification evidence,
 - mandatory content cannot fit the budget,
 - the task specification is not dispatchable (route it through the spec
-  stage first).
+  stage first) or carries a secret-like value in any of its fields — task
+  text reaches the prompt and the serialized artifact exactly like evidence
+  payloads, so it fails closed on the same token shapes,
+- repository evidence is packed without a pinned `repository_revision`, or a
+  repository record was retrieved at a different revision — all repository
+  evidence must come from one trusted pinned tree, never a mix of commits.
 
 A required source the mission may not read — its `permitted_missions` or the
 mission's explicit `knowledge_sources` exclude it — is not demanded of that
@@ -122,10 +132,11 @@ changed citation locator changes the digest). `dispatch_envelope_for_packet` pin
 envelope as `contextPackDigest` and adds `sha256:<packSha256>` to
 `inputRefs`, so the orchestrator's agent run record carries the exact packet
 content every run received. The envelope also verifies the full mission
-contract — role, risk level, write/read/forbidden paths, token and runtime
-limits —
+contract — role, risk level, write/read/forbidden paths, the knowledge-source
+allowlist, token and runtime limits —
 against the packet's bound limits, so a mission edited without a version
-bump cannot dispatch a prompt that still encodes the old policy.
+bump cannot dispatch a prompt that still encodes the old policy or reuse
+evidence the mission may no longer read.
 
 ## CLI
 
@@ -139,6 +150,29 @@ sdlcctl context-packet \
 
 `request.json` holds `missionId`, `workRef`, the `task` (`title`, `body`,
 optional `labels`), `records` (evidence documents as the knowledge layer
-serializes them), optional `verification`, optional `budgetBytes`, and
-optional `retrievalFailures`. A blocked dispatch exits `2` and prints the
-actionable reason on stderr.
+serializes them), `repositoryRevision` (the trusted checkout revision —
+required whenever `records` carry repository evidence), optional
+`verification`, optional `budgetBytes`, and optional `retrievalFailures`.
+A blocked dispatch exits `2` and prints the actionable reason on stderr.
+
+Dispatching goes through the packet contract, never around it:
+
+```sh
+sdlcctl dispatch-packet \
+  --config agentic-sdlc.toml \
+  --knowledge knowledge.toml \
+  --request request.json \
+  --agents agents.json \
+  --packet packet.json \
+  --output envelope.json
+```
+
+`dispatch-packet` rebuilds and re-validates the packet from the same request
+inputs — evidence authorization, the reviewer-verification requirement, and
+the budget checks all run again — selects the agent (`--history` works as in
+`dispatch-mission`), and emits the envelope via `dispatch_envelope_for_packet`
+with `contextPackDigest` bound to the packet digest and the rendered packet
+as the dispatched prompt. With `--packet`, the previously written packet
+artifact must match the rebuilt packet's digest, so a stale or tampered
+artifact never dispatches. The plain `dispatch-mission` command remains for
+non-factory missions whose prompt is not packet-built.

@@ -27,6 +27,7 @@ from .context_builder import (
     DEFAULT_PACKET_BYTES,
     ContextBuilderError,
     build_context_packet,
+    dispatch_envelope_for_packet,
     verification_from_dict,
 )
 from .dashboard_efficiency import build_infrastructure_blocker_panel
@@ -812,7 +813,13 @@ def _dispatch_mission(args: argparse.Namespace) -> int:
     return 0
 
 
-def _context_packet(args: argparse.Namespace) -> int:
+def _build_packet_from_request(args: argparse.Namespace):
+    """Rebuild and validate a packet from its request inputs.
+
+    Shared by ``context-packet`` and ``dispatch-packet``, so dispatching runs
+    the same evidence authorization, verification requirement, and budgeting
+    that produced the packet artifact.
+    """
     policy = load_policy(args.config)
     registry = load_registry(args.missions, policy)
     sources = {source.source_id: source for source in load_sources(args.knowledge)}
@@ -848,9 +855,13 @@ def _context_packet(args: argparse.Namespace) -> int:
     verification = None
     if request.get("verification") is not None:
         verification = verification_from_dict(request["verification"])
+    repository_revision = request.get("repositoryRevision", "")
+    if not isinstance(repository_revision, str):
+        raise ContextBuilderError("packet request repositoryRevision must be a string")
 
+    mission = registry.get(_request_text("missionId"))
     packet = build_context_packet(
-        registry.get(_request_text("missionId")),
+        mission,
         task,
         policy,
         work_ref=_request_text("workRef"),
@@ -859,8 +870,48 @@ def _context_packet(args: argparse.Namespace) -> int:
         verification=verification,
         budget_bytes=request.get("budgetBytes", DEFAULT_PACKET_BYTES),
         retrieval_failures=tuple(failures),
+        repository_revision=repository_revision,
     )
+    return registry, mission, packet
+
+
+def _context_packet(args: argparse.Namespace) -> int:
+    _registry, _mission, packet = _build_packet_from_request(args)
     _write(packet.as_dict(), args.output)
+    return 0
+
+
+def _dispatch_packet(args: argparse.Namespace) -> int:
+    """Dispatch through the packet contract, never around it.
+
+    The packet is rebuilt and re-validated from the same request inputs that
+    produced the artifact, so dispatching runs evidence authorization, the
+    reviewer-verification requirement, and the budget checks; the resulting
+    envelope carries the packet digest as ``contextPackDigest`` and the
+    rendered packet as its prompt.
+    """
+    registry, mission, packet = _build_packet_from_request(args)
+    if args.packet:
+        artifact = json.loads(Path(args.packet).read_text(encoding="utf-8"))
+        if not isinstance(artifact, dict) or artifact.get("packetSha256") != packet.packet_sha256:
+            raise ContextBuilderError(
+                "the packet artifact does not match the packet rebuilt from the "
+                "request; rebuild the packet before dispatching"
+            )
+    agents = load_agents(json.loads(Path(args.agents).read_text(encoding="utf-8")))
+    history: dict[str, str] = {}
+    if args.history:
+        raw = json.loads(Path(args.history).read_text(encoding="utf-8"))
+        if not isinstance(raw, dict) or not all(
+            isinstance(key, str) and isinstance(value, str) for key, value in raw.items()
+        ):
+            raise MissionError("history must map mission IDs to agent IDs")
+        history = raw
+    agent = registry.select_agent(mission.mission_id, agents, history=history)
+    envelope = dispatch_envelope_for_packet(
+        packet, mission, agent, input_refs=tuple(args.input_ref)
+    )
+    _write(envelope, args.output)
     return 0
 
 
@@ -1866,6 +1917,18 @@ def build_parser() -> argparse.ArgumentParser:
     packet.add_argument("--request", required=True)
     packet.add_argument("--output")
     packet.set_defaults(handler=_context_packet)
+
+    dispatch_packet = commands.add_parser("dispatch-packet")
+    dispatch_packet.add_argument("--config", required=True)
+    dispatch_packet.add_argument("--missions")
+    dispatch_packet.add_argument("--knowledge", required=True)
+    dispatch_packet.add_argument("--request", required=True)
+    dispatch_packet.add_argument("--agents", required=True)
+    dispatch_packet.add_argument("--history")
+    dispatch_packet.add_argument("--packet")
+    dispatch_packet.add_argument("--input-ref", action="append", default=[])
+    dispatch_packet.add_argument("--output")
+    dispatch_packet.set_defaults(handler=_dispatch_packet)
 
     executors = commands.add_parser("validate-executors")
     executors.add_argument("--executors", required=True)
