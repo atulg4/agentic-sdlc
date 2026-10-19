@@ -133,7 +133,7 @@ _CREDENTIAL_REFERENCE = re.compile(r"://[^/?#\s]*@")
 #: GitLab glpat-): a credential supplied as a query parameter or fragment
 #: (``?access=ghp_...``) carries no URL userinfo yet IS the secret, and the
 #: snapshot republishes URLs as clickable links.
-def _utf16_units(value: str) -> int:
+def utf16_units(value: str) -> int:
     """The console's ``value.length``: UTF-16 code units, not code points.
 
     Python's ``len`` counts astral characters once where JavaScript counts
@@ -377,7 +377,7 @@ def _text(entry: Mapping[str, Any], key: str, label: str, *, required: bool = Fa
     # UTF-16 code units): astral characters count twice, so the producer can
     # never emit a field its bundled viewer rejects as overlong.
     _require(
-        _utf16_units(value) <= MAX_TEXT_LENGTH,
+        utf16_units(value) <= MAX_TEXT_LENGTH,
         f"{label}.{key} must be at most {MAX_TEXT_LENGTH} characters",
     )
     return value
@@ -403,6 +403,14 @@ def _unit_text(entry: Mapping[str, Any], key: str, label: str) -> str:
     _require(
         not _CREDENTIAL_REFERENCE.search(raw),
         f"{label}.{key} embeds URL userinfo (value withheld); "
+        "rename the unit in the source document",
+    )
+    # Token shapes too, percent-encoded included: the id is identity, never
+    # redactable, and it is serialized into the snapshot, warnings and the
+    # shared console store whether or not any projection matches it.
+    _require(
+        not _carries_credential_token(raw),
+        f"{label}.{key} is credential-shaped (value withheld); "
         "rename the unit in the source document",
     )
     return raw.strip()
@@ -1646,6 +1654,18 @@ def _build_backlog_tree(
 
 def _registered_view_fields(registry: ProjectRegistry, project_id: str) -> dict[str, Any]:
     profile = registry.get(project_id)
+    for repository in profile.repositories:
+        # The registry grammar admits token-shaped identifiers
+        # (glpat-SECRET/repo is a syntactically valid path), and a registered
+        # profile's repositories are rendered and persisted verbatim by the
+        # console, outside the malformed-repository redaction that covers
+        # ledger values — so a credential-shaped identifier fails the build
+        # closed with the value withheld.
+        _require(
+            not _carries_credential_token(repository.identifier),
+            "a registered repository identifier is credential-shaped (value "
+            "withheld); rename the repository in the project registry",
+        )
     return {
         "display_name": profile.display_name,
         "group": profile.group,
@@ -1693,6 +1713,11 @@ def build_control_center_snapshot(
             not _CREDENTIAL_REFERENCE.search(projection.project_id),
             "a ledger project identifier embeds URL userinfo (value withheld); "
             "rename the project in the lifecycle ledger",
+        )
+        _require(
+            not _carries_credential_token(projection.project_id),
+            "a ledger project identifier is credential-shaped (value "
+            "withheld); rename the project in the lifecycle ledger",
         )
         # NUL delimits the console's identity keys: a ledger-permitted
         # project id carrying it would produce a validly digested snapshot
@@ -1833,6 +1858,14 @@ def build_control_center_snapshot(
                 "a work unit identifier embeds URL userinfo (value withheld); "
                 "rename the unit in the lifecycle ledger",
             )
+            # Token shapes too: a ledger id like ghp_... (percent-encoded
+            # included) would otherwise serialize into statuses, warnings
+            # and the shared store exactly like a userinfo-bearing one.
+            _require(
+                not _carries_credential_token(unit_id),
+                "a work unit identifier is credential-shaped (value withheld); "
+                "rename the unit in the lifecycle ledger",
+            )
             name = status.repository
             if name and not _REPOSITORY_IDENTIFIER.fullmatch(name):
                 malformed_repositories.add(name)
@@ -1848,7 +1881,7 @@ def build_control_center_snapshot(
                 ):
                     redactions[field_name] = ""
                     credential_references += 1
-                elif value and _utf16_units(value) > 512:
+                elif value and utf16_units(value) > 512:
                     # The console bounds every rendered reference at 512
                     # UTF-16 code units (JavaScript's value.length), so the
                     # producer measures in the SAME units and withholds

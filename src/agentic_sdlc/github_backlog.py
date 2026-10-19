@@ -39,6 +39,7 @@ from .control_center import (
     RELEASED_SPEC_RULE,
     SPEC_WITHOUT_APPROVAL_RULE,
     ControlCenterError,
+    utf16_units,
 )
 
 
@@ -894,8 +895,12 @@ def incidents_from_change_requests(
             # failure, and both blockers are real.
         if number in checks:
             summary = f"Deterministic verification failed: {checks[number]}"
+            # Measured in UTF-16 units like the document loader's _text
+            # bound: an emoji-heavy check-name list below 512 code points
+            # but above 512 units would pass here only to fail the export's
+            # mandatory load_incident_document round trip.
             _require(
-                len(summary) <= 512,
+                utf16_units(summary) <= 512,
                 f"change request {number}: too many failing check names to record; "
                 "narrow --failing",
             )
