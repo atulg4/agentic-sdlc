@@ -363,12 +363,24 @@ def _unit_text(entry: Mapping[str, Any], key: str, label: str) -> str:
     """A work-unit id under the LEDGER's identifier contract: any string, with
     no character-set restriction and NO length cap, because existing
     version-1 ledgers already hold unbounded ids and every unit the ledger
-    accepted must stay addressable from backlog items and incidents."""
+    accepted must stay addressable from backlog items and incidents.
+
+    One exception fails closed: a value embedding URL userinfo. A document's
+    work-unit id is serialized into the snapshot and repeated by the
+    unknown-unit warning whether or not any projection matches it, so a
+    credential-bearing id from a backlog or incident export must never pass —
+    exactly like the ledger-keyed check in the snapshot build — and the
+    value is withheld from the error."""
 
     raw = entry.get(key, "")
     if raw is None:
         raw = ""
     _require(isinstance(raw, str), f"{label}.{key} must be a string")
+    _require(
+        not _CREDENTIAL_REFERENCE.search(raw),
+        f"{label}.{key} embeds URL userinfo (value withheld); "
+        "rename the unit in the source document",
+    )
     return raw.strip()
 
 
@@ -742,8 +754,9 @@ class BacklogItem:
     labels: tuple[str, ...] = ()
     url: str = ""
     updated_at: str = ""
-    #: The SCM provider the item's DOCUMENT declared as its source; carried
-    #: for provider-qualified ownership checks, never serialized back out.
+    #: The SCM provider the item's DOCUMENT declared as its source: part of
+    #: the item's identity (references are only unique within one provider)
+    #: and serialized so the console can scope joins and links by it.
     source_provider: str = ""
 
     def as_dict(self) -> dict[str, Any]:
@@ -759,6 +772,7 @@ class BacklogItem:
             "labels": list(self.labels),
             "url": self.url,
             "updatedAt": self.updated_at,
+            "sourceProvider": self.source_provider,
         }
 
 
@@ -948,8 +962,9 @@ class Incident:
     backlog_item_id: str = ""
     observed_at: str = ""
     evidence_ref: str = ""
-    #: The SCM provider the incident's DOCUMENT declared as its source;
-    #: carried for provider-qualified ownership checks, never serialized.
+    #: The SCM provider the incident's DOCUMENT declared as its source: part
+    #: of the incident's identity and serialized so the console links
+    #: evidence to the provider that actually hosts it.
     source_provider: str = ""
 
     def as_dict(self) -> dict[str, Any]:
@@ -964,6 +979,7 @@ class Incident:
             "backlogItemId": self.backlog_item_id,
             "observedAt": self.observed_at,
             "evidenceRef": self.evidence_ref,
+            "sourceProvider": self.source_provider,
             "remediations": [action.as_dict() for action in remediations_for(self.kind)],
         }
 
@@ -1456,21 +1472,24 @@ def _build_backlog_tree(
 ) -> tuple[tuple[BacklogNode, ...], tuple[str, ...]]:
     """Build the epic/story/task forest, rooting any item whose parent is absent."""
 
-    present = {item.item_id for item in items}
-    children: dict[str, list[BacklogItem]] = {}
+    # Identity — and therefore every parent join — is provider-scoped: a
+    # document's parentId names an item of its OWN provider, never a
+    # same-spelled id another provider's adapter emitted.
+    present = {(item.source_provider, item.item_id) for item in items}
+    children: dict[tuple[str, str], list[BacklogItem]] = {}
     roots: list[BacklogItem] = []
-    orphans: set[str] = set()
+    orphans: set[tuple[str, str]] = set()
     warnings: list[str] = []
     for item in items:
         if item.work_unit_id and item.work_unit_id not in statuses:
             warnings.append(
                 f"backlog item {item.item_id} names an unknown work unit: {item.work_unit_id}"
             )
-        if item.parent_id and item.parent_id in present:
-            children.setdefault(item.parent_id, []).append(item)
+        if item.parent_id and (item.source_provider, item.parent_id) in present:
+            children.setdefault((item.source_provider, item.parent_id), []).append(item)
             continue
         if item.parent_id:
-            orphans.add(item.item_id)
+            orphans.add((item.source_provider, item.item_id))
             warnings.append(
                 f"backlog item {item.item_id} names a parent outside this snapshot: "
                 f"{item.parent_id}"
@@ -1479,13 +1498,14 @@ def _build_backlog_tree(
 
     def node_for(item: BacklogItem) -> BacklogNode:
         state, basis, status = _resolve_state(item, statuses, by_issue_ref, repository_providers)
+        scoped = (item.source_provider, item.item_id)
         return BacklogNode(
             item=item,
             state=state,
             state_basis=basis,
             status=status,
-            parent_missing=item.item_id in orphans,
-            children=tuple(node_for(child) for child in children.get(item.item_id, ())),
+            parent_missing=scoped in orphans,
+            children=tuple(node_for(child) for child in children.get(scoped, ())),
         )
 
     return tuple(node_for(item) for item in roots), tuple(warnings)
@@ -1544,23 +1564,28 @@ def build_control_center_snapshot(
     # github:acme/forge and gitlab:acme/forge to different projects, and both
     # naturally use acme/forge#1 item ids. Within one project the ids stay
     # unique, because its tree joins by them.
-    seen_items: set[tuple[str, str]] = set()
+    # ... and PER PROVIDER within a project: one project may own
+    # github:acme/forge and gitlab:acme/forge, whose adapters naturally emit
+    # the same acme/forge#1 ids for different work.
+    seen_items: set[tuple[str, str, str]] = set()
     for item in backlog:
-        key = (item.project_id, item.item_id)
+        key = (item.project_id, item.source_provider, item.item_id)
         _require(
             key not in seen_items,
-            f"duplicate backlog itemId in project {item.project_id}: {item.item_id}",
+            f"duplicate backlog itemId in project {item.project_id}: {item.item_id} "
+            f"(provider {item.source_provider or 'undeclared'})",
         )
         seen_items.add(key)
         by_project_backlog.setdefault(item.project_id, []).append(item)
 
     by_project_incidents: dict[str, list[Incident]] = {}
-    seen_incidents: set[tuple[str, str]] = set()
+    seen_incidents: set[tuple[str, str, str]] = set()
     for incident in incidents:
-        key = (incident.project_id, incident.incident_id)
+        key = (incident.project_id, incident.source_provider, incident.incident_id)
         _require(
             key not in seen_incidents,
-            f"duplicate incidentId in project {incident.project_id}: {incident.incident_id}",
+            f"duplicate incidentId in project {incident.project_id}: "
+            f"{incident.incident_id} (provider {incident.source_provider or 'undeclared'})",
         )
         seen_incidents.add(key)
         by_project_incidents.setdefault(incident.project_id, []).append(incident)
@@ -1624,7 +1649,14 @@ def build_control_center_snapshot(
             f"snapshot would hold more than {MAX_TOTAL_WORK_UNITS} work units in all; "
             "narrow --project-id or the ledger export",
         )
-        _detect_backlog_cycles({item.item_id: item for item in items})
+        # Cycle detection is provider-scoped like identity: a same-spelled id
+        # from another provider is an unrelated record, and collapsing the
+        # two into one dict entry would both miss cycles and invent edges.
+        scoped_items: dict[str, dict[str, BacklogItem]] = {}
+        for item in items:
+            scoped_items.setdefault(item.source_provider, {})[item.item_id] = item
+        for scoped in scoped_items.values():
+            _detect_backlog_cycles(scoped)
         # A parent id absent from this project is treated as a missing parent
         # (the item roots itself and the view warns), never matched against
         # other projects: identity is project-scoped, so a same-spelled item
@@ -1782,12 +1814,43 @@ def build_control_center_snapshot(
                     )
 
         known_units = frozenset(statuses)
-        known_items = frozenset(item.item_id for item in items)
-        item_status: dict[str, WorkUnitStatus] = {}
+        # Item identity is provider-scoped, but an UNDECLARED provider (a
+        # legacy document) stays compatible with a declared one: joins match
+        # the exact provider first, then an undeclared pairing only when it
+        # is unambiguous — two declared, disagreeing providers never join.
+        known_items: dict[str, set[str]] = {}
+        for item in items:
+            known_items.setdefault(item.item_id, set()).add(item.source_provider)
+        item_status: dict[tuple[str, str], WorkUnitStatus] = {}
         for item in items:
             _, basis, status = _resolve_state(item, statuses, by_issue_ref, repository_providers)
             if basis == STATE_BASIS_LEDGER and status is not None:
-                item_status[item.item_id] = status
+                item_status[(item.source_provider, item.item_id)] = status
+
+        def _item_status_for(
+            incident: Incident, *, item_status=item_status
+        ) -> WorkUnitStatus | None:
+            exact = item_status.get((incident.source_provider, incident.backlog_item_id))
+            if exact is not None:
+                return exact
+            candidates = [
+                status
+                for (provider, item_id), status in item_status.items()
+                if item_id == incident.backlog_item_id
+                and (not provider or not incident.source_provider)
+            ]
+            return candidates[0] if len(candidates) == 1 else None
+
+        def _item_known_for(incident: Incident, *, known_items=known_items) -> bool:
+            providers = known_items.get(incident.backlog_item_id)
+            if providers is None:
+                return False
+            return (
+                not incident.source_provider
+                or incident.source_provider in providers
+                or "" in providers
+            )
+
         # Ledger statuses by the change-request reference they carry, for
         # merge retirement. The ledger permits the same reference on more
         # than one unit, so merge proof is resolved per unit below. The
@@ -1850,7 +1913,7 @@ def build_control_center_snapshot(
             if incident.work_unit_id:
                 proven = statuses.get(incident.work_unit_id)
             else:
-                proven = item_status.get(incident.backlog_item_id)
+                proven = _item_status_for(incident)
             if incident.kind in _LEDGER_RETIREMENT and proven is not None:
                 # Label-derived incidents are outranked by durable ledger
                 # proof that their gate was already passed: a label removed
@@ -1942,7 +2005,7 @@ def build_control_center_snapshot(
                     f"incident {incident.incident_id} names an unknown work unit: "
                     f"{incident.work_unit_id}"
                 )
-            if incident.backlog_item_id and incident.backlog_item_id not in known_items:
+            if incident.backlog_item_id and not _item_known_for(incident):
                 view_warnings.append(
                     f"incident {incident.incident_id} names an unknown backlog item: "
                     f"{incident.backlog_item_id}"
