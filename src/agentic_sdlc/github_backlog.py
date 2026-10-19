@@ -25,6 +25,7 @@ guesses is worse than one that says *unknown*:
 from __future__ import annotations
 
 import re
+import urllib.parse
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -72,14 +73,25 @@ _SECRETISH_TEXT = re.compile(
 
 
 def _shown_url(url: str) -> str:
-    """A rejected URL value as a controlled error may show it."""
+    """A rejected URL value as a controlled error may show it.
+
+    The secret scan runs over each bounded percent-decoding layer too: a
+    rejected value carrying ``?x=ghp%5FABCD`` or ``?x=%67hp_ABCD`` decodes
+    to a usable token, so echoing the raw spelling would still leak it into
+    stderr and CI logs.
+    """
     cleaned = url.strip()
-    if (
-        "@" in cleaned
-        or len(cleaned) > 200
-        or not cleaned.isprintable()
-        or _SECRETISH_TEXT.search(cleaned)
-    ):
+    if "@" in cleaned or len(cleaned) > 200 or not cleaned.isprintable():
+        return "(withheld: the rejected value is not echoed into errors)"
+    decoded = cleaned
+    for _ in range(3):
+        if _SECRETISH_TEXT.search(decoded):
+            return "(withheld: the rejected value is not echoed into errors)"
+        peeled = urllib.parse.unquote(decoded)
+        if peeled == decoded:
+            break
+        decoded = peeled
+    if _SECRETISH_TEXT.search(decoded):
         return "(withheld: the rejected value is not echoed into errors)"
     return cleaned
 

@@ -36,7 +36,9 @@ with the time it happened to run.
 
 `health` is computed in a fixed order: `unregistered` → `blocked` (a blocker
 incident) → `needs-attention` (a unit nobody is moving) → `degraded` (a
-non-blocking incident) → `running` → `idle` → `no-data`. Nothing writes it.
+non-blocking incident) → `running` → `waiting` (no active work, but units
+held in a dependency wait — the project sits still for a reason, not for
+lack of work) → `idle` → `no-data`. Nothing writes it.
 
 ### Unknown is never fabricated
 
