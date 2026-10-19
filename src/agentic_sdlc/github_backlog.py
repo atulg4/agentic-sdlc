@@ -748,18 +748,14 @@ def incidents_from_change_requests(
             f"change request {number} appears more than once in the pulls export",
         )
         seen_numbers.add(number)
-        if state_field != "open":
-            # A merged or closed change request is not an open problem,
-            # whatever its final mergeability read.
-            continue
         # A detail payload names its own target repository, and the adapter
         # REQUIRES it: without base.repo.full_name there is no evidence the
         # record belongs to this repository at all, and one naming another
         # repository must not attribute its blockers to a same-numbered
-        # local change request. Validated BEFORE the draft skip, so a
-        # mistargeted or partial export fails closed instead of silently
-        # dropping its drafts (an all-draft foreign export would otherwise
-        # emit an apparently valid empty document).
+        # local change request. Validated BEFORE the closed and draft skips,
+        # so a mistargeted or partial export fails closed instead of silently
+        # dropping its records (an all-closed or all-draft foreign export
+        # would otherwise emit an apparently valid empty document).
         base = pull.get("base")
         base_repo = base.get("repo") if isinstance(base, Mapping) else None
         full_name = base_repo.get("full_name") if isinstance(base_repo, Mapping) else None
@@ -772,6 +768,10 @@ def incidents_from_change_requests(
             full_name.lower() == repository.lower(),
             f"change request {number} belongs to {full_name}, not repository {repository}",
         )
+        if state_field != "open":
+            # A merged or closed change request is not an open problem,
+            # whatever its final mergeability read.
+            continue
         draft = pull.get("draft")
         # GitHub's pull-detail schema defines draft as a boolean; a partial
         # payload without it carries no evidence the pull is ready for

@@ -976,6 +976,21 @@
           } else if (!node.issueRef || node.status.issueRef !== node.issueRef) {
             return `${where} backlog node ${node.itemId} status is not joined by its issue reference.`;
           }
+          // The embedded status rides into the adopted document and the
+          // "Copy the current snapshot" serialization, so its references
+          // carry the same bounded no-userinfo rule as active and attention
+          // unit references — the producer redacts them, so a pasted or
+          // store-written credential-bearing value is never producer output.
+          for (const field of ["issueRef", "changeRequestRef", "runRef"]) {
+            const value = node.status[field];
+            if (value === undefined || value === "") continue;
+            if (typeof value !== "string" || value.length > 512) {
+              return `${where} backlog node ${node.itemId} status ${field} must be a bounded string.`;
+            }
+            if (/:\/\/[^/?#\s]*@/.test(value)) {
+              return `${where} backlog node ${node.itemId} status ${field} must not embed credentials.`;
+            }
+          }
         } else if (node.stateBasis === "state declared by the backlog source") {
           if (!node.state || node.state !== node.declaredState) return `${where} backlog node ${node.itemId} state disagrees with its declared state.`;
           if (!factoryStates.includes(node.state)) return `${where} backlog node ${node.itemId} names an unknown declared state.`;
@@ -1785,13 +1800,17 @@
             // The store offers no server-owned ordering, so the writer clamps
             // its own clock one second past the newest visible draft: the
             // "at"-ordered subscription window can never drop a fresh draft
-            // behind a peer's forward-skewed timestamp.
+            // behind a peer's forward-skewed timestamp. The ceiling bounds
+            // that clamp to a day ahead: a store row carrying the maximum
+            // parseable date would otherwise push newest past what
+            // toISOString can represent and break every later draft save.
+            const now = Date.now();
             let newest = 0;
+            const ceiling = now + 86_400_000;
             for (const draft of state.drafts) {
               const parsed = Date.parse(draft.at || "");
-              if (!Number.isNaN(parsed) && parsed > newest) newest = parsed;
+              if (!Number.isNaN(parsed) && parsed > newest && parsed <= ceiling) newest = parsed;
             }
-            const now = Date.now();
             const at = new Date(newest >= now ? newest + 1000 : now).toISOString();
             await state.db.doc("projectDrafts/" + (await docId(entry.projectId))).set({
               projectId: entry.projectId, entry, byId: state.viewer?.id || "", at,

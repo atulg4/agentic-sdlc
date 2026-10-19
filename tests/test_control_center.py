@@ -5188,6 +5188,12 @@ def test_the_console_binds_incidents_and_enforces_full_membership():
     assert 'for (const field of ["issueRef", "changeRequestRef", "runRef"])' in html
     assert "${field} must be a bounded string." in html
     assert "${field} must not embed credentials." in html
+    # Embedded ledger-basis backlog statuses carry the same reference rule:
+    # the adopted document (and its "Copy the current snapshot" serialization)
+    # must never retain a credential-bearing status reference.
+    assert html.count('for (const field of ["issueRef", "changeRequestRef", "runRef"])') == 2
+    assert "status ${field} must be a bounded string." in html
+    assert "status ${field} must not embed credentials." in html
     # Incident and backlog references carry the same bounded no-userinfo rule.
     assert 'for (const field of ["evidenceRef", "backlogItemId"])' in html
     assert 'for (const key of ["itemId", "issueRef", "parentId"])' in html
@@ -5221,9 +5227,10 @@ def test_the_console_binds_incidents_and_enforces_full_membership():
     assert "function feedStopped(collection, error)" in html
     assert "feedErrors: new Map()" in html
     assert "for (const message of state.feedErrors.values())" in html
-    # The note-timestamp clamp is bounded: an absurd cached timestamp cannot
-    # overflow the Date range and break every save.
-    assert "parsed <= ceiling" in html
+    # Both timestamp clamps are bounded — notes AND project drafts: an absurd
+    # stored timestamp cannot overflow the Date range and break every save.
+    assert html.count("parsed <= ceiling") == 2
+    assert "for (const draft of state.drafts)" in html
     # A backfill read that resumes after a notes delivery made the key live
     # leaves the subscription's newer data alone.
     assert "if (liveNoteKeys.has(key)) return;" in html
@@ -5904,4 +5911,34 @@ def test_draft_ownership_is_validated_before_the_skip():
     with pytest.raises(ControlCenterError, match="base.repo.full_name is required"):
         incidents_from_change_requests(
             [partial], project_id="forge", repository="acme/forge", observed_at=NOW
+        )
+
+
+def test_closed_ownership_is_validated_before_the_skip():
+    # An all-closed foreign export must fail closed too: ownership is
+    # source-level validation, so the closed skip must not let a pulls file
+    # fetched from another repository publish an apparently valid empty
+    # incident document that conceals the target's open change requests.
+    foreign = {
+        "number": 9,
+        "title": "done elsewhere",
+        "state": "closed",
+        "draft": False,
+        "mergeable_state": "unknown",
+        "base": {"repo": {"full_name": "other/repo"}},
+    }
+    with pytest.raises(ControlCenterError, match="belongs to other/repo"):
+        incidents_from_change_requests(
+            [foreign], project_id="forge", repository="acme/forge", observed_at=NOW
+        )
+    missing = {
+        "number": 9,
+        "title": "done",
+        "state": "closed",
+        "draft": False,
+        "mergeable_state": "unknown",
+    }
+    with pytest.raises(ControlCenterError, match="base.repo.full_name is required"):
+        incidents_from_change_requests(
+            [missing], project_id="forge", repository="acme/forge", observed_at=NOW
         )
