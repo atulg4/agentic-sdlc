@@ -1871,9 +1871,13 @@ def build_control_center_snapshot(
         for item in items:
             known_items.setdefault(item.item_id, set()).add(item.source_provider)
         item_status: dict[tuple[str, str], WorkUnitStatus] = {}
+        # Computed ONCE per project: the contested set scans the whole
+        # backlog, so recomputing it inside the loop would make snapshot
+        # generation quadratic at the supported 5000-item budget.
+        contested_refs = _contested_issue_refs(items)
         for item in items:
             _, basis, status = _resolve_state(
-                item, statuses, by_issue_ref, repository_providers, _contested_issue_refs(items)
+                item, statuses, by_issue_ref, repository_providers, contested_refs
             )
             if basis == STATE_BASIS_LEDGER and status is not None:
                 item_status[(item.source_provider, item.item_id)] = status

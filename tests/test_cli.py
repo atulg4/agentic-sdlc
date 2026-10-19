@@ -1706,3 +1706,42 @@ def test_github_backlog_withholds_credentialed_urls_from_errors(tmp_path, capsys
     err = capsys.readouterr().err
     assert "hunter2secret" not in err
     assert "withheld" in err
+    # A query-string credential rides inside what a looser pattern would
+    # capture as the repository NAME; the tightened pattern rejects it and
+    # the withholding covers the echo.
+    issues.write_text(
+        json.dumps(
+            [
+                {
+                    "number": 11,
+                    "title": "A task",
+                    "state": "open",
+                    "repository_url": (
+                        "https://api.github.com/repos/acme/forge?access_token=hunter2qs"
+                    ),
+                    "labels": [],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        cli_main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+                "--observed-at",
+                "2026-10-12T10:30:00Z",
+                "--backlog-output",
+                str(tmp_path / "backlog.json"),
+            ]
+        )
+        == 2
+    )
+    err = capsys.readouterr().err
+    assert "hunter2qs" not in err

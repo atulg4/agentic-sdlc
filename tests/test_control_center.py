@@ -5255,6 +5255,10 @@ def test_the_console_binds_incidents_and_enforces_full_membership():
     assert "counts.byStage names an unknown stage" in html
     assert "byStage disagrees with byState on the unit total." in html
     assert "must sum to the dependency-wait stage count." in html
+    # The stage census must cover the visibly listed units, not merely match
+    # the aggregate total.
+    assert "visibleByStage[unit.stage] = (visibleByStage[unit.stage] || 0) + 1;" in html
+    assert "holds fewer ${key} units than are visibly listed." in html
     # Every formerly live key is exact-read verified, cached or not.
     assert ".filter((key) => !live.has(key));" in html
     # A live note that was never backfilled is seeded into the cache before
