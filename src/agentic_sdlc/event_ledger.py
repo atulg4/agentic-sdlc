@@ -694,17 +694,6 @@ class WorkUnitProjection:
 #: Center applies to current references before rendering them.
 _CREDENTIAL_REFERENCE = re.compile(r"://[^/?#\s]*@")
 
-_MERGE_EVIDENT_STATES = frozenset(
-    {
-        FactoryState.MERGED,
-        FactoryState.DEPLOYING,
-        FactoryState.DEPLOYMENT_VERIFYING,
-        FactoryState.LIVE,
-        FactoryState.ROLLING_BACK,
-        FactoryState.ROLLED_BACK,
-    }
-)
-
 
 @dataclass
 class _Fold:
@@ -795,7 +784,12 @@ def _fold(events: Sequence[LifecycleEvent]) -> WorkUnitProjection:
                 accumulator.repair_cycles += 1
             accumulator.blocked_reason = event.reason if event.state is FactoryState.BLOCKED else ""
             accumulator.state = event.state
-            if event.state in _MERGE_EVIDENT_STATES and accumulator.references.change_request_ref:
+            # Captured ONLY at the transition into merged: every post-merge
+            # state is reachable through merged alone (chains open at
+            # intake), so a same-state re-point of the current reference
+            # followed by a deploying transition must not mint fresh merge
+            # proof for a change request that never merged.
+            if event.state is FactoryState.MERGED and accumulator.references.change_request_ref:
                 reference = accumulator.references.change_request_ref
                 # A credential-bearing reference is never RETAINED: the
                 # historical set outlives the current reference's replacement

@@ -5207,6 +5207,15 @@ def test_the_console_binds_incidents_and_enforces_full_membership():
     # A ledger-basis backlog status binds to THIS item's unit.
     assert "status names another work unit." in html
     assert "status is not joined by its issue reference." in html
+    # Identity is provider-scoped like the producer's: same-spelled ids from
+    # two providers coexist, and evidence links require the incident's own
+    # provider to be GitHub before linking there.
+    assert '(node.sourceProvider || "") + "\\u0000" + node.itemId' in html
+    assert '(incident.sourceProvider || "") + "\\u0000" + incident.incidentId' in html
+    assert '"workUnitId", "sourceProvider"' in html
+    assert 'incident.sourceProvider === "github" && match' in html
+    # A recovered feed clears its own failure banner on the next delivery.
+    assert "if (state.feedErrors.delete(collection)) render();" in html
     # Every formerly live key is exact-read verified, cached or not.
     assert ".filter((key) => !live.has(key));" in html
     # A live note that was never backfilled is seeded into the cache before
@@ -6009,3 +6018,119 @@ def test_closed_ownership_is_validated_before_the_skip():
         incidents_from_change_requests(
             [missing], project_id="forge", repository="acme/forge", observed_at=NOW
         )
+
+
+def test_post_merge_transitions_mint_no_fresh_merge_proof():
+    # The unit merged !1, was re-pointed at unmerged !2, and then entered
+    # deploying: merge proof binds at the actual merge transition alone, so
+    # the follow-up request must stay blocked through every post-merge state.
+    swap = _event(
+        eventId="e-swap",
+        idempotencyKey="k-swap",
+        state="merged",
+        stage="merge",
+        workUnit={
+            "projectId": "forge",
+            "workUnitId": "wu-1",
+            "changeRequestRef": "acme/forge!2",
+        },
+        activity="re-pointed at a follow-up change request",
+    )
+    deploying = _event(
+        eventId="e-deploy",
+        idempotencyKey="k-deploy",
+        state="deploying",
+        stage="deploy",
+        workUnit={"projectId": "forge", "workUnitId": "wu-1"},
+    )
+    ledger = _ledger(
+        *_chain(
+            TO_MERGED,
+            workUnit={
+                "projectId": "forge",
+                "workUnitId": "wu-1",
+                "changeRequestRef": "acme/forge!1",
+            },
+        ),
+        swap,
+        deploying,
+    )
+    blocked = _incident(
+        incidentId="acme/forge!2:merge-state-blocked",
+        kind="unclassified",
+        severity="degraded",
+        evidenceRef="acme/forge!2",
+        summary="The follow-up change request is blocked",
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=ledger.projections(),
+        incidents=load_incident_document(_incidents(blocked)),
+    )
+    kept = [item.incident_id for item in snapshot.get("forge").incidents]
+    assert kept == ["acme/forge!2:merge-state-blocked"]
+
+
+def test_document_unit_identifiers_fail_closed():
+    # A credential-bearing workUnitId from a backlog or incident document is
+    # serialized and repeated by the unknown-unit warning whether or not any
+    # projection matches it, so it fails closed at load — value withheld.
+    with pytest.raises(ControlCenterError, match="workUnitId embeds URL userinfo") as items_error:
+        load_backlog_document(_document(_backlog(workUnitId="https://x:hunter2@host/unit")))
+    assert "hunter2" not in str(items_error.value)
+    with pytest.raises(
+        ControlCenterError, match="workUnitId embeds URL userinfo"
+    ) as incident_error:
+        load_incident_document(_incidents(_incident(workUnitId="https://x:hunter2@host/unit")))
+    assert "hunter2" not in str(incident_error.value)
+
+
+def test_same_path_providers_coexist_in_one_project():
+    # One project may own github:acme/forge and gitlab:acme/forge, whose
+    # adapters naturally emit the same item and incident ids: identity is
+    # provider-scoped, so both providers' work appears instead of a
+    # duplicate-ID refusal, and each record carries its provider.
+    github_items = load_backlog_document(
+        {
+            "schemaVersion": BACKLOG_SCHEMA_VERSION,
+            "source": "github",
+            "items": [_backlog(title="GitHub task")],
+        }
+    )
+    gitlab_items = load_backlog_document(
+        {
+            "schemaVersion": BACKLOG_SCHEMA_VERSION,
+            "source": "gitlab",
+            "items": [_backlog(title="GitLab task")],
+        }
+    )
+    github_incident = load_incident_document(
+        _incidents(_incident(incidentId="acme/forge#1:untriaged", kind="triage-needed"))
+    )
+    gitlab_incident = load_incident_document(
+        {
+            "schemaVersion": INCIDENT_SCHEMA_VERSION,
+            "source": "gitlab",
+            "incidents": [_incident(incidentId="acme/forge#1:untriaged", kind="triage-needed")],
+        }
+    )
+    snapshot = build_control_center_snapshot(
+        generated_at=NOW,
+        registry=REGISTRY,
+        projections=(),
+        backlog=tuple(github_items) + tuple(gitlab_items),
+        incidents=tuple(github_incident) + tuple(gitlab_incident),
+    )
+    view = snapshot.get("forge")
+    titles = sorted(node.item.title for node in view.backlog)
+    assert titles == ["GitHub task", "GitLab task"]
+    providers = sorted(node.item.source_provider for node in view.backlog)
+    assert providers == ["github", "gitlab"]
+    assert sorted(incident.source_provider for incident in view.incidents) == [
+        "github",
+        "gitlab",
+    ]
+    document = snapshot.as_dict()
+    serialized = json.dumps(document)
+    assert '"sourceProvider": "gitlab"' in serialized
