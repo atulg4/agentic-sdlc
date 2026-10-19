@@ -918,6 +918,7 @@
       // implementing unit from active while the counts declare running work.
       const activeByState = {};
       const attentionByState = {};
+      const visibleByStage = {};
       for (const [membership, list] of [["active", project.active || []], ["attention", project.attention || []]]) {
         for (const unit of list) {
           if (!isObj(unit)) return `${where} has a work unit that is not an object.`;
@@ -973,6 +974,16 @@
           }
           const tally = membership === "active" ? activeByState : attentionByState;
           tally[unit.state] = (tally[unit.state] || 0) + 1;
+          visibleByStage[unit.stage] = (visibleByStage[unit.stage] || 0) + 1;
+        }
+      }
+      // The stage census must COVER the visible units, not merely match the
+      // aggregate total: a rewrite pairing byState.implementing with
+      // byStage.merge while an active unit still says implementation would
+      // pass the sum check yet describe units the document does not hold.
+      for (const key of Object.keys(visibleByStage)) {
+        if ((project.counts.byStage[key] || 0) < visibleByStage[key]) {
+          return `${where}.counts.byStage holds fewer ${key} units than are visibly listed.`;
         }
       }
       // Reconcile both lists against the validated state counts: every unit

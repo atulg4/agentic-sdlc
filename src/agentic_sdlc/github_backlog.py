@@ -50,8 +50,14 @@ def _require(condition: bool, message: str) -> None:
 #: alone would let https://evil.example/repos/acme/forge/issues/1 pass the
 #: ownership checks and supply hierarchy edges or repository identity.
 _PARENT_URL = re.compile(r"/issues/(\d+)/?$")
-_PARENT_REPOSITORY = re.compile(r"^https://api\.github\.com/repos/([^/\s]+/[^/\s]+)/issues/\d+/?$")
-_REPOSITORY_URL = re.compile(r"^https://api\.github\.com/repos/([^/\s]+/[^/\s]+)/?$")
+#: The owner/name segments exclude `?` and `#` as well as `/`: a query
+#: string would otherwise ride inside the captured name, and the name is
+#: echoed by mismatch errors — `.../repos/acme/forge?access_token=...`
+#: must never parse as a repository called "forge?access_token=...".
+_PARENT_REPOSITORY = re.compile(
+    r"^https://api\.github\.com/repos/([^/\s?#]+/[^/\s?#]+)/issues/\d+/?$"
+)
+_REPOSITORY_URL = re.compile(r"^https://api\.github\.com/repos/([^/\s?#]+/[^/\s?#]+)/?$")
 #: Rejected URL values can carry what a URL may carry: userinfo before the
 #: host (https://user:secret@...), token-shaped query text, control
 #: characters. Rejection messages reach stderr and typically CI logs, so a
@@ -139,9 +145,12 @@ def _issue_repository(issue: Mapping[str, Any], repository: str) -> str:
     )
     assert match is not None
     name = match.group(1)
+    # The parsed name is still payload text: _shown_url withholds anything
+    # token-shaped from the mismatch message too, belt and braces with the
+    # tightened pattern above.
     _require(
         name.lower() == repository.lower(),
-        f"issue {number!r} belongs to {name}, not repository {repository}",
+        f"issue {number!r} belongs to {_shown_url(name)}, not repository {repository}",
     )
     return name
 
