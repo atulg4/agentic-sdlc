@@ -395,7 +395,15 @@
           render();
         },
       );
-    } catch (error) { state.error = describe(error); }
+    } catch (error) {
+      // A synchronous setup throw leaves no listener either: recorded in
+      // feedErrors exactly like an asynchronous termination, because a later
+      // successful manual load clears state.error and would erase the
+      // warning while the view silently stays stale.
+      state.feedErrors.set("snapshot", "Live snapshot updates stopped ("
+        + describe(error)
+        + "). Showing the last loaded snapshot; reload the page to reconnect.");
+    }
     let notesDelivery = 0;
     subscribe("notes", async (docs) => {
       // Adoption yields at each docId await, so an older delivery could
@@ -2181,14 +2189,19 @@
             catch (error) { result.append(el("div", { class: "banner bad", text: "That is not valid JSON: " + describe(error) })); return; }
             // The shared generation orders this load against LIVE deliveries
             // too: a pasted document whose validation finishes after a newer
-            // delivery adopted must not put the older view back.
-            const adoption = ++snapshotAdoptions;
+            // delivery adopted must not put the older view back. The
+            // generation is CLAIMED only once the candidate verifies — an
+            // invalid paste must never supersede a live delivery that is
+            // still mid-verification — so until then the paste only observes
+            // the current generation and bails if a delivery arrives.
+            const observed = snapshotAdoptions;
             const problem = validateSnapshot(parsed) || await digestMismatch(parsed);
-            if (adoption !== snapshotAdoptions) {
+            if (problem) { result.append(el("div", { class: "banner bad", text: problem })); return; }
+            if (observed !== snapshotAdoptions) {
               result.append(el("div", { class: "banner", text: "A newer snapshot arrived while this one was being verified; it was not loaded." }));
               return;
             }
-            if (problem) { result.append(el("div", { class: "banner bad", text: problem })); return; }
+            const adoption = ++snapshotAdoptions;
             const at = new Date().toISOString();
             let saveProblem = "";
             if (state.db) {

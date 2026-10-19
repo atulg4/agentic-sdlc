@@ -5499,13 +5499,19 @@ def test_the_console_validates_backlog_provenance_and_scoped_liveness():
     assert "if (button.disabled) return;" in html
     # ONE adoption generation across the live subscription and manual loads:
     # whichever validation finishes under a stale generation is discarded.
+    # A manual load CLAIMS the generation only once its candidate verifies —
+    # an invalid paste observes it instead, so it can never supersede a live
+    # delivery still mid-verification.
     assert "let snapshotAdoptions = 0;" in html
+    assert "const observed = snapshotAdoptions;" in html
+    assert "observed !== snapshotAdoptions" in html
     assert "const adoption = ++snapshotAdoptions;" in html
     assert "const delivery = ++snapshotAdoptions;" in html
-    assert html.count("adoption !== snapshotAdoptions") == 2
+    assert html.count("adoption !== snapshotAdoptions") == 1
     # A dead snapshot listener warns through feedErrors, which a later
-    # manual load cannot erase; the store limit measures ENCODED bytes.
-    assert 'state.feedErrors.set("snapshot", "Live snapshot updates stopped ("' in html
+    # manual load cannot erase — a SYNCHRONOUS setup throw records the same
+    # warning; the store limit measures ENCODED bytes.
+    assert html.count('state.feedErrors.set("snapshot", "Live snapshot updates stopped ("') == 2
     assert "new TextEncoder().encode(JSON.stringify(parsed)).length" in html
 
     # parentMissing renders by truthiness, so a digest-consistent rewrite
@@ -5713,6 +5719,17 @@ def test_failing_check_names_must_be_nonempty_bounded_strings():
             repository="acme/forge",
             observed_at=NOW,
             failing={7: "x" * 513},
+        )
+    # UTF-16 units, not code points: an astral-heavy check-name list below
+    # 512 code points would otherwise pass the adapter here only to fail the
+    # export's mandatory load_incident_document round trip.
+    with pytest.raises(ControlCenterError, match="narrow --failing"):
+        incidents_from_change_requests(
+            [pull],
+            project_id="forge",
+            repository="acme/forge",
+            observed_at=NOW,
+            failing={7: "\U0001f600" * 300},
         )
 
 
@@ -6434,6 +6451,75 @@ def test_document_unit_identifiers_fail_closed():
     ) as incident_error:
         load_incident_document(_incidents(_incident(workUnitId="https://x:hunter2@host/unit")))
     assert "hunter2" not in str(incident_error.value)
+
+
+def test_credential_shaped_identities_fail_closed():
+    # Token SHAPES are credentials with no userinfo to catch: a document
+    # workUnitId, a ledger unit id, or a registry-valid repository path
+    # spelling ghp_/glpat- (percent-encoded included) would serialize into
+    # the snapshot and the shared store verbatim, so each fails the build
+    # closed with the value withheld.
+    token = "ghp_0123456789abcdefghij"
+    with pytest.raises(ControlCenterError, match="workUnitId is credential-shaped") as item_error:
+        load_backlog_document(_document(_backlog(workUnitId=token)))
+    assert token not in str(item_error.value)
+    with pytest.raises(
+        ControlCenterError, match="workUnitId is credential-shaped"
+    ) as encoded_error:
+        load_incident_document(_incidents(_incident(workUnitId="unit-ghp%5F0123456789abcdefghij")))
+    assert "0123456789abcdefghij" not in str(encoded_error.value)
+    ledger = _ledger(
+        *_chain(
+            TO_IMPLEMENTING,
+            work_unit=token,
+            workUnit={"projectId": "forge", "workUnitId": token, "repository": "acme/forge"},
+        )
+    )
+    with pytest.raises(
+        ControlCenterError, match="work unit identifier is credential-shaped"
+    ) as ledger_error:
+        build_control_center_snapshot(
+            generated_at=NOW,
+            registry=REGISTRY,
+            projections=ledger.projections(),
+            incidents=load_incident_document(_incidents()),
+        )
+    assert token not in str(ledger_error.value)
+    # The registry grammar admits glpat-SECRET/repo as a syntactically valid
+    # path, and registered repositories render outside the ledger-side
+    # malformed-repository redaction.
+    tokened_registry = load_project_registry(
+        {
+            "schemaVersion": 1,
+            "projects": [
+                {
+                    "projectId": "forge",
+                    "displayName": "Forge",
+                    "group": "platform",
+                    "defaultBranch": "main",
+                    "repositories": [
+                        {
+                            "provider": "gitlab",
+                            "identifier": "glpat-0123456789abcdefghij/repo",
+                            "role": "primary",
+                        }
+                    ],
+                    "environments": [{"name": "production", "kind": "production"}],
+                    "capabilities": ["planning"],
+                }
+            ],
+        }
+    )
+    with pytest.raises(
+        ControlCenterError, match="registered repository identifier is credential-shaped"
+    ) as registry_error:
+        build_control_center_snapshot(
+            generated_at=NOW,
+            registry=tokened_registry,
+            projections=(),
+            incidents=load_incident_document(_incidents()),
+        )
+    assert "glpat-0123456789abcdefghij" not in str(registry_error.value)
 
 
 def test_same_path_providers_coexist_in_one_project():
