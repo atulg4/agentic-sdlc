@@ -326,3 +326,19 @@ def test_unset_python_version_lists_both_interpreters(tmp_path: Path) -> None:
     warning = check_gate_python(None, env, tmp_path)
     assert warning is not None and "python_version is not set" in warning
     assert "Python 3.12.7" in warning and "Python 3.11.2" in warning
+
+
+def test_gates_repoint_the_actions_workspace(tmp_path: Path, monkeypatch) -> None:
+    # A gate using the standard Actions variable must observe the tree the
+    # gates run in, not whatever workspace invoked this process.
+    monkeypatch.setenv("GITHUB_WORKSPACE", "/somewhere/else")
+    config = tmp_path / "policy.toml"
+    out = tmp_path / "workspace.txt"
+    _write_config(
+        config,
+        'printf %s "$GITHUB_WORKSPACE" > workspace.txt',
+        "true",
+    )
+    report = run_gates(config, tmp_path)
+    assert report["passed"] is True
+    assert out.read_text(encoding="utf-8") == str(tmp_path.resolve())

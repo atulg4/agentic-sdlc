@@ -11,7 +11,7 @@ import os
 import re
 import shlex
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -50,7 +50,7 @@ from .git_diff import (
     collect_commit_diff,
     collect_git_diff,
     committed_path,
-    derivation_worktree,
+    derivation_tree,
     read_committed_file,
     resolve_commit,
 )
@@ -836,15 +836,34 @@ def _derived_verification(args: argparse.Namespace, request: dict) -> Verificati
     base = resolve_commit(args.candidate_repository, args.candidate_base)
     head = resolve_commit(args.candidate_repository, args.candidate_head)
     snapshot = collect_commit_diff(args.candidate_repository, base, head)
-    # run_gates executes a CHECKOUT, and the caller's own is not evidence:
-    # it can be dirty, carry ignored files a gate would read, or have its
-    # status output suppressed by repository-local configuration — and a
-    # gate run leaves caches behind that would fail the next derivation.
-    # Gates therefore run in a disposable worktree materialized from the
-    # object database at the candidate head, so they observe exactly the
-    # committed tree and leave nothing in the caller's checkout.
-    with derivation_worktree(args.candidate_repository, head) as tree:
-        report = run_gates(args.config, tree)
+    # Gate definitions are repository-owned: reading --config from the
+    # caller's checkout would let an uncommitted edit replace the real test
+    # command while the report binds to the candidate head, so the gates run
+    # under the configuration AS COMMITTED at the candidate head.
+    repo_root = Path(args.candidate_repository).resolve()
+    try:
+        config_rel = Path(args.config).resolve().relative_to(repo_root)
+    except ValueError:
+        raise ContextBuilderError(
+            "derived gates run under the gate configuration committed in the "
+            "candidate repository; pass --config as a path inside it"
+        ) from None
+    # The caller's own checkout is not evidence: it can be dirty, carry
+    # ignored files a gate would read, or have status output suppressed by
+    # repository-local configuration — and a gate run leaves caches behind
+    # that would fail the next derivation. Gates therefore run in a
+    # disposable tree materialized from the object database at the candidate
+    # head (no checkout, so no local smudge filter or hook runs), observing
+    # exactly the committed content and leaving the caller's state untouched.
+    with derivation_tree(args.candidate_repository, head) as tree:
+        tree_config = tree / config_rel
+        if not tree_config.is_file():
+            raise ContextBuilderError(
+                "the gate configuration is not committed at the candidate "
+                "head; commit it so derived gates run repository-owned "
+                "definitions"
+            )
+        report = run_gates(tree_config, tree)
     # Wall-clock timings are not evidence, and they make everything bound to
     # the report nondeterministic: the rendered size, the budget accounting,
     # the evidence selection, and the packet digest would all differ between
@@ -867,6 +886,9 @@ def _derived_verification(args: argparse.Namespace, request: dict) -> Verificati
         patch_sha256=hashlib.sha256(snapshot.patch).hexdigest(),
         gate_report=report,
         prior_findings=tuple(findings),
+        # The reviewer reads the change itself, not only its hash and paths;
+        # the digest above still binds the exact bytes.
+        patch=snapshot.patch.decode("utf-8", errors="replace"),
     )
 
 
@@ -906,6 +928,25 @@ def _check_dispatch_authorization(args: argparse.Namespace, policy, packet) -> N
         raise ContextBuilderError(
             f"the authorization result names {work_ref}, not the packet's "
             f"work item {packet.work_ref}; authorize the dispatched work item"
+        )
+    # The verdict must cover the POLICY's approval set, not a caller-selected
+    # one: `check-request --authorize-labels --label harmless` reports ready
+    # on an issue that merely carries the policy labels while its verdict
+    # proves writers applied only "harmless".
+    required_labels = {
+        policy.implementation_label.casefold(),
+        policy.ready_label.casefold(),
+        policy.human_review_label.casefold(),
+    }
+    checked = verdict.get("labelers")
+    checked_labels = (
+        {name.casefold() for name in checked} if isinstance(checked, Mapping) else set()
+    )
+    if checked_labels != required_labels:
+        raise ContextBuilderError(
+            "the authorization verdict does not cover exactly the policy's "
+            "approval labels; re-run check-request --authorize-labels without "
+            "narrowing --label"
         )
     digest = request_digest(packet.task.title, packet.task.raw_body)
     if document.get("contentDigest") != digest:
@@ -1129,24 +1170,35 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
     agents = load_agents(json.loads(Path(args.agents).read_text(encoding="utf-8")))
     history: dict[str, str] = {}
     if args.history:
-        raw = json.loads(Path(args.history).read_text(encoding="utf-8"))
-        if not isinstance(raw, dict) or not all(
-            isinstance(key, str) and isinstance(value, str) for key, value in raw.items()
-        ):
-            raise MissionError("history must map mission IDs to agent IDs")
-        history = raw
-    if mission_role(mission) == "reviewer":
-        # A review necessarily follows a producing run, so an absent or
-        # partial history is not authoritative: with nothing to exclude,
-        # the roster's first eligible agent could review its own earlier
-        # work despite the mission's independence contract.
-        missing = [other for other in mission.independent_of if other not in history]
-        if not args.history or missing:
-            named = ", ".join(missing) if missing else "the producing missions"
+        # The history is the ORCHESTRATOR STATE, not a bare mission→agent
+        # map: a caller-authored map could record "" (or any other agent) for
+        # a mission the selected reviewer actually performed. The state is
+        # replayed through the orchestrator's own validation, and the run
+        # records of THIS work item — their mission and agent identity —
+        # define the exclusions.
+        document = json.loads(Path(args.history).read_text(encoding="utf-8"))
+        engine = Orchestrator.from_dict(document)
+        try:
+            unit = engine.get(packet.work_ref)
+        except OrchestrationError as error:
             raise MissionError(
-                "reviewer dispatch requires --history recording which agent "
-                f"performed each mission this review is independent of ({named}); "
-                'record "" for a mission that never ran'
+                f"the run history records no work unit {packet.work_ref}; pass "
+                "the orchestrator state that dispatched this work item"
+            ) from error
+        for run in unit.runs:
+            history[run.mission_id] = run.agent_id
+    if mission_role(mission) == "reviewer":
+        # A review necessarily follows a producing run, so an absent history
+        # — or one recording no producing run for this work item — is not
+        # authoritative: with nothing to exclude, the roster's first eligible
+        # agent could review its own earlier work despite the mission's
+        # independence contract.
+        produced = [other for other in mission.independent_of if other in history]
+        if not args.history or not produced:
+            raise MissionError(
+                "reviewer dispatch requires --history: the orchestrator state "
+                "recording the producing runs of this work item (none of the "
+                "missions this review is independent of has a recorded run)"
             )
     # Roster order defines fallbacks: an eligible agent whose declared
     # context window cannot fit the packet is skipped for the next eligible

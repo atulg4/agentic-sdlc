@@ -100,7 +100,10 @@ depends on input order. Each exclusion is recorded on the packet, and the
 pack's own qualifications (stale retentions, detected contradictions) are
 rendered into the prompt with the evidence they qualify — each notice
 single-lined, secret-scanned (a credential-bearing retrieval-failure detail
-is withheld), and wrapped inside an untrusted boundary, since failure details
+is withheld, and a non-printable one travels JSON-escaped on one line, so
+request-controlled failure text cannot inject log lines into the pack
+qualifications or the blocking errors printed to stderr), and wrapped
+inside an untrusted boundary, since failure details
 quote retrieval-controlled text. The secret scan walks every RAW serialized
 record field — the packet artifact carries the whole record, author, scope,
 anchors and link targets included — alongside the rendered block, so JSON
@@ -172,7 +175,12 @@ contract — role, risk level, write/read/forbidden paths, the knowledge-source
 allowlist, token and runtime limits —
 against the packet's bound limits, so a mission edited without a version
 bump cannot dispatch a prompt that still encodes the old policy or reuse
-evidence the mission may no longer read.
+evidence the mission may no longer read. The bound limits carry the FULL
+execution contract — purpose, success criteria, output artifacts, and the
+command allowlist — which renders into the prompt's policy section, so the
+agent is told its mission-specific contract (not generic role text) and a
+same-version edit to any of those fields refuses dispatch of the stale
+packet.
 
 ## CLI
 
@@ -213,15 +221,26 @@ DERIVED, never declared: with `--candidate-repository`, `--candidate-base`
 and `--candidate-head`, the CLI resolves both commits in that repository,
 computes the diff summary with `collect_commit_diff`, runs the
 gates itself (`run_gates`, with wall-clock durations zeroed so derived
-packets are deterministic end to end) inside a disposable worktree
-materialized from the object database at the candidate head — the caller's
-own checkout is never executed, so uncommitted edits, ignored files,
-status-suppressing repository config, and the caches one gate run leaves
-behind can neither block a derivation nor reach a gate — and reads every
+packets are deterministic end to end) inside a disposable tree materialized
+RAW from the object database at the candidate head (`ls-tree`/`cat-file`,
+never a checkout or `git archive` — both run the smudge filters
+repository-local config can define for a committed `.gitattributes`) — the
+caller's own checkout is never executed, so uncommitted edits, ignored
+files, status-suppressing repository config, locally configured filters,
+and the caches one gate run leaves
+behind can neither block a derivation nor reach a gate. The gates run under
+the gate configuration AS COMMITTED at the candidate head (`--config` must
+resolve inside the candidate repository and be committed there), with
+`GITHUB_WORKSPACE` repointed at the disposable tree so an Actions-style
+gate cannot read the caller's checkout. The derivation also reads every
 pinned repository
 record's payload back from the candidate tree through the adapter's own
 sanitization — a fabricated payload with a self-consistent hash is
 rejected, and a token-shaped path is withheld from every readback error.
+The verification evidence carries the candidate patch text itself (the
+digest binds the exact bytes), rendered inside an untrusted boundary, so
+the reviewer reads the change under review rather than only its hash,
+path names, and line counts.
 Builder and tester dispatches carrying repository evidence take
 `--candidate-repository` alone (the derivation flags are reviewer-only) and
 are refused without it: the request's `repositoryRevision` must be the full
@@ -231,12 +250,16 @@ implementation agent fabricated source under a self-consistent citation.
 Write-capable dispatches also re-run the task policy
 (`evaluate_task(..., "implement")`) and require `--authorization`: the
 `check-request --authorize-labels` result, which must be ready, authorized
-and stable, and must name this exact project, work item, and content digest
-— label names spelled into caller-supplied request JSON are not approval
-evidence. Reviewer dispatches require `--history` recording which agent
-performed each mission the review is independent of (`""` for a mission
-that never ran): an absent or partial run history is not authoritative, and
-would otherwise let the roster's first eligible agent review its own work.
+and stable, must name this exact project, work item, and content digest,
+and whose verdict must cover exactly the policy's implementation, ready,
+and human-review labels — label names spelled into caller-supplied request
+JSON are not approval evidence, and neither is a verdict narrowed to a
+caller-selected label. Reviewer dispatches require `--history`: the
+ORCHESTRATOR STATE document, replayed through the orchestrator's own
+validation, whose recorded runs for this work item (mission and agent
+identity) define the independence exclusions — a caller-authored
+mission→agent map is not authoritative, and a state recording no producing
+run for any mission the review is independent of refuses dispatch.
 Request
 JSON can never impersonate pipeline evidence: `dispatch-packet` refuses a
 request-supplied `verification` object outright, and `context-packet`

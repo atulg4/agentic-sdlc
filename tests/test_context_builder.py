@@ -91,11 +91,58 @@ def _authorization(path, title: str, body: str, **overrides):
         "project": "example/project",
         "ready": True,
         "contentDigest": request_digest(title, body),
-        "authorization": {"authorized": True},
+        # The verdict covers exactly the policy approval set: dispatch
+        # rejects a verdict that checked a caller-selected subset.
+        "authorization": {
+            "authorized": True,
+            "labelers": {
+                "implementation-approved": "maintainer",
+                "agent-ready": "maintainer",
+                "human-review-required": "maintainer",
+            },
+        },
         "stable": {"updatedAt": "2026-10-12T10:00:00Z", "attempts": 1},
     }
     document.update(overrides)
     path.write_text(json.dumps(document), encoding="utf-8")
+    return path
+
+
+def _run_history(path, agent_id="builder-agent", work_ref=WORK_REF):
+    """Orchestrator state recording an implementation run of the work item."""
+    from agentic_sdlc.orchestration import Orchestrator
+
+    engine = Orchestrator()
+    engine.create_unit(work_ref, event_key="evt-0", timestamp="2026-10-12T09:00:00Z")
+    for index, state in enumerate(
+        ("triaged", "specified", "planned", "approved", "dispatched"), start=1
+    ):
+        engine.transition(
+            work_ref,
+            state,
+            actor="operator",
+            actor_kind="human",
+            event_key=f"evt-{index}",
+            timestamp=f"2026-10-12T09:0{index}:00Z",
+        )
+    engine.start_run(
+        work_ref,
+        "implementation",
+        {
+            "missionId": "implementation-worker",
+            "missionVersion": "1.0.0",
+            "agentId": agent_id,
+            "adapter": "claude-code",
+            "adapterVersion": "1.0.0",
+            "provider": "anthropic",
+            "model": "claude-sonnet-5-5",
+            "promptSha256": "0" * 64,
+            "envelopeSha256": "0" * 64,
+        },
+        event_key="evt-run",
+        timestamp="2026-10-12T09:10:00Z",
+    )
+    path.write_text(json.dumps(engine.as_dict()), encoding="utf-8")
     return path
 
 
@@ -1323,9 +1370,46 @@ def test_dispatch_binds_the_mission_source_allowlist(registry, policy):
         provider="anthropic",
         model="claude-sonnet-5-5",
         capabilities=mission.capabilities,
+        context_window_tokens=4_000_000,
     )
     with pytest.raises(ContextBuilderError, match="mission contract does not match"):
         dispatch_envelope_for_packet(packet, drifted, agent)
+    # The FULL execution contract is bound, not only the caps: a same-version
+    # mission whose purpose, success criteria, outputs, or command allowlist
+    # moved must not dispatch the old packet — and the contract renders into
+    # the prompt, so the agent is told its mission, not generic role text.
+    for moved in (
+        dc_replace(mission, purpose="something else entirely"),
+        dc_replace(mission, success_criteria=("ship it",)),
+        dc_replace(mission, output_artifacts=("memo",)),
+        dc_replace(mission, commands=("rm",)),
+    ):
+        with pytest.raises(ContextBuilderError, match="mission contract does not match"):
+            dispatch_envelope_for_packet(packet, moved, agent)
+    prompt = render_packet_for_prompt(packet)
+    assert f"Mission purpose: {mission.purpose}" in prompt
+    assert "Success criteria (the run is judged against these):" in prompt
+    for criterion in mission.success_criteria:
+        assert criterion in prompt
+
+
+def test_nonprintable_retrieval_failures_are_escaped(registry, policy):
+    # A failure detail with a newline or escape sequence would otherwise
+    # inject log lines into pack qualifications and the blocking errors main
+    # prints to stderr.
+    packet = _packet(
+        registry,
+        policy,
+        retrieval_failures=("repo-main:\n::error::spoof", "\x1bnaked"),
+    )
+    serialized = json.dumps(packet.as_dict())
+    failures = [note for note in packet.pack.exclusions if note.startswith("retrieval failed:")]
+    assert failures
+    assert all("\n" not in item and "\x1b" not in item for item in failures)
+    # The declared source keeps its bare prefix for required-source
+    # accounting; the detail travels JSON-escaped on one line.
+    assert any('repo-main: "' in item and "\\n" in item for item in failures)
+    assert "\x1bnaked" not in serialized
 
 
 def test_the_cli_dispatches_through_the_packet_contract(tmp_path, policy_file, valid_body):
@@ -1827,7 +1911,12 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
     # sanitized payload legitimately differs from the raw blob.
     (repo / "src" / "marked.py").write_text("left</untrusted-evidence>right\n", encoding="utf-8")
     (repo / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
-    git("add", "a.txt", "src/scheduler.py", "src/marked.py", ".gitignore")
+    # Derived gates run under the configuration COMMITTED at the candidate
+    # head, so the policy lives in the repository like a real project's.
+    (repo / "agentic-sdlc.toml").write_text(
+        policy_file.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    git("add", "a.txt", "src/scheduler.py", "src/marked.py", ".gitignore", "agentic-sdlc.toml")
     git("commit", "-q", "-m", "base")
     base = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "HEAD"],
@@ -1877,7 +1966,7 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
             [
                 "context-packet",
                 "--config",
-                str(policy_file),
+                str(repo / "agentic-sdlc.toml"),
                 "--knowledge",
                 str(knowledge),
                 "--request",
@@ -1903,18 +1992,16 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
     assert verification["diffPaths"] == ["a.txt"]
     assert verification["gateReport"] == {"passed": False, "gates": []}
     assert verification["priorFindings"] == ["Round one flagged an unbounded retry loop."]
+    # The reviewer reads the change itself: the trusted patch travels in the
+    # verification evidence and renders inside an untrusted boundary.
+    assert "+two" in verification["patch"]
+    assert "diff --git a/a.txt b/a.txt" in verification["patch"]
 
     # A review follows a producing run: dispatch demands the orchestrator's
     # run history naming who performed each mission the review must be
     # independent of, so an empty default can never let the roster's first
     # agent review its own work.
-    history_file = tmp_path / "history.json"
-    history_file.write_text(
-        json.dumps(
-            {"implementation-worker": "builder-agent", "repair-agent": "", "test-author": ""}
-        ),
-        encoding="utf-8",
-    )
+    history_file = _run_history(tmp_path / "history.json")
 
     # A derived artifact dispatches: durations are zeroed at derivation, so
     # the whole-document comparison is exact.
@@ -1950,7 +2037,7 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
             [
                 "dispatch-packet",
                 "--config",
-                str(policy_file),
+                str(repo / "agentic-sdlc.toml"),
                 "--knowledge",
                 str(knowledge),
                 "--request",
@@ -1978,21 +2065,29 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
     # the next eligible agent instead of blocking the dispatch.
     assert envelope["agentId"] == "roomy-reviewer"
 
-    # Without the run history — or with a mission it is independent of left
-    # unrecorded — reviewer dispatch refuses rather than trusting an empty
-    # or partial exclusion set.
+    # Reviewer dispatch consumes the ORCHESTRATOR STATE, not a caller-authored
+    # map: without it, with a state that never dispatched this work item, or
+    # with one recording no producing run, dispatch refuses rather than
+    # trusting an empty exclusion set.
     capsys.readouterr()
-    partial_history = tmp_path / "partial-history.json"
-    partial_history.write_text(
-        json.dumps({"implementation-worker": "builder-agent"}), encoding="utf-8"
-    )
-    for history_args in ([], ["--history", str(partial_history)]):
+    from agentic_sdlc.orchestration import Orchestrator
+
+    other_unit = _run_history(tmp_path / "other-history.json", work_ref="example/project#999")
+    runless = Orchestrator()
+    runless.create_unit(WORK_REF, event_key="evt-0", timestamp="2026-10-12T09:00:00Z")
+    runless_file = tmp_path / "runless-history.json"
+    runless_file.write_text(json.dumps(runless.as_dict()), encoding="utf-8")
+    for history_args, said in (
+        ([], "reviewer dispatch requires --history"),
+        (["--history", str(other_unit)], "records no work unit"),
+        (["--history", str(runless_file)], "reviewer dispatch requires --history"),
+    ):
         assert (
             cli_main(
                 [
                     "dispatch-packet",
                     "--config",
-                    str(policy_file),
+                    str(repo / "agentic-sdlc.toml"),
                     "--knowledge",
                     str(knowledge),
                     "--request",
@@ -2010,7 +2105,7 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
             )
             == 2
         )
-    assert "reviewer dispatch requires --history" in capsys.readouterr().err
+        assert said in capsys.readouterr().err
 
     # A fabricated payload with a self-consistent hash is read back from the
     # pinned tree and rejected.
@@ -2038,7 +2133,7 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
             [
                 "context-packet",
                 "--config",
-                str(policy_file),
+                str(repo / "agentic-sdlc.toml"),
                 "--knowledge",
                 str(knowledge),
                 "--request",
@@ -2081,7 +2176,7 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
             [
                 "context-packet",
                 "--config",
-                str(policy_file),
+                str(repo / "agentic-sdlc.toml"),
                 "--knowledge",
                 str(knowledge),
                 "--request",
@@ -2112,7 +2207,7 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
             [
                 "context-packet",
                 "--config",
-                str(policy_file),
+                str(repo / "agentic-sdlc.toml"),
                 "--knowledge",
                 str(knowledge),
                 "--request",
@@ -2175,7 +2270,7 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
             [
                 "dispatch-packet",
                 "--config",
-                str(policy_file),
+                str(repo / "agentic-sdlc.toml"),
                 "--knowledge",
                 str(knowledge),
                 "--request",
@@ -2292,6 +2387,10 @@ def test_dispatch_packet_enforces_task_policy(tmp_path, policy_file, valid_body,
         {"issue": 119},
         {"project": "another/project"},
         {"contentDigest": "0" * 64},
+        # A genuine check-request run narrowed to a caller-selected label:
+        # ready, authorized and stable — but the verdict proves writers
+        # applied only "harmless", not the policy approval set.
+        {"authorization": {"authorized": True, "labelers": {"harmless": "maintainer"}}},
     ):
         bad = _authorization(
             tmp_path / "authorization.json", "P1: a bounded change", valid_body, **broken

@@ -246,6 +246,12 @@ def run_gates(
 
     results = []
     root = Path(repository)
+    # A gate that uses the standard Actions variable must observe the tree
+    # the gates run in: the ambient value points at whatever workspace
+    # invoked this process, which for an isolated derivation is the caller's
+    # checkout, not the tree under test.
+    if "GITHUB_WORKSPACE" in environment:
+        environment["GITHUB_WORKSPACE"] = str(root.resolve())
     warning = check_gate_python(python_version, environment, root)
     if warning:
         print(f"::warning::{warning}", file=sys.stderr, flush=True)
