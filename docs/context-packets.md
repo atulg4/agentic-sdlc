@@ -286,7 +286,9 @@ PER-COMMIT SERIES (`git log --no-show-signature --text --patch` over
 pair can never execute a verifier before the sandbox, and a committed
 `.gitattributes` rule such as `*.py -diff` cannot render source changes as
 an opaque binary patch — every file is forced to render as text, with
-genuinely non-UTF-8 bytes still travelling losslessly as base64): a commit that adds
+genuinely non-UTF-8 bytes AND NUL-bearing decodable text travelling
+losslessly as base64, since a NUL stripped after the digest was taken
+would let two distinct changes render identically): a commit that adds
 content a later commit removes leaves the endpoint tree diff empty while a
 push of the head still publishes the blob, so the reviewer reads every
 intermediate change, the endpoint and whole-series line counters both
@@ -391,7 +393,13 @@ run's for a verification, the named review run's for a review — so a
 verdict always attaches to the exact dispatched code it judged. A signed
 review whose own `result` is not `succeeded` is refused outright: a
 crashed or failed reviewer proves nothing about the patch, so its genuine
-record cannot pass as a zero-finding verdict. And the verdict EDGES
+record cannot pass as a zero-finding verdict. The REPORT is part of the
+verdict too: an outcome with findings requires `--findings-report` (the
+canonical JSON array of the reviewer's findings), whose digest travels
+inside the attestation as `findingsSha256`; `orchestrate review` verifies
+the supplied report against it and records the digest in the attested
+state, so a later packet presenting the genuine signed count with a
+laundered findings list is refused at dispatch. And the verdict EDGES
 themselves are owned by these actions: under a key, a generic
 `orchestrate --action transition` refuses to take `verifying` or
 `reviewing`/`re-reviewing` into their verdict targets (`reviewing`,
@@ -407,18 +415,23 @@ cannot relabel a producing agent under a fresh `agentId` or route
 authorized work to an undeclared executor. REPAIR dispatches
 (`--run-kind repair`) have the same exposure from the other side: the
 repair candidate's pinned HEAD is the failed implementation's own commits,
-so they require `--review-target-repository` (same separation checks) and
+and a REVIEWER derivation's pin is the untrusted candidate head — a
+head-committed reviewer mission could instruct approval OUTSIDE the
+untrusted patch boundary — so both require `--review-target-repository`
+(same separation checks) and
 re-pin the WHOLE contract — policy, mission registry, knowledge sources,
 and roster — to its `origin/<default branch>`, with the base-committed
 policy required to agree on the branch name that located it, so a widened
-repair mission or weakened policy committed at the failed head shapes
+mission or weakened policy committed at the candidate head shapes
 nothing. And one envelope
 digest seeds at most ONE recorded run, with no exception for failed runs:
 an attested `start-run` refuses an envelope whose digest the unit already
 recorded, so a pre-repair review envelope can never report on the repaired
 head and a failed run's envelope cannot seed a second attempt under the
-first's attribution — a retry is a fresh dispatch, whose moved revision or
-refreshed authorization gives it a fresh digest. And every command that derives
+first's attribution — a retry is a fresh dispatch, and every dispatch
+mints a digested `dispatchNonce`, so even byte-identical content
+re-dispatches under a fresh digest and completion/outcome records bind
+the exact dispatch they attest, not merely its content. And every command that derives
 or attests these artifacts (`context-packet`, `dispatch-packet`,
 `orchestrate`, `attest-completion`, `attest-outcome`) runs under STRICT executable trust:
 working-tree `trust_mode` and the `AGENTIC_SDLC_GIT`/`AGENTIC_SDLC_GH`
@@ -436,7 +449,18 @@ some producing run must record the candidate head as its `commit_sha`, or
 an older genuine state would omit the agent who produced the head. A
 caller-authored mission→agent map is not authoritative, and a state
 recording no producing run for any mission the review is independent of
-refuses dispatch.
+refuses dispatch. The binding is to the LATEST producer: after
+implementation commit A and repair commit B, a stale review packet for A
+still finds A in the history, so the most recent producing run must have
+SUCCEEDED at exactly the candidate head — any-run matching would let a
+zero-finding verdict on pre-repair code advance the repaired unit.
+Reviewer dispatches also require `--authorization` (the reviewer judges
+the candidate AGAINST the request's task, and the title and body are
+caller JSON — the attested check-request result binds this exact project,
+work item, and content digest), refuse evidence whose own gate aggregate
+is false (a failed head belongs in repair, not review), and verify the
+packet's `priorFindings` hash to the findings-report digest the attested
+state records for the unit's latest review.
 Request
 JSON can never impersonate pipeline evidence: `dispatch-packet` refuses a
 request-supplied `verification` object outright, and `context-packet`

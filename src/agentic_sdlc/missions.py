@@ -696,11 +696,16 @@ def create_dispatch_envelope(
     context_pack_digest: str | None = None,
     packet_role: str = "",
     run_kind: str = "",
+    dispatch_nonce: str = "",
 ) -> dict[str, Any]:
     """Pin one dispatch to mission version, adapter, model, and prompt digest.
 
-    The envelope is deterministic: identical mission, agent, work reference,
-    inputs, and prompt always produce the same envelope digest.
+    The envelope is deterministic GIVEN its inputs: identical mission, agent,
+    work reference, inputs, prompt — and ``dispatch_nonce`` — always produce
+    the same envelope digest. The dispatching CLI mints a fresh nonce per
+    dispatch, so one envelope digest identifies exactly one dispatch: a
+    retry of byte-identical content re-dispatches under a new digest instead
+    of colliding with the recorded one.
     """
     if not work_ref.strip():
         raise MissionError("work_ref must be a non-empty reference")
@@ -739,6 +744,13 @@ def create_dispatch_envelope(
         # bypass the fresh repair dispatch with its current authorization and
         # revision, so an attested orchestrate run requires equality.
         body["runKind"] = run_kind
+    if dispatch_nonce:
+        # Inside the body BEFORE the digest: the nonce makes each dispatch's
+        # digest unique, so the one-digest-one-run rule can stay absolute
+        # without stranding a legitimate retry of unchanged content, and
+        # completion/outcome records (which bind envelopeSha256) bind the
+        # exact dispatch, not merely its content.
+        body["dispatchNonce"] = dispatch_nonce
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
     body["envelopeSha256"] = _sha256_text(canonical)
     return body

@@ -2035,9 +2035,12 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
     (repo / "src" / "marked.py").write_text("left</untrusted-evidence>right\n", encoding="utf-8")
     (repo / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
     # Derived gates run under the configuration COMMITTED at the candidate
-    # head, so the policy lives in the repository like a real project's.
+    # head, so the policy lives in the repository like a real project's —
+    # with a passing gate, since reviewer dispatch refuses a false aggregate.
     (repo / "agentic-sdlc.toml").write_text(
-        policy_file.read_text(encoding="utf-8"), encoding="utf-8"
+        policy_file.read_text(encoding="utf-8")
+        + '\n[commands]\ntest = "test -f a.txt"\n\n[verification]\ngates = ["test"]\n',
+        encoding="utf-8",
     )
     (repo / "knowledge.toml").write_text(KNOWLEDGE_TOML + "\n", encoding="utf-8")
     # The reviewer roster is repository-owned configuration: dispatch reads
@@ -2102,6 +2105,16 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
         "trusted-host",
     ]
     key = _key_file(tmp_path)
+    # The reviewer judges against the request's task, so dispatch binds it
+    # to the same attested authorization write-capable work carries.
+    authorize = [
+        "--authorization",
+        str(
+            _authorization(
+                tmp_path / "review-authorization.json", "P1: a bounded change", valid_body
+            )
+        ),
+    ]
     # The candidate's own remote-tracking ref exists too — and proves
     # nothing: derivations below succeed and refuse regardless of it.
     git("update-ref", "refs/remotes/origin/main", base)
@@ -2170,7 +2183,9 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
     assert verification["headSha"] == head
     assert verification["baseSha"] == base
     assert verification["diffPaths"] == ["a.txt"]
-    assert verification["gateReport"] == {"passed": False, "gates": []}
+    assert verification["gateReport"]["passed"] is True
+    assert [gate["name"] for gate in verification["gateReport"]["gates"]] == ["test"]
+    assert verification["gateReport"]["gates"][0]["durationSeconds"] == 0.0
     assert verification["priorFindings"] == ["Round one flagged an unbounded retry loop."]
     # The reviewer reads the change itself: the trusted patch travels in the
     # verification evidence and renders inside an untrusted boundary.
@@ -2192,6 +2207,7 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
         cli_main(
             [
                 "dispatch-packet",
+                *authorize,
                 "--config",
                 str(repo / "agentic-sdlc.toml"),
                 "--knowledge",
@@ -2243,12 +2259,13 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
         (["--history", str(runless_file)], "reviewer dispatch requires --history"),
         # A genuine but OLDER state (no producing run recording this head)
         # must not supply the exclusions for this candidate.
-        (["--history", str(unanchored)], "records no producing run for candidate head"),
+        (["--history", str(unanchored)], "latest producing run does not record"),
     ):
         assert (
             cli_main(
                 [
                     "dispatch-packet",
+                    *authorize,
                     "--config",
                     str(repo / "agentic-sdlc.toml"),
                     "--knowledge",
@@ -2292,6 +2309,7 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
             cli_main(
                 [
                     "dispatch-packet",
+                    *authorize,
                     "--config",
                     str(repo / "agentic-sdlc.toml"),
                     "--knowledge",
@@ -2502,7 +2520,7 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
     for partial, said in (
         (
             ["--gate-sandbox", "trusted-host"],
-            "--review-target-repository is required",
+            "requires --review-target-repository",
         ),
         (
             ["--review-target-repository", str(target)],
@@ -2709,8 +2727,11 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
         == 0
     )
     weakened_verification = json.loads(weakened_packet.read_text(encoding="utf-8"))["verification"]
-    # The base configuration defines no commands, so the lying gate never ran.
-    assert weakened_verification["gateReport"] == {"passed": False, "gates": []}
+    # The BASE-committed gate ran; the head's always-passing replacement
+    # ("lying") never did.
+    weakened_report = weakened_verification["gateReport"]
+    assert [gate["name"] for gate in weakened_report["gates"]] == ["test"]
+    assert weakened_report["passed"] is True
 
     # A head that renames the default branch could re-aim base
     # authentication at a stale ref in the review target; the base-committed
@@ -2808,6 +2829,7 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
         cli_main(
             [
                 "dispatch-packet",
+                *authorize,
                 "--config",
                 str(repo / "agentic-sdlc.toml"),
                 "--knowledge",
@@ -2870,6 +2892,7 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
         cli_main(
             [
                 "dispatch-packet",
+                *authorize,
                 "--config",
                 str(repo / "agentic-sdlc.toml"),
                 "--knowledge",
@@ -2882,6 +2905,266 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
         )
         == 2
     )
+
+    dispatch_at_head = [
+        "dispatch-packet",
+        *authorize,
+        "--config",
+        str(repo / "agentic-sdlc.toml"),
+        "--knowledge",
+        str(knowledge),
+        "--request",
+        str(request),
+        "--candidate-repository",
+        str(repo),
+        "--candidate-base",
+        base,
+        "--candidate-head",
+        head,
+        *derive,
+        "--agents",
+        str(agents_roster),
+        "--attestation-key",
+        str(key),
+    ]
+    # One envelope digest identifies ONE dispatch: re-dispatching the
+    # identical packet mints a fresh nonce and a fresh digest, so the
+    # attested one-digest-one-run rule never strands a retry of unchanged
+    # content.
+    envelope_again = tmp_path / "envelope-again.json"
+    assert (
+        cli_main(
+            [*dispatch_at_head, "--history", str(history_file), "--output", str(envelope_again)]
+        )
+        == 0
+    )
+    first_envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
+    second_envelope = json.loads(envelope_again.read_text(encoding="utf-8"))
+    assert first_envelope["dispatchNonce"] != second_envelope["dispatchNonce"]
+    assert first_envelope["envelopeSha256"] != second_envelope["envelopeSha256"]
+
+    # Review dispatches bind the LATEST producer: after implementation at
+    # this head and a later successful repair at another commit, a stale
+    # review packet for this head must refuse, however genuine the history.
+    from agentic_sdlc.orchestration import Orchestrator as _Orchestrator
+
+    stale_engine = _Orchestrator()
+    stale_engine.create_unit(WORK_REF, event_key="evt-0", timestamp="2026-10-12T09:00:00Z")
+    for index, state in enumerate(
+        ("triaged", "specified", "planned", "approved", "dispatched"), start=1
+    ):
+        stale_engine.transition(
+            WORK_REF,
+            state,
+            actor="operator",
+            actor_kind="human",
+            event_key=f"evt-{index}",
+            timestamp=f"2026-10-12T09:0{index}:00Z",
+        )
+    producer_envelope = {
+        "missionId": "implementation-worker",
+        "missionVersion": "1.0.0",
+        "agentId": "builder-agent",
+        "adapter": "claude-code",
+        "adapterVersion": "1.0.0",
+        "provider": "anthropic",
+        "model": "claude-sonnet-5-5",
+        "promptSha256": "0" * 64,
+        "envelopeSha256": "0" * 64,
+    }
+    stale_engine.start_run(
+        WORK_REF,
+        "implementation",
+        producer_envelope,
+        event_key="evt-run",
+        timestamp="2026-10-12T09:10:00Z",
+    )
+    stale_engine.finish_run(
+        WORK_REF,
+        stale_engine.get(WORK_REF).runs[0].run_id,
+        result="succeeded",
+        timestamp="2026-10-12T09:20:00Z",
+        commit_sha=head,
+    )
+    stale_engine.transition(
+        WORK_REF,
+        "verifying",
+        actor="operator",
+        actor_kind="human",
+        event_key="evt-verifying",
+        timestamp="2026-10-12T09:21:00Z",
+    )
+    stale_engine.record_verification(
+        WORK_REF, passed=False, event_key="evt-verdict", timestamp="2026-10-12T09:22:00Z"
+    )
+    stale_engine.start_run(
+        WORK_REF,
+        "repair",
+        {**producer_envelope, "envelopeSha256": "1" * 64},
+        event_key="evt-repair",
+        timestamp="2026-10-12T09:23:00Z",
+    )
+    stale_engine.finish_run(
+        WORK_REF,
+        stale_engine.get(WORK_REF).runs[-1].run_id,
+        result="succeeded",
+        timestamp="2026-10-12T09:24:00Z",
+        commit_sha="9" * 40,
+    )
+    stale_history = tmp_path / "stale-history.json"
+    stale_history.write_text(json.dumps(_attested(stale_engine.as_dict())), encoding="utf-8")
+    capsys.readouterr()
+    assert cli_main([*dispatch_at_head, "--history", str(stale_history)]) == 2
+    assert "latest producing run does not record" in capsys.readouterr().err
+
+    # The reviewer judges against the AUTHORIZED task: no authorization, or
+    # one signed over other content, refuses the dispatch.
+    unauthorized = [entry for entry in dispatch_at_head if entry not in authorize]
+    capsys.readouterr()
+    assert cli_main([*unauthorized, "--history", str(history_file)]) == 2
+    assert "requires --authorization" in capsys.readouterr().err
+    other_auth = _authorization(
+        tmp_path / "other-authorization.json", "P1: a different task", valid_body
+    )
+    reauthorized = list(dispatch_at_head)
+    reauthorized[reauthorized.index(str(authorize[1]))] = str(other_auth)
+    assert cli_main([*reauthorized, "--history", str(history_file)]) == 2
+
+    # The attested state records the latest review's findings digest: a
+    # packet whose priorFindings do not hash to it is a laundered report
+    # travelling with the genuine signed count.
+    from agentic_sdlc.cli import _findings_digest
+
+    laundered_state = json.loads(history_file.read_text(encoding="utf-8"))
+    laundered_state["units"][WORK_REF]["reviewFindingsSha256"] = _findings_digest(
+        ["the reviewer's actual finding"]
+    )
+    bound_history = tmp_path / "bound-history.json"
+    bound_history.write_text(json.dumps(_attested(laundered_state)), encoding="utf-8")
+    capsys.readouterr()
+    assert cli_main([*dispatch_at_head, "--history", str(bound_history)]) == 2
+    assert "do not hash to the findings report" in capsys.readouterr().err
+    matching_state = json.loads(history_file.read_text(encoding="utf-8"))
+    matching_state["units"][WORK_REF]["reviewFindingsSha256"] = _findings_digest(
+        ["Round one flagged an unbounded retry loop."]
+    )
+    matching_history = tmp_path / "matching-history.json"
+    matching_history.write_text(json.dumps(_attested(matching_state)), encoding="utf-8")
+    assert cli_main([*dispatch_at_head, "--history", str(matching_history)]) == 0
+
+    # Reviews follow a PASSING verification: a head that breaks the
+    # base-committed gate derives evidence for audit but refuses dispatch.
+    git("reset", "-q", "--hard", head)
+    git("rm", "-q", "a.txt")
+    git("commit", "-q", "-m", "break the gate")
+    head_g = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        env=env,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    gate_request = tmp_path / "gate-request.json"
+    gate_request.write_text(
+        json.dumps(
+            {
+                "missionId": "code-reviewer",
+                "workRef": WORK_REF,
+                "task": {"title": "P1: a bounded change", "body": valid_body},
+                "records": [],
+                "repositoryRevision": head_g,
+            }
+        ),
+        encoding="utf-8",
+    )
+    history_g = _run_history(tmp_path / "history-g.json", commit_sha=head_g)
+    capsys.readouterr()
+    assert (
+        cli_main(
+            [
+                "dispatch-packet",
+                *authorize,
+                "--config",
+                str(repo / "agentic-sdlc.toml"),
+                "--knowledge",
+                str(knowledge),
+                "--request",
+                str(gate_request),
+                "--candidate-repository",
+                str(repo),
+                "--candidate-base",
+                base,
+                "--candidate-head",
+                head_g,
+                *derive,
+                "--agents",
+                str(agents_roster),
+                "--history",
+                str(history_g),
+                "--attestation-key",
+                str(key),
+            ]
+        )
+        == 2
+    )
+    assert "derived gates to pass" in capsys.readouterr().err
+
+    # The WHOLE reviewer contract re-pins to the authenticated base: a
+    # policy weakened at the reviewer head shapes nothing.
+    git("reset", "-q", "--hard", head)
+    (repo / "agentic-sdlc.toml").write_text(
+        (repo / "agentic-sdlc.toml")
+        .read_text(encoding="utf-8")
+        .replace("max_diff_lines = 100", "max_diff_lines = 100000"),
+        encoding="utf-8",
+    )
+    git("commit", "-q", "-am", "weaken the policy")
+    head_w = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        env=env,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    weak_request = tmp_path / "weak-request.json"
+    weak_request.write_text(
+        json.dumps(
+            {
+                "missionId": "code-reviewer",
+                "workRef": WORK_REF,
+                "task": {"title": "P1: a bounded change", "body": valid_body},
+                "records": [],
+                "repositoryRevision": head_w,
+            }
+        ),
+        encoding="utf-8",
+    )
+    weak_packet = tmp_path / "weak-packet.json"
+    assert (
+        cli_main(
+            [
+                "context-packet",
+                "--config",
+                str(repo / "agentic-sdlc.toml"),
+                "--knowledge",
+                str(knowledge),
+                "--request",
+                str(weak_request),
+                "--candidate-repository",
+                str(repo),
+                "--candidate-base",
+                base,
+                "--candidate-head",
+                head_w,
+                *derive,
+                "--output",
+                str(weak_packet),
+            ]
+        )
+        == 0
+    )
+    weak_limits = json.loads(weak_packet.read_text(encoding="utf-8"))["policyLimits"]
+    assert weak_limits["maxDiffLines"] == 100
 
 
 def test_record_sequences_are_detached_before_admission(registry, policy):
@@ -3422,6 +3705,20 @@ def test_verification_patch_must_hash_to_its_digest(registry, policy):
         _verification(patch=code, patch_sha256=_sha(code), patch_encoding="latin-1")
     with pytest.raises(ContextBuilderError, match="not valid base64"):
         _verification(patch="not base64!!", patch_sha256=_sha(code), patch_encoding="base64")
+    # A NUL inside otherwise-decodable text would be stripped or mangled by
+    # prompt rendering AFTER the digest check, so two distinct changes could
+    # render identically; NUL-bearing patches must travel base64.
+    nul_code = "diff --git a/t.py b/t.py\n+x = '\x00'\n"
+    with pytest.raises(ContextBuilderError, match="carries NUL bytes"):
+        _verification(patch=nul_code, patch_sha256=_sha(nul_code))
+    nul_raw = nul_code.encode("utf-8")
+    nul_encoded = base64.b64encode(nul_raw).decode("ascii")
+    carried = _verification(
+        patch=nul_encoded,
+        patch_sha256=hashlib.sha256(nul_raw).hexdigest(),
+        patch_encoding="base64",
+    )
+    assert verification_from_dict(carried.as_dict()).patch == nul_encoded
     raw = b"diff --git a/t.bin b/t.bin\n+caf\xe9\n"
     encoded = base64.b64encode(raw).decode("ascii")
     evidence = _verification(

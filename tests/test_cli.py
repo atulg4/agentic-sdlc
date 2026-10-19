@@ -1151,6 +1151,75 @@ def test_orchestrate_attests_only_runs_a_trusted_dispatch_produced(tmp_path: Pat
         path.write_text(json.dumps(document), encoding="utf-8")
         return str(path)
 
+    # A review WITH findings carries the report inside the attestation: the
+    # count alone is not the review, so attest-outcome demands the canonical
+    # findings array and binds its digest.
+    capsys.readouterr()
+    found_base = [
+        "attest-outcome",
+        "--unit",
+        "42",
+        "--kind",
+        "review",
+        "--result",
+        "succeeded",
+        "--findings",
+        "2",
+        "--run-id",
+        "42:run-002",
+        "--envelope-sha256",
+        review_envelope["envelopeSha256"],
+        "--attestation-key",
+        str(key_file),
+    ]
+    assert main(found_base) == 2
+    assert "requires --findings-report" in capsys.readouterr().err
+    report = tmp_path / "findings.json"
+    report.write_text(json.dumps(["finding one", "finding two"]), encoding="utf-8")
+    short_report = tmp_path / "short-findings.json"
+    short_report.write_text(json.dumps(["finding one"]), encoding="utf-8")
+    capsys.readouterr()
+    assert main([*found_base, "--findings-report", str(short_report)]) == 2
+    assert "declares 2" in capsys.readouterr().err
+    found_outcome = tmp_path / "found-outcome.json"
+    assert (
+        main([*found_base, "--findings-report", str(report), "--output", str(found_outcome)]) == 0
+    )
+    # The recorded transition verifies the report against the signed digest:
+    # a tampered report — or none at all — never rides the genuine count.
+    review_two = [
+        *base,
+        "--action",
+        "review",
+        "--run-id",
+        "42:run-002",
+        "--findings",
+        "2",
+        "--event-key",
+        "evt-review-two",
+        "--timestamp",
+        stamp,
+    ]
+    tampered_report = tmp_path / "tampered-findings.json"
+    tampered_report.write_text(json.dumps(["finding one", "tampered"]), encoding="utf-8")
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                *review_two,
+                "--outcome",
+                str(found_outcome),
+                "--findings-report",
+                str(tampered_report),
+            ]
+        )
+        == 2
+    )
+    assert "different findings report" in capsys.readouterr().err
+    capsys.readouterr()
+    assert main([*review_two, "--outcome", str(found_outcome)]) == 2
+    assert "different findings report" in capsys.readouterr().err
+
     # The reviewing -> ready-for-human-merge edge is verdict-owned too.
     capsys.readouterr()
     assert (

@@ -11,6 +11,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shlex
 import sys
 from collections.abc import Iterable, Mapping
@@ -1074,11 +1075,14 @@ def _derived_verification(
         raise ContextBuilderError("packet request priorFindings must be an array of strings")
     # The reviewer reads the change itself, and reads EVERY byte the digest
     # binds: a replacement-character decode would render two distinct
-    # non-UTF-8 changes identically, so bytes that are not UTF-8 travel
-    # base64-encoded instead of lossily decoded.
+    # non-UTF-8 changes identically, and a NUL inside decodable text would
+    # be stripped by prompt sanitization after the digest was taken, so
+    # both travel base64-encoded instead of lossily rendered.
     try:
         patch_text = series_patch.decode("utf-8")
         patch_encoding = "utf-8"
+        if "\x00" in patch_text:
+            raise UnicodeDecodeError("utf-8", b"", 0, 1, "NUL renders lossily")
     except UnicodeDecodeError:
         patch_text = base64.b64encode(series_patch).decode("ascii")
         patch_encoding = "base64"
@@ -1205,9 +1209,10 @@ def _check_dispatch_authorization(args: argparse.Namespace, policy, packet) -> N
     """
     if not getattr(args, "authorization", None):
         raise ContextBuilderError(
-            "write-capable dispatch requires --authorization: the "
-            "check-request --authorize-labels result proving the approval "
-            "labels were applied to the work item by authorized writers"
+            "dispatch requires --authorization: the check-request "
+            "--authorize-labels result proving the approval labels were "
+            "applied to the work item by authorized writers (a reviewer "
+            "judges against this authorized content too)"
         )
     document = json.loads(Path(args.authorization).read_text(encoding="utf-8"))
     if not isinstance(document, dict):
@@ -1369,20 +1374,23 @@ def _build_packet_from_request(
             )
         pinned = resolve_commit(args.candidate_repository, pin_source)
         policy = load_policy_bytes(_committed_configuration(args, pinned, args.config, "--config"))
-        if getattr(args, "run_kind", None) == "repair":
+        if getattr(args, "run_kind", None) == "repair" or args.candidate_head:
             # The repair candidate's pinned HEAD is the failed
-            # implementation's own commits: a widened repair mission or
-            # weakened policy committed there must not shape a write-capable
-            # repair envelope, and the head-controlled default branch must
+            # implementation's own commits, and a REVIEWER derivation's pin
+            # is the untrusted candidate head: a widened or rewritten
+            # mission, weakened policy, or re-permissioned knowledge source
+            # committed there must not shape the envelope (a head-committed
+            # reviewer mission could instruct approval OUTSIDE the untrusted
+            # patch boundary), and the head-controlled default branch must
             # not choose which ref supplies the base either, so the WHOLE
             # contract re-pins to the authenticated base (the base-committed
             # policy must agree on the branch name that located it).
             if not getattr(args, "review_target_repository", None):
                 raise ContextBuilderError(
-                    "--run-kind repair requires --review-target-repository: "
-                    "the repair contract (policy, missions, knowledge, "
-                    "roster) loads from the authenticated base, never the "
-                    "failed candidate's own head"
+                    "a repair or reviewer derivation requires "
+                    "--review-target-repository: the contract (policy, "
+                    "missions, knowledge, roster) loads from the "
+                    "authenticated base, never the candidate's own head"
                 )
             _require_separate_target(args)
             try:
@@ -1393,17 +1401,16 @@ def _build_packet_from_request(
                 raise ContextBuilderError(
                     "the review target repository has no "
                     f"origin/{policy.default_branch}; fetch the authoritative "
-                    "base before dispatching a repair"
+                    "base before dispatching against it"
                 ) from error
             base_policy = load_policy_bytes(
                 _committed_configuration(args, base_pin, args.config, "--config")
             )
             if base_policy.default_branch != policy.default_branch:
                 raise ContextBuilderError(
-                    "the repair candidate changes the policy's default "
-                    "branch; that re-aims base authentication, so land the "
-                    "configuration change through the human-controlled path "
-                    "before repairing against it"
+                    "the candidate changes the policy's default branch; that "
+                    "re-aims base authentication, so land the configuration "
+                    "change through the human-controlled path first"
                 )
             policy = base_policy
             pinned = base_pin
@@ -1585,6 +1592,27 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
         # `check-request --authorize-labels` gate, whose result must name
         # this exact work item and content.
         _check_dispatch_authorization(args, policy, packet)
+    else:
+        # The reviewer judges the candidate AGAINST the request's task, and
+        # the title and body are caller JSON: without the same authorization
+        # gate, a caller could keep the signed history's workRef and head
+        # while replacing the acceptance criteria with a weaker
+        # specification. The attested check-request result binds this exact
+        # project, work item, and content digest.
+        _check_dispatch_authorization(args, policy, packet)
+        # Reviews follow a PASSING verification: evidence whose own gate
+        # aggregate is false describes a failed head — the unit belongs in
+        # repair, and a reviewer's zero-finding verdict must not carry it
+        # toward merge past the failed deterministic gates.
+        if (
+            packet.verification is not None
+            and packet.verification.gate_report.get("passed") is not True
+        ):
+            raise ContextBuilderError(
+                "reviewer dispatch requires the derived gates to pass: the "
+                "gate report's aggregate is false, so route the unit through "
+                "repair instead of review"
+            )
     if args.packet:
         artifact = json.loads(Path(args.packet).read_text(encoding="utf-8"))
 
@@ -1678,6 +1706,21 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
                 "the orchestrator state that dispatched this work item"
             ) from error
         unit_runs = tuple(unit.runs)
+        # The attested state records the latest review's canonical findings
+        # digest: a re-review packet whose caller-supplied priorFindings do
+        # not hash to it is carrying a laundered report alongside the
+        # genuine signed count, so the dispatch refuses.
+        recorded_findings = getattr(unit, "review_findings_sha256", "")
+        if (
+            recorded_findings
+            and packet.verification is not None
+            and _findings_digest(packet.verification.prior_findings) != recorded_findings
+        ):
+            raise MissionError(
+                "the packet's priorFindings do not hash to the findings "
+                "report the attested state records for this unit's latest "
+                "review; carry the reviewer's actual findings"
+            )
         for run in unit_runs:
             # EVERY agent that performed the mission is excluded, not only
             # the last assignee: a work item can carry several runs of one
@@ -1703,19 +1746,21 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
                 "recording the producing runs of this work item (none of the "
                 "missions this review is independent of has a recorded run)"
             )
-        # The state must be the history of THIS candidate: a genuine but
-        # older state from before a repair would omit the agent who produced
-        # the head, so some producing run must record the candidate head as
-        # the commit it produced.
+        # The state must be the history of THIS candidate, bound to its
+        # LATEST producer: after implementation commit A and repair commit
+        # B, a stale review packet for A still finds A in the history, so
+        # ANY-run matching would let a zero-finding verdict on the
+        # pre-repair code advance the repaired unit. The most recent
+        # producing run must have succeeded at exactly this head.
         head_sha = packet.verification.head_sha if packet.verification else ""
-        if not any(
-            run.kind in ("implementation", "repair") and run.commit_sha == head_sha
-            for run in unit_runs
-        ):
+        producing_runs = [run for run in unit_runs if run.kind in ("implementation", "repair")]
+        latest = producing_runs[-1] if producing_runs else None
+        if latest is None or latest.result != "succeeded" or latest.commit_sha != head_sha:
             raise MissionError(
-                "the run history records no producing run for candidate head "
-                f"{head_sha}; finish the producing run with its commit_sha so "
-                "review exclusions bind to the candidate under review"
+                "the run history's latest producing run does not record "
+                f"candidate head {head_sha} as its successful commit; review "
+                "dispatches bind to the most recent producer, never a stale "
+                "earlier head"
             )
     # Roster order defines fallbacks: an eligible agent whose declared
     # context window cannot fit the packet is skipped for the next eligible
@@ -1731,7 +1776,17 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
         )
         try:
             envelope = dispatch_envelope_for_packet(
-                packet, mission, agent, input_refs=tuple(args.input_ref), run_kind=run_kind
+                packet,
+                mission,
+                agent,
+                input_refs=tuple(args.input_ref),
+                run_kind=run_kind,
+                # A fresh nonce per dispatch: one envelope digest identifies
+                # exactly ONE dispatch, so the attested one-digest-one-run
+                # rule stays absolute without stranding a retry of unchanged
+                # content, and completion/outcome records bind the exact
+                # dispatch they attest.
+                dispatch_nonce=secrets.token_hex(16),
             )
             break
         except ContextBuilderError as error:
@@ -2045,12 +2100,36 @@ def _orchestrate(args: argparse.Namespace) -> int:
                     "than the run being reviewed; regenerate it with "
                     "attest-outcome for this run's envelope"
                 )
+            # The report is part of the verdict: the recorded state carries
+            # the attested report digest so repair and re-review dispatches
+            # can refuse a laundered findings list travelling with the
+            # genuine signed count.
+            report_digest = (
+                _findings_report_digest(args.findings_report, expected_count=args.findings)
+                if getattr(args, "findings_report", None)
+                else ""
+            )
+            if outcome.get("findingsSha256", "") != report_digest:
+                raise OrchestrationError(
+                    "the outcome record binds a different findings report "
+                    "than --findings-report supplies; pass the report the "
+                    "reviewer harness actually signed"
+                )
+            if args.findings > 0 and not report_digest:
+                raise OrchestrationError(
+                    "a review with findings requires --findings-report: the "
+                    "canonical findings array whose digest the outcome binds"
+                )
+            findings_sha256 = report_digest
+        else:
+            findings_sha256 = ""
         engine.record_review(
             args.unit,
             args.run_id,
             findings=args.findings,
             event_key=args.event_key,
             timestamp=args.timestamp,
+            findings_sha256=findings_sha256,
         )
     state_document = engine.as_dict()
     if key is not None:
@@ -2091,6 +2170,31 @@ def _require_signed_outcome(args: argparse.Namespace, key: bytes, *, kind: str) 
     return outcome
 
 
+def _findings_report_digest(path: str, *, expected_count: int | None = None) -> str:
+    """The canonical digest of a findings report: a JSON array of strings.
+
+    The digest covers the canonical compact encoding of the array IN ORDER,
+    so two reports with the same findings differently spelled or ordered
+    never collide, and every consumer (attest-outcome, orchestrate review,
+    reviewer dispatch) computes the same value from the same findings.
+    """
+    report = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(report, list) or not all(isinstance(item, str) for item in report):
+        raise OrchestrationError("the findings report must be a JSON array of finding strings")
+    if expected_count is not None and len(report) != expected_count:
+        raise OrchestrationError(
+            f"the findings report carries {len(report)} finding(s) but the "
+            f"outcome declares {expected_count}; record the review the "
+            "harness actually observed"
+        )
+    return _findings_digest(report)
+
+
+def _findings_digest(findings) -> str:
+    canonical = json.dumps(list(findings), separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _attest_outcome(args: argparse.Namespace) -> int:
     """Record a verification or review OUTCOME, signed by the harness that
     observed it, bound to the dispatched envelope it judged."""
@@ -2100,12 +2204,27 @@ def _attest_outcome(args: argparse.Namespace) -> int:
             "--envelope-sha256 must be the judged run's dispatched envelope "
             "digest (64 hex characters)"
         )
+    # The COUNT alone is not the review: a later caller could present the
+    # genuine signed count with a laundered report, so the canonical report
+    # digest travels inside the attestation whenever findings exist.
+    if args.findings > 0 and not args.findings_report:
+        raise OrchestrationError(
+            "an outcome with findings requires --findings-report: the "
+            "canonical JSON array of the reviewer's findings, whose digest "
+            "the attestation binds"
+        )
+    findings_sha256 = (
+        _findings_report_digest(args.findings_report, expected_count=args.findings)
+        if args.findings_report
+        else ""
+    )
     document = {
         "schemaVersion": 1,
         "unit": args.unit,
         "kind": args.kind,
         "result": args.result,
         "findings": args.findings,
+        "findingsSha256": findings_sha256,
         "runId": args.run_id,
         "envelopeSha256": args.envelope_sha256,
         "recordedAt": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
@@ -3168,6 +3287,11 @@ def build_parser() -> argparse.ArgumentParser:
         "attest-outcome record the verifier or reviewer harness signed for "
         "the judged run",
     )
+    orchestrate.add_argument(
+        "--findings-report",
+        help="with --outcome on review: the canonical JSON findings array "
+        "whose digest the outcome binds; recorded in the attested state",
+    )
     orchestrate.add_argument("--max-repair-cycles", type=int, default=2)
     orchestrate.add_argument("--status-output")
     orchestrate.add_argument(
@@ -3200,6 +3324,11 @@ def build_parser() -> argparse.ArgumentParser:
     attest_outcome.add_argument("--kind", choices=("verification", "review"), required=True)
     attest_outcome.add_argument("--result", choices=("succeeded", "failed"), required=True)
     attest_outcome.add_argument("--findings", type=int, default=0)
+    attest_outcome.add_argument(
+        "--findings-report",
+        help="the canonical JSON array of the review's findings; required "
+        "when --findings is positive, its digest travels in the attestation",
+    )
     attest_outcome.add_argument("--run-id", default="")
     attest_outcome.add_argument(
         "--envelope-sha256",

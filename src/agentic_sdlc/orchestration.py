@@ -199,6 +199,10 @@ class _WorkUnit:
         self.repair_count = 0
         self.superseded_by = ""
         self.created_at = created_at
+        # The latest review's canonical findings-report digest: repair and
+        # re-review consumers verify their supplied findings against it, so
+        # the signed count can never travel with a laundered report.
+        self.review_findings_sha256 = ""
         self.transitions: list[TransitionRecord] = []
         self.runs: list[AgentRunRecord] = []
         self.event_keys: set[str] = set()
@@ -212,6 +216,7 @@ class _WorkUnit:
             "repairCount": self.repair_count,
             "supersededBy": self.superseded_by,
             "createdAt": self.created_at,
+            "reviewFindingsSha256": self.review_findings_sha256,
             "transitions": [item.as_dict() for item in self.transitions],
             "runs": [item.as_dict() for item in self.runs],
             "eventKeys": sorted(self.event_keys),
@@ -648,8 +653,15 @@ class Orchestrator:
         findings: int,
         event_key: str,
         timestamp: str,
+        findings_sha256: str = "",
     ) -> _WorkUnit:
-        """Apply an independent review outcome with bounded repair routing."""
+        """Apply an independent review outcome with bounded repair routing.
+
+        ``findings_sha256`` is the canonical findings-report digest the
+        review's attestation binds; it is recorded on the unit so repair and
+        re-review dispatches can verify the report they are fed is the one
+        the reviewer actually produced.
+        """
         unit = self.get(unit_id)
         if event_key in unit.event_keys:
             return unit
@@ -667,6 +679,7 @@ class Orchestrator:
             f"review {run_id} predates repair cycle {unit.repair_count}; every repair "
             "requires a fresh independent review",
         )
+        unit.review_findings_sha256 = findings_sha256
         if findings == 0:
             return self.transition(
                 unit_id,
@@ -781,6 +794,7 @@ class Orchestrator:
             unit.state = WorkUnitState(raw.get("state", "intake"))
             unit.repair_count = int(raw.get("repairCount", 0))
             unit.superseded_by = str(raw.get("supersededBy", ""))
+            unit.review_findings_sha256 = str(raw.get("reviewFindingsSha256", ""))
             unit.event_keys = set(raw.get("eventKeys", ()))
             unit.transitions = [
                 TransitionRecord(

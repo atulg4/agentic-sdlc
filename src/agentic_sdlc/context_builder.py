@@ -381,6 +381,17 @@ class VerificationEvidence:
                         "declared encoding; re-encode the raw patch bytes"
                     ) from error
             else:
+                # A NUL inside otherwise-decodable text would be stripped or
+                # mangled downstream of the digest check, so two distinct
+                # changes could render identically while patchSha256 binds
+                # bytes the reviewer never sees: NUL-bearing patches travel
+                # base64 like every other not-safely-renderable byte stream.
+                if "\x00" in self.patch:
+                    raise ContextBuilderError(
+                        "verification patch carries NUL bytes under the "
+                        "utf-8 encoding; carry it base64-encoded so every "
+                        "byte renders losslessly"
+                    )
                 raw = self.patch.encode("utf-8")
             if hashlib.sha256(raw).hexdigest() != self.patch_sha256:
                 raise ContextBuilderError(
@@ -797,9 +808,12 @@ def _boundary_safe_text(text: str) -> str:
     Escaping runs to a fixpoint for the same reason stripping does: escaping
     one marker must not leave another spliced together, and every pass only
     grows the text where a marker stood, so the loop terminates. NUL bytes
-    are dropped like sanitize_payload drops them.
+    are escaped VISIBLY rather than dropped: ``patchSha256`` binds the
+    original bytes, so silently deleting NULs would render two distinct
+    changes identically while the digest attests bytes the reviewer never
+    saw.
     """
-    cleaned = text.replace("\x00", "")
+    cleaned = text.replace("\x00", "\\u0000")
     while True:
         escaped = _BOUNDARY_MARKER.sub(
             lambda match: match.group(0).replace("<", "\\u003c").replace(">", "\\u003e"),
@@ -1519,6 +1533,7 @@ def dispatch_envelope_for_packet(
     *,
     input_refs: Sequence[str] = (),
     run_kind: str = "",
+    dispatch_nonce: str = "",
 ) -> dict[str, Any]:
     """Pin one dispatch to the packet: its digest becomes ``contextPackDigest``.
 
@@ -1602,4 +1617,5 @@ def dispatch_envelope_for_packet(
         # orchestrate run can refuse this envelope under any other kind.
         packet_role=packet.role,
         run_kind=run_kind,
+        dispatch_nonce=dispatch_nonce,
     )
