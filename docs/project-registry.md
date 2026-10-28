@@ -10,7 +10,8 @@ one consumer repository. Two modules make that concrete:
 Dashboards, cost accounting and effectiveness analysis read this canonical
 data model instead of inferring state independently from each repository. The
 per-run usage ledger (`docs/usage-accounting.md`) reuses the same work-unit and
-actor vocabulary.
+actor vocabulary. The Control Center (`docs/control-center.md`) joins both into
+one snapshot per portfolio.
 
 ## Project registry
 

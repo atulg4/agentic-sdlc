@@ -62,6 +62,9 @@ The Python package owns behavior that must be identical on GitHub and GitLab:
 - the capacity instrument that reads that ledger for concurrency, queueing,
   runner and plan-capacity utilization, useful work and bottlenecks
   (`docs/capacity-metrics.md`);
+- the read-only Control Center snapshot that joins the registry, the
+  lifecycle ledger, each project's epic tree and its open blockers, with a
+  declared remediation per blocker kind (`docs/control-center.md`);
 - machine-readable decisions and audit output.
 
 ### Provider adapters
