@@ -468,6 +468,12 @@ def collect_series_patch(repository: str | Path, base: str, head: str) -> bytes:
             # candidate-controlled executable — before any gate sandbox is
             # entered, so signature rendering is disabled outright.
             "--no-show-signature",
+            # --no-show-signature does not cover a signature REQUESTED BY THE
+            # FORMAT: a repository-local `format.pretty = %G?` would make
+            # this log verify signatures anyway, executing the candidate's
+            # `gpg.program` on the host, so the format is pinned explicitly
+            # to git's default instead of inherited from candidate config.
+            "--pretty=medium",
             "--no-ext-diff",
             "--no-textconv",
             # The candidate's committed .gitattributes is honored by default:

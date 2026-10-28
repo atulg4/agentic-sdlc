@@ -545,6 +545,22 @@ def _refuse_open_prs(issue: int, prs: list[str], result: dict[str, Any]) -> tupl
     return PULL_REQUEST_OPEN, f"PR OPEN: #{issue} already has an open pull request: {listed}"
 
 
+def _continuation_allows(key: str, continuation: str) -> bool:
+    """Is the open pull request `key` the one `--continuation-pr` names?
+
+    A key is the inventory's URL (or ``#N`` fallback); the flag takes that
+    exact string, or the bare PR number, matched only as a whole trailing
+    path segment so #123 can never excuse #1123.
+    """
+    if not continuation:
+        return False
+    if key == continuation:
+        return True
+    if continuation.isdigit():
+        return key == f"#{continuation}" or re.fullmatch(rf".*/{continuation}", key) is not None
+    return False
+
+
 def _dependency_states(project: str, dependencies: Iterable[int]) -> dict[str, dict[str, str]]:
     """{"N": {"state", "updatedAt"}} for each dependency issue, read now. The state must be open
     or closed (anything else is an error, never "closed"); the update time is kept so a
@@ -666,6 +682,9 @@ def _check_request(args: argparse.Namespace) -> int:
     authorizing = bool(args.authorize_labels)
     if args.label and not authorizing:
         raise ValueError("--label only applies with --authorize-labels")
+    continuation = getattr(args, "continuation_pr", "") or ""
+    if continuation and not authorizing:
+        raise ValueError("--continuation-pr only applies with --authorize-labels")
     if args.base:
         base = _verified_base(args.repository, args.project, args.base)
         policy = _committed_policy(args.repository, base, args.config, args.base)
@@ -688,10 +707,14 @@ def _check_request(args: argparse.Namespace) -> int:
             break
         # Codex 4243193102: a PR opened (or linked) for the issue since the claim is work this
         # push would duplicate. The open-PR inventory is read with each snapshot, and is part of
-        # what must hold still between the two reads.
+        # what must hold still between the two reads. The unit's OWN pull request — named by
+        # --continuation-pr — is tolerated, so review and repair stay authorizable after the
+        # draft PR publishes (the ordering the harness plane supports); every other open PR
+        # still refuses.
         prs = _open_pr_keys(args.project, args.issue)
-        if prs:
-            code, message = _refuse_open_prs(args.issue, prs, result)
+        blocking = [key for key in prs if not _continuation_allows(key, continuation)]
+        if blocking:
+            code, message = _refuse_open_prs(args.issue, blocking, result)
             break
         # The dependencies are part of the snapshot (Codex 4242373526): one reopened between
         # the reads is a change like any other, judged afresh on the next attempt.
@@ -702,9 +725,14 @@ def _check_request(args: argparse.Namespace) -> int:
         after = _issue_snapshot(again, issue_events(args.project, args.issue, run_gh))
         after["dependencies"] = _dependency_states(args.project, result["dependencies"])
         after["open pull requests"] = _open_pr_keys(args.project, args.issue)
-        if after["open pull requests"]:
+        blocking_after = [
+            key
+            for key in after["open pull requests"]
+            if not _continuation_allows(key, continuation)
+        ]
+        if blocking_after:
             _status(f"#{args.issue} gained an open pull request while it was checked")
-            code, message = _refuse_open_prs(args.issue, after["open pull requests"], result)
+            code, message = _refuse_open_prs(args.issue, blocking_after, result)
             break
         if before == after:
             result["stable"] = {"updatedAt": after["updated_at"], "attempts": attempt}
@@ -727,6 +755,11 @@ def _check_request(args: argparse.Namespace) -> int:
             f"UNSTABLE: #{args.issue} changed during each of {CHECK_REQUEST_ATTEMPTS} checks "
             f"({', '.join(moved)}); not concluding"
         )
+    if continuation:
+        # The tolerance is part of what the result attests: dispatch refuses
+        # a continuation authorization for a fresh implementation, which is
+        # exactly the duplicate work the open-PR refusal exists to prevent.
+        result["continuationPullRequest"] = continuation
     # When the judgement was made, for consumers that must refuse stale
     # authorization: labels, dependencies, and pull requests all move after
     # a check, so the result's age is part of what it attests.
@@ -1334,6 +1367,21 @@ def _check_dispatch_authorization(args: argparse.Namespace, policy, packet) -> N
         raise ContextBuilderError(
             f"the authorization result names {work_ref}, not the packet's "
             f"work item {packet.work_ref}; authorize the dispatched work item"
+        )
+    # A continuation authorization tolerated the unit's OWN open pull request
+    # so post-publication review and repair stay dispatchable; a fresh
+    # implementation under one would duplicate exactly the work the open-PR
+    # refusal exists to prevent.
+    if (
+        document.get("continuationPullRequest")
+        and packet.role != "reviewer"
+        and getattr(args, "run_kind", None) != "repair"
+    ):
+        raise ContextBuilderError(
+            "the authorization result is a continuation (it tolerates the "
+            "unit's own open pull request); an implementation dispatch "
+            "requires a fresh check-request authorization without "
+            "--continuation-pr"
         )
     # The verdict must cover the POLICY's approval set, not a caller-selected
     # one: `check-request --authorize-labels --label harmless` reports ready
@@ -3315,6 +3363,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="with --authorize-labels: a label of the approval set (repeat for each; the first "
         "is the approval label); default: the implementation, ready and human-review labels "
         "of the policy (as committed on --base when given)",
+    )
+    check_request.add_argument(
+        "--continuation-pr",
+        help="with --authorize-labels: tolerate exactly this open pull request (its inventory "
+        "URL or bare number) — the unit's own PR — so review and repair stay authorizable "
+        "after the draft publishes; any other open PR still refuses, and dispatch accepts "
+        "the resulting continuation authorization only for reviewer or repair runs",
     )
     check_request.add_argument("--output")
     check_request.add_argument(

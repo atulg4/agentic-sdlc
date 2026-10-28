@@ -198,6 +198,18 @@ def test_series_patch_disables_signature_helpers(tmp_path: Path) -> None:
     patch = collect_series_patch(repo, base, head)
     assert b"+two" in patch
     assert not marker.exists()
+    # --no-show-signature does not cover a signature requested by the FORMAT:
+    # a repository-local `format.pretty = %G?` makes a bare log verify
+    # anyway, executing the candidate's gpg.program on the host, so the
+    # series patch pins the format instead of inheriting the candidate's.
+    _git(repo, "config", "--unset", "log.showSignature")
+    _git(repo, "config", "format.pretty", "%G?")
+    subprocess.run(["git", "log", "-1"], cwd=repo, check=True, capture_output=True)
+    assert marker.exists()
+    marker.unlink()
+    patch = collect_series_patch(repo, base, head)
+    assert b"+two" in patch
+    assert not marker.exists()
 
 
 def test_series_patch_forces_textual_rendering(tmp_path: Path) -> None:

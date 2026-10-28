@@ -3283,6 +3283,21 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
     matching_history = tmp_path / "matching-history.json"
     matching_history.write_text(json.dumps(_attested(matching_state)), encoding="utf-8")
     assert cli_main([*dispatch_at_head, "--history", str(matching_history)]) == 0
+    # A CONTINUATION authorization — check-request ran with --continuation-pr
+    # naming the unit's own open PR — authorizes the post-publication review,
+    # so the unit stays reviewable after its draft PR opens and the original
+    # authorization expires.
+    continuation_authorization = _authorization(
+        tmp_path / "continuation-authorization.json",
+        "P1: a bounded change",
+        valid_body,
+        continuationPullRequest="https://x/pr/20",
+    )
+    continued = list(dispatch_at_head)
+    continued[continued.index(str(tmp_path / "review-authorization.json"))] = str(
+        continuation_authorization
+    )
+    assert cli_main([*continued, "--history", str(matching_history)]) == 0
     # With NO recorded report digest the carried findings are caller-authored
     # — no reviewer ever attested them — so the dispatch refuses rather than
     # rendering a fabricated report into the prompt.
@@ -3557,6 +3572,19 @@ def test_dispatch_packet_enforces_task_policy(tmp_path, policy_file, valid_body,
         == 0
     )
     assert json.loads(envelope_path.read_text(encoding="utf-8"))["agentId"] == "codex-1"
+    # A CONTINUATION authorization tolerated the unit's own open PR: it
+    # authorizes post-publication review and repair, never a fresh
+    # implementation — which would duplicate exactly the work the open-PR
+    # refusal exists to prevent.
+    continuation = _authorization(
+        tmp_path / "continuation-authorization.json",
+        "P1: a bounded change",
+        valid_body,
+        continuationPullRequest="https://x/pr/20",
+    )
+    capsys.readouterr()
+    assert cli_main(["dispatch-packet", *base, *history, "--authorization", str(continuation)]) == 2
+    assert "requires a fresh check-request authorization" in capsys.readouterr().err
     # The freshness ceiling only NARROWS: a caller holding a stale signed
     # result must not widen the window to restore the replay checkedAt
     # exists to prevent.
