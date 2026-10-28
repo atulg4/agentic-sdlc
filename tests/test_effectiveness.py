@@ -761,13 +761,20 @@ def test_learnings_are_reported_as_advisory_in_the_report() -> None:
 def test_an_outcome_is_completed_as_the_work_unit_progresses() -> None:
     ledger = EffectivenessLedger()
     outcome_id = outcome_id_for("alpha", "github:example/alpha:issue:1", "v0.2.0")
+    intake_refs = WorkUnitRef(
+        project_id="alpha",
+        work_unit_id="github:example/alpha:issue:1",
+        repository="example/alpha",
+        issue_ref="example/alpha#1",
+    )
     ledger.append(
         OutcomeRecord(
             outcome_id=outcome_id,
-            work_unit=_work_unit(),
+            # At intake there is an issue but no change request yet.
+            work_unit=intake_refs,
             intended_outcome="Effectiveness scoring",
             recorded_at=T0,
-            provenance=_provenance(),
+            provenance=OutcomeProvenance(source="forge-ci", evidence_refs=("intake.json",)),
             acceptance_criteria=(AcceptanceCriterion(text="value never fabricated"),),
             intake_at=T0,
         )
@@ -775,23 +782,38 @@ def test_an_outcome_is_completed_as_the_work_unit_progresses() -> None:
     ledger.append(
         OutcomeRecord(
             outcome_id=outcome_id,
-            work_unit=_work_unit(),
+            # The merge stage is the first append that knows the change request
+            # and the commit.
+            work_unit=WorkUnitRef(
+                project_id="alpha",
+                work_unit_id="github:example/alpha:issue:1",
+                change_request_ref="example/alpha!118",
+            ),
             intended_outcome="Effectiveness scoring",
             recorded_at=T1,
-            provenance=_provenance(),
+            provenance=OutcomeProvenance(
+                source="merge-workflow",
+                commit_sha="d" * 40,
+                evidence_refs=("gate-report.json",),
+            ),
             result=OutcomeResult.DELIVERED,
             deployment_status=DeploymentStatus.DEPLOYED,
             merged_at=T1,
             first_pass_verification=True,
+            acceptance_criteria=(
+                AcceptanceCriterion(
+                    text="value never fabricated", met=True, evidence_ref="gate-report.json"
+                ),
+            ),
         )
     )
     ledger.append(
         OutcomeRecord(
             outcome_id=outcome_id,
-            work_unit=_work_unit(),
+            work_unit=intake_refs,
             intended_outcome="Effectiveness scoring",
             recorded_at=T2,
-            provenance=_provenance(),
+            provenance=OutcomeProvenance(source="deploy-workflow", release_ref="v0.2.0"),
             deployment_status=DeploymentStatus.VERIFIED,
             live_at=T2,
             observations=(
@@ -817,6 +839,17 @@ def test_an_outcome_is_completed_as_the_work_unit_progresses() -> None:
     assert completed.live_at == T2
     assert completed.time_to_live_seconds == 2 * 86400
     assert [item.observation_id for item in completed.observations] == ["obs-1"]
+    # Linkage and evidence each stage learned are kept, not discarded.
+    assert completed.work_unit.change_request_ref == "example/alpha!118"
+    assert completed.provenance.commit_sha == "d" * 40
+    assert completed.provenance.release_ref == "v0.2.0"
+    assert completed.provenance.evidence_refs == ("intake.json", "gate-report.json")
+    # The outcome's provenance source stays the one that opened it.
+    assert completed.provenance.source == "forge-ci"
+    # The criterion verdict filled at merge survives.
+    assert completed.acceptance_criteria[0].met is True
+    assert completed.acceptance_criteria[0].evidence_ref == "gate-report.json"
+    assert completed.acceptance_criteria_met is True
 
 
 def test_a_recorded_outcome_value_can_never_be_quietly_rewritten() -> None:
@@ -1104,3 +1137,194 @@ def test_the_report_states_its_limitations() -> None:
     assert any("never presented as dollars billed" in line for line in report["limitations"])
     assert any("counted as unobserved" in line for line in report["limitations"])
     assert MonetaryStatus.SUBSCRIPTION.value == "subscription"
+
+
+# -- regressions found by independent review ----------------------------------
+
+
+def test_a_stale_deployment_replay_cannot_undo_a_rollback() -> None:
+    """A deployment advances; a late replay of an earlier stage must not reverse it."""
+    ledger = EffectivenessLedger()
+    ledger.append(_outcome(deployment_status=DeploymentStatus.VERIFIED))
+    ledger.append(_outcome(deployment_status=DeploymentStatus.ROLLED_BACK, rolled_back=None))
+
+    rolled_back = ledger.get(_outcome().outcome_id)
+    assert rolled_back.deployment_status is DeploymentStatus.ROLLED_BACK
+    assert rolled_back.accepted is False
+
+    # Replaying the original verified record would otherwise restore `verified`
+    # and score the rolled-back capability as delivered value again.
+    with pytest.raises(EffectivenessError, match="cannot undo it"):
+        ledger.append(_outcome(deployment_status=DeploymentStatus.VERIFIED))
+
+    assert ledger.get(_outcome().outcome_id).deployment_status is DeploymentStatus.ROLLED_BACK
+    assert ledger.get(_outcome().outcome_id).accepted is False
+
+
+def test_a_deployment_still_advances_through_its_stages() -> None:
+    ledger = EffectivenessLedger()
+    outcome_id = _outcome().outcome_id
+    for status in (
+        DeploymentStatus.NOT_DEPLOYED,
+        DeploymentStatus.DEPLOYING,
+        DeploymentStatus.DEPLOYED,
+        DeploymentStatus.VERIFIED,
+    ):
+        ledger.append(_outcome(deployment_status=status))
+        assert ledger.get(outcome_id).deployment_status is status
+
+    # An unknown status never overwrites a recorded one.
+    ledger.append(_outcome(deployment_status=DeploymentStatus.UNKNOWN))
+    assert ledger.get(outcome_id).deployment_status is DeploymentStatus.VERIFIED
+
+
+def test_later_appends_fill_references_and_provenance_without_overwriting() -> None:
+    ledger = EffectivenessLedger()
+    outcome_id = _outcome().outcome_id
+    ledger.append(
+        _outcome(
+            work_unit=WorkUnitRef(project_id="alpha", work_unit_id="github:example/alpha:issue:1"),
+            provenance=OutcomeProvenance(source="forge-ci", evidence_refs=("intake.json",)),
+        )
+    )
+    ledger.append(
+        _outcome(
+            work_unit=_work_unit(),
+            provenance=OutcomeProvenance(
+                source="deploy-workflow",
+                commit_sha="e" * 40,
+                release_ref="v1.4.0",
+                evidence_refs=("intake.json", "deploy.json"),
+            ),
+        )
+    )
+
+    completed = ledger.get(outcome_id)
+    assert completed.work_unit.change_request_ref == "example/alpha!12"
+    assert completed.work_unit.issue_ref == "example/alpha#1"
+    assert completed.provenance.commit_sha == "e" * 40
+    assert completed.provenance.release_ref == "v1.4.0"
+    # Evidence unions without duplicating.
+    assert completed.provenance.evidence_refs == ("intake.json", "deploy.json")
+
+    with pytest.raises(EffectivenessError, match="change_request_ref is already recorded"):
+        ledger.append(
+            _outcome(
+                work_unit=WorkUnitRef(
+                    project_id="alpha",
+                    work_unit_id="github:example/alpha:issue:1",
+                    change_request_ref="example/alpha!999",
+                )
+            )
+        )
+    with pytest.raises(EffectivenessError, match="commit_sha is already recorded"):
+        ledger.append(_outcome(provenance=OutcomeProvenance(source="x", commit_sha="f" * 40)))
+
+
+def test_criterion_verdicts_and_evidence_survive_an_intake_replay() -> None:
+    ledger = EffectivenessLedger()
+    outcome_id = _outcome().outcome_id
+    unassessed = (
+        AcceptanceCriterion(text="value metrics never fabricate"),
+        AcceptanceCriterion(text="learnings are append-only"),
+    )
+    ledger.append(_outcome(acceptance_criteria=unassessed))
+    ledger.append(
+        _outcome(
+            acceptance_criteria=(
+                AcceptanceCriterion(
+                    text="value metrics never fabricate", met=True, evidence_ref="gate.json"
+                ),
+                AcceptanceCriterion(text="learnings are append-only", met=False),
+            )
+        )
+    )
+
+    # Replaying the unassessed intake record must not erase the verdicts.
+    ledger.append(_outcome(acceptance_criteria=unassessed))
+    criteria = ledger.get(outcome_id).acceptance_criteria
+
+    assert [item.met for item in criteria] == [True, False]
+    assert criteria[0].evidence_ref == "gate.json"
+    assert ledger.get(outcome_id).acceptance_criteria_met is False
+
+    with pytest.raises(EffectivenessError, match="verdict on .* is already recorded"):
+        ledger.append(
+            _outcome(
+                acceptance_criteria=(
+                    AcceptanceCriterion(text="value metrics never fabricate", met=False),
+                    AcceptanceCriterion(text="learnings are append-only", met=False),
+                )
+            )
+        )
+
+
+def test_explicit_reverted_and_rolled_back_states_count_in_the_rates() -> None:
+    """A known failure must not read as an observed zero because a flag was omitted."""
+    sample = (
+        _outcome(release_ref="standing", reverted=False, rolled_back=False),
+        # Both declare the failure through the state alone, with no redundant flag.
+        _outcome(
+            release_ref="reverted",
+            result=OutcomeResult.REVERTED,
+            reverted=None,
+            rolled_back=None,
+        ),
+        _outcome(
+            release_ref="rolled-back",
+            deployment_status=DeploymentStatus.ROLLED_BACK,
+            reverted=None,
+            rolled_back=None,
+        ),
+    )
+
+    quality = build_effectiveness_report(sample)["quality"]
+
+    assert quality["revertRate"]["numerator"] == 1
+    assert quality["revertRate"]["denominator"] == 2
+    assert quality["rollbackRate"]["numerator"] == 1
+    assert quality["rollbackRate"]["denominator"] == 2
+    assert sample[1].was_reverted is True
+    assert sample[2].was_rolled_back is True
+    assert sample[0].was_reverted is False
+
+    # The project comparison reads the same signals.
+    comparison = compare_projects(sample, metric="rollbackRate")
+    assert comparison["projects"]["alpha"]["raw"]["numerator"] == 1
+    assert (
+        compare_projects(sample, metric="revertRate")["projects"]["alpha"]["raw"]["numerator"] == 1
+    )
+
+
+def test_an_unobserved_revert_signal_is_still_unknown() -> None:
+    unassessed = OutcomeRecord(
+        outcome_id=outcome_id_for("alpha", "github:example/alpha:issue:1", "v-none"),
+        work_unit=_work_unit(),
+        intended_outcome="not yet assessed",
+        recorded_at=T2,
+        provenance=_provenance(),
+    )
+
+    assert unassessed.was_reverted is None
+    assert unassessed.was_rolled_back is None
+    quality = build_effectiveness_report((unassessed,))["quality"]
+    assert quality["revertRate"]["status"] == "unknown"
+    assert quality["rollbackRate"]["status"] == "unknown"
+
+
+def test_query_time_bounds_compare_instants_not_strings() -> None:
+    """RFC 3339 offsets do not sort chronologically as text."""
+    ledger = EffectivenessLedger()
+    # 01:00+02:00 is 23:00Z the previous day — earlier than the bound below.
+    ledger.append(_outcome(release_ref="early", recorded_at="2026-10-01T01:00:00+02:00"))
+    ledger.append(_outcome(release_ref="late", recorded_at="2026-10-01T09:00:00Z"))
+
+    after = ledger.query(since="2026-10-01T00:00:00Z")
+    before = ledger.query(until="2026-10-01T00:00:00Z")
+
+    assert [item.provenance.release_ref for item in after] == ["late"]
+    assert [item.provenance.release_ref for item in before] == ["early"]
+    # Fractional seconds compare as instants too.
+    assert len(ledger.query(since="2026-10-01T09:00:00.500Z")) == 0
+    with pytest.raises(EffectivenessError, match="query since"):
+        ledger.query(since="yesterday")

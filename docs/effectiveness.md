@@ -100,9 +100,39 @@ first-class answer, not a gap.
 
 An outcome is learned in stages: intake, then the merge, then the deployment,
 then an observation days later. `EffectivenessLedger.append` fills what was
-unobserved and adds new observations, but a value already recorded can never be
-quietly replaced — a contradicting append fails closed, and so does restating
-an observation differently. Replaying the same record is a no-op.
+unobserved and adds what is new, but a value already recorded can never be
+quietly replaced — a contradicting append fails closed. Replaying the same
+record is a no-op.
+
+Each kind of field is merged on its own terms:
+
+- **Scalars** (`result`, timings, counts, flags) fill once and then freeze.
+- **References and provenance** fill field by field, because at intake there is
+  no change request, commit, release or deployment evidence to record yet. A
+  later append supplies them; evidence references union; a conflicting value for
+  something already recorded fails closed. The provenance `source` stays the one
+  that opened the outcome.
+- **Acceptance criteria** merge per criterion: a verdict or evidence reference
+  filled later is kept, and replaying the unassessed intake record cannot erase
+  it. The criteria text must still match, and a contradicting verdict fails
+  closed.
+- **Deployment status** advances but never walks back. A late replay of an
+  earlier stage — a `verified` record arriving after a `rolled-back` one — is a
+  stale delivery, not news, and is refused rather than allowed to restore
+  `verified` and have the rolled-back capability scored as delivered value
+  again. `rolled-back` is the end of the line for one outcome; a successful
+  redeploy is a new release, and so a new `outcomeId`.
+- **Observations** are added by ID; restating one differently fails closed.
+
+### Reading a revert or a rollback
+
+`result: "reverted"` and `deploymentStatus: "rolled-back"` are themselves the
+observation, so an outcome that declares either counts as reverted or rolled
+back whether or not the redundant boolean flag was also set — otherwise a known
+failure would be excluded from `revertRate` and `rollbackRate` and those rates
+would read as an observed zero. Only an outcome that says neither reads as
+unobserved. `was_reverted` and `was_rolled_back` expose the resolved signal, and
+the project comparison reads the same ones.
 
 ## Learning records
 
@@ -158,6 +188,14 @@ task class are compared as the `unclassified` class rather than dropped.
 Comparable metrics are `acceptedOutcomeRate`, `firstPassVerificationRate`,
 `firstPassReviewAcceptanceRate`, `regressionEscapeRate`, `revertRate` and
 `rollbackRate`.
+
+## Querying
+
+`EffectivenessLedger.query` scopes by project, work unit, task class, result and
+time. Time bounds are compared as **instants**, not as strings: the schema
+accepts any RFC 3339 offset and fractional seconds, and those do not sort
+chronologically as text — `2026-10-01T01:00:00+02:00` is an hour *before*
+`2026-10-01T00:00:00Z`, however the two compare character by character.
 
 ## Relationship to `efficacy.py`
 

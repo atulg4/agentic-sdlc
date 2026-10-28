@@ -44,13 +44,20 @@ import math
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, fields, replace
+from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
 from .capacity_metrics import ObservationWindow
 from .event_ledger import LedgerError, LifecycleStage, WorkUnitRef, load_work_unit_ref
 from .project_registry import EMPTY_PROJECT_REGISTRY, ProjectRegistry
-from .usage_ledger import MonetaryStatus, UsageRecord, UsageResult, parse_timestamp
+from .usage_ledger import (
+    MonetaryStatus,
+    UsageError,
+    UsageRecord,
+    UsageResult,
+    parse_timestamp,
+)
 
 __all__ = [
     "ACCEPTED_RESULTS",
@@ -143,6 +150,20 @@ class DeploymentStatus(StrEnum):
     UNKNOWN = "unknown"
 
 
+#: How far a deployment has got, as a progression. An append may advance this
+#: but never walk it back: a late-arriving earlier record is a stale delivery,
+#: not news. ``rolled-back`` is the end of the line for one outcome — a
+#: successful redeploy is a new release, and so a new ``outcomeId``.
+_DEPLOYMENT_RANK: Mapping[DeploymentStatus, int] = {
+    DeploymentStatus.NOT_APPLICABLE: 0,
+    DeploymentStatus.NOT_DEPLOYED: 0,
+    DeploymentStatus.DEPLOYING: 1,
+    DeploymentStatus.DEPLOYED: 2,
+    DeploymentStatus.VERIFIED: 3,
+    DeploymentStatus.ROLLED_BACK: 4,
+}
+
+
 class ObservationKind(StrEnum):
     """What a post-merge or post-deploy observation observed."""
 
@@ -219,6 +240,14 @@ def _bounded(value: str, label: str) -> str:
 def _timestamp(value: str, label: str) -> str:
     _require(bool(_TIMESTAMP.fullmatch(value)), f"{label} must be an RFC 3339 timestamp: {value!r}")
     return value
+
+
+def _instant(value: str, label: str) -> datetime:
+    """One timestamp as a comparable instant, so offsets cannot reorder history."""
+    try:
+        return parse_timestamp(value, label)
+    except UsageError as error:
+        raise EffectivenessError(f"{label}: {error}") from error
 
 
 def _optional_timestamp(entry: Mapping[str, Any], key: str, label: str) -> str:
@@ -451,6 +480,25 @@ class OutcomeRecord:
         return self.work_unit.work_unit_id
 
     @property
+    def was_reverted(self) -> bool | None:
+        """Whether the change was reverted, from the explicit result or the flag.
+
+        ``result: "reverted"`` is itself the observation, so an outcome that
+        declares it counts as reverted whether or not the redundant flag was
+        also set. Only an outcome that says neither reads as unobserved.
+        """
+        if self.result is OutcomeResult.REVERTED:
+            return True
+        return self.reverted
+
+    @property
+    def was_rolled_back(self) -> bool | None:
+        """Whether the change was rolled back, from the deployment status or the flag."""
+        if self.deployment_status is DeploymentStatus.ROLLED_BACK:
+            return True
+        return self.rolled_back
+
+    @property
     def accepted(self) -> bool:
         """An accepted outcome is delivered and still standing.
 
@@ -459,9 +507,7 @@ class OutcomeRecord:
         """
         if self.result not in ACCEPTED_RESULTS:
             return False
-        if self.reverted or self.rolled_back:
-            return False
-        return self.deployment_status is not DeploymentStatus.ROLLED_BACK
+        return not (self.was_reverted or self.was_rolled_back)
 
     @property
     def has_outcome_data(self) -> bool:
@@ -473,8 +519,8 @@ class OutcomeRecord:
         """Intake to live, in seconds; ``None`` unless both instants were observed."""
         if not self.intake_at or not self.live_at:
             return None
-        start = parse_timestamp(self.intake_at, "outcome record: intakeAt")
-        end = parse_timestamp(self.live_at, "outcome record: liveAt")
+        start = _instant(self.intake_at, "outcome record: intakeAt")
+        end = _instant(self.live_at, "outcome record: liveAt")
         seconds = (end - start).total_seconds()
         _require(seconds >= 0, "outcome record: liveAt precedes intakeAt")
         return int(seconds)
@@ -859,6 +905,76 @@ def _is_unset(name: str, value: Any) -> bool:
     return value == _UNSET[name] if name in _UNSET else value is None
 
 
+def _merge_fields(
+    label: str,
+    stored: Any,
+    incoming: Any,
+    *,
+    skip: tuple[str, ...] = (),
+    keep_first: tuple[str, ...] = (),
+    union: tuple[str, ...] = (),
+) -> Any:
+    """Fill the fields a stored record left empty without overwriting any.
+
+    An outcome is learned in stages, so a later append legitimately supplies the
+    change request, the commit, the release and the evidence that did not exist
+    at intake. Filling those is not rewriting history; replacing a value that
+    was already recorded would be, so it fails closed instead.
+    """
+    updates: dict[str, Any] = {}
+    for item in fields(stored):
+        name = item.name
+        if name in skip or name in keep_first:
+            continue
+        old = getattr(stored, name)
+        new = getattr(incoming, name)
+        if name in union:
+            merged = old + tuple(value for value in new if value not in old)
+            if merged != old:
+                updates[name] = merged
+            continue
+        if not new or new == old:
+            continue
+        _require(
+            not old,
+            f"{label}: {name} is already recorded as {old!r} and cannot be rewritten to {new!r}",
+        )
+        updates[name] = new
+    return replace(stored, **updates) if updates else stored
+
+
+def _merge_criteria(
+    label: str,
+    stored: tuple[AcceptanceCriterion, ...],
+    incoming: tuple[AcceptanceCriterion, ...],
+) -> tuple[AcceptanceCriterion, ...]:
+    """Merge criterion verdicts and evidence, preserving what was recorded."""
+    _require(
+        tuple(item.text for item in stored) == tuple(item.text for item in incoming),
+        f"{label}: acceptance criteria are already recorded and their text cannot be rewritten",
+    )
+    merged = []
+    for old, new in zip(stored, incoming, strict=True):
+        met = old.met
+        if new.met is not None:
+            _require(
+                old.met is None or old.met == new.met,
+                f"{label}: the verdict on {old.text!r} is already recorded as "
+                f"{old.met} and cannot be rewritten to {new.met}",
+            )
+            met = new.met
+        evidence = old.evidence_ref
+        if new.evidence_ref:
+            _require(
+                not old.evidence_ref or old.evidence_ref == new.evidence_ref,
+                f"{label}: the evidence for {old.text!r} is already recorded as "
+                f"{old.evidence_ref!r} and cannot be rewritten",
+            )
+            evidence = new.evidence_ref
+        merged.append(AcceptanceCriterion(text=old.text, met=met, evidence_ref=evidence))
+    return tuple(merged)
+
+
 class EffectivenessLedger:
     """Outcome records across every Forge project, immutable once observed.
 
@@ -937,17 +1053,52 @@ class EffectivenessLedger:
                 f"{existing.result.value} and cannot be rewritten to {incoming.result.value}",
             )
             updates["result"] = incoming.result
-        if incoming.deployment_status is not DeploymentStatus.UNKNOWN:
-            updates["deployment_status"] = incoming.deployment_status
+        if (
+            incoming.deployment_status is not DeploymentStatus.UNKNOWN
+            and incoming.deployment_status is not existing.deployment_status
+        ):
+            if existing.deployment_status is DeploymentStatus.UNKNOWN:
+                updates["deployment_status"] = incoming.deployment_status
+            else:
+                # A deployment advances; it never un-advances. A late replay of an
+                # earlier stage must not raise a rolled-back outcome back to
+                # verified and have it scored as delivered value again.
+                _require(
+                    _DEPLOYMENT_RANK[incoming.deployment_status]
+                    > _DEPLOYMENT_RANK[existing.deployment_status],
+                    f"outcome {existing.outcome_id}: deploymentStatus is already "
+                    f"recorded as {existing.deployment_status.value} and a stale or "
+                    f"contradicting {incoming.deployment_status.value} cannot undo it",
+                )
+                updates["deployment_status"] = incoming.deployment_status
         if incoming.acceptance_criteria:
             if existing.acceptance_criteria:
-                _require(
-                    tuple(item.text for item in existing.acceptance_criteria)
-                    == tuple(item.text for item in incoming.acceptance_criteria),
-                    f"outcome {existing.outcome_id}: acceptance criteria are already "
-                    "recorded and their text cannot be rewritten",
+                merged_criteria = _merge_criteria(
+                    f"outcome {existing.outcome_id}",
+                    existing.acceptance_criteria,
+                    incoming.acceptance_criteria,
                 )
-            updates["acceptance_criteria"] = incoming.acceptance_criteria
+                if merged_criteria != existing.acceptance_criteria:
+                    updates["acceptance_criteria"] = merged_criteria
+            else:
+                updates["acceptance_criteria"] = incoming.acceptance_criteria
+        references = _merge_fields(
+            f"outcome {existing.outcome_id} workUnit",
+            existing.work_unit,
+            incoming.work_unit,
+            skip=("project_id", "work_unit_id"),
+        )
+        if references != existing.work_unit:
+            updates["work_unit"] = references
+        provenance = _merge_fields(
+            f"outcome {existing.outcome_id} provenance",
+            existing.provenance,
+            incoming.provenance,
+            keep_first=("source",),
+            union=("evidence_refs",),
+        )
+        if provenance != existing.provenance:
+            updates["provenance"] = provenance
         known = {item.observation_id: item for item in existing.observations}
         added = []
         for observation in incoming.observations:
@@ -980,9 +1131,16 @@ class EffectivenessLedger:
         since: str | None = None,
         until: str | None = None,
     ) -> tuple[OutcomeRecord, ...]:
-        """Filter outcomes; project scoping is exact so projects never leak."""
+        """Filter outcomes; project scoping is exact so projects never leak.
+
+        Time bounds are compared as instants, not as strings: the schema accepts
+        any RFC 3339 offset and fractional seconds, and those do not sort
+        chronologically as text.
+        """
         scope = _scope(project_id, project_ids)
         wanted = OutcomeResult(result) if result is not None else None
+        after = _instant(since, "query since") if since is not None else None
+        before = _instant(until, "query until") if until is not None else None
         return tuple(
             record
             for record in self.records
@@ -990,8 +1148,8 @@ class EffectivenessLedger:
             and (work_unit_id is None or record.work_unit_id == work_unit_id)
             and (task_class is None or record.task_class == task_class)
             and (wanted is None or record.result is wanted)
-            and (since is None or record.recorded_at >= since)
-            and (until is None or record.recorded_at <= until)
+            and (after is None or _instant(record.recorded_at, "recordedAt") >= after)
+            and (before is None or _instant(record.recorded_at, "recordedAt") <= before)
         )
 
     def project_ids(self) -> tuple[str, ...]:
@@ -1538,8 +1696,8 @@ def _quality_report(outcomes: Sequence[OutcomeRecord]) -> dict[str, Any]:
         ),
         "regressionEscapeRate": _flag_rate("regressionEscapeRate", outcomes, "regression_escaped"),
         "reopenRate": _flag_rate("reopenRate", outcomes, "reopened"),
-        "revertRate": _flag_rate("revertRate", outcomes, "reverted"),
-        "rollbackRate": _flag_rate("rollbackRate", outcomes, "rolled_back"),
+        "revertRate": _flag_rate("revertRate", outcomes, "was_reverted"),
+        "rollbackRate": _flag_rate("rollbackRate", outcomes, "was_rolled_back"),
         "defectFollowupRate": _rate(
             "defectFollowupRate",
             sum(
@@ -1690,8 +1848,8 @@ COMPARABLE_METRICS: Mapping[str, str] = {
     "firstPassVerificationRate": "first_pass_verification",
     "firstPassReviewAcceptanceRate": "first_pass_review_accepted",
     "regressionEscapeRate": "regression_escaped",
-    "revertRate": "reverted",
-    "rollbackRate": "rolled_back",
+    "revertRate": "was_reverted",
+    "rollbackRate": "was_rolled_back",
 }
 
 
