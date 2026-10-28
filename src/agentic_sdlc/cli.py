@@ -12,6 +12,7 @@ import re
 import shlex
 import sys
 from collections.abc import Iterable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -22,6 +23,13 @@ from .capacity_metrics import (
     ObservationWindow,
     build_capacity_report,
     load_capacity_inputs,
+)
+from .control_center import (
+    ControlCenterError,
+    build_control_center_snapshot,
+    load_backlog_document,
+    load_incident_document,
+    read_control_center_inputs,
 )
 from .dashboard_efficiency import build_infrastructure_blocker_panel
 from .effectiveness import (
@@ -52,6 +60,16 @@ from .git_diff import (
     committed_path,
     read_committed_file,
     resolve_commit,
+)
+from .github_backlog import (
+    LifecycleLabels,
+    backlog_document_from_issues,
+    canonical_repository,
+    canonical_repository_from_pulls,
+    incident_document,
+    incidents_from_change_requests,
+    incidents_from_issues,
+    parent_links,
 )
 from .infra_recovery import (
     FailureClass,
@@ -166,6 +184,98 @@ def _write(data: Any, output: str | None) -> None:
         Path(output).write_text(rendered, encoding="utf-8")
     else:
         sys.stdout.write(rendered)
+
+
+def _write_group(documents: list[tuple[Any, str | None]]) -> None:
+    """Write a document set as a group: every file target is staged next to
+    its destination before any destination is replaced, and a replacement
+    failure restores the destinations already replaced, so a failure never
+    leaves the set describing two different exports."""
+
+    outputs = [output for _, output in documents]
+    if any(outputs) and not all(outputs):
+        # A stdout member cannot be staged or rolled back: were its write to
+        # fail after the file members were already replaced (their backups
+        # gone), the set on disk would describe two different exports.
+        raise OSError(
+            "grouped outputs must all go to files or all to stdout; "
+            "mixed destinations cannot be written atomically"
+        )
+
+    destinations = {Path(output).resolve() for _, output in documents if output}
+    taken: set[Path] = set()
+
+    def _scratch(destination: Path, tag: str) -> Path:
+        # Staging and backup paths must stay disjoint from every destination
+        # and every existing path, a dangling symlink included: a scratch name
+        # that is secretly a symlink must never be written through or moved.
+        counter = 0
+        while True:
+            candidate = destination.with_name(f"{destination.name}.{tag}-{os.getpid()}-{counter}")
+            resolved = candidate.resolve()
+            if (
+                resolved not in destinations
+                and resolved not in taken
+                and not os.path.lexists(candidate)
+            ):
+                taken.add(resolved)
+                return candidate
+            counter += 1
+
+    staged: list[tuple[Path, Path]] = []
+    try:
+        for data, output in documents:
+            if not output:
+                continue
+            destination = Path(output)
+            if destination.is_dir():
+                raise OSError(f"output names an existing directory: {destination}")
+            temp = _scratch(destination, "staged")
+            # Exclusive creation never follows a pre-created symlink, and the
+            # destination's own mode applies BEFORE any content is written: a
+            # 0600 output is never readable through a loose staging file, a
+            # 0660 shared output stays group-writable after replacement.
+            mode = destination.stat().st_mode & 0o7777 if destination.exists() else 0o666
+            # Tracked before writing, so a failed write is cleaned up too.
+            staged.append((temp, destination))
+            handle = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                if destination.exists():
+                    os.fchmod(handle, mode)
+                stream.write(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    except BaseException:
+        for temp, _ in staged:
+            temp.unlink(missing_ok=True)
+        raise
+    replaced: list[tuple[Path | None, Path]] = []
+    try:
+        for temp, destination in staged:
+            backup: Path | None = None
+            if destination.exists():
+                backup = _scratch(destination, "backup")
+                os.replace(destination, backup)
+            # Track the backup before replacing: a failure between the two
+            # moves must still restore this destination from its backup.
+            replaced.append((backup, destination))
+            os.replace(temp, destination)
+    except BaseException:
+        # Restore every destination this group already replaced, newest
+        # first, then drop the staging litter: the set on disk must read as
+        # one export, the previous one.
+        for backup, destination in reversed(replaced):
+            if backup is not None:
+                os.replace(backup, destination)
+            else:
+                destination.unlink(missing_ok=True)
+        for temp, _ in staged:
+            temp.unlink(missing_ok=True)
+        raise
+    for backup, _ in replaced:
+        if backup is not None:
+            backup.unlink(missing_ok=True)
+    for data, output in documents:
+        if not output:
+            _write(data, None)
 
 
 def _validate_task(args: argparse.Namespace) -> int:
@@ -957,6 +1067,284 @@ def _project_state(args: argparse.Namespace) -> int:
         },
         args.output,
     )
+    return 0
+
+
+def _require_path_not_blank(option: str, supplied: str | None) -> None:
+    """An explicitly supplied empty path is a bad invocation, never "omitted".
+
+    ``--ledger "$LEDGER"`` with an unset shell variable expands to an empty
+    string; silently reading it as an absent option would publish an
+    incomplete or wholly unregistered snapshot instead of surfacing the
+    deployment bug.
+    """
+
+    if supplied is not None and not supplied.strip():
+        raise ControlCenterError(
+            f"{option} was given an empty path; pass a real file or omit the option"
+        )
+
+
+def _require_timestamp_not_blank(option: str, supplied: str | None) -> None:
+    """An explicitly blank timestamp must not silently become "now".
+
+    ``--generated-at "$STAMP"`` with an unset shell variable expands to an
+    empty string; substituting the current time would fabricate temporal
+    provenance instead of surfacing the bad invocation.
+    """
+
+    if supplied is not None and not supplied.strip():
+        raise ControlCenterError(
+            f"{option} was given an empty value; pass a timestamp or omit the option"
+        )
+
+
+def _control_center(args: argparse.Namespace) -> int:
+    _require_path_not_blank("--registry", args.registry)
+    _require_path_not_blank("--ledger", args.ledger)
+    _require_path_not_blank("--output", args.output)
+    for supplied in args.backlog:
+        _require_path_not_blank("--backlog", supplied)
+    for supplied in args.incidents:
+        _require_path_not_blank("--incidents", supplied)
+    registry, backlog, incidents = read_control_center_inputs(
+        registry_path=args.registry,
+        backlog_paths=tuple(args.backlog),
+        incidents_paths=tuple(args.incidents),
+    )
+    projections: tuple[Any, ...] = ()
+    sources: list[str] = []
+    if args.registry:
+        sources.append(f"registry:{args.registry}")
+    if args.ledger:
+        # Load permissively: the snapshot builder itself surfaces projects the
+        # registry does not declare, flagged unregistered rather than rejected.
+        ledger = EventLedger.from_dict(json.loads(Path(args.ledger).read_text(encoding="utf-8")))
+        projections = ledger.projections()
+        sources.append(f"ledger:{args.ledger}")
+    sources.extend(f"backlog:{path}" for path in args.backlog)
+    sources.extend(f"incidents:{path}" for path in args.incidents)
+    if args.output:
+        _require_not_an_input(
+            args.output, [args.registry, args.ledger, *args.backlog, *args.incidents], "--output"
+        )
+    _require_timestamp_not_blank("--generated-at", args.generated_at)
+    generated_at = args.generated_at or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    snapshot = build_control_center_snapshot(
+        generated_at=generated_at,
+        registry=registry,
+        projections=projections,
+        backlog=backlog,
+        incidents=incidents,
+        sources=sources,
+        project_ids=tuple(args.project_id) or None,
+    )
+    # Staged replacement: even an alias the guard could not see (an exotic
+    # link arrangement) is replaced by a fresh inode, never truncated.
+    _write_group([(snapshot.as_document(), args.output)])
+    return 0
+
+
+def _require_not_an_input(output: str, inputs: list[str | None], flag: str) -> None:
+    """Reject an output that IS an input, by path or by inode: a different
+    pathname hard-linked to an input shares its inode, which a resolved-path
+    comparison alone cannot see."""
+
+    resolved = Path(output).resolve()
+    for declared in inputs:
+        if not declared:
+            continue
+        declared_path = Path(declared)
+        same = declared_path.resolve() == resolved
+        if not same and declared_path.exists() and resolved.exists():
+            same = os.path.samefile(declared_path, resolved)
+        if same:
+            raise ControlCenterError(f"{flag} would overwrite an input: {declared}")
+
+
+def _json_file(path: str) -> Any:
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _record_array(value: Any, label: str, *, require_number: bool = False) -> list[dict[str, Any]]:
+    """Require a JSON array whose every element is an object.
+
+    With ``require_number``, each record must also carry an integer ``number``,
+    which the adapter indexes without a fallback.
+    """
+    if not isinstance(value, list):
+        raise ControlCenterError(f"{label} must hold a JSON array")
+    for index, entry in enumerate(value):
+        if not isinstance(entry, dict):
+            raise ControlCenterError(f"{label}[{index}] must be an object")
+        number = entry.get("number")
+        if require_number and (
+            isinstance(number, bool) or not isinstance(number, int) or number <= 0
+        ):
+            raise ControlCenterError(f"{label}[{index}] must carry a positive integer number")
+    return value
+
+
+def _failing_checks(values: list[str]) -> dict[int, str]:
+    """Parse ``--failing NUMBER=check`` pairs the caller read from its CI API."""
+    failing: dict[int, str] = {}
+    for entry in values:
+        number, _, name = entry.partition("=")
+        if not number.strip().isdigit() or not name.strip():
+            raise ControlCenterError(f"--failing expects NUMBER=check-name, got: {entry}")
+        key = int(number)
+        # Repeated flags for one pull aggregate: every failing check is kept.
+        failing[key] = f"{failing[key]}, {name.strip()}" if key in failing else name.strip()
+    return failing
+
+
+def _sub_issue_group(entry: str) -> tuple[Any, int | None]:
+    """Parse a --sub-issues value: ``PARENT=path`` names the parent explicitly,
+    a bare path relies on each child's own parent reference."""
+    number, separator, path = entry.partition("=")
+    if separator and number.strip().isdigit():
+        parent = int(number)
+        if parent <= 0:
+            raise ControlCenterError(f"--sub-issues parent must be a positive number: {entry}")
+        payload = _json_file(path)
+    else:
+        payload, parent = _json_file(entry), None
+    return _record_array(payload, f"--sub-issues ({entry})", require_number=True), parent
+
+
+def _github_backlog(args: argparse.Namespace) -> int:
+    # An unset shell variable expands to an empty string; reading it as an
+    # omitted option would silently use default labels, drop the pulls
+    # classification, discard an output, or redirect it to stdout.
+    _require_path_not_blank("--config", args.config)
+    _require_path_not_blank("--issues", args.issues)
+    _require_path_not_blank("--pulls", args.pulls)
+    _require_path_not_blank("--backlog-output", args.backlog_output)
+    _require_path_not_blank("--incidents-output", args.incidents_output)
+    labels = None
+    if args.config:
+        # The policy can rename the automation labels; the generated workflows
+        # then fire on those names, so the adapter must evaluate the same ones.
+        # The policy must also BE this export's: another repository's labels
+        # (or a non-GitHub policy) would silently misread every issue.
+        policy = load_policy(args.config)
+        if policy.provider != "github":
+            raise ControlCenterError(
+                f"--config names a {policy.provider} policy; this adapter exports GitHub"
+            )
+        if policy.project_id.lower() != args.repository.lower():
+            raise ControlCenterError(
+                f"--config belongs to {policy.project_id}, not --repository {args.repository}"
+            )
+        # The policy's spelling is canonical: the read model joins issue
+        # references by exact string equality, so the export must emit the
+        # same spelling the ledger records carry.
+        args.repository = policy.project_id
+        labels = LifecycleLabels(
+            ready=policy.ready_label,
+            human_review=policy.human_review_label,
+            implementation=policy.implementation_label,
+        )
+    issues = _record_array(_json_file(args.issues), "--issues", require_number=True)
+    # The payloads themselves carry the provider's canonical spelling: with or
+    # without a policy, the export must emit the strings ledger records join.
+    # An empty issues payload cannot supply one, so the pulls payload is the
+    # canonical source then — never the caller's own casing.
+    args.repository = canonical_repository(issues, args.repository)
+    pulls = None
+    if args.pulls:
+        pulls = _record_array(_json_file(args.pulls), "--pulls", require_number=True)
+        if not issues:
+            args.repository = canonical_repository_from_pulls(pulls, args.repository)
+    links = parent_links(
+        *(_sub_issue_group(entry) for entry in args.sub_issues),
+        repository=args.repository,
+    )
+    backlog = backlog_document_from_issues(
+        issues,
+        project_id=args.project_id,
+        repository=args.repository,
+        parents=links,
+        labels=labels,
+    )
+    _require_timestamp_not_blank("--observed-at", args.observed_at)
+    observed_at = args.observed_at or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    groups = [
+        incidents_from_issues(
+            issues,
+            project_id=args.project_id,
+            repository=args.repository,
+            observed_at=observed_at,
+            labels=labels,
+        )
+    ]
+    if args.failing and not args.pulls:
+        raise ControlCenterError("--failing names change-request checks, so it requires --pulls")
+    if pulls is not None:
+        failing = _failing_checks(args.failing)
+        present = {int(pull["number"]) for pull in pulls}
+        missing = sorted(set(failing) - present)
+        if missing:
+            raise ControlCenterError(
+                "--failing names change requests absent from --pulls: "
+                + ", ".join(str(number) for number in missing)
+            )
+        groups.append(
+            incidents_from_change_requests(
+                pulls,
+                project_id=args.project_id,
+                repository=args.repository,
+                observed_at=observed_at,
+                failing=failing,
+            )
+        )
+    if (
+        args.incidents_output
+        and Path(args.incidents_output).resolve() == Path(args.backlog_output or "").resolve()
+    ):
+        raise ControlCenterError("--backlog-output and --incidents-output name the same file")
+    if (args.pulls or args.failing) and not args.incidents_output:
+        # Classified change-request blockers (merge conflicts, behind
+        # branches, failing checks) land in the incident document alone: an
+        # export that validated them and then silently dropped the document
+        # would leave those blockers absent from the next snapshot.
+        raise ControlCenterError(
+            "--pulls and --failing classify change-request incidents, so they "
+            "require --incidents-output"
+        )
+    if any(groups) and not args.incidents_output:
+        # Issue-level incidents (an approved issue missing its dispatch
+        # labels, say) are generated from --issues alone: computing them and
+        # silently dropping the document would leave those blockers absent
+        # from the next snapshot exactly like a dropped change-request
+        # classification, so a nonempty incident group always needs a
+        # destination.
+        raise ControlCenterError(
+            "the issues payload yields incidents, so this export requires "
+            "--incidents-output; without it the generated incident document "
+            "would be dropped"
+        )
+    sub_issue_paths = [
+        entry.partition("=")[2]
+        if "=" in entry and entry.partition("=")[0].strip().isdigit()
+        else entry
+        for entry in args.sub_issues
+    ]
+    input_paths = [args.config, args.issues, args.pulls, *sub_issue_paths]
+    for output in (args.backlog_output, args.incidents_output):
+        if output:
+            _require_not_an_input(output, input_paths, "an output")
+    # Round-trip every generated document through its own loader BEFORE
+    # writing any of them, so a bad input (e.g. a malformed --observed-at)
+    # fails the export without leaving a mismatched pair on disk.
+    load_backlog_document(backlog)
+    incidents_document = incident_document(*groups) if args.incidents_output else None
+    if incidents_document is not None:
+        load_incident_document(incidents_document)
+    documents: list[tuple[Any, str | None]] = [(backlog, args.backlog_output)]
+    if incidents_document is not None:
+        documents.append((incidents_document, args.incidents_output))
+    _write_group(documents)
     return 0
 
 
@@ -1967,6 +2355,29 @@ def build_parser() -> argparse.ArgumentParser:
     project_state.add_argument("--output")
     project_state.set_defaults(handler=_project_state)
 
+    control_center = commands.add_parser("control-center")
+    control_center.add_argument("--registry")
+    control_center.add_argument("--ledger")
+    control_center.add_argument("--backlog", action="append", default=[])
+    control_center.add_argument("--incidents", action="append", default=[])
+    control_center.add_argument("--project-id", action="append", default=[])
+    control_center.add_argument("--generated-at")
+    control_center.add_argument("--output")
+    control_center.set_defaults(handler=_control_center)
+
+    github_backlog = commands.add_parser("github-backlog")
+    github_backlog.add_argument("--config")
+    github_backlog.add_argument("--issues", required=True)
+    github_backlog.add_argument("--project-id", required=True)
+    github_backlog.add_argument("--repository", required=True)
+    github_backlog.add_argument("--sub-issues", action="append", default=[])
+    github_backlog.add_argument("--pulls")
+    github_backlog.add_argument("--failing", action="append", default=[])
+    github_backlog.add_argument("--observed-at")
+    github_backlog.add_argument("--incidents-output")
+    github_backlog.add_argument("--backlog-output")
+    github_backlog.set_defaults(handler=_github_backlog)
+
     record_usage = commands.add_parser("record-usage")
     record_usage.add_argument("--ledger", required=True)
     record_usage.add_argument("--record", required=True)
@@ -2374,6 +2785,7 @@ def main(argv: list[str] | None = None) -> int:
         TaskSpecError,
         ArtifactError,
         CapacityError,
+        ControlCenterError,
         EffectivenessError,
         EventError,
         ExecutorError,

@@ -1378,6 +1378,414 @@ def test_capacity_report_cli_fails_closed(tmp_path: Path) -> None:
     )
 
 
+def test_control_center_joins_registry_backlog_and_incidents(tmp_path):
+    registry = tmp_path / "registry.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "projects": [
+                    {
+                        "projectId": "forge",
+                        "displayName": "Forge",
+                        "defaultBranch": "main",
+                        "repositories": [{"provider": "github", "identifier": "acme/forge"}],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    issues = tmp_path / "issues.json"
+    issues.write_text(
+        json.dumps(
+            [
+                {
+                    "number": 1,
+                    "title": "EPIC: ship it",
+                    "state": "open",
+                    "labels": [
+                        {"name": "implementation-approved"},
+                        {"name": "human-review-required"},
+                    ],
+                    "html_url": "https://github.com/acme/forge/issues/1",
+                    "repository_url": "https://api.github.com/repos/acme/forge",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    backlog = tmp_path / "backlog.json"
+    incidents = tmp_path / "incidents.json"
+    assert (
+        main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+                "--observed-at",
+                "2026-10-11T21:30:00Z",
+                "--backlog-output",
+                str(backlog),
+                "--incidents-output",
+                str(incidents),
+            ]
+        )
+        == 0
+    )
+    snapshot = tmp_path / "snapshot.json"
+    assert (
+        main(
+            [
+                "control-center",
+                "--registry",
+                str(registry),
+                "--backlog",
+                str(backlog),
+                "--incidents",
+                str(incidents),
+                "--generated-at",
+                "2026-10-11T21:30:00Z",
+                "--output",
+                str(snapshot),
+            ]
+        )
+        == 0
+    )
+    document = json.loads(snapshot.read_text(encoding="utf-8"))
+    assert document["schemaVersion"] == 1
+    assert document["snapshotSha256"]
+    project = document["projects"][0]
+    assert project["projectId"] == "forge"
+    assert project["health"] == "blocked"
+    assert project["backlog"][0]["kind"] == "epic"
+    assert project["incidents"][0]["kind"] == "dispatch-blocked"
+    assert project["incidents"][0]["remediations"]
+    assert document["sources"] == [
+        f"registry:{registry}",
+        f"backlog:{backlog}",
+        f"incidents:{incidents}",
+    ]
+
+
+def test_control_center_rejects_an_explicitly_empty_input_path():
+    # An unset shell variable ("--ledger \"$LEDGER\"") expands to an empty
+    # string; that is a bad invocation, never an omitted option.
+    assert main(["control-center", "--ledger", ""]) == 2
+    assert main(["control-center", "--registry", "  "]) == 2
+    assert main(["control-center", "--backlog", ""]) == 2
+    assert main(["control-center", "--incidents", ""]) == 2
+    assert main(["control-center", "--output", ""]) == 2
+    # The GitHub adapter command applies the same rule to its path options.
+    base = ["github-backlog", "--project-id", "forge", "--repository", "acme/forge"]
+    assert main([*base, "--issues", ""]) == 2
+    assert main([*base, "--issues", "x.json", "--config", " "]) == 2
+    assert main([*base, "--issues", "x.json", "--pulls", ""]) == 2
+    assert main([*base, "--issues", "x.json", "--backlog-output", ""]) == 2
+    assert main([*base, "--issues", "x.json", "--incidents-output", " "]) == 2
+    # Blank timestamps must not silently become "now": that would fabricate
+    # temporal provenance instead of surfacing the bad invocation.
+    assert main(["control-center", "--generated-at", ""]) == 2
+    assert main([*base, "--issues", "x.json", "--observed-at", " "]) == 2
+
+
+def test_control_center_rejects_a_malformed_failing_check_pair(tmp_path):
+    issues = tmp_path / "issues.json"
+    issues.write_text(json.dumps([]), encoding="utf-8")
+    pulls = tmp_path / "pulls.json"
+    pulls.write_text(json.dumps([]), encoding="utf-8")
+    assert (
+        main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--pulls",
+                str(pulls),
+                "--failing",
+                "not-a-number",
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+            ]
+        )
+        == 2
+    )
+
+
+def test_control_center_rejects_issues_that_are_not_an_array(tmp_path):
+    issues = tmp_path / "issues.json"
+    issues.write_text(json.dumps({"number": 1}), encoding="utf-8")
+    assert (
+        main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+            ]
+        )
+        == 2
+    )
+
+
+def test_github_backlog_rejects_mixed_output_destinations(tmp_path: Path, capsys) -> None:
+    # A stdout member of a grouped export cannot be staged or rolled back, so
+    # a failure after the file member was replaced would leave a mismatched
+    # set; mixed destinations are refused up front.
+    issues = tmp_path / "issues.json"
+    issues.write_text("[]", encoding="utf-8")
+    incidents_output = tmp_path / "incidents.json"
+    result = main(
+        [
+            "github-backlog",
+            "--issues",
+            str(issues),
+            "--project-id",
+            "forge",
+            "--repository",
+            "acme/forge",
+            "--observed-at",
+            "2026-10-11T21:30:00Z",
+            "--incidents-output",
+            str(incidents_output),
+        ]
+    )
+    assert result == 2
+    assert "mixed destinations" in capsys.readouterr().err
+    assert not incidents_output.exists()
+
+
+def test_github_backlog_failing_requires_an_incident_destination(tmp_path, capsys):
+    import json
+
+    from agentic_sdlc.cli import main as cli_main
+
+    issues = tmp_path / "issues.json"
+    issues.write_text(json.dumps([]), encoding="utf-8")
+    pulls = tmp_path / "pulls.json"
+    pulls.write_text(
+        json.dumps(
+            [
+                {
+                    "number": 7,
+                    "title": "A change",
+                    "state": "open",
+                    "draft": False,
+                    "mergeable_state": "dirty",
+                    "base": {"repo": {"full_name": "acme/forge"}},
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        cli_main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--pulls",
+                str(pulls),
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+                "--observed-at",
+                "2026-10-12T10:30:00Z",
+                "--failing",
+                "7=test",
+                "--backlog-output",
+                str(tmp_path / "backlog.json"),
+            ]
+        )
+        == 2
+    )
+    assert "require --incidents-output" in capsys.readouterr().err
+
+
+def test_github_backlog_issue_incidents_require_a_destination(tmp_path, capsys):
+    # Issue-level incidents are generated from --issues alone: an export
+    # computing a nonempty incident group without --incidents-output would
+    # silently drop the blockers, so it refuses instead.
+    import json
+
+    from agentic_sdlc.cli import main as cli_main
+
+    issues = tmp_path / "issues.json"
+    issues.write_text(
+        json.dumps(
+            [
+                {
+                    "number": 11,
+                    "title": "Approved but undispatchable",
+                    "state": "open",
+                    "repository_url": "https://api.github.com/repos/acme/forge",
+                    # Approved for implementation with neither dispatch label:
+                    # exactly the approved-without-dispatch-labels incident.
+                    "labels": [{"name": "implementation-approved"}],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    argv = [
+        "github-backlog",
+        "--issues",
+        str(issues),
+        "--project-id",
+        "forge",
+        "--repository",
+        "acme/forge",
+        "--observed-at",
+        "2026-10-12T10:30:00Z",
+        "--backlog-output",
+        str(tmp_path / "backlog.json"),
+    ]
+    assert cli_main(argv) == 2
+    err = capsys.readouterr().err
+    assert "requires --incidents-output" in err
+    assert "would be dropped" in err
+    # With the destination the same export succeeds and keeps the incident.
+    assert cli_main([*argv, "--incidents-output", str(tmp_path / "incidents.json")]) == 0
+    incidents = json.loads((tmp_path / "incidents.json").read_text(encoding="utf-8"))
+    assert any(
+        entry["incidentId"].endswith("approved-without-dispatch-labels")
+        for entry in incidents["incidents"]
+    )
+
+
+def test_github_backlog_withholds_credentialed_urls_from_errors(tmp_path, capsys):
+    # Rejection messages reach stderr and CI logs: a malformed URL embedding
+    # userinfo must not echo the credential.
+    import json
+
+    from agentic_sdlc.cli import main as cli_main
+
+    issues = tmp_path / "issues.json"
+    issues.write_text(
+        json.dumps(
+            [
+                {
+                    "number": 11,
+                    "title": "A task",
+                    "state": "open",
+                    "repository_url": "https://user:hunter2secret@api.github.com/repos/acme/forge",
+                    "labels": [],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        cli_main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+                "--observed-at",
+                "2026-10-12T10:30:00Z",
+                "--backlog-output",
+                str(tmp_path / "backlog.json"),
+            ]
+        )
+        == 2
+    )
+    err = capsys.readouterr().err
+    assert "hunter2secret" not in err
+    assert "withheld" in err
+    # A query-string credential rides inside what a looser pattern would
+    # capture as the repository NAME; the tightened pattern rejects it and
+    # the withholding covers the echo.
+    issues.write_text(
+        json.dumps(
+            [
+                {
+                    "number": 11,
+                    "title": "A task",
+                    "state": "open",
+                    "repository_url": (
+                        "https://api.github.com/repos/acme/forge?access_token=hunter2qs"
+                    ),
+                    "labels": [],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        cli_main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+                "--observed-at",
+                "2026-10-12T10:30:00Z",
+                "--backlog-output",
+                str(tmp_path / "backlog.json"),
+            ]
+        )
+        == 2
+    )
+    err = capsys.readouterr().err
+    assert "hunter2qs" not in err
+    # A real token SHAPE under an innocuous parameter name names no
+    # credential word, yet IS the credential: withheld by prefix.
+    issues.write_text(
+        json.dumps(
+            [
+                {
+                    "number": 11,
+                    "title": "A task",
+                    "state": "open",
+                    "repository_url": (
+                        "https://api.github.com/repos/acme/forge?x=ghp_0123456789abcdefghij000"
+                    ),
+                    "labels": [],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        cli_main(
+            [
+                "github-backlog",
+                "--issues",
+                str(issues),
+                "--project-id",
+                "forge",
+                "--repository",
+                "acme/forge",
+                "--observed-at",
+                "2026-10-12T10:30:00Z",
+                "--backlog-output",
+                str(tmp_path / "backlog.json"),
+            ]
+        )
+        == 2
+    )
+    err = capsys.readouterr().err
+    assert "ghp_0123456789" not in err
+    assert "withheld" in err
+
+
 def _outcome_document(
     release_ref: str,
     *,
