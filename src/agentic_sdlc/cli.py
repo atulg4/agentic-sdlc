@@ -1868,8 +1868,9 @@ def _dispatch_packet(args: argparse.Namespace) -> int:
         ):
             raise ContextBuilderError(
                 "reviewer dispatch requires the derived gates to pass: the "
-                "gate report's aggregate is false, so route the unit through "
-                "repair instead of review"
+                "gate report's aggregate is false, so record the failed "
+                "verification (orchestrate --action verification) to route "
+                "the unit back to repair instead of review"
             )
     if args.packet:
         artifact = json.loads(Path(args.packet).read_text(encoding="utf-8"))

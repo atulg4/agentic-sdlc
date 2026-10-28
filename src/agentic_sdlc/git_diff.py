@@ -485,6 +485,12 @@ def collect_series_patch(repository: str | Path, base: str, head: str) -> bytes:
             "--text",
             "--binary",
             "--full-index",
+            # A repository-local `diff.ignoreSubmodules = all` would omit a
+            # gitlink change from the patch entirely, concealing the
+            # dependency revision the series introduces while the diff
+            # summary still names the path — the same override `_run` gives
+            # every `git diff`, which `git log --patch` does not inherit.
+            "--ignore-submodules=none",
             "--patch",
             "--reverse",
             f"{base}..{head}",

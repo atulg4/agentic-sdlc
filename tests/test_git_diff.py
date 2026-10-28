@@ -212,6 +212,35 @@ def test_series_patch_disables_signature_helpers(tmp_path: Path) -> None:
     assert not marker.exists()
 
 
+def test_series_patch_renders_gitlink_changes_despite_config(tmp_path: Path) -> None:
+    # A repository-local `diff.ignoreSubmodules = all` would omit a gitlink
+    # change from the patch entirely, concealing the dependency revision the
+    # series introduces while the diff summary still names the path; the
+    # series patch overrides it exactly like every `git diff` does.
+    from agentic_sdlc.git_diff import collect_series_patch
+
+    repo = tmp_path / "gitlinks"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    (repo / "a.txt").write_text("one\n", encoding="utf-8")
+    _git(repo, "add", "--", ".")
+    _git(repo, "commit", "-qm", "base")
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    _git(repo, "config", "diff.ignoreSubmodules", "all")
+    pinned = "1" * 40
+    _git(repo, "update-index", "--add", "--cacheinfo", f"160000,{pinned},dep")
+    _git(repo, "commit", "-qm", "pin a dependency")
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    patch = collect_series_patch(repo, base, head)
+    assert f"Subproject commit {pinned}".encode() in patch
+
+
 def test_series_patch_forces_textual_rendering(tmp_path: Path) -> None:
     # The candidate's committed .gitattributes is honored by a default diff:
     # a `*.py -diff` rule renders source changes as an opaque "GIT binary

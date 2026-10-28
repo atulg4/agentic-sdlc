@@ -629,8 +629,16 @@ class Orchestrator:
         unit = self.get(unit_id)
         if event_key in unit.event_keys:
             return unit
+        # A FAILED verification is also recordable from re-reviewing: a
+        # completed repair whose derived gates fail must route to another
+        # repair (budget permitting) or to budget-exhaustion blocking through
+        # this authenticated path — no reviewer envelope exists for a failing
+        # head, so no review outcome could authorize those edges. A PASSED
+        # verification in re-reviewing records nothing: the unit is already
+        # awaiting its reviewer.
         _require(
-            unit.state is WorkUnitState.VERIFYING,
+            unit.state is WorkUnitState.VERIFYING
+            or (unit.state is WorkUnitState.RE_REVIEWING and not passed),
             f"verification result requires state verifying, not {unit.state.value}",
         )
         if passed:

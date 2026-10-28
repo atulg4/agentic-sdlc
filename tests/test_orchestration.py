@@ -157,6 +157,38 @@ def test_review_findings_trigger_one_bounded_repair_cycle() -> None:
     assert engine.get("u1").state is WorkUnitState.RE_REVIEWING
 
 
+def test_failed_verification_in_re_reviewing_routes_to_repair_or_blocks() -> None:
+    # A completed repair whose derived gates FAIL has no reviewer envelope —
+    # no review outcome could authorize re-reviewing -> repair-needed — so
+    # the failed verification itself is the authenticated route: another
+    # repair while budget remains, budget-exhaustion blocking after.
+    engine = Orchestrator(max_repair_cycles=2)
+    review_id = _advance_to_reviewing(engine, "u1")
+    engine.record_review("u1", review_id, findings=2, event_key="review-1", timestamp=T)
+    repair = engine.start_run(
+        "u1", "repair", _envelope("codex-1", "repair-agent"), event_key="repair-1", timestamp=T
+    )
+    engine.finish_run("u1", repair.run_id, result="succeeded", timestamp=T, commit_sha="e" * 40)
+    engine.record_repair_complete("u1", event_key="repair-1-done", timestamp=T, actor="codex-1")
+    assert engine.get("u1").state is WorkUnitState.RE_REVIEWING
+    # A PASSED verification records nothing here: the unit already awaits
+    # its reviewer.
+    with pytest.raises(OrchestrationError, match="requires state verifying"):
+        engine.record_verification("u1", passed=True, event_key="v-pass", timestamp=T)
+    engine.record_verification("u1", passed=False, event_key="v-fail", timestamp=T)
+    assert engine.get("u1").state is WorkUnitState.REPAIR_NEEDED
+    # The budget still bounds the loop: a second repair whose gates fail
+    # again blocks instead of looping.
+    second = engine.start_run(
+        "u1", "repair", _envelope("codex-1", "repair-agent"), event_key="repair-2", timestamp=T
+    )
+    engine.finish_run("u1", second.run_id, result="succeeded", timestamp=T, commit_sha="f" * 40)
+    engine.record_repair_complete("u1", event_key="repair-2-done", timestamp=T, actor="codex-1")
+    assert engine.get("u1").state is WorkUnitState.RE_REVIEWING
+    engine.record_verification("u1", passed=False, event_key="v-fail-2", timestamp=T)
+    assert engine.get("u1").state is WorkUnitState.BLOCKED
+
+
 def test_passing_review_does_not_trigger_repair() -> None:
     engine = Orchestrator()
     review_id = _advance_to_reviewing(engine, "u1")

@@ -6,6 +6,7 @@ import base64
 import datetime
 import hashlib
 import json
+import os
 import random
 from pathlib import Path
 
@@ -2651,7 +2652,9 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
         "gateReport"
     ]
     assert wrapped_report["passed"] is True
-    assert wrapped_report["gates"][0]["command"][0] == "/usr/bin/env"
+    # The recorded argv[0] is the RESOLVED path: on runners where
+    # /usr/bin/env is a symlink, realpath is what executes.
+    assert wrapped_report["gates"][0]["command"][0] == os.path.realpath("/usr/bin/env")
     # A bare launcher NAME resolves against the root-only system locations
     # first — strict trust never consults PATH as root, so without them the
     # documented bare form would be unusable on root-based runners — and the
@@ -2685,7 +2688,10 @@ def test_the_cli_derives_reviewer_verification_from_the_candidate(
     )
     bare_report = json.loads(bare_packet.read_text(encoding="utf-8"))["verification"]["gateReport"]
     assert bare_report["passed"] is True
-    assert bare_report["gates"][0]["command"][0] in ("/usr/bin/env", "/bin/env")
+    assert bare_report["gates"][0]["command"][0] in (
+        os.path.realpath("/usr/bin/env"),
+        os.path.realpath("/bin/env"),
+    )
 
     # The review target must be a SEPARATE repository: the candidate itself,
     # a symlink alias of it, and a worktree sharing its object store are all
