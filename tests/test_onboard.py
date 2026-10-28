@@ -2390,6 +2390,13 @@ def test_doctor_rejects_a_ci_gate_whose_failure_is_ignored(tmp_path, mutate):
         ("set -n | cat; pytest", "bash", True),
         # `a && b &` backgrounds the whole and-or list (Codex 4252316108).
         ("true; pytest && true &", "bash", False),
+        # `command -v` only describes its operand; words after `set --` are positional
+        # parameters, never options (Codex 4398454667/4398454653).
+        ('tool=python; command -v "$tool"; pytest | tee out', "bash", True),
+        ('set -- "$PWD"; pytest | tee out', "bash", True),
+        ('set -- "$PWD"; pytest', "bash", True),
+        ("set -o pipefail $x; pytest | tee out", None, False),
+        ('set -e "$x"; pytest', "bash", False),
         # `set -n` behind a redirection; `shopt -q` only queries; a quoted control word as an
         # argument is a plain word (Codex 4253363484/4253363488/4253363470).
         (">/tmp/x set -n; pytest", "bash", False),
@@ -3839,6 +3846,11 @@ def test_doctor_rejects_a_gate_whose_meaning_is_changed(tmp_path, mutate):
         lambda doc, job, step: step.update({"run": "source .venv/bin/activate\n" + step["run"]}),
         lambda doc, job, step: job["steps"].insert(1, {"uses": "actions/cache@v4"}),
         lambda doc, job, step: step.update({"run": "helper() { echo hi; }\n" + step["run"]}),
+        # Codex 4398454667/4398454653
+        lambda doc, job, step: step.update(
+            {"run": 'tool=python; command -v "$tool"\n' + step["run"]}
+        ),
+        lambda doc, job, step: step.update({"run": 'set -- "$PWD"\n' + step["run"]}),
     ],
 )
 def test_doctor_accepts_a_gate_with_benign_surroundings(tmp_path, mutate):

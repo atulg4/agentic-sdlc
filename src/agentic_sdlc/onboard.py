@@ -6635,13 +6635,23 @@ def _effective_command(argv: list[str]) -> list[str]:
     `2>/dev/null`), `time`'s options (`time -p`) and the `builtin`/`command` wrappers with
     theirs."""
     words = list(argv)
+    wrapped = False
     while words:
         head = words[0]
         if head and set(head) <= set("<>&|") and ("<" in head or ">" in head):
             del words[:2]  # the operator and its target
         elif head.isdigit() and len(words) > 1 and set(words[1]) <= set("<>&|"):
             words.pop(0)  # `2` of `2>/dev/null`
-        elif head.startswith("-") or head in _BUILTIN_WRAPPERS:
+        elif head == "--" and wrapped:
+            words.pop(0)
+            break
+        elif head.startswith("-"):
+            if wrapped and set(head[1:]) & {"v", "V"}:
+                # `command -v NAME` only describes NAME, it runs nothing (Codex 4398454667).
+                return []
+            words.pop(0)
+        elif head in _BUILTIN_WRAPPERS:
+            wrapped = True
             words.pop(0)
         else:
             break
@@ -6742,6 +6752,25 @@ def _quotes_a_control_word(line: str) -> bool:
             and (token in _SHELL_CONTROL_WORDS or token == "time" or _ASSIGNMENT_WORD.match(token))
         ):
             command_position = False
+    return False
+
+
+def _set_expands_an_option(arguments: list[str]) -> bool:
+    """Whether an expansion in a `set` call's arguments may become an option: one before
+    `--`, `-` or the first literal operand. After those every word is a positional parameter,
+    so `set -- "$PWD"` changes no option (Codex 4398454653)."""
+    index = 0
+    while index < len(arguments):
+        word = arguments[index]
+        if set(word) & _SHELL_EXPANSION_CHARS:
+            return True
+        if word in {"--", "-"} or len(word) < 2 or word[0] not in "-+":
+            return False
+        if "o" in word[1:]:
+            index += 1  # `-o NAME`: the name is the option's, not an operand
+            if index < len(arguments) and set(arguments[index]) & _SHELL_EXPANSION_CHARS:
+                return True
+        index += 1
     return False
 
 
@@ -6999,7 +7028,7 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                     and (
                         _set_enables_noexec(noexec_arguments)
                         # `set -$x` may expand to `-n` (Codex 4252316079).
-                        or any(set(w) & _SHELL_EXPANSION_CHARS for w in noexec_arguments)
+                        or _set_expands_an_option(noexec_arguments)
                     )
                 ):
                     # `set -n` reads the rest without running it (Codex 4252099381).
@@ -7008,9 +7037,7 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                     invocation = None  # `command -v set ...`: not a call we can read
                 if invocation is not None and wrappers_untrusted and argv[0] in _BUILTIN_WRAPPERS:
                     invocation = None
-                if invocation is not None and any(
-                    set(word) & _SHELL_EXPANSION_CHARS for word in invocation[0]
-                ):
+                if invocation is not None and _set_expands_an_option(invocation[0]):
                     # `set -o pipefail $x`: $x may expand to `+o pipefail`; so may a brace or a
                     # pathname expansion, `+o {pipefail,pipefail}` (Codex 4251046343).
                     invocation = None
