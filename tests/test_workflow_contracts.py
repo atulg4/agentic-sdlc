@@ -73,6 +73,28 @@ def test_implementation_separates_ai_verifier_and_publisher_authority() -> None:
     assert "needs: [prepare, attest_patch]" in publisher
 
 
+def test_publishing_draft_state_is_a_caller_choice_defaulting_to_draft() -> None:
+    document = (WORKFLOWS / "reusable-implement.yml").read_text(encoding="utf-8")
+    publisher = _job(document, "publish_draft")
+
+    # The flag must be a declared input, so a caller whose independent review
+    # gates on `draft == false` can publish ready for review.
+    assert "open_as_draft:" in document
+    assert re.search(r"open_as_draft:\n(?:.*\n)*?\s+default: true\n", document), (
+        "open_as_draft must default to true and keep the existing behaviour"
+    )
+
+    # The publisher must branch on the input rather than hardcoding --draft,
+    # and must read it through env like every other value in that job.
+    assert "OPEN_AS_DRAFT: ${{ inputs.open_as_draft }}" in publisher
+    assert '[ "$OPEN_AS_DRAFT" = "true" ]' in publisher
+    assert "\n            --draft \\\n" not in publisher, "--draft must not be unconditional"
+
+    # The issue comment must not call a ready pull request a draft.
+    assert "Verified ${state}: ${pr_url}" in publisher
+    assert "Verified draft pull request: ${pr_url}" not in publisher
+
+
 def test_claude_subscription_oauth_is_explicit_and_never_silently_falls_back() -> None:
     document = (WORKFLOWS / "reusable-implement.yml").read_text(encoding="utf-8")
     preparer = _job(document, "prepare", "generate_patch")
