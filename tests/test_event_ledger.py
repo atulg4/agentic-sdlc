@@ -165,6 +165,7 @@ def test_future_schema_versions_fail_closed() -> None:
         (lambda doc: doc.update(surprise=1), "unknown keys"),
         (lambda doc: doc.update(apiToken="x"), "must not carry credentials or secrets"),
         (lambda doc: doc.update(stage="teleport"), "unknown stage"),
+        (lambda doc: doc.update(stage="merge"), "disagrees with state"),
         (lambda doc: doc.update(state="orbiting"), "unknown state"),
         (lambda doc: doc.update(occurredAt="yesterday"), "must be an RFC 3339 timestamp"),
         (lambda doc: doc.update(eventId=""), "eventId is required"),
@@ -712,3 +713,25 @@ def test_the_same_work_unit_can_be_migrated_into_two_isolated_projects() -> None
     assert ledger.projection("alpha", unit_id).state is FactoryState.MERGED
     assert ledger.projection("beta", unit_id).state is FactoryState.MERGED
     assert ledger.aggregate()["totals"]["workUnits"] == 2
+
+
+def test_direct_construction_enforces_stage_state_agreement() -> None:
+    # The loader's check alone would let an appended in-process event project
+    # a contradictory pair the console rejects.
+    with pytest.raises(LedgerError, match="disagrees with state"):
+        _event(1, FactoryState.INTAKE, stage=LifecycleStage.MERGE)
+    # dependency-wait stays the one declared exception.
+    _event(1, FactoryState.APPROVED, stage=LifecycleStage.DEPENDENCY_WAIT)
+
+
+def test_direct_construction_coerces_string_stage_and_state():
+    # StrEnum equality lets a valid string pass the agreement check, but
+    # serialization and projection identity checks need the members: both
+    # fields are coerced at construction.
+    from dataclasses import replace
+
+    event = _event(1, FactoryState.INTAKE)
+    direct = replace(event, stage="intake", state="intake")
+    assert direct.stage is LifecycleStage.INTAKE
+    assert direct.state is FactoryState.INTAKE
+    assert direct.as_dict()["stage"] == "intake"

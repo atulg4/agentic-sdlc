@@ -41,6 +41,15 @@ on:
         description: Client ID of the repository-scoped publisher GitHub App
         required: true
         type: string
+      open_as_draft:
+        description: >-
+          Open the change request as a draft. Defaults to true, which is the
+          long-standing behaviour. A caller whose independent review gates on
+          `draft == false` must pass false, because nothing downstream promotes
+          a draft and the review would otherwise never run.
+        required: false
+        default: true
+        type: boolean
       agent:
         description: Patch generator, codex or claude
         required: false
@@ -949,25 +958,35 @@ jobs:
           git commit -m "Implement issue #${ISSUE_NUMBER}"
           git push origin "HEAD:refs/heads/${branch}"
           printf 'branch=%s\n' "$branch" >> "$GITHUB_ENV"
-      - name: Open draft pull request
+      - name: Open pull request
         id: open-pr
         env:
           GH_TOKEN: ${{ steps.publisher-token.outputs.token }}
           ISSUE_NUMBER: ${{ inputs.issue_number }}
+          OPEN_AS_DRAFT: ${{ inputs.open_as_draft }}
         run: |
           set -euo pipefail
           body="$(printf '%s\n\n%s\n\n%s' \
             'Automated patch generated in an isolated AI job and republished only after fresh deterministic verification.' \
             "Closes #${ISSUE_NUMBER}" \
             "Verification run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")"
+          # A caller whose independent review gates on `draft == false` must be
+          # able to publish ready for review, or the review never runs at all.
+          # The empty-array guard keeps `set -u` quiet on bash before 4.4.
+          draft_args=()
+          state='pull request'
+          if [ "$OPEN_AS_DRAFT" = "true" ]; then
+            draft_args+=(--draft)
+            state='draft pull request'
+          fi
           pr_url="$(gh pr create \
-            --draft \
+            ${draft_args[@]+"${draft_args[@]}"} \
             --base "${{ github.event.repository.default_branch }}" \
             --head "$branch" \
             --title "Agent implementation for issue #${ISSUE_NUMBER}" \
             --body "$body")"
           printf 'pr_url=%s\n' "$pr_url" >> "$GITHUB_OUTPUT"
-          gh issue comment "$ISSUE_NUMBER" --body "Verified draft pull request: ${pr_url}"
+          gh issue comment "$ISSUE_NUMBER" --body "Verified ${state}: ${pr_url}"
       # Runs whatever happened above, with a note that says whether a PR was opened. A failure
       # here does not fail the job (the PR stands); lease_released stays unset and
       # release_lease_on_failure retries the release.
