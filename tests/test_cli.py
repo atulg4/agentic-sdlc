@@ -1376,3 +1376,337 @@ def test_capacity_report_cli_fails_closed(tmp_path: Path) -> None:
         )
         == 2
     )
+
+
+def _outcome_document(
+    release_ref: str,
+    *,
+    project_id: str = "alpha",
+    result: str = "delivered",
+    task_class: str = "implementation",
+    **overrides: object,
+) -> dict:
+    document: dict = {
+        "schemaVersion": 1,
+        "outcomeId": f"outcome-{project_id}-{release_ref}",
+        "workUnit": {
+            "projectId": project_id,
+            "workUnitId": f"github:example/{project_id}:issue:1",
+            "changeRequestRef": f"example/{project_id}!12",
+        },
+        "intendedOutcome": "ledger-backed effectiveness scoring",
+        "deliveredCapability": "sdlcctl effectiveness-report",
+        "acceptanceCriteria": [{"text": "value metrics never fabricate", "met": True}],
+        "result": result,
+        "deploymentStatus": "verified",
+        "taskClass": task_class,
+        "firstPassVerification": True,
+        "firstPassReviewAccepted": True,
+        "repairRounds": 0,
+        "reverted": False,
+        "rolledBack": False,
+        "intakeAt": "2026-10-01T09:00:00Z",
+        "mergedAt": "2026-10-01T17:00:00Z",
+        "liveAt": "2026-10-02T09:00:00Z",
+        "recordedAt": "2026-10-02T09:00:00Z",
+        "provenance": {"source": "forge-ci", "releaseRef": release_ref},
+    }
+    document.update(overrides)
+    return document
+
+
+def _learning_document(statement: str, *, kind: str = "delay-cause") -> dict:
+    return {
+        "schemaVersion": 1,
+        "learningId": f"learning-{abs(hash(statement)) % 10**8}",
+        "kind": kind,
+        "statement": statement,
+        "cause": "no deterministic gate caught it before review",
+        "recommendedAdjustment": "add the check to the pre-review gate",
+        "projectId": "alpha",
+        "recordedAt": "2026-10-02T09:00:00Z",
+        "provenance": {"source": "effectiveness-review", "evidenceRefs": ["gate-report.json"]},
+    }
+
+
+def test_record_outcome_cli_completes_an_outcome_idempotently(tmp_path: Path) -> None:
+    outcomes = tmp_path / "outcomes.json"
+    outcome = tmp_path / "outcome.json"
+    registry = tmp_path / "projects.json"
+    output = tmp_path / "record.json"
+    registry.write_text(json.dumps(_registry_document()), encoding="utf-8")
+    command = ["record-outcome", "--outcomes", str(outcomes), "--registry", str(registry)]
+
+    outcome.write_text(
+        json.dumps(_outcome_document("v1", result="unknown", deploymentStatus="deploying")),
+        encoding="utf-8",
+    )
+    assert main([*command, "--outcome", str(outcome)]) == 0
+
+    outcome.write_text(json.dumps(_outcome_document("v1")), encoding="utf-8")
+    assert main([*command, "--outcome", str(outcome), "--output", str(output)]) == 0
+
+    # Replaying the same observation changes nothing.
+    before = outcomes.read_text(encoding="utf-8")
+    assert main([*command, "--outcome", str(outcome)]) == 0
+    assert outcomes.read_text(encoding="utf-8") == before
+
+    stored = json.loads(before)
+    assert len(stored["outcomes"]) == 1
+    assert stored["outcomes"][0]["result"] == "delivered"
+    assert stored["outcomes"][0]["deploymentStatus"] == "verified"
+    assert json.loads(output.read_text(encoding="utf-8"))["accepted"] is True
+
+
+def test_record_outcome_cli_fails_closed(tmp_path: Path) -> None:
+    outcomes = tmp_path / "outcomes.json"
+    outcome = tmp_path / "outcome.json"
+    registry = tmp_path / "projects.json"
+    registry.write_text(json.dumps(_registry_document()), encoding="utf-8")
+
+    outcome.write_text(json.dumps(_outcome_document("v1", project_id="gamma")), encoding="utf-8")
+    assert (
+        main(
+            [
+                "record-outcome",
+                "--outcomes",
+                str(outcomes),
+                "--registry",
+                str(registry),
+                "--outcome",
+                str(outcome),
+            ]
+        )
+        == 2
+    )
+    assert not outcomes.exists()
+
+    outcome.write_text(json.dumps(_outcome_document("v1", result="half")), encoding="utf-8")
+    assert main(["record-outcome", "--outcomes", str(outcomes), "--outcome", str(outcome)]) == 2
+
+
+def test_record_outcome_cli_refuses_to_rewrite_a_recorded_result(tmp_path: Path) -> None:
+    outcomes = tmp_path / "outcomes.json"
+    outcome = tmp_path / "outcome.json"
+    outcome.write_text(json.dumps(_outcome_document("v1")), encoding="utf-8")
+    assert main(["record-outcome", "--outcomes", str(outcomes), "--outcome", str(outcome)]) == 0
+
+    outcome.write_text(
+        json.dumps(_outcome_document("v1", result="not-delivered")), encoding="utf-8"
+    )
+    assert main(["record-outcome", "--outcomes", str(outcomes), "--outcome", str(outcome)]) == 2
+    stored = json.loads(outcomes.read_text(encoding="utf-8"))
+    assert stored["outcomes"][0]["result"] == "delivered"
+
+
+def test_record_learning_cli_is_append_only(tmp_path: Path) -> None:
+    learnings = tmp_path / "learnings.json"
+    learning = tmp_path / "learning.json"
+    document = _learning_document("review keeps flagging missing docstrings")
+    learning.write_text(json.dumps(document), encoding="utf-8")
+    command = ["record-learning", "--learnings", str(learnings), "--learning", str(learning)]
+
+    assert main(command) == 0
+    assert main(command) == 0
+    stored = json.loads(learnings.read_text(encoding="utf-8"))
+    assert len(stored["learnings"]) == 1
+    assert stored["advisory"] is True
+
+    # An in-place rewrite is refused; a revision must supersede it.
+    learning.write_text(json.dumps({**document, "cause": "a different cause"}), encoding="utf-8")
+    assert main(command) == 2
+
+    revision = _learning_document("a ruff docstring rule now covers it")
+    revision["supersedes"] = document["learningId"]
+    learning.write_text(json.dumps(revision), encoding="utf-8")
+    assert main(command) == 0
+    assert len(json.loads(learnings.read_text(encoding="utf-8"))["learnings"]) == 2
+
+
+def test_record_learning_cli_refuses_a_non_advisory_learning(tmp_path: Path) -> None:
+    learnings = tmp_path / "learnings.json"
+    learning = tmp_path / "learning.json"
+    document = _learning_document("routing should change")
+    document["advisory"] = False
+    learning.write_text(json.dumps(document), encoding="utf-8")
+
+    assert (
+        main(["record-learning", "--learnings", str(learnings), "--learning", str(learning)]) == 2
+    )
+
+
+def test_effectiveness_report_cli_scores_outcomes_against_usage(tmp_path: Path) -> None:
+    outcomes = tmp_path / "outcomes.json"
+    outcome = tmp_path / "outcome.json"
+    usage = tmp_path / "usage.json"
+    record = tmp_path / "record.json"
+    learnings = tmp_path / "learnings.json"
+    learning = tmp_path / "learning.json"
+    output = tmp_path / "report.json"
+
+    for release_ref, project_id, result in (
+        ("v1", "alpha", "delivered"),
+        ("v2", "alpha", "reverted"),
+        ("v3", "beta", "delivered"),
+    ):
+        extra = {"reverted": True} if result == "reverted" else {}
+        outcome.write_text(
+            json.dumps(
+                _outcome_document(release_ref, project_id=project_id, result=result, **extra)
+            ),
+            encoding="utf-8",
+        )
+        assert main(["record-outcome", "--outcomes", str(outcomes), "--outcome", str(outcome)]) == 0
+
+    actual = {
+        "tokens": {"input": 400000, "output": 100000, "cacheRead": 0, "cacheWrite": 0},
+        "monetary": {
+            "status": "payg",
+            "pricing": _pricing_document()["pricing"][0],
+            "paygEquivalentUsd": 13.5,
+            "billedUsd": 13.5,
+        },
+        "result": "completed",
+        "runtimeSeconds": 1800,
+    }
+    for run_id, project_id in (("run-1", "alpha"), ("run-2", "beta")):
+        record.write_text(
+            json.dumps(_usage_document(run_id, project_id=project_id, actual=actual)),
+            encoding="utf-8",
+        )
+        assert main(["record-usage", "--ledger", str(usage), "--record", str(record)]) == 0
+
+    learning.write_text(
+        json.dumps(_learning_document("waiting on a dependency dominated the delay")),
+        encoding="utf-8",
+    )
+    assert (
+        main(["record-learning", "--learnings", str(learnings), "--learning", str(learning)]) == 0
+    )
+
+    assert (
+        main(
+            [
+                "effectiveness-report",
+                "--outcomes",
+                str(outcomes),
+                "--usage",
+                str(usage),
+                "--learnings",
+                str(learnings),
+                "--window-start",
+                "2026-10-01T00:00:00Z",
+                "--window-end",
+                "2026-10-03T00:00:00Z",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    report = json.loads(output.read_text(encoding="utf-8"))
+
+    assert report["sampleCount"] == 3
+    assert report["outcomes"]["accepted"] == 2
+    assert report["outcomes"]["byResult"]["reverted"] == 1
+    # Two accepted outcomes over one agent-hour of observed runtime.
+    assert report["value"]["inputs"]["agentHours"] == 1.0
+    assert report["value"]["perAgentHour"]["value"] == 2.0
+    assert report["value"]["perWallClockDay"]["value"] == 1.0
+    assert report["learnings"]["count"] == 1
+    assert report["learnings"]["advisory"] is True
+    assert set(report["byProject"]) == {"alpha", "beta"}
+    assert report["limitations"]
+
+    # A project scope narrows both the outcomes and the effort they are divided by.
+    assert (
+        main(
+            [
+                "effectiveness-report",
+                "--outcomes",
+                str(outcomes),
+                "--usage",
+                str(usage),
+                "--project-id",
+                "beta",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    scoped = json.loads(output.read_text(encoding="utf-8"))
+    assert scoped["sampleCount"] == 1
+    assert set(scoped["byProject"]) == {"beta"}
+    # No window was supplied this time, so wall-clock value is unknown, not zero.
+    assert scoped["value"]["perWallClockDay"]["status"] == "unknown"
+
+
+def test_effectiveness_report_cli_requires_both_window_bounds(tmp_path: Path) -> None:
+    outcomes = tmp_path / "outcomes.json"
+    outcome = tmp_path / "outcome.json"
+    outcome.write_text(json.dumps(_outcome_document("v1")), encoding="utf-8")
+    assert main(["record-outcome", "--outcomes", str(outcomes), "--outcome", str(outcome)]) == 0
+
+    assert (
+        main(
+            [
+                "effectiveness-report",
+                "--outcomes",
+                str(outcomes),
+                "--window-start",
+                "2026-10-01T00:00:00Z",
+            ]
+        )
+        == 2
+    )
+    assert main(["effectiveness-report", "--outcomes", str(tmp_path / "absent.json")]) == 2
+
+
+def test_compare_projects_cli_normalizes_for_task_class_mix(tmp_path: Path) -> None:
+    outcomes = tmp_path / "outcomes.json"
+    outcome = tmp_path / "outcome.json"
+    output = tmp_path / "comparison.json"
+    plan = (
+        ("alpha-1", "alpha", "chore", "delivered"),
+        ("alpha-2", "alpha", "implementation", "not-delivered"),
+        ("beta-1", "beta", "chore", "delivered"),
+        ("beta-2", "beta", "chore", "delivered"),
+    )
+    for release_ref, project_id, task_class, result in plan:
+        outcome.write_text(
+            json.dumps(
+                _outcome_document(
+                    release_ref, project_id=project_id, task_class=task_class, result=result
+                )
+            ),
+            encoding="utf-8",
+        )
+        assert main(["record-outcome", "--outcomes", str(outcomes), "--outcome", str(outcome)]) == 0
+
+    assert main(["compare-projects", "--outcomes", str(outcomes), "--output", str(output)]) == 0
+    comparison = json.loads(output.read_text(encoding="utf-8"))
+
+    assert comparison["metric"] == "acceptedOutcomeRate"
+    assert comparison["pooledTaskClassMix"] == {"chore": 0.75, "implementation": 0.25}
+    assert comparison["projects"]["alpha"]["raw"]["value"] == 0.5
+    assert comparison["projects"]["beta"]["raw"]["value"] == 1.0
+    # beta never worked the hard class, so its comparison is explicitly partial.
+    assert comparison["projects"]["beta"]["normalized"]["status"] == "partial"
+    assert comparison["projects"]["alpha"]["normalized"]["status"] == "observed"
+
+    assert (
+        main(
+            [
+                "compare-projects",
+                "--outcomes",
+                str(outcomes),
+                "--metric",
+                "regressionEscapeRate",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    assert json.loads(output.read_text(encoding="utf-8"))["metric"] == "regressionEscapeRate"
