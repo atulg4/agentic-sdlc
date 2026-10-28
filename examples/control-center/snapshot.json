@@ -1,0 +1,2243 @@
+{
+  "generatedAt": "2026-10-12T10:30:00Z",
+  "projects": [
+    {
+      "active": [],
+      "attention": [],
+      "backlog": [
+        {
+          "children": [],
+          "declaredState": "",
+          "issueRef": "atulg4/agentic-sdlc#140",
+          "itemId": "atulg4/agentic-sdlc#140",
+          "kind": "task",
+          "labels": [],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "unknown",
+          "stateBasis": "state unknown: no ledger events and no declared state",
+          "status": null,
+          "title": "Issue leases: prevent two agents/sessions from implementing the same ticket",
+          "updatedAt": "2026-09-30T05:33:24Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/140",
+          "workUnitId": ""
+        },
+        {
+          "children": [],
+          "declaredState": "approved",
+          "issueRef": "atulg4/agentic-sdlc#132",
+          "itemId": "atulg4/agentic-sdlc#132",
+          "kind": "task",
+          "labels": [
+            "agent-ready",
+            "cloud-ready",
+            "enhancement",
+            "human-review-required",
+            "implementation-approved",
+            "spec-approved",
+            "spec-drafted"
+          ],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "approved",
+          "stateBasis": "state declared by the backlog source",
+          "status": null,
+          "title": "P2: Evaluate Jev reranking of optional context while preserving mandatory evidence and provenance",
+          "updatedAt": "2026-10-12T08:15:46Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/132",
+          "workUnitId": ""
+        },
+        {
+          "children": [],
+          "declaredState": "approved",
+          "issueRef": "atulg4/agentic-sdlc#131",
+          "itemId": "atulg4/agentic-sdlc#131",
+          "kind": "task",
+          "labels": [
+            "agent-ready",
+            "cloud-ready",
+            "enhancement",
+            "human-review-required",
+            "implementation-approved",
+            "spec-approved",
+            "spec-drafted"
+          ],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "approved",
+          "stateBasis": "state declared by the backlog source",
+          "status": null,
+          "title": "P2: Add Jev task and mission-fit advice alongside Forge's deterministic executor router",
+          "updatedAt": "2026-10-12T08:15:45Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/131",
+          "workUnitId": ""
+        },
+        {
+          "children": [],
+          "declaredState": "approved",
+          "issueRef": "atulg4/agentic-sdlc#130",
+          "itemId": "atulg4/agentic-sdlc#130",
+          "kind": "task",
+          "labels": [
+            "agent-ready",
+            "cloud-ready",
+            "enhancement",
+            "human-review-required",
+            "implementation-approved",
+            "spec-approved",
+            "spec-drafted"
+          ],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "approved",
+          "stateBasis": "state declared by the backlog source",
+          "status": null,
+          "title": "P2: Use Jev to advise on unknown failures without changing exact-head retry or repair authority",
+          "updatedAt": "2026-10-12T08:15:43Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/130",
+          "workUnitId": ""
+        },
+        {
+          "children": [],
+          "declaredState": "approved",
+          "issueRef": "atulg4/agentic-sdlc#129",
+          "itemId": "atulg4/agentic-sdlc#129",
+          "kind": "task",
+          "labels": [
+            "agent-ready",
+            "cloud-ready",
+            "enhancement",
+            "human-review-required",
+            "implementation-approved",
+            "spec-approved",
+            "spec-drafted"
+          ],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "approved",
+          "stateBasis": "state declared by the backlog source",
+          "status": null,
+          "title": "P1: Benchmark Jev in shadow mode with calibrated decisions and honest end-to-end cost accounting",
+          "updatedAt": "2026-10-12T08:15:41Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/129",
+          "workUnitId": ""
+        },
+        {
+          "children": [],
+          "declaredState": "approved",
+          "issueRef": "atulg4/agentic-sdlc#128",
+          "itemId": "atulg4/agentic-sdlc#128",
+          "kind": "task",
+          "labels": [
+            "agent-ready",
+            "cloud-ready",
+            "enhancement",
+            "human-review-required",
+            "implementation-approved",
+            "spec-approved",
+            "spec-drafted"
+          ],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "approved",
+          "stateBasis": "state declared by the backlog source",
+          "status": null,
+          "title": "P1: Add an optional Jev decision adapter with strict schemas, egress controls and bounded cost",
+          "updatedAt": "2026-10-12T08:15:40Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/128",
+          "workUnitId": ""
+        },
+        {
+          "children": [],
+          "declaredState": "approved",
+          "issueRef": "atulg4/agentic-sdlc#127",
+          "itemId": "atulg4/agentic-sdlc#127",
+          "kind": "epic",
+          "labels": [
+            "agent-ready",
+            "cloud-ready",
+            "enhancement",
+            "human-review-required",
+            "implementation-approved",
+            "spec-approved",
+            "spec-drafted"
+          ],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "approved",
+          "stateBasis": "state declared by the backlog source",
+          "status": null,
+          "title": "EPIC P1: Evaluate Jev as a policy-bounded decision adviser for Forge",
+          "updatedAt": "2026-10-12T08:15:38Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/127",
+          "workUnitId": ""
+        },
+        {
+          "children": [],
+          "declaredState": "approved",
+          "issueRef": "atulg4/agentic-sdlc#121",
+          "itemId": "atulg4/agentic-sdlc#121",
+          "kind": "task",
+          "labels": [
+            "cloud-ready",
+            "human-review-required",
+            "implementation-approved"
+          ],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "approved",
+          "stateBasis": "state declared by the backlog source",
+          "status": null,
+          "title": "P1: Add factory learning loop from planned-vs-actual outcomes",
+          "updatedAt": "2026-09-25T16:53:43Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/121",
+          "workUnitId": ""
+        },
+        {
+          "children": [],
+          "declaredState": "approved",
+          "issueRef": "atulg4/agentic-sdlc#120",
+          "itemId": "atulg4/agentic-sdlc#120",
+          "kind": "task",
+          "labels": [
+            "cloud-ready",
+            "human-review-required",
+            "implementation-approved"
+          ],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "approved",
+          "stateBasis": "state declared by the backlog source",
+          "status": null,
+          "title": "P0: Wire factory plans into autonomous lifecycle dispatch",
+          "updatedAt": "2026-09-25T16:53:45Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/120",
+          "workUnitId": ""
+        },
+        {
+          "children": [],
+          "declaredState": "approved",
+          "issueRef": "atulg4/agentic-sdlc#119",
+          "itemId": "atulg4/agentic-sdlc#119",
+          "kind": "task",
+          "labels": [
+            "cloud-ready",
+            "human-review-required",
+            "implementation-approved"
+          ],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "approved",
+          "stateBasis": "state declared by the backlog source",
+          "status": null,
+          "title": "P0: Add role-aware acceptance review gates for Forge factory runs",
+          "updatedAt": "2026-09-25T16:53:47Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/119",
+          "workUnitId": ""
+        },
+        {
+          "children": [],
+          "declaredState": "approved",
+          "issueRef": "atulg4/agentic-sdlc#118",
+          "itemId": "atulg4/agentic-sdlc#118",
+          "kind": "task",
+          "labels": [
+            "cloud-ready",
+            "human-review-required",
+            "implementation-approved"
+          ],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "approved",
+          "stateBasis": "state declared by the backlog source",
+          "status": null,
+          "title": "P0: Build compact role-specific context packets for factory units",
+          "updatedAt": "2026-09-25T16:53:49Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/118",
+          "workUnitId": ""
+        },
+        {
+          "children": [],
+          "declaredState": "approved",
+          "issueRef": "atulg4/agentic-sdlc#110",
+          "itemId": "atulg4/agentic-sdlc#110",
+          "kind": "epic",
+          "labels": [
+            "agent-ready",
+            "cloud-ready",
+            "human-review-required",
+            "implementation-approved",
+            "spec-approved",
+            "spec-drafted"
+          ],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "approved",
+          "stateBasis": "state declared by the backlog source",
+          "status": null,
+          "title": "EPIC: Launch Marketing Maestro \u2014 AI marketing factory for any Forge-managed product",
+          "updatedAt": "2026-10-12T08:15:37Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/110",
+          "workUnitId": ""
+        },
+        {
+          "children": [
+            {
+              "children": [],
+              "declaredState": "approved",
+              "issueRef": "atulg4/agentic-sdlc#108",
+              "itemId": "atulg4/agentic-sdlc#108",
+              "kind": "task",
+              "labels": [
+                "cloud-ready",
+                "human-review-required",
+                "implementation-approved"
+              ],
+              "parentId": "atulg4/agentic-sdlc#109",
+              "parentMissing": false,
+              "projectId": "forge",
+              "sourceProvider": "github",
+              "state": "approved",
+              "stateBasis": "state declared by the backlog source",
+              "status": null,
+              "title": "P0: Mobile-first, chart-first Forge Control Center UX with real-time JavaScript interactions",
+              "updatedAt": "2026-09-25T16:53:54Z",
+              "url": "https://github.com/atulg4/agentic-sdlc/issues/108",
+              "workUnitId": ""
+            },
+            {
+              "children": [],
+              "declaredState": "approved",
+              "issueRef": "atulg4/agentic-sdlc#107",
+              "itemId": "atulg4/agentic-sdlc#107",
+              "kind": "task",
+              "labels": [
+                "agent-ready",
+                "cloud-ready",
+                "human-review-required",
+                "implementation-approved",
+                "spec-approved",
+                "spec-drafted"
+              ],
+              "parentId": "atulg4/agentic-sdlc#109",
+              "parentMissing": false,
+              "projectId": "forge",
+              "sourceProvider": "github",
+              "state": "approved",
+              "stateBasis": "state declared by the backlog source",
+              "status": null,
+              "title": "P1: Real-time multi-project Forge Control Center with backlog lifecycle, cost and effectiveness views",
+              "updatedAt": "2026-10-12T08:15:34Z",
+              "url": "https://github.com/atulg4/agentic-sdlc/issues/107",
+              "workUnitId": ""
+            },
+            {
+              "children": [],
+              "declaredState": "approved",
+              "issueRef": "atulg4/agentic-sdlc#106",
+              "itemId": "atulg4/agentic-sdlc#106",
+              "kind": "task",
+              "labels": [
+                "agent-ready",
+                "cloud-ready",
+                "human-review-required",
+                "implementation-approved",
+                "spec-approved",
+                "spec-drafted"
+              ],
+              "parentId": "atulg4/agentic-sdlc#109",
+              "parentMissing": false,
+              "projectId": "forge",
+              "sourceProvider": "github",
+              "state": "approved",
+              "stateBasis": "state declared by the backlog source",
+              "status": null,
+              "title": "P1: Outcome effectiveness, learning ledger and value-per-agent-hour scoring",
+              "updatedAt": "2026-10-12T08:15:32Z",
+              "url": "https://github.com/atulg4/agentic-sdlc/issues/106",
+              "workUnitId": ""
+            },
+            {
+              "children": [],
+              "declaredState": "merged",
+              "issueRef": "atulg4/agentic-sdlc#105",
+              "itemId": "atulg4/agentic-sdlc#105",
+              "kind": "task",
+              "labels": [],
+              "parentId": "atulg4/agentic-sdlc#109",
+              "parentMissing": false,
+              "projectId": "forge",
+              "sourceProvider": "github",
+              "state": "merged",
+              "stateBasis": "state declared by the backlog source",
+              "status": null,
+              "title": "P0: Measure agent parallelism, queueing, runner utilization and subscription-capacity efficiency",
+              "updatedAt": "2026-09-22T16:35:33Z",
+              "url": "https://github.com/atulg4/agentic-sdlc/issues/105",
+              "workUnitId": ""
+            },
+            {
+              "children": [],
+              "declaredState": "merged",
+              "issueRef": "atulg4/agentic-sdlc#104",
+              "itemId": "atulg4/agentic-sdlc#104",
+              "kind": "task",
+              "labels": [],
+              "parentId": "atulg4/agentic-sdlc#109",
+              "parentMissing": false,
+              "projectId": "forge",
+              "sourceProvider": "github",
+              "state": "merged",
+              "stateBasis": "state declared by the backlog source",
+              "status": null,
+              "title": "P0: Per-agent token, time, model, worker and cost accounting with estimate-vs-actual learning",
+              "updatedAt": "2026-09-22T02:05:59Z",
+              "url": "https://github.com/atulg4/agentic-sdlc/issues/104",
+              "workUnitId": ""
+            },
+            {
+              "children": [],
+              "declaredState": "merged",
+              "issueRef": "atulg4/agentic-sdlc#103",
+              "itemId": "atulg4/agentic-sdlc#103",
+              "kind": "task",
+              "labels": [],
+              "parentId": "atulg4/agentic-sdlc#109",
+              "parentMissing": false,
+              "projectId": "forge",
+              "sourceProvider": "github",
+              "state": "merged",
+              "stateBasis": "state declared by the backlog source",
+              "status": null,
+              "title": "P0: Multi-project Forge project registry and unified lifecycle event ledger",
+              "updatedAt": "2026-09-11T19:17:54Z",
+              "url": "https://github.com/atulg4/agentic-sdlc/issues/103",
+              "workUnitId": ""
+            },
+            {
+              "children": [],
+              "declaredState": "approved",
+              "issueRef": "atulg4/agentic-sdlc#46",
+              "itemId": "atulg4/agentic-sdlc#46",
+              "kind": "task",
+              "labels": [
+                "agent-ready",
+                "cloud-ready",
+                "human-review-required",
+                "implementation-approved",
+                "spec-approved",
+                "spec-drafted"
+              ],
+              "parentId": "atulg4/agentic-sdlc#109",
+              "parentMissing": false,
+              "projectId": "forge",
+              "sourceProvider": "github",
+              "state": "approved",
+              "stateBasis": "state declared by the backlog source",
+              "status": null,
+              "title": "P0: Forge scheduler \u2014 ETA, critical path, parallelism, capacity, and blocking reasons",
+              "updatedAt": "2026-10-12T08:14:57Z",
+              "url": "https://github.com/atulg4/agentic-sdlc/issues/46",
+              "workUnitId": ""
+            },
+            {
+              "children": [],
+              "declaredState": "approved",
+              "issueRef": "atulg4/agentic-sdlc#44",
+              "itemId": "atulg4/agentic-sdlc#44",
+              "kind": "task",
+              "labels": [
+                "agent-ready",
+                "cloud-ready",
+                "human-review-required",
+                "implementation-approved",
+                "spec-approved",
+                "spec-drafted"
+              ],
+              "parentId": "atulg4/agentic-sdlc#109",
+              "parentMissing": false,
+              "projectId": "forge",
+              "sourceProvider": "github",
+              "state": "approved",
+              "stateBasis": "state declared by the backlog source",
+              "status": null,
+              "title": "P1: Forge mobile control plane \u2014 mission status, approvals, budgets, and natural-language steering",
+              "updatedAt": "2026-10-12T08:14:54Z",
+              "url": "https://github.com/atulg4/agentic-sdlc/issues/44",
+              "workUnitId": ""
+            },
+            {
+              "children": [],
+              "declaredState": "approved",
+              "issueRef": "atulg4/agentic-sdlc#43",
+              "itemId": "atulg4/agentic-sdlc#43",
+              "kind": "task",
+              "labels": [
+                "agent-ready",
+                "cloud-ready",
+                "human-review-required",
+                "implementation-approved",
+                "spec-approved",
+                "spec-drafted"
+              ],
+              "parentId": "atulg4/agentic-sdlc#109",
+              "parentMissing": false,
+              "projectId": "forge",
+              "sourceProvider": "github",
+              "state": "approved",
+              "stateBasis": "state declared by the backlog source",
+              "status": null,
+              "title": "P0: Forge planning intelligence \u2014 risk-adaptive frontier planning and independent plan critique",
+              "updatedAt": "2026-10-12T08:14:52Z",
+              "url": "https://github.com/atulg4/agentic-sdlc/issues/43",
+              "workUnitId": ""
+            },
+            {
+              "children": [],
+              "declaredState": "approved",
+              "issueRef": "atulg4/agentic-sdlc#42",
+              "itemId": "atulg4/agentic-sdlc#42",
+              "kind": "task",
+              "labels": [
+                "agent-ready",
+                "cloud-ready",
+                "human-review-required",
+                "implementation-approved",
+                "spec-approved",
+                "spec-drafted"
+              ],
+              "parentId": "atulg4/agentic-sdlc#109",
+              "parentMissing": false,
+              "projectId": "forge",
+              "sourceProvider": "github",
+              "state": "approved",
+              "stateBasis": "state declared by the backlog source",
+              "status": null,
+              "title": "P0: Forge Benchmark Lab \u2014 empirical agent bakeoffs and quality/cost frontier",
+              "updatedAt": "2026-10-12T08:14:51Z",
+              "url": "https://github.com/atulg4/agentic-sdlc/issues/42",
+              "workUnitId": ""
+            },
+            {
+              "children": [],
+              "declaredState": "approved",
+              "issueRef": "atulg4/agentic-sdlc#41",
+              "itemId": "atulg4/agentic-sdlc#41",
+              "kind": "task",
+              "labels": [
+                "agent-ready",
+                "cloud-ready",
+                "human-review-required",
+                "implementation-approved",
+                "spec-approved",
+                "spec-drafted"
+              ],
+              "parentId": "atulg4/agentic-sdlc#109",
+              "parentMissing": false,
+              "projectId": "forge",
+              "sourceProvider": "github",
+              "state": "approved",
+              "stateBasis": "state declared by the backlog source",
+              "status": null,
+              "title": "P0: Forge reliability kernel \u2014 typed failures, retries, checkpoints, and resumable missions",
+              "updatedAt": "2026-10-12T08:14:50Z",
+              "url": "https://github.com/atulg4/agentic-sdlc/issues/41",
+              "workUnitId": ""
+            },
+            {
+              "children": [],
+              "declaredState": "approved",
+              "issueRef": "atulg4/agentic-sdlc#40",
+              "itemId": "atulg4/agentic-sdlc#40",
+              "kind": "task",
+              "labels": [
+                "agent-ready",
+                "cloud-ready",
+                "human-review-required",
+                "implementation-approved",
+                "spec-approved",
+                "spec-drafted"
+              ],
+              "parentId": "atulg4/agentic-sdlc#109",
+              "parentMissing": false,
+              "projectId": "forge",
+              "sourceProvider": "github",
+              "state": "approved",
+              "stateBasis": "state declared by the backlog source",
+              "status": null,
+              "title": "P1: Multi-provider adapters for Vertex, Bedrock, DeepSeek, Kimi and direct APIs",
+              "updatedAt": "2026-10-12T08:14:48Z",
+              "url": "https://github.com/atulg4/agentic-sdlc/issues/40",
+              "workUnitId": ""
+            },
+            {
+              "children": [],
+              "declaredState": "approved",
+              "issueRef": "atulg4/agentic-sdlc#39",
+              "itemId": "atulg4/agentic-sdlc#39",
+              "kind": "task",
+              "labels": [
+                "agent-ready",
+                "cloud-ready",
+                "human-review-required",
+                "implementation-approved",
+                "spec-approved",
+                "spec-drafted"
+              ],
+              "parentId": "atulg4/agentic-sdlc#109",
+              "parentMissing": false,
+              "projectId": "forge",
+              "sourceProvider": "github",
+              "state": "approved",
+              "stateBasis": "state declared by the backlog source",
+              "status": null,
+              "title": "P1: ChatGPT-plan Codex subscription-cloud executor",
+              "updatedAt": "2026-10-12T08:14:47Z",
+              "url": "https://github.com/atulg4/agentic-sdlc/issues/39",
+              "workUnitId": ""
+            },
+            {
+              "children": [],
+              "declaredState": "approved",
+              "issueRef": "atulg4/agentic-sdlc#38",
+              "itemId": "atulg4/agentic-sdlc#38",
+              "kind": "task",
+              "labels": [
+                "agent-ready",
+                "cloud-ready",
+                "human-review-required",
+                "implementation-approved",
+                "spec-approved",
+                "spec-drafted"
+              ],
+              "parentId": "atulg4/agentic-sdlc#109",
+              "parentMissing": false,
+              "projectId": "forge",
+              "sourceProvider": "github",
+              "state": "approved",
+              "stateBasis": "state declared by the backlog source",
+              "status": null,
+              "title": "P0: Quality evidence engine and learning store",
+              "updatedAt": "2026-10-12T08:14:46Z",
+              "url": "https://github.com/atulg4/agentic-sdlc/issues/38",
+              "workUnitId": ""
+            }
+          ],
+          "declaredState": "approved",
+          "issueRef": "atulg4/agentic-sdlc#109",
+          "itemId": "atulg4/agentic-sdlc#109",
+          "kind": "epic",
+          "labels": [
+            "agent-ready",
+            "cloud-ready",
+            "human-review-required",
+            "implementation-approved",
+            "spec-approved",
+            "spec-drafted"
+          ],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "approved",
+          "stateBasis": "state declared by the backlog source",
+          "status": null,
+          "title": "EPIC: Forge as an open, general-purpose AI software factory",
+          "updatedAt": "2026-10-12T08:15:36Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/109",
+          "workUnitId": ""
+        },
+        {
+          "children": [],
+          "declaredState": "merged",
+          "issueRef": "atulg4/agentic-sdlc#91",
+          "itemId": "atulg4/agentic-sdlc#91",
+          "kind": "task",
+          "labels": [],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "merged",
+          "stateBasis": "state declared by the backlog source",
+          "status": null,
+          "title": "Forge defect: deterministic CI failures must enter bounded autonomous repair",
+          "updatedAt": "2026-08-19T15:22:25Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/91",
+          "workUnitId": ""
+        },
+        {
+          "children": [],
+          "declaredState": "merged",
+          "issueRef": "atulg4/agentic-sdlc#90",
+          "itemId": "atulg4/agentic-sdlc#90",
+          "kind": "task",
+          "labels": [
+            "claude-ready",
+            "human-review-required"
+          ],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "merged",
+          "stateBasis": "state declared by the backlog source",
+          "status": null,
+          "title": "Auto-classify and retry transient GitHub infrastructure failures",
+          "updatedAt": "2026-09-11T14:53:11Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/90",
+          "workUnitId": ""
+        },
+        {
+          "children": [],
+          "declaredState": "merged",
+          "issueRef": "atulg4/agentic-sdlc#80",
+          "itemId": "atulg4/agentic-sdlc#80",
+          "kind": "task",
+          "labels": [],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "merged",
+          "stateBasis": "state declared by the backlog source",
+          "status": null,
+          "title": "Forge efficiency: adaptive parallelism and factory throughput metrics",
+          "updatedAt": "2026-08-16T10:12:40Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/80",
+          "workUnitId": ""
+        },
+        {
+          "children": [],
+          "declaredState": "merged",
+          "issueRef": "atulg4/agentic-sdlc#77",
+          "itemId": "atulg4/agentic-sdlc#77",
+          "kind": "task",
+          "labels": [],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "merged",
+          "stateBasis": "state declared by the backlog source",
+          "status": null,
+          "title": "Forge efficiency: event-driven continuation and deterministic pre-review",
+          "updatedAt": "2026-08-16T11:45:03Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/77",
+          "workUnitId": ""
+        },
+        {
+          "children": [],
+          "declaredState": "approved",
+          "issueRef": "atulg4/agentic-sdlc#51",
+          "itemId": "atulg4/agentic-sdlc#51",
+          "kind": "task",
+          "labels": [
+            "agent-ready",
+            "cloud-ready",
+            "human-review-required",
+            "implementation-approved",
+            "spec-approved",
+            "spec-drafted"
+          ],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "approved",
+          "stateBasis": "state declared by the backlog source",
+          "status": null,
+          "title": "P0: Event-driven autonomous intake dispatcher for Forge-managed work",
+          "updatedAt": "2026-10-12T08:15:31Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/51",
+          "workUnitId": ""
+        },
+        {
+          "children": [],
+          "declaredState": "approved",
+          "issueRef": "atulg4/agentic-sdlc#45",
+          "itemId": "atulg4/agentic-sdlc#45",
+          "kind": "task",
+          "labels": [
+            "agent-ready",
+            "cloud-ready",
+            "human-review-required",
+            "implementation-approved",
+            "spec-approved",
+            "spec-drafted"
+          ],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "approved",
+          "stateBasis": "state declared by the backlog source",
+          "status": null,
+          "title": "P0: Forge dashboard \u2014 responsive portfolio, mission progress, quality, cost, and next actions",
+          "updatedAt": "2026-10-12T08:14:55Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/45",
+          "workUnitId": ""
+        },
+        {
+          "children": [],
+          "declaredState": "merged",
+          "issueRef": "atulg4/agentic-sdlc#37",
+          "itemId": "atulg4/agentic-sdlc#37",
+          "kind": "task",
+          "labels": [
+            "human-review-required"
+          ],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "merged",
+          "stateBasis": "state declared by the backlog source",
+          "status": null,
+          "title": "P0: Provider/executor registry and adaptive routing policy",
+          "updatedAt": "2026-09-10T19:59:26Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/37",
+          "workUnitId": ""
+        },
+        {
+          "children": [],
+          "declaredState": "merged",
+          "issueRef": "atulg4/agentic-sdlc#36",
+          "itemId": "atulg4/agentic-sdlc#36",
+          "kind": "task",
+          "labels": [
+            "claude-ready",
+            "human-review-required"
+          ],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "merged",
+          "stateBasis": "state declared by the backlog source",
+          "status": null,
+          "title": "P0: Subscription-backed Claude Code executor using Max/Pro OAuth",
+          "updatedAt": "2026-08-14T18:53:59Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/36",
+          "workUnitId": ""
+        },
+        {
+          "children": [],
+          "declaredState": "approved",
+          "issueRef": "atulg4/agentic-sdlc#35",
+          "itemId": "atulg4/agentic-sdlc#35",
+          "kind": "epic",
+          "labels": [
+            "agent-ready",
+            "cloud-ready",
+            "human-review-required",
+            "implementation-approved",
+            "spec-approved",
+            "spec-drafted"
+          ],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "approved",
+          "stateBasis": "state declared by the backlog source",
+          "status": null,
+          "title": "FORGE Epic: Adaptive intelligence, cloud execution, quality learning, and autonomous governance",
+          "updatedAt": "2026-10-12T08:14:44Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/35",
+          "workUnitId": ""
+        },
+        {
+          "children": [],
+          "declaredState": "approved",
+          "issueRef": "atulg4/agentic-sdlc#33",
+          "itemId": "atulg4/agentic-sdlc#33",
+          "kind": "task",
+          "labels": [
+            "agent-ready",
+            "cloud-ready",
+            "human-review-required",
+            "implementation-approved",
+            "spec-approved",
+            "spec-drafted"
+          ],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "approved",
+          "stateBasis": "state declared by the backlog source",
+          "status": null,
+          "title": "Add explicit implementer model pin and risk-based Sol escalation",
+          "updatedAt": "2026-10-12T08:14:43Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/33",
+          "workUnitId": ""
+        },
+        {
+          "children": [],
+          "declaredState": "approved",
+          "issueRef": "atulg4/agentic-sdlc#22",
+          "itemId": "atulg4/agentic-sdlc#22",
+          "kind": "task",
+          "labels": [
+            "agent-ready",
+            "cloud-ready",
+            "enhancement",
+            "human-review-required",
+            "implementation-approved",
+            "spec-approved",
+            "spec-drafted"
+          ],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "approved",
+          "stateBasis": "state declared by the backlog source",
+          "status": null,
+          "title": "P0: Provider-neutral agent message bus over Pub/Sub-compatible transports",
+          "updatedAt": "2026-10-12T08:14:41Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/22",
+          "workUnitId": ""
+        },
+        {
+          "children": [],
+          "declaredState": "merged",
+          "issueRef": "atulg4/agentic-sdlc#21",
+          "itemId": "atulg4/agentic-sdlc#21",
+          "kind": "task",
+          "labels": [
+            "enhancement"
+          ],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "merged",
+          "stateBasis": "state declared by the backlog source",
+          "status": null,
+          "title": "P1: Built-in efficacy scoring, regression detection, and self-correction loop",
+          "updatedAt": "2026-09-11T06:40:45Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/21",
+          "workUnitId": ""
+        },
+        {
+          "children": [],
+          "declaredState": "merged",
+          "issueRef": "atulg4/agentic-sdlc#20",
+          "itemId": "atulg4/agentic-sdlc#20",
+          "kind": "task",
+          "labels": [
+            "enhancement"
+          ],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "merged",
+          "stateBasis": "state declared by the backlog source",
+          "status": null,
+          "title": "P0: Generic autonomous work intake from SCM, Jira, CI, alerts, and APIs",
+          "updatedAt": "2026-09-11T06:40:44Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/20",
+          "workUnitId": ""
+        },
+        {
+          "children": [],
+          "declaredState": "merged",
+          "issueRef": "atulg4/agentic-sdlc#19",
+          "itemId": "atulg4/agentic-sdlc#19",
+          "kind": "task",
+          "labels": [
+            "enhancement"
+          ],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "merged",
+          "stateBasis": "state declared by the backlog source",
+          "status": null,
+          "title": "P0: Standardized knowledge-source adapters and evidence context packs",
+          "updatedAt": "2026-09-11T06:40:43Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/19",
+          "workUnitId": ""
+        },
+        {
+          "children": [],
+          "declaredState": "merged",
+          "issueRef": "atulg4/agentic-sdlc#18",
+          "itemId": "atulg4/agentic-sdlc#18",
+          "kind": "task",
+          "labels": [
+            "enhancement"
+          ],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "merged",
+          "stateBasis": "state declared by the backlog source",
+          "status": null,
+          "title": "P1: Dependency-aware parallel work graph with isolated agent workspaces",
+          "updatedAt": "2026-09-11T06:40:42Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/18",
+          "workUnitId": ""
+        },
+        {
+          "children": [],
+          "declaredState": "merged",
+          "issueRef": "atulg4/agentic-sdlc#17",
+          "itemId": "atulg4/agentic-sdlc#17",
+          "kind": "task",
+          "labels": [
+            "enhancement"
+          ],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "merged",
+          "stateBasis": "state declared by the backlog source",
+          "status": null,
+          "title": "P0: Versioned agent mission registry and capability-based dispatch",
+          "updatedAt": "2026-08-06T18:56:04Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/17",
+          "workUnitId": ""
+        },
+        {
+          "children": [],
+          "declaredState": "merged",
+          "issueRef": "atulg4/agentic-sdlc#16",
+          "itemId": "atulg4/agentic-sdlc#16",
+          "kind": "task",
+          "labels": [
+            "enhancement"
+          ],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "merged",
+          "stateBasis": "state declared by the backlog source",
+          "status": null,
+          "title": "P0: Generic autonomous multi-agent orchestration state machine",
+          "updatedAt": "2026-09-11T06:40:42Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/16",
+          "workUnitId": ""
+        },
+        {
+          "children": [],
+          "declaredState": "merged",
+          "issueRef": "atulg4/agentic-sdlc#11",
+          "itemId": "atulg4/agentic-sdlc#11",
+          "kind": "task",
+          "labels": [
+            "bug",
+            "github_actions"
+          ],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "merged",
+          "stateBasis": "state declared by the backlog source",
+          "status": null,
+          "title": "Fix pull-request review comment publishing permission",
+          "updatedAt": "2026-08-01T22:46:23Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/11",
+          "workUnitId": ""
+        },
+        {
+          "children": [],
+          "declaredState": "merged",
+          "issueRef": "atulg4/agentic-sdlc#8",
+          "itemId": "atulg4/agentic-sdlc#8",
+          "kind": "task",
+          "labels": [
+            "bug",
+            "github_actions"
+          ],
+          "parentId": "",
+          "parentMissing": false,
+          "projectId": "forge",
+          "sourceProvider": "github",
+          "state": "merged",
+          "stateBasis": "state declared by the backlog source",
+          "status": null,
+          "title": "Fix cross-repository workflow identifier input contract",
+          "updatedAt": "2026-08-01T20:42:55Z",
+          "url": "https://github.com/atulg4/agentic-sdlc/issues/8",
+          "workUnitId": ""
+        }
+      ],
+      "capabilities": [
+        "implementation",
+        "independent-review",
+        "planning",
+        "protected-merge"
+      ],
+      "counts": {
+        "active": 0,
+        "attention": 0,
+        "backlogItems": 46,
+        "blockers": 7,
+        "byStage": {},
+        "byState": {},
+        "dependencyWaitByState": {},
+        "incidents": 34,
+        "workUnits": 0
+      },
+      "defaultBranch": "main",
+      "displayName": "Forge",
+      "environments": [],
+      "group": "platform",
+      "health": "blocked",
+      "incidents": [
+        {
+          "backlogItemId": "atulg4/agentic-sdlc#140",
+          "detail": "Issue leases: prevent two agents/sessions from implementing the same ticket",
+          "evidenceRef": "atulg4/agentic-sdlc#140",
+          "incidentId": "atulg4/agentic-sdlc#140:untriaged",
+          "kind": "triage-needed",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "triage-the-work",
+              "authority": "human-only",
+              "command": "",
+              "description": "No lifecycle label owns this item; decide its stage and label it.",
+              "handoff": "Review the item and give it the lifecycle labels that admit it to a stage (spec review, implementation approval, dispatch).",
+              "title": "Triage the work"
+            }
+          ],
+          "severity": "advisory",
+          "sourceProvider": "github",
+          "summary": "Not triaged: no lifecycle label, so no stage owns this item",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "atulg4/agentic-sdlc#132",
+          "detail": "P2: Evaluate Jev reranking of optional context while preserving mandatory evidence and provenance",
+          "evidenceRef": "atulg4/agentic-sdlc#132",
+          "incidentId": "atulg4/agentic-sdlc#132:eligible-awaiting-dispatch-evidence",
+          "kind": "awaiting-dispatch-evidence",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "confirm-the-run",
+              "authority": "operator",
+              "command": "",
+              "description": "Every precondition label is present; check whether the trigger actually fired.",
+              "handoff": "",
+              "title": "Confirm the run started"
+            },
+            {
+              "actionId": "re-apply-the-trigger-label",
+              "authority": "human-only",
+              "command": "",
+              "description": "The bundled triggers fire only on their label event; re-apply it to re-kick.",
+              "handoff": "Remove and re-add the trigger label the incident's summary names (implementation-approved for the implement trigger and agent-ready for the plan trigger by default; a project policy may rename them) to fire the event again.",
+              "title": "Re-apply the trigger label"
+            }
+          ],
+          "severity": "advisory",
+          "sourceProvider": "github",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "atulg4/agentic-sdlc#131",
+          "detail": "P2: Add Jev task and mission-fit advice alongside Forge's deterministic executor router",
+          "evidenceRef": "atulg4/agentic-sdlc#131",
+          "incidentId": "atulg4/agentic-sdlc#131:eligible-awaiting-dispatch-evidence",
+          "kind": "awaiting-dispatch-evidence",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "confirm-the-run",
+              "authority": "operator",
+              "command": "",
+              "description": "Every precondition label is present; check whether the trigger actually fired.",
+              "handoff": "",
+              "title": "Confirm the run started"
+            },
+            {
+              "actionId": "re-apply-the-trigger-label",
+              "authority": "human-only",
+              "command": "",
+              "description": "The bundled triggers fire only on their label event; re-apply it to re-kick.",
+              "handoff": "Remove and re-add the trigger label the incident's summary names (implementation-approved for the implement trigger and agent-ready for the plan trigger by default; a project policy may rename them) to fire the event again.",
+              "title": "Re-apply the trigger label"
+            }
+          ],
+          "severity": "advisory",
+          "sourceProvider": "github",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "atulg4/agentic-sdlc#130",
+          "detail": "P2: Use Jev to advise on unknown failures without changing exact-head retry or repair authority",
+          "evidenceRef": "atulg4/agentic-sdlc#130",
+          "incidentId": "atulg4/agentic-sdlc#130:eligible-awaiting-dispatch-evidence",
+          "kind": "awaiting-dispatch-evidence",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "confirm-the-run",
+              "authority": "operator",
+              "command": "",
+              "description": "Every precondition label is present; check whether the trigger actually fired.",
+              "handoff": "",
+              "title": "Confirm the run started"
+            },
+            {
+              "actionId": "re-apply-the-trigger-label",
+              "authority": "human-only",
+              "command": "",
+              "description": "The bundled triggers fire only on their label event; re-apply it to re-kick.",
+              "handoff": "Remove and re-add the trigger label the incident's summary names (implementation-approved for the implement trigger and agent-ready for the plan trigger by default; a project policy may rename them) to fire the event again.",
+              "title": "Re-apply the trigger label"
+            }
+          ],
+          "severity": "advisory",
+          "sourceProvider": "github",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "atulg4/agentic-sdlc#129",
+          "detail": "P1: Benchmark Jev in shadow mode with calibrated decisions and honest end-to-end cost accounting",
+          "evidenceRef": "atulg4/agentic-sdlc#129",
+          "incidentId": "atulg4/agentic-sdlc#129:eligible-awaiting-dispatch-evidence",
+          "kind": "awaiting-dispatch-evidence",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "confirm-the-run",
+              "authority": "operator",
+              "command": "",
+              "description": "Every precondition label is present; check whether the trigger actually fired.",
+              "handoff": "",
+              "title": "Confirm the run started"
+            },
+            {
+              "actionId": "re-apply-the-trigger-label",
+              "authority": "human-only",
+              "command": "",
+              "description": "The bundled triggers fire only on their label event; re-apply it to re-kick.",
+              "handoff": "Remove and re-add the trigger label the incident's summary names (implementation-approved for the implement trigger and agent-ready for the plan trigger by default; a project policy may rename them) to fire the event again.",
+              "title": "Re-apply the trigger label"
+            }
+          ],
+          "severity": "advisory",
+          "sourceProvider": "github",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "atulg4/agentic-sdlc#128",
+          "detail": "P1: Add an optional Jev decision adapter with strict schemas, egress controls and bounded cost",
+          "evidenceRef": "atulg4/agentic-sdlc#128",
+          "incidentId": "atulg4/agentic-sdlc#128:eligible-awaiting-dispatch-evidence",
+          "kind": "awaiting-dispatch-evidence",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "confirm-the-run",
+              "authority": "operator",
+              "command": "",
+              "description": "Every precondition label is present; check whether the trigger actually fired.",
+              "handoff": "",
+              "title": "Confirm the run started"
+            },
+            {
+              "actionId": "re-apply-the-trigger-label",
+              "authority": "human-only",
+              "command": "",
+              "description": "The bundled triggers fire only on their label event; re-apply it to re-kick.",
+              "handoff": "Remove and re-add the trigger label the incident's summary names (implementation-approved for the implement trigger and agent-ready for the plan trigger by default; a project policy may rename them) to fire the event again.",
+              "title": "Re-apply the trigger label"
+            }
+          ],
+          "severity": "advisory",
+          "sourceProvider": "github",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "atulg4/agentic-sdlc#127",
+          "detail": "EPIC P1: Evaluate Jev as a policy-bounded decision adviser for Forge",
+          "evidenceRef": "atulg4/agentic-sdlc#127",
+          "incidentId": "atulg4/agentic-sdlc#127:eligible-awaiting-dispatch-evidence",
+          "kind": "awaiting-dispatch-evidence",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "confirm-the-run",
+              "authority": "operator",
+              "command": "",
+              "description": "Every precondition label is present; check whether the trigger actually fired.",
+              "handoff": "",
+              "title": "Confirm the run started"
+            },
+            {
+              "actionId": "re-apply-the-trigger-label",
+              "authority": "human-only",
+              "command": "",
+              "description": "The bundled triggers fire only on their label event; re-apply it to re-kick.",
+              "handoff": "Remove and re-add the trigger label the incident's summary names (implementation-approved for the implement trigger and agent-ready for the plan trigger by default; a project policy may rename them) to fire the event again.",
+              "title": "Re-apply the trigger label"
+            }
+          ],
+          "severity": "advisory",
+          "sourceProvider": "github",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "atulg4/agentic-sdlc#121",
+          "detail": "P1: Add factory learning loop from planned-vs-actual outcomes",
+          "evidenceRef": "atulg4/agentic-sdlc#121",
+          "incidentId": "atulg4/agentic-sdlc#121:approved-without-agent-ready",
+          "kind": "dispatch-blocked",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "complete-dispatch-preconditions",
+              "authority": "human-only",
+              "command": "",
+              "description": "Dispatch is gated on declared labels and an approval; supply the missing one.",
+              "handoff": "Apply the label(s) the incident names as missing - the ready label, the human-review label, or the implementation approval - or record the approval event; approval alone does not restore a missing trigger label.",
+              "title": "Complete the dispatch preconditions"
+            },
+            {
+              "actionId": "re-run-dispatch",
+              "authority": "operator",
+              "command": "sdlcctl dispatch-mission --config agentic-sdlc.toml --mission-id <mission> --agents agents.json --work-ref <work-ref> --prompt prompt.md",
+              "description": "Once preconditions hold, re-dispatch the mission for this work unit.",
+              "handoff": "",
+              "title": "Re-run mission dispatch"
+            }
+          ],
+          "severity": "blocker",
+          "sourceProvider": "github",
+          "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "atulg4/agentic-sdlc#120",
+          "detail": "P0: Wire factory plans into autonomous lifecycle dispatch",
+          "evidenceRef": "atulg4/agentic-sdlc#120",
+          "incidentId": "atulg4/agentic-sdlc#120:approved-without-agent-ready",
+          "kind": "dispatch-blocked",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "complete-dispatch-preconditions",
+              "authority": "human-only",
+              "command": "",
+              "description": "Dispatch is gated on declared labels and an approval; supply the missing one.",
+              "handoff": "Apply the label(s) the incident names as missing - the ready label, the human-review label, or the implementation approval - or record the approval event; approval alone does not restore a missing trigger label.",
+              "title": "Complete the dispatch preconditions"
+            },
+            {
+              "actionId": "re-run-dispatch",
+              "authority": "operator",
+              "command": "sdlcctl dispatch-mission --config agentic-sdlc.toml --mission-id <mission> --agents agents.json --work-ref <work-ref> --prompt prompt.md",
+              "description": "Once preconditions hold, re-dispatch the mission for this work unit.",
+              "handoff": "",
+              "title": "Re-run mission dispatch"
+            }
+          ],
+          "severity": "blocker",
+          "sourceProvider": "github",
+          "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "atulg4/agentic-sdlc#119",
+          "detail": "P0: Add role-aware acceptance review gates for Forge factory runs",
+          "evidenceRef": "atulg4/agentic-sdlc#119",
+          "incidentId": "atulg4/agentic-sdlc#119:approved-without-agent-ready",
+          "kind": "dispatch-blocked",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "complete-dispatch-preconditions",
+              "authority": "human-only",
+              "command": "",
+              "description": "Dispatch is gated on declared labels and an approval; supply the missing one.",
+              "handoff": "Apply the label(s) the incident names as missing - the ready label, the human-review label, or the implementation approval - or record the approval event; approval alone does not restore a missing trigger label.",
+              "title": "Complete the dispatch preconditions"
+            },
+            {
+              "actionId": "re-run-dispatch",
+              "authority": "operator",
+              "command": "sdlcctl dispatch-mission --config agentic-sdlc.toml --mission-id <mission> --agents agents.json --work-ref <work-ref> --prompt prompt.md",
+              "description": "Once preconditions hold, re-dispatch the mission for this work unit.",
+              "handoff": "",
+              "title": "Re-run mission dispatch"
+            }
+          ],
+          "severity": "blocker",
+          "sourceProvider": "github",
+          "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "atulg4/agentic-sdlc#118",
+          "detail": "P0: Build compact role-specific context packets for factory units",
+          "evidenceRef": "atulg4/agentic-sdlc#118",
+          "incidentId": "atulg4/agentic-sdlc#118:approved-without-agent-ready",
+          "kind": "dispatch-blocked",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "complete-dispatch-preconditions",
+              "authority": "human-only",
+              "command": "",
+              "description": "Dispatch is gated on declared labels and an approval; supply the missing one.",
+              "handoff": "Apply the label(s) the incident names as missing - the ready label, the human-review label, or the implementation approval - or record the approval event; approval alone does not restore a missing trigger label.",
+              "title": "Complete the dispatch preconditions"
+            },
+            {
+              "actionId": "re-run-dispatch",
+              "authority": "operator",
+              "command": "sdlcctl dispatch-mission --config agentic-sdlc.toml --mission-id <mission> --agents agents.json --work-ref <work-ref> --prompt prompt.md",
+              "description": "Once preconditions hold, re-dispatch the mission for this work unit.",
+              "handoff": "",
+              "title": "Re-run mission dispatch"
+            }
+          ],
+          "severity": "blocker",
+          "sourceProvider": "github",
+          "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "atulg4/agentic-sdlc#110",
+          "detail": "EPIC: Launch Marketing Maestro \u2014 AI marketing factory for any Forge-managed product",
+          "evidenceRef": "atulg4/agentic-sdlc#110",
+          "incidentId": "atulg4/agentic-sdlc#110:eligible-awaiting-dispatch-evidence",
+          "kind": "awaiting-dispatch-evidence",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "confirm-the-run",
+              "authority": "operator",
+              "command": "",
+              "description": "Every precondition label is present; check whether the trigger actually fired.",
+              "handoff": "",
+              "title": "Confirm the run started"
+            },
+            {
+              "actionId": "re-apply-the-trigger-label",
+              "authority": "human-only",
+              "command": "",
+              "description": "The bundled triggers fire only on their label event; re-apply it to re-kick.",
+              "handoff": "Remove and re-add the trigger label the incident's summary names (implementation-approved for the implement trigger and agent-ready for the plan trigger by default; a project policy may rename them) to fire the event again.",
+              "title": "Re-apply the trigger label"
+            }
+          ],
+          "severity": "advisory",
+          "sourceProvider": "github",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "atulg4/agentic-sdlc#109",
+          "detail": "EPIC: Forge as an open, general-purpose AI software factory",
+          "evidenceRef": "atulg4/agentic-sdlc#109",
+          "incidentId": "atulg4/agentic-sdlc#109:eligible-awaiting-dispatch-evidence",
+          "kind": "awaiting-dispatch-evidence",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "confirm-the-run",
+              "authority": "operator",
+              "command": "",
+              "description": "Every precondition label is present; check whether the trigger actually fired.",
+              "handoff": "",
+              "title": "Confirm the run started"
+            },
+            {
+              "actionId": "re-apply-the-trigger-label",
+              "authority": "human-only",
+              "command": "",
+              "description": "The bundled triggers fire only on their label event; re-apply it to re-kick.",
+              "handoff": "Remove and re-add the trigger label the incident's summary names (implementation-approved for the implement trigger and agent-ready for the plan trigger by default; a project policy may rename them) to fire the event again.",
+              "title": "Re-apply the trigger label"
+            }
+          ],
+          "severity": "advisory",
+          "sourceProvider": "github",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "atulg4/agentic-sdlc#108",
+          "detail": "P0: Mobile-first, chart-first Forge Control Center UX with real-time JavaScript interactions",
+          "evidenceRef": "atulg4/agentic-sdlc#108",
+          "incidentId": "atulg4/agentic-sdlc#108:approved-without-agent-ready",
+          "kind": "dispatch-blocked",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "complete-dispatch-preconditions",
+              "authority": "human-only",
+              "command": "",
+              "description": "Dispatch is gated on declared labels and an approval; supply the missing one.",
+              "handoff": "Apply the label(s) the incident names as missing - the ready label, the human-review label, or the implementation approval - or record the approval event; approval alone does not restore a missing trigger label.",
+              "title": "Complete the dispatch preconditions"
+            },
+            {
+              "actionId": "re-run-dispatch",
+              "authority": "operator",
+              "command": "sdlcctl dispatch-mission --config agentic-sdlc.toml --mission-id <mission> --agents agents.json --work-ref <work-ref> --prompt prompt.md",
+              "description": "Once preconditions hold, re-dispatch the mission for this work unit.",
+              "handoff": "",
+              "title": "Re-run mission dispatch"
+            }
+          ],
+          "severity": "blocker",
+          "sourceProvider": "github",
+          "summary": "Approved for implementation but not labelled agent-ready, so no trigger fires",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "atulg4/agentic-sdlc#107",
+          "detail": "P1: Real-time multi-project Forge Control Center with backlog lifecycle, cost and effectiveness views",
+          "evidenceRef": "atulg4/agentic-sdlc#107",
+          "incidentId": "atulg4/agentic-sdlc#107:eligible-awaiting-dispatch-evidence",
+          "kind": "awaiting-dispatch-evidence",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "confirm-the-run",
+              "authority": "operator",
+              "command": "",
+              "description": "Every precondition label is present; check whether the trigger actually fired.",
+              "handoff": "",
+              "title": "Confirm the run started"
+            },
+            {
+              "actionId": "re-apply-the-trigger-label",
+              "authority": "human-only",
+              "command": "",
+              "description": "The bundled triggers fire only on their label event; re-apply it to re-kick.",
+              "handoff": "Remove and re-add the trigger label the incident's summary names (implementation-approved for the implement trigger and agent-ready for the plan trigger by default; a project policy may rename them) to fire the event again.",
+              "title": "Re-apply the trigger label"
+            }
+          ],
+          "severity": "advisory",
+          "sourceProvider": "github",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "atulg4/agentic-sdlc#106",
+          "detail": "P1: Outcome effectiveness, learning ledger and value-per-agent-hour scoring",
+          "evidenceRef": "atulg4/agentic-sdlc#106",
+          "incidentId": "atulg4/agentic-sdlc#106:eligible-awaiting-dispatch-evidence",
+          "kind": "awaiting-dispatch-evidence",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "confirm-the-run",
+              "authority": "operator",
+              "command": "",
+              "description": "Every precondition label is present; check whether the trigger actually fired.",
+              "handoff": "",
+              "title": "Confirm the run started"
+            },
+            {
+              "actionId": "re-apply-the-trigger-label",
+              "authority": "human-only",
+              "command": "",
+              "description": "The bundled triggers fire only on their label event; re-apply it to re-kick.",
+              "handoff": "Remove and re-add the trigger label the incident's summary names (implementation-approved for the implement trigger and agent-ready for the plan trigger by default; a project policy may rename them) to fire the event again.",
+              "title": "Re-apply the trigger label"
+            }
+          ],
+          "severity": "advisory",
+          "sourceProvider": "github",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "atulg4/agentic-sdlc#51",
+          "detail": "P0: Event-driven autonomous intake dispatcher for Forge-managed work",
+          "evidenceRef": "atulg4/agentic-sdlc#51",
+          "incidentId": "atulg4/agentic-sdlc#51:eligible-awaiting-dispatch-evidence",
+          "kind": "awaiting-dispatch-evidence",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "confirm-the-run",
+              "authority": "operator",
+              "command": "",
+              "description": "Every precondition label is present; check whether the trigger actually fired.",
+              "handoff": "",
+              "title": "Confirm the run started"
+            },
+            {
+              "actionId": "re-apply-the-trigger-label",
+              "authority": "human-only",
+              "command": "",
+              "description": "The bundled triggers fire only on their label event; re-apply it to re-kick.",
+              "handoff": "Remove and re-add the trigger label the incident's summary names (implementation-approved for the implement trigger and agent-ready for the plan trigger by default; a project policy may rename them) to fire the event again.",
+              "title": "Re-apply the trigger label"
+            }
+          ],
+          "severity": "advisory",
+          "sourceProvider": "github",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "atulg4/agentic-sdlc#46",
+          "detail": "P0: Forge scheduler \u2014 ETA, critical path, parallelism, capacity, and blocking reasons",
+          "evidenceRef": "atulg4/agentic-sdlc#46",
+          "incidentId": "atulg4/agentic-sdlc#46:eligible-awaiting-dispatch-evidence",
+          "kind": "awaiting-dispatch-evidence",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "confirm-the-run",
+              "authority": "operator",
+              "command": "",
+              "description": "Every precondition label is present; check whether the trigger actually fired.",
+              "handoff": "",
+              "title": "Confirm the run started"
+            },
+            {
+              "actionId": "re-apply-the-trigger-label",
+              "authority": "human-only",
+              "command": "",
+              "description": "The bundled triggers fire only on their label event; re-apply it to re-kick.",
+              "handoff": "Remove and re-add the trigger label the incident's summary names (implementation-approved for the implement trigger and agent-ready for the plan trigger by default; a project policy may rename them) to fire the event again.",
+              "title": "Re-apply the trigger label"
+            }
+          ],
+          "severity": "advisory",
+          "sourceProvider": "github",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "atulg4/agentic-sdlc#45",
+          "detail": "P0: Forge dashboard \u2014 responsive portfolio, mission progress, quality, cost, and next actions",
+          "evidenceRef": "atulg4/agentic-sdlc#45",
+          "incidentId": "atulg4/agentic-sdlc#45:eligible-awaiting-dispatch-evidence",
+          "kind": "awaiting-dispatch-evidence",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "confirm-the-run",
+              "authority": "operator",
+              "command": "",
+              "description": "Every precondition label is present; check whether the trigger actually fired.",
+              "handoff": "",
+              "title": "Confirm the run started"
+            },
+            {
+              "actionId": "re-apply-the-trigger-label",
+              "authority": "human-only",
+              "command": "",
+              "description": "The bundled triggers fire only on their label event; re-apply it to re-kick.",
+              "handoff": "Remove and re-add the trigger label the incident's summary names (implementation-approved for the implement trigger and agent-ready for the plan trigger by default; a project policy may rename them) to fire the event again.",
+              "title": "Re-apply the trigger label"
+            }
+          ],
+          "severity": "advisory",
+          "sourceProvider": "github",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "atulg4/agentic-sdlc#44",
+          "detail": "P1: Forge mobile control plane \u2014 mission status, approvals, budgets, and natural-language steering",
+          "evidenceRef": "atulg4/agentic-sdlc#44",
+          "incidentId": "atulg4/agentic-sdlc#44:eligible-awaiting-dispatch-evidence",
+          "kind": "awaiting-dispatch-evidence",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "confirm-the-run",
+              "authority": "operator",
+              "command": "",
+              "description": "Every precondition label is present; check whether the trigger actually fired.",
+              "handoff": "",
+              "title": "Confirm the run started"
+            },
+            {
+              "actionId": "re-apply-the-trigger-label",
+              "authority": "human-only",
+              "command": "",
+              "description": "The bundled triggers fire only on their label event; re-apply it to re-kick.",
+              "handoff": "Remove and re-add the trigger label the incident's summary names (implementation-approved for the implement trigger and agent-ready for the plan trigger by default; a project policy may rename them) to fire the event again.",
+              "title": "Re-apply the trigger label"
+            }
+          ],
+          "severity": "advisory",
+          "sourceProvider": "github",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "atulg4/agentic-sdlc#43",
+          "detail": "P0: Forge planning intelligence \u2014 risk-adaptive frontier planning and independent plan critique",
+          "evidenceRef": "atulg4/agentic-sdlc#43",
+          "incidentId": "atulg4/agentic-sdlc#43:eligible-awaiting-dispatch-evidence",
+          "kind": "awaiting-dispatch-evidence",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "confirm-the-run",
+              "authority": "operator",
+              "command": "",
+              "description": "Every precondition label is present; check whether the trigger actually fired.",
+              "handoff": "",
+              "title": "Confirm the run started"
+            },
+            {
+              "actionId": "re-apply-the-trigger-label",
+              "authority": "human-only",
+              "command": "",
+              "description": "The bundled triggers fire only on their label event; re-apply it to re-kick.",
+              "handoff": "Remove and re-add the trigger label the incident's summary names (implementation-approved for the implement trigger and agent-ready for the plan trigger by default; a project policy may rename them) to fire the event again.",
+              "title": "Re-apply the trigger label"
+            }
+          ],
+          "severity": "advisory",
+          "sourceProvider": "github",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "atulg4/agentic-sdlc#42",
+          "detail": "P0: Forge Benchmark Lab \u2014 empirical agent bakeoffs and quality/cost frontier",
+          "evidenceRef": "atulg4/agentic-sdlc#42",
+          "incidentId": "atulg4/agentic-sdlc#42:eligible-awaiting-dispatch-evidence",
+          "kind": "awaiting-dispatch-evidence",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "confirm-the-run",
+              "authority": "operator",
+              "command": "",
+              "description": "Every precondition label is present; check whether the trigger actually fired.",
+              "handoff": "",
+              "title": "Confirm the run started"
+            },
+            {
+              "actionId": "re-apply-the-trigger-label",
+              "authority": "human-only",
+              "command": "",
+              "description": "The bundled triggers fire only on their label event; re-apply it to re-kick.",
+              "handoff": "Remove and re-add the trigger label the incident's summary names (implementation-approved for the implement trigger and agent-ready for the plan trigger by default; a project policy may rename them) to fire the event again.",
+              "title": "Re-apply the trigger label"
+            }
+          ],
+          "severity": "advisory",
+          "sourceProvider": "github",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "atulg4/agentic-sdlc#41",
+          "detail": "P0: Forge reliability kernel \u2014 typed failures, retries, checkpoints, and resumable missions",
+          "evidenceRef": "atulg4/agentic-sdlc#41",
+          "incidentId": "atulg4/agentic-sdlc#41:eligible-awaiting-dispatch-evidence",
+          "kind": "awaiting-dispatch-evidence",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "confirm-the-run",
+              "authority": "operator",
+              "command": "",
+              "description": "Every precondition label is present; check whether the trigger actually fired.",
+              "handoff": "",
+              "title": "Confirm the run started"
+            },
+            {
+              "actionId": "re-apply-the-trigger-label",
+              "authority": "human-only",
+              "command": "",
+              "description": "The bundled triggers fire only on their label event; re-apply it to re-kick.",
+              "handoff": "Remove and re-add the trigger label the incident's summary names (implementation-approved for the implement trigger and agent-ready for the plan trigger by default; a project policy may rename them) to fire the event again.",
+              "title": "Re-apply the trigger label"
+            }
+          ],
+          "severity": "advisory",
+          "sourceProvider": "github",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "atulg4/agentic-sdlc#40",
+          "detail": "P1: Multi-provider adapters for Vertex, Bedrock, DeepSeek, Kimi and direct APIs",
+          "evidenceRef": "atulg4/agentic-sdlc#40",
+          "incidentId": "atulg4/agentic-sdlc#40:eligible-awaiting-dispatch-evidence",
+          "kind": "awaiting-dispatch-evidence",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "confirm-the-run",
+              "authority": "operator",
+              "command": "",
+              "description": "Every precondition label is present; check whether the trigger actually fired.",
+              "handoff": "",
+              "title": "Confirm the run started"
+            },
+            {
+              "actionId": "re-apply-the-trigger-label",
+              "authority": "human-only",
+              "command": "",
+              "description": "The bundled triggers fire only on their label event; re-apply it to re-kick.",
+              "handoff": "Remove and re-add the trigger label the incident's summary names (implementation-approved for the implement trigger and agent-ready for the plan trigger by default; a project policy may rename them) to fire the event again.",
+              "title": "Re-apply the trigger label"
+            }
+          ],
+          "severity": "advisory",
+          "sourceProvider": "github",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "atulg4/agentic-sdlc#39",
+          "detail": "P1: ChatGPT-plan Codex subscription-cloud executor",
+          "evidenceRef": "atulg4/agentic-sdlc#39",
+          "incidentId": "atulg4/agentic-sdlc#39:eligible-awaiting-dispatch-evidence",
+          "kind": "awaiting-dispatch-evidence",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "confirm-the-run",
+              "authority": "operator",
+              "command": "",
+              "description": "Every precondition label is present; check whether the trigger actually fired.",
+              "handoff": "",
+              "title": "Confirm the run started"
+            },
+            {
+              "actionId": "re-apply-the-trigger-label",
+              "authority": "human-only",
+              "command": "",
+              "description": "The bundled triggers fire only on their label event; re-apply it to re-kick.",
+              "handoff": "Remove and re-add the trigger label the incident's summary names (implementation-approved for the implement trigger and agent-ready for the plan trigger by default; a project policy may rename them) to fire the event again.",
+              "title": "Re-apply the trigger label"
+            }
+          ],
+          "severity": "advisory",
+          "sourceProvider": "github",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "atulg4/agentic-sdlc#38",
+          "detail": "P0: Quality evidence engine and learning store",
+          "evidenceRef": "atulg4/agentic-sdlc#38",
+          "incidentId": "atulg4/agentic-sdlc#38:eligible-awaiting-dispatch-evidence",
+          "kind": "awaiting-dispatch-evidence",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "confirm-the-run",
+              "authority": "operator",
+              "command": "",
+              "description": "Every precondition label is present; check whether the trigger actually fired.",
+              "handoff": "",
+              "title": "Confirm the run started"
+            },
+            {
+              "actionId": "re-apply-the-trigger-label",
+              "authority": "human-only",
+              "command": "",
+              "description": "The bundled triggers fire only on their label event; re-apply it to re-kick.",
+              "handoff": "Remove and re-add the trigger label the incident's summary names (implementation-approved for the implement trigger and agent-ready for the plan trigger by default; a project policy may rename them) to fire the event again.",
+              "title": "Re-apply the trigger label"
+            }
+          ],
+          "severity": "advisory",
+          "sourceProvider": "github",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "atulg4/agentic-sdlc#35",
+          "detail": "FORGE Epic: Adaptive intelligence, cloud execution, quality learning, and autonomous governance",
+          "evidenceRef": "atulg4/agentic-sdlc#35",
+          "incidentId": "atulg4/agentic-sdlc#35:eligible-awaiting-dispatch-evidence",
+          "kind": "awaiting-dispatch-evidence",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "confirm-the-run",
+              "authority": "operator",
+              "command": "",
+              "description": "Every precondition label is present; check whether the trigger actually fired.",
+              "handoff": "",
+              "title": "Confirm the run started"
+            },
+            {
+              "actionId": "re-apply-the-trigger-label",
+              "authority": "human-only",
+              "command": "",
+              "description": "The bundled triggers fire only on their label event; re-apply it to re-kick.",
+              "handoff": "Remove and re-add the trigger label the incident's summary names (implementation-approved for the implement trigger and agent-ready for the plan trigger by default; a project policy may rename them) to fire the event again.",
+              "title": "Re-apply the trigger label"
+            }
+          ],
+          "severity": "advisory",
+          "sourceProvider": "github",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "atulg4/agentic-sdlc#33",
+          "detail": "Add explicit implementer model pin and risk-based Sol escalation",
+          "evidenceRef": "atulg4/agentic-sdlc#33",
+          "incidentId": "atulg4/agentic-sdlc#33:eligible-awaiting-dispatch-evidence",
+          "kind": "awaiting-dispatch-evidence",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "confirm-the-run",
+              "authority": "operator",
+              "command": "",
+              "description": "Every precondition label is present; check whether the trigger actually fired.",
+              "handoff": "",
+              "title": "Confirm the run started"
+            },
+            {
+              "actionId": "re-apply-the-trigger-label",
+              "authority": "human-only",
+              "command": "",
+              "description": "The bundled triggers fire only on their label event; re-apply it to re-kick.",
+              "handoff": "Remove and re-add the trigger label the incident's summary names (implementation-approved for the implement trigger and agent-ready for the plan trigger by default; a project policy may rename them) to fire the event again.",
+              "title": "Re-apply the trigger label"
+            }
+          ],
+          "severity": "advisory",
+          "sourceProvider": "github",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "atulg4/agentic-sdlc#22",
+          "detail": "P0: Provider-neutral agent message bus over Pub/Sub-compatible transports",
+          "evidenceRef": "atulg4/agentic-sdlc#22",
+          "incidentId": "atulg4/agentic-sdlc#22:eligible-awaiting-dispatch-evidence",
+          "kind": "awaiting-dispatch-evidence",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "confirm-the-run",
+              "authority": "operator",
+              "command": "",
+              "description": "Every precondition label is present; check whether the trigger actually fired.",
+              "handoff": "",
+              "title": "Confirm the run started"
+            },
+            {
+              "actionId": "re-apply-the-trigger-label",
+              "authority": "human-only",
+              "command": "",
+              "description": "The bundled triggers fire only on their label event; re-apply it to re-kick.",
+              "handoff": "Remove and re-add the trigger label the incident's summary names (implementation-approved for the implement trigger and agent-ready for the plan trigger by default; a project policy may rename them) to fire the event again.",
+              "title": "Re-apply the trigger label"
+            }
+          ],
+          "severity": "advisory",
+          "sourceProvider": "github",
+          "summary": "Every dispatch label is present, but the bundled implementation trigger fires only on the implementation-approved label event: confirm a run started, and re-apply implementation-approved to re-kick if none did",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "",
+          "detail": "Build(deps): Bump actions/upload-artifact from 7.0.1 to 7.0.2",
+          "evidenceRef": "atulg4/agentic-sdlc!148",
+          "incidentId": "atulg4/agentic-sdlc!148:ci-failed",
+          "kind": "deterministic-ci-failed",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "reproduce-ci-failure",
+              "authority": "operator",
+              "command": "sdlcctl run-gates --config agentic-sdlc.toml --repository . --output gates-report.json",
+              "description": "Run the same deterministic gates the pipeline ran, before changing anything.",
+              "handoff": "",
+              "title": "Reproduce the failure locally"
+            },
+            {
+              "actionId": "route-to-bounded-repair",
+              "authority": "agent",
+              "command": "",
+              "description": "Hand the failure to a repair cycle with its declared cycle budget.",
+              "handoff": "",
+              "title": "Route to bounded repair"
+            }
+          ],
+          "severity": "blocker",
+          "sourceProvider": "github",
+          "summary": "Deterministic verification failed: test",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "",
+          "detail": "Build(deps): Bump actions/upload-artifact from 7.0.1 to 7.0.2",
+          "evidenceRef": "atulg4/agentic-sdlc!148",
+          "incidentId": "atulg4/agentic-sdlc!148:merge-state-blocked",
+          "kind": "unclassified",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "classify-incident",
+              "authority": "operator",
+              "command": "",
+              "description": "An unclassified incident has no declared remediation; classify it first.",
+              "handoff": "",
+              "title": "Classify the incident"
+            }
+          ],
+          "severity": "degraded",
+          "sourceProvider": "github",
+          "summary": "Change request mergeability is blocked: a required review or required check is outstanding",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "",
+          "detail": "Build(deps): Bump actions/download-artifact from 8.0.1 to 8.0.2",
+          "evidenceRef": "atulg4/agentic-sdlc!145",
+          "incidentId": "atulg4/agentic-sdlc!145:ci-failed",
+          "kind": "deterministic-ci-failed",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "reproduce-ci-failure",
+              "authority": "operator",
+              "command": "sdlcctl run-gates --config agentic-sdlc.toml --repository . --output gates-report.json",
+              "description": "Run the same deterministic gates the pipeline ran, before changing anything.",
+              "handoff": "",
+              "title": "Reproduce the failure locally"
+            },
+            {
+              "actionId": "route-to-bounded-repair",
+              "authority": "agent",
+              "command": "",
+              "description": "Hand the failure to a repair cycle with its declared cycle budget.",
+              "handoff": "",
+              "title": "Route to bounded repair"
+            }
+          ],
+          "severity": "blocker",
+          "sourceProvider": "github",
+          "summary": "Deterministic verification failed: test",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "",
+          "detail": "Build(deps): Bump actions/download-artifact from 8.0.1 to 8.0.2",
+          "evidenceRef": "atulg4/agentic-sdlc!145",
+          "incidentId": "atulg4/agentic-sdlc!145:merge-state-blocked",
+          "kind": "unclassified",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "classify-incident",
+              "authority": "operator",
+              "command": "",
+              "description": "An unclassified incident has no declared remediation; classify it first.",
+              "handoff": "",
+              "title": "Classify the incident"
+            }
+          ],
+          "severity": "degraded",
+          "sourceProvider": "github",
+          "summary": "Change request mergeability is blocked: a required review or required check is outstanding",
+          "workUnitId": ""
+        },
+        {
+          "backlogItemId": "",
+          "detail": "Add sdlcctl onboard + doctor: one-command Forge onboarding",
+          "evidenceRef": "atulg4/agentic-sdlc!139",
+          "incidentId": "atulg4/agentic-sdlc!139:merge-state-blocked",
+          "kind": "unclassified",
+          "observedAt": "2026-10-12T10:30:00Z",
+          "projectId": "forge",
+          "remediations": [
+            {
+              "actionId": "classify-incident",
+              "authority": "operator",
+              "command": "",
+              "description": "An unclassified incident has no declared remediation; classify it first.",
+              "handoff": "",
+              "title": "Classify the incident"
+            }
+          ],
+          "severity": "degraded",
+          "sourceProvider": "github",
+          "summary": "Change request mergeability is blocked: a required review or required check is outstanding",
+          "workUnitId": ""
+        }
+      ],
+      "projectId": "forge",
+      "registered": true,
+      "repositories": [
+        "github:atulg4/agentic-sdlc"
+      ],
+      "waiting": [],
+      "warnings": []
+    },
+    {
+      "active": [],
+      "attention": [],
+      "backlog": [],
+      "capabilities": [
+        "implementation",
+        "independent-review",
+        "planning"
+      ],
+      "counts": {
+        "active": 0,
+        "attention": 0,
+        "backlogItems": 0,
+        "blockers": 0,
+        "byStage": {},
+        "byState": {},
+        "dependencyWaitByState": {},
+        "incidents": 0,
+        "workUnits": 0
+      },
+      "defaultBranch": "main",
+      "displayName": "Marketing Maestro",
+      "environments": [],
+      "group": "maestro",
+      "health": "no-data",
+      "incidents": [],
+      "projectId": "marketingmaestro",
+      "registered": true,
+      "repositories": [
+        "github:atulg4/MarketingMaestro"
+      ],
+      "waiting": [],
+      "warnings": []
+    },
+    {
+      "active": [],
+      "attention": [],
+      "backlog": [],
+      "capabilities": [
+        "deploy",
+        "implementation",
+        "independent-review",
+        "planning",
+        "protected-merge"
+      ],
+      "counts": {
+        "active": 0,
+        "attention": 0,
+        "backlogItems": 0,
+        "blockers": 0,
+        "byStage": {},
+        "byState": {},
+        "dependencyWaitByState": {},
+        "incidents": 0,
+        "workUnits": 0
+      },
+      "defaultBranch": "main",
+      "displayName": "MarketMaestro",
+      "environments": [
+        "production:production"
+      ],
+      "group": "maestro",
+      "health": "no-data",
+      "incidents": [],
+      "projectId": "marketmaestro",
+      "registered": true,
+      "repositories": [
+        "github:atulg4/marketmaestro"
+      ],
+      "waiting": [],
+      "warnings": []
+    }
+  ],
+  "schemaVersion": 1,
+  "snapshotSha256": "29ae6b008c53a528a0a36461187021316522688f0d0f6e8af8a2445bdf7a2758",
+  "sources": [
+    "registry:examples/control-center/project-registry.json",
+    "backlog:examples/control-center/backlog.json",
+    "incidents:examples/control-center/incidents.json"
+  ],
+  "totals": {
+    "active": 0,
+    "attention": 0,
+    "backlogItems": 46,
+    "blockers": 7,
+    "incidents": 34,
+    "projects": 3,
+    "unregistered": 0,
+    "workUnits": 0
+  },
+  "warnings": []
+}
