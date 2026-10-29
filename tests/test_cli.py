@@ -2419,3 +2419,98 @@ def test_github_backlog_withholds_credentialed_urls_from_errors(tmp_path, capsys
     err = capsys.readouterr().err
     assert "ghp_0123456789" not in err
     assert "withheld" in err
+
+
+def _dispatcher_checkpoints(path: Path) -> None:
+    from agentic_sdlc.checkpoints import SQLiteCheckpointStore
+    from agentic_sdlc.dispatcher import AutonomousIntakeDispatcher
+    from agentic_sdlc.models import WorkEvent, WorkKind
+    from agentic_sdlc.orchestration import Orchestrator
+
+    dispatcher = AutonomousIntakeDispatcher(Orchestrator(), checkpoints=SQLiteCheckpointStore(path))
+    for number, labels, timestamp in (
+        (1, ("forge-managed",), "2026-10-29T09:00:00Z"),
+        (2, ("forge-managed", "forge-paused"), "2026-10-29T09:10:00Z"),
+    ):
+        dispatcher.dispatch(
+            WorkEvent(
+                provider="github",
+                kind=WorkKind.ISSUE,
+                action="opened",
+                repository="example/alpha",
+                number=number,
+                title=f"Item {number}",
+                body="",
+                labels=labels,
+                actor="someone",
+                raw={},
+            ),
+            timestamp=timestamp,
+        )
+
+
+def test_dispatcher_status_cli_joins_heartbeat_with_lifecycle_buckets(tmp_path: Path) -> None:
+    checkpoints = tmp_path / "checkpoints.sqlite3"
+    ledger = tmp_path / "ledger.json"
+    event = tmp_path / "event.json"
+    output = tmp_path / "status.json"
+    _dispatcher_checkpoints(checkpoints)
+    plan = (
+        ("alpha", "github:example/alpha:issue:1", "intake", "intake"),
+        ("alpha", "github:example/alpha:issue:1", "triaged", "intake"),
+        ("beta", "github:example/beta:issue:9", "intake", "intake"),
+    )
+    for sequence, (project_id, unit, state, stage) in enumerate(plan):
+        event.write_text(
+            json.dumps(_event_document(sequence, state, stage, project_id=project_id, unit=unit)),
+            encoding="utf-8",
+        )
+        assert main(["record-event", "--ledger", str(ledger), "--event", str(event)]) == 0
+
+    argv = [
+        "dispatcher-status",
+        "--checkpoints",
+        str(checkpoints),
+        "--now",
+        "2026-10-29T09:40:00Z",
+        "--stale-after-seconds",
+        "3600",
+        "--ledger",
+        str(ledger),
+        "--project-id",
+        "alpha",
+        "--output",
+        str(output),
+    ]
+    assert main(argv) == 0
+
+    document = json.loads(output.read_text(encoding="utf-8"))
+    assert document["heartbeat"]["condition"] == "fresh"
+    assert document["heartbeat"]["ageSeconds"] == 1800
+    assert document["dispatcher"]["units"] == {"total": 1, "byState": {"triaged": 1}}
+    assert document["dispatcher"]["rejectedEvents"]["byState"] == {"blocked": 1}
+    assert document["lifecycle"]["workUnits"] == 1
+    assert document["lifecycle"]["queued"] == 1
+    assert document["lifecycle"]["unknownStates"] == []
+
+    assert main(argv) == 0
+    assert json.loads(output.read_text(encoding="utf-8")) == document
+
+
+def test_dispatcher_status_cli_fails_closed(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    missing = tmp_path / "missing.sqlite3"
+    assert (
+        main(["dispatcher-status", "--checkpoints", str(missing), "--now", "2026-10-29T09:00:00Z"])
+        == 2
+    )
+    assert "not found" in capsys.readouterr().err
+    assert not missing.exists()
+
+    checkpoints = tmp_path / "checkpoints.sqlite3"
+    _dispatcher_checkpoints(checkpoints)
+    base = ["dispatcher-status", "--checkpoints", str(checkpoints)]
+    assert main([*base, "--now", "2026-10-29T09:00:00"]) == 2
+    assert "UTC offset" in capsys.readouterr().err
+    assert main([*base, "--now", "2026-10-29T09:00:00Z", "--stale-after-seconds", "0"]) == 2
+    assert main([*base, "--now", "2026-10-29T09:00:00Z", "--project-id", "alpha"]) == 2
+    assert "only with --ledger" in capsys.readouterr().err
