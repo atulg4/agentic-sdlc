@@ -62,6 +62,9 @@ The Python package owns behavior that must be identical on GitHub and GitLab:
 - the capacity instrument that reads that ledger for concurrency, queueing,
   runner and plan-capacity utilization, useful work and bottlenecks
   (`docs/capacity-metrics.md`);
+- the outcome and learning ledgers that score whether a delivered capability
+  actually arrived, and what it took per accepted outcome, without ever
+  inferring value from effort (`docs/effectiveness.md`);
 - the read-only Control Center snapshot that joins the registry, the
   lifecycle ledger, each project's epic tree and its open blockers, with a
   declared remediation per blocker kind (`docs/control-center.md`);

@@ -45,6 +45,16 @@ from .control_center import (
     read_control_center_inputs,
 )
 from .dashboard_efficiency import build_infrastructure_blocker_panel
+from .effectiveness import (
+    COMPARABLE_METRICS,
+    EffectivenessError,
+    EffectivenessLedger,
+    LearningLedger,
+    build_effectiveness_report,
+    compare_projects,
+    load_learning_record,
+    load_outcome_record,
+)
 from .event_ledger import EventLedger, LedgerError, LifecycleStage, load_lifecycle_event
 from .events import EventError, normalize_event
 from .executors import (
@@ -3073,6 +3083,92 @@ def _capacity_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def _read_outcome_ledger(
+    path: str, registry_path: str | None, *, create: bool
+) -> EffectivenessLedger:
+    registry = read_optional_project_registry(registry_path)
+    ledger_path = Path(path)
+    if ledger_path.is_file():
+        return EffectivenessLedger.from_dict(
+            json.loads(ledger_path.read_text(encoding="utf-8")), registry=registry
+        )
+    if not create:
+        raise EffectivenessError(f"outcome ledger not found: {path}")
+    return EffectivenessLedger(registry=registry)
+
+
+def _read_learning_ledger(
+    path: str | None, registry_path: str | None, *, create: bool
+) -> LearningLedger:
+    registry = read_optional_project_registry(registry_path)
+    if path and Path(path).is_file():
+        return LearningLedger.from_dict(
+            json.loads(Path(path).read_text(encoding="utf-8")), registry=registry
+        )
+    if path and not create:
+        raise EffectivenessError(f"learning ledger not found: {path}")
+    return LearningLedger(registry=registry)
+
+
+def _record_outcome(args: argparse.Namespace) -> int:
+    ledger = _read_outcome_ledger(args.outcomes, args.registry, create=True)
+    document = json.loads(Path(args.outcome).read_text(encoding="utf-8"))
+    record = ledger.append(load_outcome_record(document))
+    _write(ledger.as_dict(), args.outcomes)
+    if args.output:
+        _write(record.as_dict(), args.output)
+    return 0
+
+
+def _record_learning(args: argparse.Namespace) -> int:
+    ledger = _read_learning_ledger(args.learnings, args.registry, create=True)
+    document = json.loads(Path(args.learning).read_text(encoding="utf-8"))
+    record = ledger.append(load_learning_record(document))
+    _write(ledger.as_dict(), args.learnings)
+    if args.output:
+        _write(record.as_dict(), args.output)
+    return 0
+
+
+def _effectiveness_report(args: argparse.Namespace) -> int:
+    outcomes = _read_outcome_ledger(args.outcomes, args.registry, create=False)
+    usage = ()
+    if args.usage:
+        usage = _read_usage_ledger(args.usage, args.registry, create=False).records
+    learnings: tuple[Any, ...] = ()
+    if args.learnings:
+        learnings = _read_learning_ledger(args.learnings, args.registry, create=False).records
+    window = None
+    if bool(args.window_start) != bool(args.window_end):
+        raise EffectivenessError("--window-start and --window-end are required together")
+    if args.window_start:
+        window = ObservationWindow(args.window_start, args.window_end)
+    _write(
+        build_effectiveness_report(
+            outcomes.records,
+            usage_records=usage,
+            window=window,
+            learnings=learnings,
+            project_ids=tuple(args.project_id) or None,
+        ),
+        args.output,
+    )
+    return 0
+
+
+def _compare_projects(args: argparse.Namespace) -> int:
+    ledger = _read_outcome_ledger(args.outcomes, args.registry, create=False)
+    _write(
+        compare_projects(
+            ledger.records,
+            metric=args.metric,
+            project_ids=tuple(args.project_id) or None,
+        ),
+        args.output,
+    )
+    return 0
+
+
 def _validate_knowledge(args: argparse.Namespace) -> int:
     sources = load_sources(args.knowledge)
     _write(
@@ -4103,6 +4199,41 @@ def build_parser() -> argparse.ArgumentParser:
     capacity.add_argument("--output")
     capacity.set_defaults(handler=_capacity_report)
 
+    record_outcome = commands.add_parser("record-outcome")
+    record_outcome.add_argument("--outcomes", required=True)
+    record_outcome.add_argument("--outcome", required=True)
+    record_outcome.add_argument("--registry")
+    record_outcome.add_argument("--output")
+    record_outcome.set_defaults(handler=_record_outcome)
+
+    record_learning = commands.add_parser("record-learning")
+    record_learning.add_argument("--learnings", required=True)
+    record_learning.add_argument("--learning", required=True)
+    record_learning.add_argument("--registry")
+    record_learning.add_argument("--output")
+    record_learning.set_defaults(handler=_record_learning)
+
+    effectiveness = commands.add_parser("effectiveness-report")
+    effectiveness.add_argument("--outcomes", required=True)
+    effectiveness.add_argument("--usage")
+    effectiveness.add_argument("--learnings")
+    effectiveness.add_argument("--registry")
+    effectiveness.add_argument("--window-start")
+    effectiveness.add_argument("--window-end")
+    effectiveness.add_argument("--project-id", action="append", default=[])
+    effectiveness.add_argument("--output")
+    effectiveness.set_defaults(handler=_effectiveness_report)
+
+    compare = commands.add_parser("compare-projects")
+    compare.add_argument("--outcomes", required=True)
+    compare.add_argument("--registry")
+    compare.add_argument(
+        "--metric", choices=tuple(sorted(COMPARABLE_METRICS)), default="acceptedOutcomeRate"
+    )
+    compare.add_argument("--project-id", action="append", default=[])
+    compare.add_argument("--output")
+    compare.set_defaults(handler=_compare_projects)
+
     knowledge = commands.add_parser("validate-knowledge")
     knowledge.add_argument("--knowledge", required=True)
     knowledge.add_argument("--output")
@@ -4432,6 +4563,7 @@ def main(argv: list[str] | None = None) -> int:
         CapacityError,
         ContextBuilderError,
         ControlCenterError,
+        EffectivenessError,
         EventError,
         ExecutorError,
         GateError,
