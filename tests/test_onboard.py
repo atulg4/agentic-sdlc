@@ -4023,7 +4023,7 @@ def test_doctor_fails_implementation_on_a_macos_runner(tmp_path):
 # ---------------------------------------------------------------- review regressions (PR 139, 8)
 # The CI test job is fully managed: its steps must equal what onboard renders from the policy.
 
-SETUP_PYTHON = "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1"
+SETUP_PYTHON = "actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0"
 GATE_CHECK = "ci.yml runs the policy gates as 'test'"
 
 
