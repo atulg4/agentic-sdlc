@@ -102,6 +102,25 @@ environment_allowlist = ["SAFE_TEST_VALUE"]
         "control": False,
         "allowed": "visible",
     }
+    # The attestation trust anchor is as protected as any API token: a policy
+    # allowlisting the key-file path would hand candidate gate code the HMAC
+    # key on a host-sharing launcher, with which every signed artifact could
+    # be forged.
+    anchored = tmp_path / "anchored.toml"
+    anchored.write_text(
+        f"""\
+[commands]
+inspect = {json.dumps(f"{sys.executable} {script}")}
+
+[verification]
+gates = ["inspect"]
+environment_allowlist = ["AGENTIC_SDLC_ATTESTATION_KEY_FILE"]
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENTIC_SDLC_ATTESTATION_KEY_FILE", str(tmp_path / "anchor.key"))
+    with pytest.raises(GateError, match="protected names"):
+        run_gates(anchored, tmp_path)
 
 
 # Codex 4243193109: a gate runs with the generated ci.yml's shell semantics (`bash -e -c`), not
@@ -326,3 +345,78 @@ def test_unset_python_version_lists_both_interpreters(tmp_path: Path) -> None:
     warning = check_gate_python(None, env, tmp_path)
     assert warning is not None and "python_version is not set" in warning
     assert "Python 3.12.7" in warning and "Python 3.11.2" in warning
+
+
+def test_gates_repoint_the_actions_workspace(tmp_path: Path, monkeypatch) -> None:
+    # A gate using the standard Actions variable must observe the tree the
+    # gates run in, not whatever workspace invoked this process.
+    monkeypatch.setenv("GITHUB_WORKSPACE", "/somewhere/else")
+    config = tmp_path / "policy.toml"
+    out = tmp_path / "workspace.txt"
+    _write_config(
+        config,
+        'printf %s "$GITHUB_WORKSPACE" > workspace.txt',
+        "true",
+    )
+    report = run_gates(config, tmp_path)
+    assert report["passed"] is True
+    assert out.read_text(encoding="utf-8") == str(tmp_path.resolve())
+
+
+def test_gates_run_under_the_command_prefix(tmp_path: Path) -> None:
+    # An isolation wrapper prefixes the gate shell (it must contain the
+    # shell and the gate command alike), and the recorded argv shows what
+    # actually ran; malformed prefixes fail closed.
+    config = tmp_path / "policy.toml"
+    _write_config(config, 'test "$SANDBOX_MARK" = "1"', "true")
+    assert run_gates(config, tmp_path)["passed"] is False
+    report = run_gates(config, tmp_path, command_prefix=("env", "SANDBOX_MARK=1"))
+    assert report["passed"] is True
+    assert report["gates"][0]["command"][:2] == ["env", "SANDBOX_MARK=1"]
+    with pytest.raises(GateError, match="command prefix"):
+        run_gates(config, tmp_path, command_prefix=("env", ""))
+
+
+def test_the_interpreter_probe_runs_under_the_command_prefix(tmp_path: Path) -> None:
+    # The version probe EXECUTES whatever interpreter the gate PATH resolves
+    # first — on a runner with a repository-local virtualenv, a
+    # candidate-writable program — so it runs under the same isolation
+    # wrapper the gates themselves do.
+    from agentic_sdlc.gates import gate_python_version
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    script = bin_dir / "python3"
+    script.write_text(
+        '#!/bin/sh\ntest "$SANDBOX_MARK" = "1" || exit 7\necho 3.12.7\n', encoding="utf-8"
+    )
+    script.chmod(0o755)
+    environment = {"PATH": f"{bin_dir}:/usr/bin:/bin"}
+    with pytest.raises(GateError, match="did not report a Python version"):
+        gate_python_version(environment, tmp_path)
+    found, version = gate_python_version(
+        environment, tmp_path, command_prefix=("env", "SANDBOX_MARK=1")
+    )
+    assert found == str(script)
+    assert version == "3.12.7"
+
+
+def test_gates_rebind_revision_variables(tmp_path: Path, monkeypatch) -> None:
+    # An isolated derivation rebinds the standard revision variables: the
+    # ambient workflow's SHA and refs describe the caller's checkout.
+    monkeypatch.setenv("GITHUB_SHA", "f" * 40)
+    monkeypatch.setenv("GITHUB_REF", "refs/pull/1/merge")
+    config = tmp_path / "policy.toml"
+    out = tmp_path / "revisions.txt"
+    _write_config(
+        config,
+        'printf "%s|%s" "$GITHUB_SHA" "${GITHUB_REF-unset}" > revisions.txt',
+        "true",
+    )
+    report = run_gates(
+        config,
+        tmp_path,
+        environment_overrides={"GITHUB_SHA": "a" * 40, "GITHUB_REF": None},
+    )
+    assert report["passed"] is True
+    assert out.read_text(encoding="utf-8") == "a" * 40 + "|unset"
