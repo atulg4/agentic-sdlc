@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import argparse
 import base64
+import datetime
 import hashlib
+import hmac
 import json
 import math
 import os
 import re
+import secrets
 import shlex
 import sys
-from collections.abc import Iterable
-from datetime import UTC, datetime
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -23,6 +25,17 @@ from .capacity_metrics import (
     ObservationWindow,
     build_capacity_report,
     load_capacity_inputs,
+)
+from .context_builder import (
+    DEFAULT_PACKET_BYTES,
+    ContextBuilderError,
+    VerificationEvidence,
+    _safe_exclusion_path,
+    build_context_packet,
+    dispatch_envelope_for_packet,
+    mission_role,
+    render_packet_for_prompt,
+    verification_from_dict,
 )
 from .control_center import (
     ControlCenterError,
@@ -47,8 +60,12 @@ from .git_diff import (
     GitDiffError,
     collect_commit_diff,
     collect_git_diff,
+    collect_series_patch,
     committed_path,
+    default_branch_name,
+    derivation_tree,
     read_committed_file,
+    repository_identity,
     resolve_commit,
 )
 from .github_backlog import (
@@ -72,7 +89,13 @@ from .infra_recovery import (
     retry_state_from_comments,
     write_retry_state,
 )
-from .knowledge import KnowledgeError, load_sources
+from .knowledge import (
+    KnowledgeError,
+    load_sources,
+    load_sources_bytes,
+    record_from_dict,
+    sanitize_payload,
+)
 from .leases import (
     DEFAULT_TTL_MINUTES,
     LEASE_BOT_LOGINS_ENV,
@@ -95,6 +118,7 @@ from .missions import (
     create_dispatch_envelope,
     load_agents,
     load_registry,
+    load_registry_bytes,
 )
 from .models import RiskLevel
 from .onboard import (
@@ -141,6 +165,9 @@ from .trusted_exec import GH_OVERRIDE_ENV as _GH_OVERRIDE_ENV
 from .trusted_exec import (
     STRICT,
     TRUST_MODES,
+    UntrustedExecutableError,
+    candidate_reason,
+    resolve_trusted,
     use_gate_trust,
     use_trust_mode,
 )
@@ -627,6 +654,22 @@ def _refuse_open_prs(issue: int, prs: list[str], result: dict[str, Any]) -> tupl
     return PULL_REQUEST_OPEN, f"PR OPEN: #{issue} already has an open pull request: {listed}"
 
 
+def _continuation_allows(key: str, continuation: str) -> bool:
+    """Is the open pull request `key` the one `--continuation-pr` names?
+
+    A key is the inventory's URL (or ``#N`` fallback); the flag takes that
+    exact string, or the bare PR number, matched only as a whole trailing
+    path segment so #123 can never excuse #1123.
+    """
+    if not continuation:
+        return False
+    if key == continuation:
+        return True
+    if continuation.isdigit():
+        return key == f"#{continuation}" or re.fullmatch(rf".*/{continuation}", key) is not None
+    return False
+
+
 def _dependency_states(project: str, dependencies: Iterable[int]) -> dict[str, dict[str, str]]:
     """{"N": {"state", "updatedAt"}} for each dependency issue, read now. The state must be open
     or closed (anything else is an error, never "closed"); the update time is kept so a
@@ -663,6 +706,10 @@ def _judge_request(
     digest = request_digest(title, body)
     result: dict[str, Any] = {
         "issue": args.issue,
+        # The project is part of what the result attests: a consumer binding
+        # work to this record must not accept a same-numbered issue from
+        # another project.
+        "project": args.project,
         "ready": False,
         "dependencies": [],
         "contentDigest": digest,
@@ -744,6 +791,9 @@ def _check_request(args: argparse.Namespace) -> int:
     authorizing = bool(args.authorize_labels)
     if args.label and not authorizing:
         raise ValueError("--label only applies with --authorize-labels")
+    continuation = getattr(args, "continuation_pr", "") or ""
+    if continuation and not authorizing:
+        raise ValueError("--continuation-pr only applies with --authorize-labels")
     if args.base:
         base = _verified_base(args.repository, args.project, args.base)
         policy = _committed_policy(args.repository, base, args.config, args.base)
@@ -766,10 +816,14 @@ def _check_request(args: argparse.Namespace) -> int:
             break
         # Codex 4243193102: a PR opened (or linked) for the issue since the claim is work this
         # push would duplicate. The open-PR inventory is read with each snapshot, and is part of
-        # what must hold still between the two reads.
+        # what must hold still between the two reads. The unit's OWN pull request — named by
+        # --continuation-pr — is tolerated, so review and repair stay authorizable after the
+        # draft PR publishes (the ordering the harness plane supports); every other open PR
+        # still refuses.
         prs = _open_pr_keys(args.project, args.issue)
-        if prs:
-            code, message = _refuse_open_prs(args.issue, prs, result)
+        blocking = [key for key in prs if not _continuation_allows(key, continuation)]
+        if blocking:
+            code, message = _refuse_open_prs(args.issue, blocking, result)
             break
         # The dependencies are part of the snapshot (Codex 4242373526): one reopened between
         # the reads is a change like any other, judged afresh on the next attempt.
@@ -780,9 +834,14 @@ def _check_request(args: argparse.Namespace) -> int:
         after = _issue_snapshot(again, issue_events(args.project, args.issue, run_gh))
         after["dependencies"] = _dependency_states(args.project, result["dependencies"])
         after["open pull requests"] = _open_pr_keys(args.project, args.issue)
-        if after["open pull requests"]:
+        blocking_after = [
+            key
+            for key in after["open pull requests"]
+            if not _continuation_allows(key, continuation)
+        ]
+        if blocking_after:
             _status(f"#{args.issue} gained an open pull request while it was checked")
-            code, message = _refuse_open_prs(args.issue, after["open pull requests"], result)
+            code, message = _refuse_open_prs(args.issue, blocking_after, result)
             break
         if before == after:
             result["stable"] = {"updatedAt": after["updated_at"], "attempts": attempt}
@@ -805,6 +864,21 @@ def _check_request(args: argparse.Namespace) -> int:
             f"UNSTABLE: #{args.issue} changed during each of {CHECK_REQUEST_ATTEMPTS} checks "
             f"({', '.join(moved)}); not concluding"
         )
+    if continuation:
+        # The tolerance is part of what the result attests: dispatch refuses
+        # a continuation authorization for a fresh implementation, which is
+        # exactly the duplicate work the open-PR refusal exists to prevent.
+        result["continuationPullRequest"] = continuation
+    # When the judgement was made, for consumers that must refuse stale
+    # authorization: labels, dependencies, and pull requests all move after
+    # a check, so the result's age is part of what it attests.
+    result["checkedAt"] = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
+    signing_key = _resolve_attestation_key(args)
+    if signing_key is not None:
+        # Dispatch consumes this result as its authorization gate: the mark
+        # binds every field, checkedAt included, to the shared secret, so a
+        # caller cannot author an acceptable result by hand.
+        result[_ATTESTATION_FIELD] = _attest_document(result, signing_key)
     _write(result, args.output)
     _status(message)
     return code
@@ -916,6 +990,1122 @@ def _dispatch_mission(args: argparse.Namespace) -> int:
     return 0
 
 
+def _candidate_rel(args: argparse.Namespace, value: str, flag: str) -> Path:
+    """`value` relative to the candidate repository, derived LEXICALLY.
+
+    Never through ``Path.resolve``: following symlinks would let an
+    uncommitted symlink planted at the configured path select another
+    committed file, so containment is judged on the normalized spelling and
+    the committed object at that exact path is what gets read.
+    """
+    repo_root = Path(os.path.abspath(args.candidate_repository))
+    # A RELATIVE value is repository-relative by contract — a central
+    # orchestrator addressing another checkout by path must not have its
+    # config resolved against the process working directory.
+    joined = value if os.path.isabs(value) else os.path.join(repo_root, value)
+    candidate = Path(os.path.normpath(joined))
+    try:
+        return candidate.relative_to(repo_root)
+    except ValueError:
+        raise ContextBuilderError(
+            f"{flag} must name a path inside the candidate repository; "
+            "candidate paths read repository-owned configuration committed "
+            "at the pinned revision"
+        ) from None
+
+
+def _committed_configuration(args: argparse.Namespace, pinned: str, value: str, flag: str) -> bytes:
+    """The bytes of a configuration file as COMMITTED at the pinned revision."""
+    rel = _candidate_rel(args, value, flag)
+    try:
+        return read_committed_file(
+            args.candidate_repository, pinned, rel.as_posix(), label="the pinned tree"
+        )
+    except GitDiffError as error:
+        raise ContextBuilderError(
+            f"the {flag} configuration is not committed at the pinned revision; "
+            "commit it so the packet is built under repository-owned definitions"
+        ) from error
+
+
+def _require_separate_target(args: argparse.Namespace) -> None:
+    """The review target must BE a separate repository, not merely spelled so.
+
+    A flag is a caller declaration; identity is not: the candidate itself, a
+    symlink alias of it, a worktree sharing its object store, or a repository
+    containing or contained by the candidate's tree is candidate-mutable, and
+    its refs would authenticate nothing.
+    """
+    candidate_root = os.path.realpath(args.candidate_repository)
+    target_root = os.path.realpath(args.review_target_repository)
+    target_identity = repository_identity(args.review_target_repository)
+    if (
+        target_identity == repository_identity(args.candidate_repository)
+        or target_identity == candidate_root
+        or target_identity.startswith(candidate_root + os.sep)
+        # Containment refuses in BOTH directions: a candidate checkout
+        # nested inside the target's worktree can reach the parent's .git
+        # and move its refs, so the "authoritative" base would be
+        # candidate-mutable again.
+        or candidate_root == target_root
+        or candidate_root.startswith(target_root + os.sep)
+        # ...and the target's WORKTREE must not sit under the candidate
+        # either: a linked worktree of an otherwise separate repository
+        # placed beneath the candidate keeps its common directory elsewhere,
+        # yet candidate code can run git inside it and move the shared refs.
+        or target_root.startswith(candidate_root + os.sep)
+    ):
+        raise ContextBuilderError(
+            "--review-target-repository must be a separate repository: the "
+            "candidate itself, a symlink alias, a worktree sharing its object "
+            "store, or a repository containing or contained by the candidate "
+            "tree is candidate-mutable and authenticates nothing"
+        )
+
+
+def _anchor_branch(args: argparse.Namespace, policy) -> str:
+    """The review base's branch name, from a TARGET-SIDE trust anchor.
+
+    A committed policy's ``default_branch`` is candidate-written (or stale-
+    tip-written) text: selecting the base ref by it is CIRCULAR, since a
+    stale branch tip's own policy names the same old branch and the
+    agreement check then passes against weaker definitions. The target's
+    ``origin/HEAD`` symref names the remote's default branch without
+    consulting any committed policy; the policies must then AGREE with it.
+    """
+    anchor = default_branch_name(args.review_target_repository)
+    if not anchor:
+        raise ContextBuilderError(
+            "the review target repository declares no origin/HEAD default "
+            "branch; run `git remote set-head origin --auto` in it so base "
+            "authentication anchors on target-side state, never on a "
+            "committed policy's branch name"
+        )
+    if policy.default_branch != anchor:
+        raise ContextBuilderError(
+            "the candidate changes the policy's default branch away from the "
+            "review target's own default; that re-aims base authentication, "
+            "so land the configuration change through the human-controlled "
+            "path first"
+        )
+    return anchor
+
+
+#: Where a system --gate-sandbox launcher lives, in preference order: strict
+#: trust never consults PATH as root, so a bare launcher name resolves against
+#: these root-only locations instead of being unresolvable on root runners.
+_LAUNCHER_SYSTEM_DIRS = ("/usr/bin", "/bin", "/usr/local/bin", "/usr/sbin", "/sbin")
+
+
+def _derived_verification(
+    args: argparse.Namespace, request: dict, policy: ProjectPolicy
+) -> VerificationEvidence:
+    """Reviewer verification DERIVED from the candidate repository itself.
+
+    The diff summary comes from ``collect_commit_diff`` over the resolved
+    base and head commits and the gate report from ``run_gates`` run here,
+    in the trusted caller — request JSON never impersonates pipeline
+    evidence, the base is authenticated outside the candidate repository,
+    and the gates run under the configuration committed at that base.
+    """
+    if not args.candidate_base or not args.candidate_head:
+        raise ContextBuilderError(
+            "--candidate-base and --candidate-head are required with --candidate-repository"
+        )
+    base = resolve_commit(args.candidate_repository, args.candidate_base)
+    head = resolve_commit(args.candidate_repository, args.candidate_head)
+    # The base is AUTHENTICATED against a repository the candidate cannot
+    # write: every ref inside the candidate repository — remote-tracking
+    # origin/<branch> included — is mutable by the producing run itself
+    # (`git update-ref`), so a caller-chosen later ancestor could pose as
+    # the review target and hide already-landed changes from the verified
+    # diff. The review target therefore resolves in the caller's separately
+    # maintained repository.
+    if not getattr(args, "review_target_repository", None):
+        raise ContextBuilderError(
+            "--review-target-repository is required to derive reviewer "
+            "verification: the trusted repository whose "
+            f"origin/{policy.default_branch} defines the review base — a ref "
+            "inside the candidate repository is candidate-mutable and "
+            "authenticates nothing"
+        )
+    _require_separate_target(args)
+    anchor_branch = _anchor_branch(args, policy)
+    try:
+        expected_base = resolve_commit(args.review_target_repository, f"origin/{anchor_branch}")
+    except GitDiffError as error:
+        raise ContextBuilderError(
+            "the review target repository has no "
+            f"origin/{anchor_branch}; fetch the authoritative review "
+            "target before deriving verification"
+        ) from error
+    if base != expected_base:
+        raise ContextBuilderError(
+            "--candidate-base must be the current authoritative review target "
+            f"(origin/{anchor_branch} in the review target repository "
+            f"is {expected_base})"
+        )
+    # Gate definitions come from the AUTHENTICATED BASE, never the head: the
+    # configuration committed at the head is itself part of the untrusted
+    # candidate, so a candidate commit replacing the configured gates with
+    # `true` would otherwise record a passing report under its own weakened
+    # rules. The base SHA is content-addressed, so reading it from the
+    # candidate's object database reads trusted bytes.
+    config_rel = _candidate_rel(args, args.config, "--config")
+    try:
+        base_config = read_committed_file(
+            args.candidate_repository, base, config_rel.as_posix(), label="the review base"
+        )
+    except GitDiffError as error:
+        raise ContextBuilderError(
+            "the gate configuration is not committed at the authenticated "
+            "review base; derived gates run only repository-owned, "
+            "base-trusted definitions"
+        ) from error
+    # The anchor already outranks every committed branch name; the
+    # base-committed policy must still AGREE with it, so a configuration
+    # drift between the target's default branch and the policy is a
+    # controlled error, never a silently re-aimed authentication.
+    if load_policy_bytes(base_config).default_branch != anchor_branch:
+        raise ContextBuilderError(
+            "the candidate head changes the policy's default branch; that "
+            "re-aims base authentication, so land the configuration change "
+            "through the human-controlled path before reviewing candidates "
+            "against it"
+        )
+    # Candidate gates are candidate-controlled COMMANDS: run bare they
+    # execute as the caller's OS user, and a disposable clone restricts
+    # nothing outside itself (dotfiles, credentials, the original checkout
+    # through /proc, background processes that survive the clone's
+    # deletion). The caller must either name the isolation wrapper the
+    # commands run under or explicitly accept host execution for a
+    # candidate it already trusts.
+    if not getattr(args, "gate_sandbox", None):
+        raise ContextBuilderError(
+            "--gate-sandbox is required: derived gates execute "
+            "candidate-controlled commands, so name the isolation wrapper "
+            "they run under (a container or sandbox command prefix), or pass "
+            "--gate-sandbox trusted-host to accept execution on this host "
+            "for a candidate you already trust"
+        )
+    if args.gate_sandbox == "trusted-host":
+        sandbox_prefix: tuple[str, ...] = ()
+    else:
+        sandbox_prefix = tuple(shlex.split(args.gate_sandbox))
+        if not sandbox_prefix:
+            raise ContextBuilderError(
+                "--gate-sandbox must name a non-empty wrapper command, or the literal trusted-host"
+            )
+        # The LAUNCHER itself must be trusted: run_gates executes it under
+        # the gate PATH, whose first entries on a CI runner can be a
+        # candidate-writable virtualenv, so a bare launcher name — or a
+        # writable file — would run candidate code on the host before any
+        # sandbox exists. The first argv element resolves exactly like git
+        # does under strict trust.
+        launcher = sandbox_prefix[0]
+        try:
+            if os.path.isabs(launcher):
+                reason = (
+                    candidate_reason(launcher)
+                    if os.path.lexists(launcher)
+                    else "the file does not exist"
+                )
+                if reason:
+                    raise ContextBuilderError(
+                        f"--gate-sandbox names an untrusted launcher: {reason}"
+                    )
+                resolved_launcher = os.path.realpath(launcher)
+            else:
+                # Strict trust never searches PATH as root, so a bare
+                # launcher name needs explicit system candidates — the
+                # locations only root can replace — or root-based container
+                # runners could never resolve the documented bare form.
+                resolved_launcher = resolve_trusted(
+                    launcher,
+                    tuple(os.path.join(directory, launcher) for directory in _LAUNCHER_SYSTEM_DIRS),
+                    "",
+                )
+        except UntrustedExecutableError as error:
+            raise ContextBuilderError(f"--gate-sandbox launcher is not trusted: {error}") from None
+        sandbox_prefix = (resolved_launcher, *sandbox_prefix[1:])
+    snapshot = collect_commit_diff(args.candidate_repository, base, head)
+    # The BASE diff policy governs what may even reach review: a candidate
+    # touching forbidden paths or exceeding the changed-file, line or patch
+    # caps must not receive a signed reviewer dispatch just because its
+    # gates pass — check-diff would refuse the same change on the Actions
+    # path. The size caps read the HISTORICAL counters, exactly like
+    # check-diff: an intermediate commit that publishes an oversized patch
+    # which a later commit shrinks back is still published by a push of the
+    # head, so the endpoint counts alone would accept a series check-diff
+    # rejects.
+    diff_decision = evaluate_diff(
+        snapshot.paths,
+        snapshot.cap_added_lines,
+        snapshot.cap_deleted_lines,
+        policy,
+        patch_bytes=snapshot.cap_patch_bytes,
+    )
+    if not diff_decision.allowed:
+        raise ContextBuilderError(
+            "the derived diff violates the base policy: " + "; ".join(diff_decision.reasons)
+        )
+    # The reviewer reads the SERIES, not only its end state: a commit that
+    # adds content a later commit removes leaves the endpoint tree diff
+    # empty while a push of the head still publishes the blob, so the
+    # evidence patch carries the per-commit patches and the digest binds
+    # those bytes.
+    series_patch = collect_series_patch(args.candidate_repository, base, head)
+    # The caller's own checkout is not evidence: it can be dirty, carry
+    # ignored files a gate would read, or have status output suppressed by
+    # repository-local configuration — and a gate run leaves caches behind
+    # that would fail the next derivation. Gates therefore run in a
+    # disposable tree materialized from the object database at the candidate
+    # head (no checkout, so no local smudge filter or hook runs), observing
+    # exactly the committed content and leaving the caller's state untouched.
+    # The tree's own origin/<default branch> is PINNED to the authenticated
+    # base: the mirror would otherwise import the candidate's value for that
+    # ref, and a gate diffing `origin/$GITHUB_BASE_REF...HEAD` against a
+    # candidate-moved ref could see an empty diff while the packet's
+    # separately computed diff is not.
+    with derivation_tree(
+        args.candidate_repository,
+        head,
+        pin_refs={f"refs/remotes/origin/{policy.default_branch}": base},
+    ) as tree:
+        gate_config = tree.parent / "gate-config-at-base.toml"
+        gate_config.write_bytes(base_config)
+        report = run_gates(
+            gate_config,
+            tree,
+            # The ambient workflow's revision variables describe the
+            # caller's checkout; gates in the isolated tree see the
+            # candidate's instead. GITHUB_BASE_REF keeps Actions' BRANCH
+            # NAME semantics — a gate diffing `origin/$GITHUB_BASE_REF...`
+            # must find the ref — and the resolved base SHA travels in its
+            # own variable.
+            environment_overrides={
+                "GITHUB_SHA": head,
+                "GITHUB_BASE_REF": policy.default_branch,
+                "AGENTIC_SDLC_BASE_SHA": base,
+                "GITHUB_REF": None,
+                "GITHUB_HEAD_REF": None,
+            },
+            command_prefix=sandbox_prefix,
+        )
+    # Wall-clock timings are not evidence, and they make everything bound to
+    # the report nondeterministic: the rendered size, the budget accounting,
+    # the evidence selection, and the packet digest would all differ between
+    # the artifact build and the dispatch rebuild. Zeroed HERE, so derived
+    # packets are deterministic end to end and the artifact comparison below
+    # stays exact.
+    report = {
+        "passed": report.get("passed"),
+        "gates": [{**gate, "durationSeconds": 0.0} for gate in report.get("gates", [])],
+    }
+    findings = request.get("priorFindings", [])
+    if not isinstance(findings, list) or not all(isinstance(item, str) for item in findings):
+        raise ContextBuilderError("packet request priorFindings must be an array of strings")
+    # The reviewer reads the change itself, and reads EVERY byte the digest
+    # binds: a replacement-character decode would render two distinct
+    # non-UTF-8 changes identically, and a NUL inside decodable text would
+    # be stripped by prompt sanitization after the digest was taken, so
+    # both travel base64-encoded instead of lossily rendered.
+    try:
+        patch_text = series_patch.decode("utf-8")
+        patch_encoding = "utf-8"
+        if "\x00" in patch_text:
+            raise UnicodeDecodeError("utf-8", b"", 0, 1, "NUL renders lossily")
+    except UnicodeDecodeError:
+        patch_text = base64.b64encode(series_patch).decode("ascii")
+        patch_encoding = "base64"
+    return VerificationEvidence(
+        head_sha=head,
+        base_sha=base,
+        diff_paths=snapshot.paths,
+        added_lines=snapshot.added_lines,
+        deleted_lines=snapshot.deleted_lines,
+        history_added_lines=snapshot.history_added_lines,
+        history_deleted_lines=snapshot.history_deleted_lines,
+        patch_sha256=hashlib.sha256(series_patch).hexdigest(),
+        gate_report=report,
+        prior_findings=tuple(findings),
+        patch=patch_text,
+        patch_encoding=patch_encoding,
+    )
+
+
+_ATTESTATION_FIELD = "attestation"
+
+
+#: The harness TRUST ANCHOR: when the execution harness sets this variable,
+#: the file it names is the attestation key for every attested command the
+#: harness runs — non-overridable from the command line.
+_ATTESTATION_ANCHOR_ENV = "AGENTIC_SDLC_ATTESTATION_KEY_FILE"
+
+
+def _attestation_key_bytes(path: str) -> bytes:
+    """The shared attestation secret: at least 32 bytes of key material.
+
+    The artifacts and the key that verifies them must not BOTH be caller
+    inputs: an invoker could mint a fresh 32-byte key, sign a fabricated
+    authorization result or run history under it, and pass both. A harness
+    that sets the trust anchor pins the key — the anchor file is the key,
+    attestation cannot be switched off by omitting the flag, and a
+    ``--attestation-key`` naming different key material is refused rather
+    than trusted. Without the anchor the caller IS the operator, and the
+    argument stands alone.
+    """
+
+    def _read(name: str, what: str) -> bytes:
+        try:
+            key = Path(name).read_bytes().strip()
+        except OSError as error:
+            raise ContextBuilderError(f"the {what} could not be read: {error}") from None
+        if len(key) < 32:
+            raise ContextBuilderError(
+                f"the {what} must hold at least 32 bytes of secret key material"
+            )
+        return key
+
+    anchor = os.environ.get(_ATTESTATION_ANCHOR_ENV, "")
+    if not anchor:
+        if not path:
+            raise ContextBuilderError(
+                "no attestation key: pass --attestation-key or set the "
+                f"{_ATTESTATION_ANCHOR_ENV} trust anchor"
+            )
+        return _read(path, "attestation key")
+    pinned = _read(anchor, f"attestation trust anchor ({_ATTESTATION_ANCHOR_ENV})")
+    if path and not hmac.compare_digest(pinned, _read(path, "attestation key")):
+        raise ContextBuilderError(
+            "--attestation-key does not match the harness trust anchor "
+            f"({_ATTESTATION_ANCHOR_ENV}): the anchor pins the verification "
+            "key, so artifacts signed under a caller-supplied substitute key "
+            "are refused"
+        )
+    return pinned
+
+
+def _resolve_attestation_key(args: argparse.Namespace) -> bytes | None:
+    """The key for an optionally-attested command, or None for unattested.
+
+    The harness anchor forces attestation ON: a caller inside an anchored
+    harness cannot skip verification by omitting ``--attestation-key``.
+    """
+    flag = getattr(args, "attestation_key", None) or ""
+    if os.environ.get(_ATTESTATION_ANCHOR_ENV, "") or flag:
+        return _attestation_key_bytes(flag)
+    return None
+
+
+def _attest_document(document: Mapping, key: bytes) -> str:
+    """HMAC-SHA256 over the document's canonical JSON, attestation field excluded."""
+    body = {name: value for name, value in document.items() if name != _ATTESTATION_FIELD}
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hmac.new(key, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _verify_attested_input(args: argparse.Namespace, document, what: str, producer: str) -> None:
+    """Accept a caller-supplied trust artifact only under a valid attestation.
+
+    These documents are plain JSON an invoker could author: without a mark
+    from the shared secret, a fabricated run history or authorization result
+    satisfies every structural check this CLI can run. The secret never
+    travels in the artifact, so holding or reading a file confers no ability
+    to mint one; only the trusted producer commands, run with the same key,
+    emit documents dispatch accepts.
+    """
+    key = _resolve_attestation_key(args)
+    if key is None:
+        raise ContextBuilderError(
+            f"dispatch requires --attestation-key to verify the {what}; "
+            f"produce the artifact with {producer} under the same key"
+        )
+    mark = document.get(_ATTESTATION_FIELD) if isinstance(document, Mapping) else None
+    if not isinstance(mark, str) or not hmac.compare_digest(mark, _attest_document(document, key)):
+        raise ContextBuilderError(
+            f"the {what} carries no valid attestation under --attestation-key; "
+            f"regenerate it with {producer} and the same key"
+        )
+
+
+def _check_dispatch_authorization(args: argparse.Namespace, policy, packet) -> None:
+    """Bind a write-capable dispatch to the trusted label-authorization gate.
+
+    Request labels are caller-supplied text: a caller could spell the
+    approval label names into the request without any authorized writer ever
+    applying them to the work item. The `check-request --authorize-labels`
+    result is the trusted record of that gate, so dispatch requires it and
+    verifies it names this exact project, work item, and request content,
+    passed its authorization, and held still across its two reads.
+    """
+    if not getattr(args, "authorization", None):
+        raise ContextBuilderError(
+            "dispatch requires --authorization: the check-request "
+            "--authorize-labels result proving the approval labels were "
+            "applied to the work item by authorized writers (a reviewer "
+            "judges against this authorized content too)"
+        )
+    document = json.loads(Path(args.authorization).read_text(encoding="utf-8"))
+    if not isinstance(document, dict):
+        raise ContextBuilderError("the authorization result must be a JSON object")
+    # Structure proves nothing about provenance: the result is plain JSON an
+    # invoker could author with every expected field, so it is accepted only
+    # under a valid mark from the shared attestation key the trusted
+    # check-request run signed it with.
+    _verify_attested_input(
+        args,
+        document,
+        "authorization result",
+        "check-request --authorize-labels --attestation-key",
+    )
+    verdict = document.get("authorization")
+    stable = document.get("stable")
+    if (
+        document.get("ready") is not True
+        or not isinstance(verdict, dict)
+        or verdict.get("authorized") is not True
+        or not isinstance(stable, dict)
+    ):
+        raise ContextBuilderError(
+            "the authorization result does not record a ready, label-authorized, "
+            "stable check; re-run check-request --authorize-labels"
+        )
+    work_ref = f"{document.get('project')}#{document.get('issue')}"
+    if document.get("project") != policy.project_id or work_ref != packet.work_ref:
+        raise ContextBuilderError(
+            f"the authorization result names {work_ref}, not the packet's "
+            f"work item {packet.work_ref}; authorize the dispatched work item"
+        )
+    # A continuation authorization tolerated the unit's OWN open pull request
+    # so post-publication review and repair stay dispatchable; a fresh
+    # implementation under one would duplicate exactly the work the open-PR
+    # refusal exists to prevent.
+    if (
+        document.get("continuationPullRequest")
+        and packet.role != "reviewer"
+        and getattr(args, "run_kind", None) != "repair"
+    ):
+        raise ContextBuilderError(
+            "the authorization result is a continuation (it tolerates the "
+            "unit's own open pull request); an implementation dispatch "
+            "requires a fresh check-request authorization without "
+            "--continuation-pr"
+        )
+    # The verdict must cover the POLICY's approval set, not a caller-selected
+    # one: `check-request --authorize-labels --label harmless` reports ready
+    # on an issue that merely carries the policy labels while its verdict
+    # proves writers applied only "harmless".
+    required_labels = {
+        policy.implementation_label.casefold(),
+        policy.ready_label.casefold(),
+        policy.human_review_label.casefold(),
+    }
+    checked = verdict.get("labelers")
+    checked_labels = (
+        {name.casefold() for name in checked} if isinstance(checked, Mapping) else set()
+    )
+    if checked_labels != required_labels:
+        raise ContextBuilderError(
+            "the authorization verdict does not cover exactly the policy's "
+            "approval labels; re-run check-request --authorize-labels without "
+            "narrowing --label"
+        )
+    digest = request_digest(packet.task.title, packet.task.raw_body)
+    if document.get("contentDigest") != digest:
+        raise ContextBuilderError(
+            "the authorization result was taken for different request content; "
+            "re-run check-request --authorize-labels against the current title "
+            "and body"
+        )
+    # A stale but genuine result can authorize work the CURRENT issue state
+    # no longer permits (a removed label, a reopened dependency, a fresh
+    # pull request), so the result must be recent — and the ceiling can be
+    # NARROWED, never widened: a caller holding a stale signed result must
+    # not restore the replay checkedAt exists to prevent.
+    if args.authorization_max_age_seconds > 900:
+        raise ContextBuilderError(
+            "--authorization-max-age-seconds can narrow the freshness "
+            "ceiling, never widen it: values above 900 are refused"
+        )
+    checked_at = document.get("checkedAt")
+    try:
+        checked = datetime.datetime.fromisoformat(str(checked_at))
+    except (TypeError, ValueError):
+        checked = None
+    if checked is None or checked.tzinfo is None:
+        raise ContextBuilderError(
+            "the authorization result records no checkedAt instant; re-run "
+            "check-request --authorize-labels with the current CLI"
+        )
+    age = (datetime.datetime.now(datetime.UTC) - checked).total_seconds()
+    if age < 0 or age > args.authorization_max_age_seconds:
+        raise ContextBuilderError(
+            "the authorization result is older than "
+            f"{args.authorization_max_age_seconds} seconds (or from the "
+            "future); re-run check-request --authorize-labels and dispatch "
+            "promptly"
+        )
+
+
+def _readback_repository_records(repository: str, pin: str, records: tuple) -> None:
+    """Read every pinned repository payload back from the trusted tree.
+
+    The record's self-declared content hash proves nothing about the TREE: a
+    fabricated payload with a recomputed hash would hand the agent
+    attacker-chosen source under a self-consistent citation, so each record
+    pinned at `pin` is read back from that commit and compared through the
+    adapter's own sanitization (a file legitimately containing boundary
+    marker text is not misread as fabricated). Off-pin or malformed records
+    are left to the builder, which rejects them itself.
+    """
+    for record in records:
+        if record.source_type != "git-repository":
+            continue
+        if record.revision != pin:
+            continue  # the builder rejects off-pin records itself
+        suffix = "@" + record.revision
+        if not record.external_id.endswith(suffix):
+            continue  # the builder rejects the malformed shape itself
+        path = record.external_id[: -len(suffix)]
+        # Paths are retrieval-controlled text: a token-shaped filename is
+        # withheld from every error this readback can raise, exactly as
+        # the builder withholds it from exclusion notes.
+        shown = _safe_exclusion_path(path)
+        try:
+            committed = read_committed_file(repository, pin, path, label="the pinned tree")
+        except GitDiffError as error:
+            raise ContextBuilderError(
+                f"repository evidence for {shown} could not be read from "
+                "the pinned candidate tree; re-retrieve it from the "
+                "pinned revision"
+            ) from error
+        try:
+            expected = sanitize_payload(committed.decode("utf-8"))
+        except UnicodeDecodeError:
+            expected = None
+        if expected != record.payload:
+            raise ContextBuilderError(
+                f"repository evidence for {shown} does not match the pinned "
+                "candidate tree; re-retrieve it from the pinned revision"
+            )
+
+
+def _build_packet_from_request(
+    args: argparse.Namespace, *, trusted_verification_only: bool = False
+):
+    """Rebuild and validate a packet from its request inputs.
+
+    Shared by ``context-packet`` and ``dispatch-packet``, so dispatching runs
+    the same evidence authorization, verification requirement, and budgeting
+    that produced the packet artifact.
+    """
+    request = json.loads(Path(args.request).read_text(encoding="utf-8"))
+    if not isinstance(request, dict):
+        raise ContextBuilderError("packet request must be a JSON object")
+    repository_revision = request.get("repositoryRevision", "")
+    if not isinstance(repository_revision, str):
+        raise ContextBuilderError("packet request repositoryRevision must be a string")
+    if getattr(args, "candidate_repository", None):
+        # The policy that shapes the packet — limits, forbidden paths, task
+        # policy — is read from the COMMITTED candidate tree, exactly like
+        # the gate configuration: an uncommitted caller-side edit must not
+        # loosen the packet while the gate report presents the committed
+        # definitions. The pin is role-independent: reviewer derivations name
+        # --candidate-head, builder paths pin repositoryRevision.
+        pin_source = args.candidate_head or repository_revision
+        if not pin_source:
+            raise ContextBuilderError(
+                "--candidate-repository requires --candidate-head or a pinned "
+                "repositoryRevision to locate the committed configuration"
+            )
+        pinned = resolve_commit(args.candidate_repository, pin_source)
+        policy = load_policy_bytes(_committed_configuration(args, pinned, args.config, "--config"))
+        if getattr(args, "run_kind", None) == "repair" or args.candidate_head:
+            # The repair candidate's pinned HEAD is the failed
+            # implementation's own commits, and a REVIEWER derivation's pin
+            # is the untrusted candidate head: a widened or rewritten
+            # mission, weakened policy, or re-permissioned knowledge source
+            # committed there must not shape the envelope (a head-committed
+            # reviewer mission could instruct approval OUTSIDE the untrusted
+            # patch boundary), and the head-controlled default branch must
+            # not choose which ref supplies the base either, so the WHOLE
+            # contract re-pins to the authenticated base (the base-committed
+            # policy must agree on the branch name that located it).
+            if not getattr(args, "review_target_repository", None):
+                raise ContextBuilderError(
+                    "a repair or reviewer derivation requires "
+                    "--review-target-repository: the contract (policy, "
+                    "missions, knowledge, roster) loads from the "
+                    "authenticated base, never the candidate's own head"
+                )
+            _require_separate_target(args)
+            anchor_branch = _anchor_branch(args, policy)
+            try:
+                base_pin = resolve_commit(args.review_target_repository, f"origin/{anchor_branch}")
+            except GitDiffError as error:
+                raise ContextBuilderError(
+                    "the review target repository has no "
+                    f"origin/{anchor_branch}; fetch the authoritative "
+                    "base before dispatching against it"
+                ) from error
+            base_policy = load_policy_bytes(
+                _committed_configuration(args, base_pin, args.config, "--config")
+            )
+            if base_policy.default_branch != anchor_branch:
+                raise ContextBuilderError(
+                    "the candidate changes the policy's default branch; that "
+                    "re-aims base authentication, so land the configuration "
+                    "change through the human-controlled path first"
+                )
+            policy = base_policy
+            pinned = base_pin
+        # The mission registry and knowledge sources are the same
+        # human-reviewed, baseline-forbidden configuration the policy is: an
+        # uncommitted edit must not widen a consumer mission or a source's
+        # permissions while the artifact and rebuild agree on it.
+        if args.missions:
+            registry = load_registry_bytes(
+                _committed_configuration(args, pinned, args.missions, "--missions"), policy
+            )
+        else:
+            registry = load_registry(None, policy)
+        sources = {
+            source.source_id: source
+            for source in load_sources_bytes(
+                _committed_configuration(args, pinned, args.knowledge, "--knowledge")
+            )
+        }
+    else:
+        policy = load_policy(args.config)
+        registry = load_registry(args.missions, policy)
+        sources = {source.source_id: source for source in load_sources(args.knowledge)}
+
+    def _request_text(key: str) -> str:
+        value = request.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ContextBuilderError(f"packet request field {key} must be a non-empty string")
+        return value
+
+    task_entry = request.get("task")
+    if not isinstance(task_entry, dict):
+        raise ContextBuilderError("packet request task must be an object")
+    labels = task_entry.get("labels", [])
+    if not isinstance(labels, list) or not all(isinstance(item, str) for item in labels):
+        raise ContextBuilderError("packet request task labels must be an array of strings")
+    title = task_entry.get("title")
+    body = task_entry.get("body")
+    if not isinstance(title, str) or not isinstance(body, str):
+        raise ContextBuilderError("packet request task title and body must be strings")
+    task = parse_task(title, body, tuple(labels))
+
+    records_entry = request.get("records", [])
+    if not isinstance(records_entry, list):
+        raise ContextBuilderError("packet request records must be an array")
+    records = tuple(record_from_dict(entry) for entry in records_entry)
+    failures = request.get("retrievalFailures", [])
+    if not isinstance(failures, list) or not all(isinstance(item, str) for item in failures):
+        raise ContextBuilderError("packet request retrievalFailures must be an array of strings")
+    mission = registry.get(_request_text("missionId"))
+    role = mission_role(mission)
+    verification = None
+    if getattr(args, "candidate_repository", None):
+        if request.get("verification") is not None:
+            raise ContextBuilderError(
+                "the packet request must not carry verification when the CLI "
+                "derives it from the candidate repository"
+            )
+        if role == "reviewer":
+            verification = _derived_verification(args, request, policy)
+            pin = verification.head_sha
+        else:
+            # Builders and testers must not receive verification evidence,
+            # but their repository records still need a trusted tree: the
+            # candidate repository verifies the request's pinned revision.
+            if args.candidate_base or args.candidate_head:
+                raise ContextBuilderError(
+                    "--candidate-base and --candidate-head derive reviewer "
+                    f"verification; a {role} mission takes --candidate-repository "
+                    "alone"
+                )
+            if (
+                not repository_revision
+                or resolve_commit(args.candidate_repository, repository_revision)
+                != repository_revision
+            ):
+                raise ContextBuilderError(
+                    "repositoryRevision must be the full commit SHA of the "
+                    "trusted pinned tree in the candidate repository"
+                )
+            # The pin must be the CURRENT trusted checkout, not any
+            # resolvable historical SHA: policy, missions, knowledge and
+            # repository evidence all load from the pin, so a request naming
+            # an older revision would dispatch a write-capable envelope
+            # under stale, possibly weaker configuration and source.
+            current = resolve_commit(args.candidate_repository, "HEAD")
+            if repository_revision != current:
+                raise ContextBuilderError(
+                    "repositoryRevision must be the candidate repository's "
+                    f"current checkout ({current}); a historical pin would "
+                    "dispatch under stale configuration and source"
+                )
+            pin = repository_revision
+        _readback_repository_records(args.candidate_repository, pin, records)
+    elif request.get("verification") is not None:
+        if trusted_verification_only:
+            # Schema-valid request JSON is not pipeline evidence: a dispatch
+            # could otherwise render a fabricated gate report or diff summary
+            # beneath the trusted-pipeline heading.
+            raise ContextBuilderError(
+                "dispatch derives reviewer verification from the candidate "
+                "repository; pass --candidate-repository, --candidate-base and "
+                "--candidate-head instead of request verification"
+            )
+        verification = verification_from_dict(request["verification"])
+    elif trusted_verification_only:
+        # Every dispatch pins its configuration, evidence or not: a request
+        # with no records would otherwise read policy, missions, and
+        # knowledge from the mutable working tree, and a repository record's
+        # self-declared content hash proves nothing about any tree without
+        # readback.
+        raise ContextBuilderError(
+            "dispatch-packet requires --candidate-repository: every dispatch "
+            "pins repository-owned configuration at the trusted revision, and "
+            "pinned payloads are read back from it"
+        )
+    if trusted_verification_only:
+        # Only repository evidence has a trusted readback today: every other
+        # source type would dispatch exactly the payload the request chose,
+        # under a self-consistent hash and a copied scope, so it is refused
+        # on this path until an attested retrieval exists for it.
+        unattested = sorted(
+            {record.source_type for record in records if record.source_type != "git-repository"}
+        )
+        if unattested:
+            raise ContextBuilderError(
+                "dispatch accepts repository evidence only (read back from the "
+                "pinned tree); no attested retrieval exists for "
+                + ", ".join(unattested)
+                + " records — retrieve them through the trusted pipeline, not "
+                "request JSON"
+            )
+    packet_findings: tuple[str, ...] = ()
+    if getattr(args, "run_kind", None) == "repair":
+        # The repair agent's channel for WHAT must be fixed: the findings
+        # render in the packet and dispatch verifies them against the
+        # attested state's recorded review digest.
+        raw_findings = request.get("priorFindings", [])
+        if not isinstance(raw_findings, list) or not all(
+            isinstance(item, str) for item in raw_findings
+        ):
+            raise ContextBuilderError("packet request priorFindings must be an array of strings")
+        packet_findings = tuple(raw_findings)
+    packet = build_context_packet(
+        mission,
+        task,
+        policy,
+        work_ref=_request_text("workRef"),
+        records=records,
+        sources=sources,
+        verification=verification,
+        budget_bytes=request.get("budgetBytes", DEFAULT_PACKET_BYTES),
+        retrieval_failures=tuple(failures),
+        repository_revision=repository_revision,
+        prior_findings=packet_findings,
+    )
+    return registry, mission, packet, policy
+
+
+def _context_packet(args: argparse.Namespace) -> int:
+    _registry, _mission, packet, _policy = _build_packet_from_request(args)
+    _write(packet.as_dict(), args.output)
+    return 0
+
+
+def _dispatch_packet(args: argparse.Namespace) -> int:
+    """Dispatch through the packet contract, never around it.
+
+    The packet is rebuilt and re-validated from the same request inputs that
+    produced the artifact, so dispatching runs evidence authorization, the
+    reviewer-verification requirement, and the budget checks; the resulting
+    envelope carries the packet digest as ``contextPackDigest`` and the
+    rendered packet as its prompt.
+    """
+    registry, mission, packet, policy = _build_packet_from_request(
+        args, trusted_verification_only=True
+    )
+    if mission_role(mission) != "reviewer":
+        # The official dispatch path binds write-capable work to the same
+        # eligibility decision the implementation-readiness path enforces: a
+        # request without the approval labels, or matching a forbidden task
+        # pattern, must not reach an envelope just because it came in as a
+        # packet.
+        decision = evaluate_task(packet.task, policy, "implement")
+        if not decision.allowed:
+            raise ContextBuilderError(
+                "dispatch blocked by task policy: " + "; ".join(decision.reasons)
+            )
+        # evaluate_task proves only that the configured label NAMES appear in
+        # the caller-supplied request: approval itself is the trusted
+        # `check-request --authorize-labels` gate, whose result must name
+        # this exact work item and content.
+        _check_dispatch_authorization(args, policy, packet)
+    else:
+        # The reviewer judges the candidate AGAINST the request's task, and
+        # the title and body are caller JSON: without the same authorization
+        # gate, a caller could keep the signed history's workRef and head
+        # while replacing the acceptance criteria with a weaker
+        # specification. The attested check-request result binds this exact
+        # project, work item, and content digest.
+        _check_dispatch_authorization(args, policy, packet)
+        # Reviews follow a PASSING verification: evidence whose own gate
+        # aggregate is false describes a failed head — the unit belongs in
+        # repair, and a reviewer's zero-finding verdict must not carry it
+        # toward merge past the failed deterministic gates.
+        if (
+            packet.verification is not None
+            and packet.verification.gate_report.get("passed") is not True
+        ):
+            raise ContextBuilderError(
+                "reviewer dispatch requires the derived gates to pass: the "
+                "gate report's aggregate is false, so record the failed "
+                "verification (orchestrate --action verification) to route "
+                "the unit back to repair instead of review"
+            )
+    if args.packet:
+        artifact = json.loads(Path(args.packet).read_text(encoding="utf-8"))
+
+        # The WHOLE document is compared, never just its digest field, and
+        # through canonical JSON encodings: Python equality conflates JSON
+        # booleans and numbers (False == 0), which would let a schema-invalid
+        # artifact read as matching.
+        def _encoded(document: object) -> str:
+            return json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+        # Derived gate reports carry zeroed durations, so every rebuild —
+        # derived or not — is deterministic and the comparison stays EXACT,
+        # digest field included: a digest-inconsistent audit artifact is
+        # rejected whatever path produced it.
+        if _encoded(artifact) != _encoded(packet.as_dict()):
+            raise ContextBuilderError(
+                "the packet artifact does not match the packet rebuilt from the "
+                "request; rebuild the packet before dispatching"
+            )
+    # The roster is repository-owned configuration like the policy and the
+    # mission registry: an uncommitted caller-side roster could relabel a
+    # producing agent under a fresh agentId to evade the history exclusions,
+    # or route authorized write work to an undeclared executor — and the
+    # resulting envelope would then be SIGNED as a trusted dispatch. It is
+    # read from the committed tree at the packet's pinned revision — except
+    # for REVIEWER dispatches, whose pin is the untrusted candidate head: a
+    # producer could commit a roster aliasing itself under a fresh reviewer
+    # agentId there, so reviewer identities come from the AUTHENTICATED BASE.
+    # The envelope digests the EXACT lifecycle kind it may seed (validated
+    # against the role here, since the roster pin depends on it).
+    role = mission_role(mission)
+    canonical_kind = {"builder": "implementation", "tester": "verification", "reviewer": "review"}
+    run_kind = getattr(args, "run_kind", None) or canonical_kind[role]
+    if run_kind not in _ROLE_RUN_KINDS[role]:
+        raise ContextBuilderError(
+            f"--run-kind {run_kind} is not a {role} run; builders dispatch "
+            "implementation or repair, testers verification, reviewers review"
+        )
+    roster_pin = packet.repository_revision
+    if role == "reviewer" and packet.verification is not None:
+        roster_pin = packet.verification.base_sha
+    if run_kind == "repair":
+        # A repair candidate's pinned HEAD is the failed implementation's own
+        # commits: a replaced roster committed there would route the
+        # write-capable repair to a planted executor, so repair rosters load
+        # from the authenticated base exactly like reviewer rosters.
+        if not getattr(args, "review_target_repository", None):
+            raise ContextBuilderError(
+                "--run-kind repair requires --review-target-repository: the "
+                "repair candidate's own head can carry a replaced roster, so "
+                "repair rosters load from the authenticated base"
+            )
+        _require_separate_target(args)
+        try:
+            roster_pin = resolve_commit(
+                args.review_target_repository, f"origin/{policy.default_branch}"
+            )
+        except GitDiffError as error:
+            raise ContextBuilderError(
+                "the review target repository has no "
+                f"origin/{policy.default_branch}; fetch the authoritative "
+                "base before dispatching a repair"
+            ) from error
+    agents = load_agents(
+        json.loads(
+            _committed_configuration(args, roster_pin, args.agents, "--agents").decode("utf-8")
+        )
+    )
+    history: dict[str, list[str]] = {}
+    producing_agents: set[str] = set()
+    unit_runs: tuple = ()
+    history_state_id = ""
+    history_unit_sha256 = ""
+    if args.history:
+        # The history is the ORCHESTRATOR STATE, not a bare mission→agent
+        # map: a caller-authored map could record "" (or any other agent) for
+        # a mission the selected reviewer actually performed. The state is
+        # replayed through the orchestrator's own validation, and the run
+        # records of THIS work item — their mission and agent identity —
+        # define the exclusions.
+        document = json.loads(Path(args.history).read_text(encoding="utf-8"))
+        # ``Orchestrator.from_dict`` validates shape, not provenance: a
+        # fabricated state could record an innocent agent as the producer
+        # and omit the real one, so the state is accepted only under a valid
+        # mark from the key the trusted ``orchestrate`` runs signed it with.
+        _verify_attested_input(args, document, "run history", "orchestrate --attestation-key")
+        engine = Orchestrator.from_dict(document)
+        history_state_id = engine.state_id
+        try:
+            unit = engine.get(packet.work_ref)
+        except OrchestrationError as error:
+            raise MissionError(
+                f"the run history records no work unit {packet.work_ref}; pass "
+                "the orchestrator state that dispatched this work item"
+            ) from error
+        unit_runs = tuple(unit.runs)
+        # The envelope binds this unit's EXACT snapshot, not only the state
+        # lineage: the lineage id never changes as the state advances, so a
+        # stale (but genuinely attested) earlier snapshot could otherwise
+        # derive a review envelope for a superseded producer that the current
+        # state would still accept.
+        history_unit_sha256 = _unit_state_digest(unit)
+        # The attested state records the latest review's canonical findings
+        # digest: a re-review packet whose caller-supplied priorFindings do
+        # not hash to it is carrying a laundered report alongside the
+        # genuine signed count, so the dispatch refuses.
+        recorded_findings = getattr(unit, "review_findings_sha256", "")
+        carried_findings = (
+            packet.verification.prior_findings
+            if packet.verification is not None
+            else packet.prior_findings
+        )
+        if recorded_findings:
+            if _findings_digest(carried_findings) != recorded_findings:
+                raise MissionError(
+                    "the packet's priorFindings do not hash to the findings "
+                    "report the attested state records for this unit's latest "
+                    "review; carry the reviewer's actual findings"
+                )
+        elif carried_findings:
+            # No recorded digest means NO reviewer ever attested a report
+            # for this unit — an initial review, or a repair after a
+            # deterministic verification failure — so any carried findings
+            # are caller-authored, never a reviewer's.
+            raise MissionError(
+                "the packet carries priorFindings but the attested state "
+                "records no findings report for this unit; only a report a "
+                "recorded review attested may seed a dispatch"
+            )
+        for run in unit_runs:
+            # EVERY agent that performed the mission is excluded, not only
+            # the last assignee: a work item can carry several runs of one
+            # producing mission by different agents.
+            agents_for = history.setdefault(run.mission_id, [])
+            if run.agent_id not in agents_for:
+                agents_for.append(run.agent_id)
+            # Producing status comes from the run's PERSISTED kind, never a
+            # registry lookup: a mission removed or rewritten after the run
+            # must not launder its agents back into review eligibility.
+            if run.kind in ("implementation", "repair"):
+                producing_agents.add(run.agent_id)
+    if mission_role(mission) == "reviewer":
+        # A review necessarily follows a producing run, so an absent history
+        # — or one recording no producing run for this work item — is not
+        # authoritative: with nothing to exclude, the roster's first eligible
+        # agent could review its own earlier work despite the mission's
+        # independence contract.
+        produced = [other for other in mission.independent_of if other in history]
+        if not args.history or not produced:
+            raise MissionError(
+                "reviewer dispatch requires --history: the orchestrator state "
+                "recording the producing runs of this work item (none of the "
+                "missions this review is independent of has a recorded run)"
+            )
+        # The state must be the history of THIS candidate, bound to its
+        # LATEST producer: after implementation commit A and repair commit
+        # B, a stale review packet for A still finds A in the history, so
+        # ANY-run matching would let a zero-finding verdict on the
+        # pre-repair code advance the repaired unit. The most recent
+        # producing run must have succeeded at exactly this head.
+        head_sha = packet.verification.head_sha if packet.verification else ""
+        producing_runs = [run for run in unit_runs if run.kind in ("implementation", "repair")]
+        latest = producing_runs[-1] if producing_runs else None
+        if latest is None or latest.result != "succeeded" or latest.commit_sha != head_sha:
+            raise MissionError(
+                "the run history's latest producing run does not record "
+                f"candidate head {head_sha} as its successful commit; review "
+                "dispatches bind to the most recent producer, never a stale "
+                "earlier head"
+            )
+    # An ATTESTED dispatch binds the orchestration state's lineage: without
+    # --history (or against a legacy state with no stateId) the envelope
+    # could not be tied to a generation, and a recreated state would accept
+    # old signed envelopes, completions and outcomes as fresh.
+    signing_key = _resolve_attestation_key(args)
+    if signing_key is not None and not history_state_id:
+        raise ContextBuilderError(
+            "an attested dispatch requires --history naming a state with a "
+            "lineage id (stateId): the envelope digests it so a recreated "
+            "state cannot replay old signed dispatches; re-create legacy "
+            "state with the current orchestrate CLI"
+        )
+    # Roster order defines fallbacks: an eligible agent whose declared
+    # context window cannot fit the packet is skipped for the next eligible
+    # one instead of blocking a dispatch a fallback could carry.
+    roster = list(agents)
+    reviewer = role == "reviewer"
+    while True:
+        agent = registry.select_agent(
+            mission.mission_id,
+            tuple(roster),
+            history=history,
+            excluded_agents=frozenset(producing_agents) if reviewer else frozenset(),
+        )
+        try:
+            envelope = dispatch_envelope_for_packet(
+                packet,
+                mission,
+                agent,
+                input_refs=tuple(args.input_ref),
+                run_kind=run_kind,
+                # A fresh nonce per dispatch: one envelope digest identifies
+                # exactly ONE dispatch, so the attested one-digest-one-run
+                # rule stays absolute without stranding a retry of unchanged
+                # content, and completion/outcome records bind the exact
+                # dispatch they attest.
+                dispatch_nonce=secrets.token_hex(16),
+                state_id=history_state_id,
+                unit_state_sha256=history_unit_sha256,
+            )
+            break
+        except ContextBuilderError as error:
+            if "context window" not in str(error):
+                raise
+            roster = [entry for entry in roster if entry.agent_id != agent.agent_id]
+            if not roster:
+                raise ContextBuilderError(
+                    f"{error}; no other eligible agent declares a sufficient context window"
+                ) from error
+    if signing_key is not None:
+        # The envelope seeds the attested run history: `orchestrate
+        # start-run` under the same key accepts only envelopes a trusted
+        # dispatch signed, so run attribution can never be hand-authored.
+        envelope[_ATTESTATION_FIELD] = _attest_document(envelope, signing_key)
+    if getattr(args, "prompt_output", None):
+        # The envelope signs promptSha256; the EXECUTOR needs the exact
+        # rendered prompt those bytes digest, so dispatch emits it as a
+        # bound artifact instead of leaving the executor to rebuild
+        # undocumented in-memory objects.
+        Path(args.prompt_output).write_text(render_packet_for_prompt(packet), encoding="utf-8")
+    _write(envelope, args.output)
+    return 0
+
+
 def _validate_executors(args: argparse.Namespace) -> int:
     document = json.loads(Path(args.executors).read_text(encoding="utf-8"))
     executors = load_executors(document)
@@ -948,10 +2138,88 @@ def _route_executor(args: argparse.Namespace) -> int:
     return 0 if decision.selected_executor_id else 2
 
 
+#: The run kinds each packet role's dispatches may seed: builders produce,
+#: testers verify, reviewers review. A producing envelope recorded under a
+#: non-producing kind would launder its agent past review exclusions.
+_ROLE_RUN_KINDS = {
+    "builder": frozenset({"implementation", "repair"}),
+    "tester": frozenset({"verification"}),
+    "reviewer": frozenset({"review"}),
+}
+
+
+def _require_attested_envelope(envelope, key: bytes, *, unit: str, kind: str) -> None:
+    """An attested state records only runs a trusted dispatch produced.
+
+    The envelope names the run's agent and mission — exactly what review
+    exclusions are later derived from — so a hand-authored envelope must not
+    seed the state: its attestation must verify under the shared key, and its
+    self-digest must match its content so a signed envelope cannot be
+    re-labeled either. The envelope must also be FOR this record: a genuine
+    envelope replayed into another work item, or recorded under a kind its
+    packet role does not permit, would fabricate run attribution exactly like
+    a forged one.
+    """
+    mark = envelope.get(_ATTESTATION_FIELD) if isinstance(envelope, Mapping) else None
+    if not isinstance(mark, str) or not hmac.compare_digest(mark, _attest_document(envelope, key)):
+        raise OrchestrationError(
+            "the dispatch envelope carries no valid attestation under "
+            "--attestation-key; produce it with dispatch-packet "
+            "--attestation-key and the same key"
+        )
+    body = {
+        name: value
+        for name, value in envelope.items()
+        if name not in (_ATTESTATION_FIELD, "envelopeSha256")
+    }
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    if hashlib.sha256(canonical.encode("utf-8")).hexdigest() != envelope.get("envelopeSha256"):
+        raise OrchestrationError(
+            "the dispatch envelope's envelopeSha256 does not match its "
+            "content; regenerate the envelope with dispatch-packet"
+        )
+    if envelope.get("workRef") != unit:
+        raise OrchestrationError(
+            f"the dispatch envelope names work item {envelope.get('workRef')!r}, "
+            f"not --unit {unit!r}; an attested run records only the envelope's "
+            "own work item"
+        )
+    permitted = _ROLE_RUN_KINDS.get(str(envelope.get("packetRole") or ""), frozenset())
+    if kind not in permitted:
+        raise OrchestrationError(
+            f"the dispatch envelope's packet role "
+            f"{envelope.get('packetRole')!r} does not permit a {kind} run; an "
+            "attested run records only the kind its dispatch declared"
+        )
+    # EXACT kind, not just the role's category: a builder's implementation
+    # envelope replayed as a repair run would bypass the fresh repair
+    # dispatch with its current authorization, revision, and prompt.
+    if envelope.get("runKind") != kind:
+        raise OrchestrationError(
+            f"the dispatch envelope declares run kind "
+            f"{envelope.get('runKind')!r}, not {kind}; an attested run "
+            "records exactly the kind its dispatch digested"
+        )
+
+
 def _orchestrate(args: argparse.Namespace) -> int:
     state_path = Path(args.state)
+    key = _resolve_attestation_key(args)
     if state_path.is_file():
         document = json.loads(state_path.read_text(encoding="utf-8"))
+        if key is not None:
+            # An attested pipeline round-trips its own marks: state edited
+            # outside orchestrate, or written under another key, is refused
+            # here exactly as dispatch would refuse it.
+            mark = document.get(_ATTESTATION_FIELD) if isinstance(document, dict) else None
+            if not isinstance(mark, str) or not hmac.compare_digest(
+                mark, _attest_document(document, key)
+            ):
+                raise OrchestrationError(
+                    "the orchestration state carries no valid attestation "
+                    "under --attestation-key; it was edited outside "
+                    "orchestrate or written under a different key"
+                )
         engine = Orchestrator.from_dict(document)
     else:
         engine = Orchestrator(max_repair_cycles=args.max_repair_cycles)
@@ -965,6 +2233,24 @@ def _orchestrate(args: argparse.Namespace) -> int:
             depends_on=tuple(args.depends_on),
         )
     elif args.action == "transition":
+        # The VERDICT edges belong to the verification/review actions and
+        # their signed outcomes: a generic transition taking one under a key
+        # would bypass the outcome gating and still receive a genuine state
+        # attestation. Operator aborts (cancelled, failed) stay generic.
+        if key is not None:
+            current = engine.get(args.unit).state.value
+            owned = {
+                "verifying": {"reviewing", "repair-needed", "blocked"},
+                "reviewing": {"ready-for-human-merge", "repair-needed", "blocked"},
+                "re-reviewing": {"ready-for-human-merge", "repair-needed", "blocked"},
+            }
+            if args.to in owned.get(current, frozenset()):
+                raise OrchestrationError(
+                    f"an attested transition from {current} to {args.to} is a "
+                    "verification or review verdict: record it with --action "
+                    "verification/review and the harness-signed --outcome, "
+                    "never as a generic transition"
+                )
         engine.transition(
             args.unit,
             args.to,
@@ -976,6 +2262,54 @@ def _orchestrate(args: argparse.Namespace) -> int:
         )
     elif args.action == "start-run":
         envelope = json.loads(Path(args.envelope).read_text(encoding="utf-8"))
+        if key is not None:
+            _require_attested_envelope(envelope, key, unit=args.unit, kind=args.kind)
+            # The envelope must bind THIS state lineage: dispatch digests
+            # the attested state's stateId, so an envelope signed against an
+            # earlier (or recreated) state — along with the completions and
+            # outcomes bound to its digest — cannot replay here.
+            if not engine.state_id or envelope.get("stateId") != engine.state_id:
+                raise OrchestrationError(
+                    "the dispatch envelope does not bind this orchestration "
+                    "state's lineage id; a recreated state cannot replay old "
+                    "signed dispatches — re-dispatch the packet against the "
+                    "current attested state"
+                )
+            # One digest identifies ONE recorded run, with NO retry
+            # exception: a FAILED review's envelope reused in re-reviewing
+            # would still hand the reviewer the pre-repair packet and head
+            # while record_review advances the repaired unit, so every
+            # previously recorded digest refuses and a retry re-dispatches.
+            digest = envelope.get("envelopeSha256")
+            replayed = [run for run in engine.get(args.unit).runs if run.envelope_sha256 == digest]
+            # A retry of the SAME event with the SAME envelope is the
+            # orchestrator's documented event-key idempotency — a caller
+            # that lost the response — and start_run returns the recorded
+            # run unchanged, so neither replay check below applies to it.
+            retried = any(run.event_key == args.event_key for run in replayed)
+            if replayed and not retried:
+                raise OrchestrationError(
+                    "this dispatch envelope was already recorded for work "
+                    f"unit {args.unit} ({replayed[0].run_id}); every run "
+                    "records a fresh dispatch, so re-dispatch the packet to "
+                    "obtain a new envelope"
+                )
+            # The lineage id alone never changes as the state advances: a
+            # genuine OLDER snapshot of this same lineage — retained from
+            # before a repair — could derive a fresh envelope whose
+            # latest-producer check passed against the stale unit, so the
+            # envelope must also bind the unit's snapshot exactly as this
+            # state records it now.
+            if not retried and envelope.get("unitStateSha256") != _unit_state_digest(
+                engine.get(args.unit)
+            ):
+                raise OrchestrationError(
+                    "the dispatch envelope does not bind this work unit's "
+                    "current state snapshot: the unit advanced since the "
+                    "dispatching snapshot (or the envelope was derived from a "
+                    "stale copy of this lineage) — re-dispatch the packet "
+                    "against the current attested state"
+                )
         engine.start_run(
             args.unit,
             args.kind,
@@ -984,6 +2318,58 @@ def _orchestrate(args: argparse.Namespace) -> int:
             timestamp=args.timestamp,
         )
     elif args.action == "finish-run":
+        # A completion value is caller input: in an attested pipeline the
+        # recorded commit must carry COMPLETION PROVENANCE — the execution
+        # harness's attest-completion record binding this unit, run and
+        # commit, written when the run produced it. Mere existence of the
+        # commit proves nothing about who produced it, and an innocent
+        # agent's genuinely signed run finished at another agent's head
+        # would otherwise exclude the wrong reviewer.
+        if key is not None and args.commit_sha:
+            if not args.completion:
+                raise OrchestrationError(
+                    "an attested finish-run with --commit-sha requires "
+                    "--completion: the attest-completion record binding this "
+                    "unit, run and commit, written by the execution harness "
+                    "at run completion"
+                )
+            completion = json.loads(Path(args.completion).read_text(encoding="utf-8"))
+            mark = completion.get(_ATTESTATION_FIELD) if isinstance(completion, dict) else None
+            if not isinstance(mark, str) or not hmac.compare_digest(
+                mark, _attest_document(completion, key)
+            ):
+                raise OrchestrationError(
+                    "the completion record carries no valid attestation under "
+                    "--attestation-key; produce it with attest-completion and "
+                    "the same key"
+                )
+            bound = (
+                completion.get("unit"),
+                completion.get("runId"),
+                completion.get("result"),
+                completion.get("commitSha"),
+            )
+            if bound != (args.unit, args.run_id, args.result, args.commit_sha):
+                raise OrchestrationError(
+                    "the completion record does not bind this exact unit, run, "
+                    "result and commit; regenerate it with attest-completion "
+                    "for the run that produced the commit, with the result the "
+                    "harness observed"
+                )
+            # Run IDs RESTART at run-001 when state is recreated, so (unit,
+            # runId) does not identify a run across histories: the completion
+            # must bind the dispatch envelope's digest, which the run record
+            # carries from its attested start.
+            records = {run.run_id: run for run in engine.get(args.unit).runs}
+            record = records.get(args.run_id)
+            if record is None:
+                raise OrchestrationError(f"work unit {args.unit} records no run {args.run_id}")
+            if completion.get("envelopeSha256") != record.envelope_sha256:
+                raise OrchestrationError(
+                    "the completion record binds a different dispatch "
+                    "envelope than the run being finished; regenerate it with "
+                    "attest-completion for this run's envelope"
+                )
         engine.finish_run(
             args.unit,
             args.run_id,
@@ -992,6 +2378,28 @@ def _orchestrate(args: argparse.Namespace) -> int:
             commit_sha=args.commit_sha,
         )
     elif args.action == "verification":
+        # "--result succeeded" is caller input: under a key, the recorded
+        # verdict must be the one the verifier harness signed for the code
+        # actually judged — the unit's latest producing run's envelope.
+        if key is not None:
+            outcome = _require_signed_outcome(args, key, kind="verification")
+            if outcome.get("result") != args.result:
+                raise OrchestrationError(
+                    "the outcome record attests a different verification "
+                    "result than the transition claims; record the result the "
+                    "verifier harness actually signed"
+                )
+            produced = [
+                run
+                for run in engine.get(args.unit).runs
+                if run.kind in ("implementation", "repair")
+            ]
+            if not produced or outcome.get("envelopeSha256") != produced[-1].envelope_sha256:
+                raise OrchestrationError(
+                    "the outcome record does not bind the unit's latest "
+                    "producing run's dispatch envelope; a verification verdict "
+                    "counts only for the code it actually judged"
+                )
         engine.record_verification(
             args.unit,
             passed=args.result == "succeeded",
@@ -999,16 +2407,219 @@ def _orchestrate(args: argparse.Namespace) -> int:
             timestamp=args.timestamp,
         )
     elif args.action == "review":
+        # "--findings 0" is caller input: under a key, the recorded count
+        # must be the one the reviewer harness signed for this exact run.
+        if key is not None:
+            outcome = _require_signed_outcome(args, key, kind="review")
+            # A reviewer that crashed or failed proves NOTHING about the
+            # patch: its genuine signed record must not advance the unit as
+            # a zero-finding pass — re-dispatch the review instead.
+            if outcome.get("result") != "succeeded":
+                raise OrchestrationError(
+                    "the outcome record attests a review run that did not "
+                    "succeed; a failed or crashed reviewer proves nothing "
+                    "about the patch, so re-dispatch the review"
+                )
+            if outcome.get("runId") != args.run_id or outcome.get("findings") != args.findings:
+                raise OrchestrationError(
+                    "the outcome record does not bind this run and findings "
+                    "count; record the review the reviewer harness actually "
+                    "signed"
+                )
+            reviewed = {run.run_id: run for run in engine.get(args.unit).runs}.get(args.run_id)
+            if reviewed is None or outcome.get("envelopeSha256") != reviewed.envelope_sha256:
+                raise OrchestrationError(
+                    "the outcome record binds a different dispatch envelope "
+                    "than the run being reviewed; regenerate it with "
+                    "attest-outcome for this run's envelope"
+                )
+            # The report is part of the verdict: the recorded state carries
+            # the attested report digest so repair and re-review dispatches
+            # can refuse a laundered findings list travelling with the
+            # genuine signed count.
+            report_digest = (
+                _findings_report_digest(args.findings_report, expected_count=args.findings)
+                if getattr(args, "findings_report", None)
+                else ""
+            )
+            if outcome.get("findingsSha256", "") != report_digest:
+                raise OrchestrationError(
+                    "the outcome record binds a different findings report "
+                    "than --findings-report supplies; pass the report the "
+                    "reviewer harness actually signed"
+                )
+            if args.findings > 0 and not report_digest:
+                raise OrchestrationError(
+                    "a review with findings requires --findings-report: the "
+                    "canonical findings array whose digest the outcome binds"
+                )
+            findings_sha256 = report_digest
+        else:
+            findings_sha256 = ""
         engine.record_review(
             args.unit,
             args.run_id,
             findings=args.findings,
             event_key=args.event_key,
             timestamp=args.timestamp,
+            findings_sha256=findings_sha256,
         )
-    _write(engine.as_dict(), str(state_path))
+    state_document = engine.as_dict()
+    if key is not None:
+        state_document[_ATTESTATION_FIELD] = _attest_document(state_document, key)
+    _write(state_document, str(state_path))
     if args.status_output:
         Path(args.status_output).write_text(engine.status_document(args.unit), encoding="utf-8")
+    return 0
+
+
+def _require_signed_outcome(args: argparse.Namespace, key: bytes, *, kind: str) -> dict:
+    """An attested state records only outcomes a trusted harness signed.
+
+    ``--result succeeded`` and ``--findings 0`` are otherwise raw CLI inputs:
+    an invoker could mark failed gates as passing, or report zero findings
+    with no reviewer artifact, and the resulting state would carry a genuine
+    HMAC. The verifier or reviewer harness — the key-holding component that
+    actually observed the outcome — signs it with ``attest-outcome``.
+    """
+    if not getattr(args, "outcome", None):
+        raise OrchestrationError(
+            f"an attested {kind} transition requires --outcome: the "
+            "attest-outcome record the verifier or reviewer harness signed "
+            "for this run"
+        )
+    outcome = json.loads(Path(args.outcome).read_text(encoding="utf-8"))
+    mark = outcome.get(_ATTESTATION_FIELD) if isinstance(outcome, dict) else None
+    if not isinstance(mark, str) or not hmac.compare_digest(mark, _attest_document(outcome, key)):
+        raise OrchestrationError(
+            "the outcome record carries no valid attestation under "
+            "--attestation-key; produce it with attest-outcome and the same key"
+        )
+    if outcome.get("kind") != kind or outcome.get("unit") != args.unit:
+        raise OrchestrationError(
+            "the outcome record does not bind this unit and transition kind; "
+            "regenerate it with attest-outcome"
+        )
+    return outcome
+
+
+def _findings_report_digest(path: str, *, expected_count: int | None = None) -> str:
+    """The canonical digest of a findings report: a JSON array of strings.
+
+    The digest covers the canonical compact encoding of the array IN ORDER,
+    so two reports with the same findings differently spelled or ordered
+    never collide, and every consumer (attest-outcome, orchestrate review,
+    reviewer dispatch) computes the same value from the same findings.
+    """
+    report = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(report, list) or not all(isinstance(item, str) for item in report):
+        raise OrchestrationError("the findings report must be a JSON array of finding strings")
+    if expected_count is not None and len(report) != expected_count:
+        raise OrchestrationError(
+            f"the findings report carries {len(report)} finding(s) but the "
+            f"outcome declares {expected_count}; record the review the "
+            "harness actually observed"
+        )
+    return _findings_digest(report)
+
+
+def _findings_digest(findings) -> str:
+    canonical = json.dumps(list(findings), separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _unit_state_digest(unit) -> str:
+    """The canonical digest of ONE work unit's serialized state.
+
+    Dispatch embeds it in the envelope and an attested start-run requires
+    equality against the unit as the CURRENT state records it: the lineage id
+    alone never changes as the state advances, so a genuine older snapshot of
+    the same lineage could otherwise re-derive an envelope for a superseded
+    producer and start it against the advanced state.
+    """
+    canonical = json.dumps(
+        unit.as_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _attest_outcome(args: argparse.Namespace) -> int:
+    """Record a verification or review OUTCOME, signed by the harness that
+    observed it, bound to the dispatched envelope it judged."""
+    key = _attestation_key_bytes(args.attestation_key)
+    if not re.fullmatch(r"[0-9a-f]{64}", args.envelope_sha256 or ""):
+        raise OrchestrationError(
+            "--envelope-sha256 must be the judged run's dispatched envelope "
+            "digest (64 hex characters)"
+        )
+    # The COUNT alone is not the review: a later caller could present the
+    # genuine signed count with a laundered report, so the canonical report
+    # digest travels inside the attestation whenever findings exist.
+    if args.findings > 0 and not args.findings_report:
+        raise OrchestrationError(
+            "an outcome with findings requires --findings-report: the "
+            "canonical JSON array of the reviewer's findings, whose digest "
+            "the attestation binds"
+        )
+    findings_sha256 = (
+        _findings_report_digest(args.findings_report, expected_count=args.findings)
+        if args.findings_report
+        else ""
+    )
+    document = {
+        "schemaVersion": 1,
+        "unit": args.unit,
+        "kind": args.kind,
+        "result": args.result,
+        "findings": args.findings,
+        "findingsSha256": findings_sha256,
+        "runId": args.run_id,
+        "envelopeSha256": args.envelope_sha256,
+        "recordedAt": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
+    }
+    document[_ATTESTATION_FIELD] = _attest_document(document, key)
+    _write(document, args.output)
+    return 0
+
+
+def _attest_completion(args: argparse.Namespace) -> int:
+    """Record WHICH commit a run produced, signed at the moment it happened.
+
+    Written by the execution harness — the operator-side component that
+    actually watched the agent produce the commit — never by the agent
+    itself, which holds no key. ``orchestrate finish-run`` under the same key
+    accepts a commit only with this record, so a later caller cannot finish
+    an innocent agent's run at another agent's head. The commit must exist
+    in the trusted checkout when the record is written.
+    """
+    key = _attestation_key_bytes(args.attestation_key)
+    if resolve_commit(args.commit_repository, args.commit_sha) != args.commit_sha:
+        raise OrchestrationError(
+            "--commit-sha must be the full object name of a commit in --commit-repository"
+        )
+    if not re.fullmatch(r"[0-9a-f]{64}", args.envelope_sha256 or ""):
+        raise OrchestrationError(
+            "--envelope-sha256 must be the dispatched envelope's 64-hex digest: "
+            "run IDs restart when state is recreated, so the envelope digest is "
+            "the run's identity across histories"
+        )
+    if args.result not in ("succeeded", "failed"):
+        raise OrchestrationError("--result must be succeeded or failed")
+    document = {
+        "schemaVersion": 1,
+        "unit": args.unit,
+        "runId": args.run_id,
+        # The RESULT the harness observed is part of the record: a failed
+        # producer's genuine completion replayed as finish-run --result
+        # succeeded would otherwise satisfy the reviewer dispatch's
+        # latest-producer success check on a commit the harness saw fail.
+        "result": args.result,
+        "commitSha": args.commit_sha,
+        "envelopeSha256": args.envelope_sha256,
+        "recordedAt": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
+    }
+    document[_ATTESTATION_FIELD] = _attest_document(document, key)
+    _write(document, args.output)
     return 0
 
 
@@ -1119,7 +2730,9 @@ def _control_center(args: argparse.Namespace) -> int:
             args.output, [args.registry, args.ledger, *args.backlog, *args.incidents], "--output"
         )
     _require_timestamp_not_blank("--generated-at", args.generated_at)
-    generated_at = args.generated_at or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    generated_at = args.generated_at or datetime.datetime.now(datetime.UTC).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
     snapshot = build_control_center_snapshot(
         generated_at=generated_at,
         registry=registry,
@@ -1258,7 +2871,9 @@ def _github_backlog(args: argparse.Namespace) -> int:
         labels=labels,
     )
     _require_timestamp_not_blank("--observed-at", args.observed_at)
-    observed_at = args.observed_at or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    observed_at = args.observed_at or datetime.datetime.now(datetime.UTC).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
     groups = [
         incidents_from_issues(
             issues,
@@ -2141,7 +3756,19 @@ def build_parser() -> argparse.ArgumentParser:
         "is the approval label); default: the implementation, ready and human-review labels "
         "of the policy (as committed on --base when given)",
     )
+    check_request.add_argument(
+        "--continuation-pr",
+        help="with --authorize-labels: tolerate exactly this open pull request (its inventory "
+        "URL or bare number) — the unit's own PR — so review and repair stay authorizable "
+        "after the draft publishes; any other open PR still refuses, and dispatch accepts "
+        "the resulting continuation authorization only for reviewer or repair runs",
+    )
     check_request.add_argument("--output")
+    check_request.add_argument(
+        "--attestation-key",
+        help="secret key file: the written result carries an HMAC attestation "
+        "dispatch-packet --authorization verifies",
+    )
     check_request.set_defaults(handler=_check_request)
 
     manifest = commands.add_parser("create-manifest")
@@ -2189,6 +3816,77 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch.add_argument("--output")
     dispatch.set_defaults(handler=_dispatch_mission)
 
+    packet = commands.add_parser("context-packet")
+    packet.add_argument("--config", required=True)
+    packet.add_argument("--missions")
+    packet.add_argument("--knowledge", required=True)
+    packet.add_argument("--request", required=True)
+    packet.add_argument("--candidate-repository")
+    packet.add_argument("--candidate-base")
+    packet.add_argument("--candidate-head")
+    packet.add_argument(
+        "--review-target-repository",
+        help="trusted repository (not the candidate's) whose origin/<default "
+        "branch> authenticates --candidate-base",
+    )
+    packet.add_argument(
+        "--gate-sandbox",
+        help="isolation wrapper command prefix derived gates run under, or "
+        "the literal trusted-host to accept host execution",
+    )
+    packet.add_argument(
+        "--run-kind",
+        choices=("implementation", "repair", "verification", "review"),
+        help="the lifecycle kind the packet is built for: a repair packet "
+        "carries the request's priorFindings, so dispatch-packet --run-kind "
+        "repair --packet compares against an identical document",
+    )
+    packet.add_argument("--output")
+    packet.set_defaults(handler=_context_packet)
+
+    dispatch_packet = commands.add_parser("dispatch-packet")
+    dispatch_packet.add_argument("--config", required=True)
+    dispatch_packet.add_argument("--missions")
+    dispatch_packet.add_argument("--knowledge", required=True)
+    dispatch_packet.add_argument("--request", required=True)
+    dispatch_packet.add_argument("--candidate-repository")
+    dispatch_packet.add_argument("--candidate-base")
+    dispatch_packet.add_argument("--candidate-head")
+    dispatch_packet.add_argument(
+        "--review-target-repository",
+        help="trusted repository (not the candidate's) whose origin/<default "
+        "branch> authenticates --candidate-base",
+    )
+    dispatch_packet.add_argument(
+        "--gate-sandbox",
+        help="isolation wrapper command prefix derived gates run under, or "
+        "the literal trusted-host to accept host execution",
+    )
+    dispatch_packet.add_argument("--agents", required=True)
+    dispatch_packet.add_argument(
+        "--run-kind",
+        choices=("implementation", "repair", "verification", "review"),
+        help="the exact lifecycle kind this dispatch seeds (digested into the "
+        "envelope); defaults to the mission role's canonical kind",
+    )
+    dispatch_packet.add_argument("--history")
+    dispatch_packet.add_argument("--authorization")
+    dispatch_packet.add_argument(
+        "--attestation-key",
+        help="secret key file verifying the --history and --authorization "
+        "artifacts' HMAC attestations",
+    )
+    dispatch_packet.add_argument("--authorization-max-age-seconds", type=int, default=900)
+    dispatch_packet.add_argument("--packet")
+    dispatch_packet.add_argument(
+        "--prompt-output",
+        help="write the exact rendered prompt the envelope's promptSha256 "
+        "digests, so the executor submits the signed model input",
+    )
+    dispatch_packet.add_argument("--input-ref", action="append", default=[])
+    dispatch_packet.add_argument("--output")
+    dispatch_packet.set_defaults(handler=_dispatch_packet)
+
     executors = commands.add_parser("validate-executors")
     executors.add_argument("--executors", required=True)
     executors.add_argument("--output")
@@ -2234,8 +3932,76 @@ def build_parser() -> argparse.ArgumentParser:
     orchestrate.add_argument("--result", choices=("succeeded", "failed"))
     orchestrate.add_argument("--findings", type=int, default=0)
     orchestrate.add_argument("--commit-sha", default="")
+    orchestrate.add_argument(
+        "--completion",
+        help="with --attestation-key and --commit-sha: the attest-completion "
+        "record binding this unit, run and commit",
+    )
+    orchestrate.add_argument(
+        "--outcome",
+        help="with --attestation-key on verification/review: the "
+        "attest-outcome record the verifier or reviewer harness signed for "
+        "the judged run",
+    )
+    orchestrate.add_argument(
+        "--findings-report",
+        help="with --outcome on review: the canonical JSON findings array "
+        "whose digest the outcome binds; recorded in the attested state",
+    )
     orchestrate.add_argument("--max-repair-cycles", type=int, default=2)
     orchestrate.add_argument("--status-output")
+    orchestrate.add_argument(
+        "--attestation-key",
+        help="secret key file: the written state carries an HMAC attestation "
+        "dispatch-packet --history verifies, and existing state is verified on read",
+    )
+
+    attest_completion = commands.add_parser("attest-completion")
+    attest_completion.add_argument("--unit", required=True)
+    attest_completion.add_argument("--run-id", required=True)
+    attest_completion.add_argument(
+        "--result",
+        required=True,
+        help="the result the harness observed (succeeded or failed): finish-run "
+        "requires the completion to bind it, so a failed producer's record "
+        "cannot finish the run as succeeded",
+    )
+    attest_completion.add_argument("--commit-sha", required=True)
+    attest_completion.add_argument(
+        "--commit-repository",
+        required=True,
+        help="the trusted checkout the finished run's commit must exist in",
+    )
+    attest_completion.add_argument(
+        "--envelope-sha256",
+        required=True,
+        help="the dispatched envelope's digest: run IDs restart when state is "
+        "recreated, so this is the run's identity across histories",
+    )
+    attest_completion.add_argument("--attestation-key", required=True)
+    attest_completion.add_argument("--output")
+    attest_completion.set_defaults(handler=_attest_completion)
+
+    attest_outcome = commands.add_parser("attest-outcome")
+    attest_outcome.add_argument("--unit", required=True)
+    attest_outcome.add_argument("--kind", choices=("verification", "review"), required=True)
+    attest_outcome.add_argument("--result", choices=("succeeded", "failed"), required=True)
+    attest_outcome.add_argument("--findings", type=int, default=0)
+    attest_outcome.add_argument(
+        "--findings-report",
+        help="the canonical JSON array of the review's findings; required "
+        "when --findings is positive, its digest travels in the attestation",
+    )
+    attest_outcome.add_argument("--run-id", default="")
+    attest_outcome.add_argument(
+        "--envelope-sha256",
+        required=True,
+        help="the judged run's dispatched envelope digest: the verdict counts "
+        "only for the code that run actually produced",
+    )
+    attest_outcome.add_argument("--attestation-key", required=True)
+    attest_outcome.add_argument("--output")
+    attest_outcome.set_defaults(handler=_attest_outcome)
     orchestrate.set_defaults(handler=_orchestrate)
 
     registry = commands.add_parser("validate-registry")
@@ -2623,6 +4389,16 @@ GATE_COMMANDS = frozenset(
         "renew",
         "release",
         "confirm-cloud-routine",
+        # Packet derivation and attested orchestration DERIVE trust
+        # artifacts: resolving git through a working-tree trust_mode or an
+        # override variable would let a candidate-planted executable
+        # fabricate the commits, committed files, and identities those
+        # artifacts are then signed over.
+        "context-packet",
+        "dispatch-packet",
+        "orchestrate",
+        "attest-completion",
+        "attest-outcome",
     }
 )
 
@@ -2654,6 +4430,7 @@ def main(argv: list[str] | None = None) -> int:
         TaskSpecError,
         ArtifactError,
         CapacityError,
+        ContextBuilderError,
         ControlCenterError,
         EventError,
         ExecutorError,
