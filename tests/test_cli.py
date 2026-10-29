@@ -737,6 +737,641 @@ def test_orchestrate_cli_round_trips_state(tmp_path: Path) -> None:
     assert main([*base, "--action", "transition", "--event-key", "evt-3", "--to", "merged"]) == 2
 
 
+def test_packet_commands_run_under_strict_executable_trust(tmp_path: Path, monkeypatch, capsys):
+    # Packet derivation and attested orchestration derive trust artifacts:
+    # they resolve git strictly, and an executable override is ignored with a
+    # warning instead of trusting a candidate-planted program.
+    from agentic_sdlc.cli import GATE_COMMANDS
+
+    assert {
+        "context-packet",
+        "dispatch-packet",
+        "orchestrate",
+        "attest-completion",
+        "attest-outcome",
+    } <= GATE_COMMANDS
+    monkeypatch.setenv("AGENTIC_SDLC_GIT", str(tmp_path / "planted-git"))
+    state = tmp_path / "state.json"
+    assert (
+        main(
+            [
+                "orchestrate",
+                "--state",
+                str(state),
+                "--unit",
+                "9",
+                "--timestamp",
+                "2026-08-06T12:00:00Z",
+                "--action",
+                "create",
+                "--event-key",
+                "evt-1",
+            ]
+        )
+        == 0
+    )
+    assert "is ignored by" in capsys.readouterr().err
+
+
+def test_orchestrate_attests_only_runs_a_trusted_dispatch_produced(tmp_path: Path, capsys) -> None:
+    # An attested state records only dispatch-signed envelopes: a
+    # hand-authored envelope — or a signed one whose agent was re-labeled —
+    # must not seed run attribution, and a finished run's commit must exist
+    # in the trusted checkout before the state attests it.
+    import hashlib
+    import subprocess
+
+    from agentic_sdlc.cli import _attest_document
+
+    secret = b"an-attestation-secret-of-at-least-32-bytes"
+    key_file = tmp_path / "attestation.key"
+    key_file.write_bytes(secret)
+    state = tmp_path / "state.json"
+    base = [
+        "orchestrate",
+        "--state",
+        str(state),
+        "--unit",
+        "42",
+        "--attestation-key",
+        str(key_file),
+    ]
+    stamp = "2026-08-06T12:00:00Z"
+    assert main([*base, "--action", "create", "--event-key", "evt-0", "--timestamp", stamp]) == 0
+    for index, to in enumerate(("triaged", "specified", "planned", "approved", "dispatched"), 1):
+        assert (
+            main(
+                [
+                    *base,
+                    "--action",
+                    "transition",
+                    "--event-key",
+                    f"evt-{index}",
+                    "--to",
+                    to,
+                    "--timestamp",
+                    stamp,
+                    "--actor",
+                    "operator",
+                    "--actor-kind",
+                    "human",
+                ]
+            )
+            == 0
+        )
+    # A trusted dispatch digests the attested state's lineage id AND the
+    # work unit's exact snapshot, so the crafted envelopes bind both exactly
+    # as dispatch-packet would.
+    state_id = json.loads(state.read_text(encoding="utf-8"))["stateId"]
+
+    def _unit_snapshot_sha256() -> str:
+        document = json.loads(state.read_text(encoding="utf-8"))
+        canonical = json.dumps(
+            document["units"]["42"], sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    body = {
+        "schemaVersion": 1,
+        "missionId": "implementation-worker",
+        "missionVersion": "1.0.0",
+        "agentId": "builder-agent",
+        "adapter": "claude-code",
+        "adapterVersion": "1.0.0",
+        "provider": "anthropic",
+        "model": "claude-sonnet-5-5",
+        "workRef": "42",
+        "inputRefs": [],
+        "promptSha256": "0" * 64,
+        "packetRole": "builder",
+        "runKind": "implementation",
+        "stateId": state_id,
+        "unitStateSha256": _unit_snapshot_sha256(),
+    }
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    envelope = {**body, "envelopeSha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest()}
+    signed = {**envelope, "attestation": _attest_document(envelope, secret)}
+
+    def _envelope_file(name: str, document: dict) -> str:
+        path = tmp_path / name
+        path.write_text(json.dumps(document), encoding="utf-8")
+        return str(path)
+
+    def _signed_for(**overrides) -> dict:
+        changed = {**body, **overrides}
+        changed_canonical = json.dumps(changed, sort_keys=True, separators=(",", ":"))
+        changed = {
+            **changed,
+            "envelopeSha256": hashlib.sha256(changed_canonical.encode("utf-8")).hexdigest(),
+        }
+        return {**changed, "attestation": _attest_document(changed, secret)}
+
+    start = [
+        *base,
+        "--action",
+        "start-run",
+        "--kind",
+        "implementation",
+        "--event-key",
+        "evt-run",
+        "--timestamp",
+        stamp,
+        "--envelope",
+    ]
+    # Unsigned, re-labeled after signing, replayed from another work item,
+    # or declared for a non-producing role: each refuses.
+    assert main([*start, _envelope_file("unsigned.json", envelope)]) == 2
+    assert main([*start, _envelope_file("relabeled.json", {**signed, "agentId": "x"})]) == 2
+    assert main([*start, _envelope_file("replayed.json", _signed_for(workRef="43"))]) == 2
+    assert main([*start, _envelope_file("reviewer.json", _signed_for(packetRole="reviewer"))]) == 2
+    # The EXACT kind is digested: an implementation envelope cannot seed a
+    # repair run, which would bypass the fresh repair dispatch.
+    repair_start = [entry if entry != "implementation" else "repair" for entry in start]
+    assert main([*repair_start, _envelope_file("replay-kind.json", signed)]) == 2
+    # A genuinely signed envelope from ANOTHER state lineage (a recreated
+    # state) cannot replay here.
+    assert main([*start, _envelope_file("other-state.json", _signed_for(stateId="f" * 32))]) == 2
+    # A genuinely signed envelope bound to a STALE snapshot of this same
+    # lineage (the unit's digest before it advanced) cannot start a run
+    # against the current state: the lineage id alone never changes, so
+    # only the unit-snapshot binding stops a replay from a retained copy.
+    capsys.readouterr()
+    assert (
+        main([*start, _envelope_file("stale-unit.json", _signed_for(unitStateSha256="e" * 64))])
+        == 2
+    )
+    assert "current state snapshot" in capsys.readouterr().err
+    assert main([*start, _envelope_file("signed.json", signed)]) == 0
+    # A retry of the SAME event with the SAME envelope is the orchestrator's
+    # documented event-key idempotency (a caller that lost the response): it
+    # returns the recorded run instead of refusing, and records no second run.
+    assert main([*start, _envelope_file("retried.json", signed)]) == 0
+    assert len(json.loads(state.read_text(encoding="utf-8"))["units"]["42"]["runs"]) == 1
+    # Under a DIFFERENT event, one digest still identifies one dispatch: the
+    # recorded envelope cannot seed a second run (a reused review envelope
+    # would otherwise report on the pre-repair packet while advancing the
+    # repaired unit).
+    capsys.readouterr()
+    replay_start = [entry if entry != "evt-run" else "evt-run-2" for entry in start]
+    assert main([*replay_start, _envelope_file("replayed-digest.json", signed)]) == 2
+    assert "already recorded" in capsys.readouterr().err
+
+    # The finished run's commit needs COMPLETION PROVENANCE: the execution
+    # harness's attest-completion record binding this unit, run and commit —
+    # and attest-completion itself requires the commit to exist in the
+    # trusted checkout.
+    repo = tmp_path / "trusted-checkout"
+    repo.mkdir()
+    env = {
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.com",
+        "HOME": str(tmp_path),
+        "PATH": "/usr/bin:/bin",
+    }
+    subprocess.run(
+        ["git", "-C", str(repo), "init", "-q", "-b", "main"],
+        check=True,
+        env=env,
+        capture_output=True,
+    )
+    (repo / "a.txt").write_text("one\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "a.txt"], check=True, env=env, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-q", "-m", "work"],
+        check=True,
+        env=env,
+        capture_output=True,
+    )
+    commit = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        env=env,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    run_id = "42:run-001"
+    completion = tmp_path / "completion.json"
+    # attest-completion refuses a commit that exists nowhere, and binds the
+    # record to this exact unit, run and commit.
+    attest = [
+        "attest-completion",
+        "--unit",
+        "42",
+        "--run-id",
+        run_id,
+        "--result",
+        "succeeded",
+        "--envelope-sha256",
+        signed["envelopeSha256"],
+        "--commit-repository",
+        str(repo),
+        "--attestation-key",
+        str(key_file),
+        "--output",
+        str(completion),
+    ]
+    assert main([*attest, "--commit-sha", "f" * 40]) == 2
+    assert main([*attest, "--commit-sha", commit]) == 0
+    finish = [
+        *base,
+        "--action",
+        "finish-run",
+        "--run-id",
+        run_id,
+        "--result",
+        "succeeded",
+        "--timestamp",
+        stamp,
+        "--commit-sha",
+        commit,
+    ]
+    # Without the completion record — or with one bound to another run — the
+    # attested finish refuses; the genuine record finishes the run.
+    assert main(finish) == 2
+    other = json.loads(completion.read_text(encoding="utf-8"))
+    other["runId"] = "42:run-999"
+    from agentic_sdlc.cli import _attest_document as _sign
+
+    other["attestation"] = _sign(other, secret)
+    mismatched = tmp_path / "mismatched-completion.json"
+    mismatched.write_text(json.dumps(other), encoding="utf-8")
+    assert main([*finish, "--completion", str(mismatched)]) == 2
+    tampered_completion = json.loads(completion.read_text(encoding="utf-8"))
+    tampered_completion["commitSha"] = commit
+    tampered_completion["unit"] = "43"
+    unsigned_completion = tmp_path / "unsigned-completion.json"
+    unsigned_completion.write_text(json.dumps(tampered_completion), encoding="utf-8")
+    assert main([*finish, "--completion", str(unsigned_completion)]) == 2
+    # Run IDs restart when state is recreated: a genuine completion bound to
+    # ANOTHER dispatch's envelope digest must not finish this run.
+    stale = json.loads(completion.read_text(encoding="utf-8"))
+    stale["envelopeSha256"] = "e" * 64
+    stale["attestation"] = _sign(stale, secret)
+    stale_file = tmp_path / "stale-completion.json"
+    stale_file.write_text(json.dumps(stale), encoding="utf-8")
+    assert main([*finish, "--completion", str(stale_file)]) == 2
+    # The RESULT is bound too: a genuinely signed completion the harness
+    # recorded as FAILED must not finish the run as succeeded, which would
+    # promote a failed producer into the reviewer dispatch's latest
+    # successful producer.
+    failed_completion = tmp_path / "failed-completion.json"
+    failed_attest = [
+        entry if entry != str(completion) else str(failed_completion) for entry in attest
+    ]
+    failed_attest[failed_attest.index("succeeded")] = "failed"
+    assert main([*failed_attest, "--commit-sha", commit]) == 0
+    capsys.readouterr()
+    assert main([*finish, "--completion", str(failed_completion)]) == 2
+    assert "result and commit" in capsys.readouterr().err
+    assert main([*finish, "--completion", str(completion)]) == 0
+
+    # VERIFICATION and REVIEW verdicts are caller input too: under a key each
+    # transition requires the attest-outcome record the judging harness
+    # signed, bound to the judged run's dispatch envelope.
+    assert (
+        main(
+            [
+                *base,
+                "--action",
+                "transition",
+                "--event-key",
+                "evt-verifying",
+                "--to",
+                "verifying",
+                "--timestamp",
+                stamp,
+                "--actor",
+                "operator",
+                "--actor-kind",
+                "human",
+            ]
+        )
+        == 0
+    )
+    # The verdict EDGES belong to those actions too: a generic transition
+    # taking verifying -> reviewing under the key would bypass the outcome
+    # gating and still receive a genuine state attestation.
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                *base,
+                "--action",
+                "transition",
+                "--event-key",
+                "evt-skip",
+                "--to",
+                "reviewing",
+                "--timestamp",
+                stamp,
+                "--actor",
+                "operator",
+                "--actor-kind",
+                "human",
+            ]
+        )
+        == 2
+    )
+    assert "verification or review verdict" in capsys.readouterr().err
+    verify = [
+        *base,
+        "--action",
+        "verification",
+        "--result",
+        "succeeded",
+        "--event-key",
+        "evt-verdict",
+        "--timestamp",
+        stamp,
+    ]
+    capsys.readouterr()
+    assert main(verify) == 2
+    assert "requires --outcome" in capsys.readouterr().err
+    outcome = tmp_path / "outcome.json"
+    assert (
+        main(
+            [
+                "attest-outcome",
+                "--unit",
+                "42",
+                "--kind",
+                "verification",
+                "--result",
+                "succeeded",
+                "--envelope-sha256",
+                signed["envelopeSha256"],
+                "--attestation-key",
+                str(key_file),
+                "--output",
+                str(outcome),
+            ]
+        )
+        == 0
+    )
+
+    def _reissued(path_name: str, **changed) -> str:
+        document = {**json.loads(outcome.read_text(encoding="utf-8")), **changed}
+        del document["attestation"]
+        document["attestation"] = _attest_document(document, secret)
+        path = tmp_path / path_name
+        path.write_text(json.dumps(document), encoding="utf-8")
+        return str(path)
+
+    # A verdict signed over another envelope — or over the opposite result —
+    # must not drive this transition.
+    assert main([*verify, "--outcome", _reissued("other-env.json", envelopeSha256="e" * 64)]) == 2
+    assert main([*verify, "--outcome", _reissued("other-result.json", result="failed")]) == 2
+    assert main([*verify, "--outcome", str(outcome)]) == 0
+
+    # The unit is now reviewing: start the review run from a reviewer-signed
+    # dispatch, then the review transition needs its own signed outcome bound
+    # to that run's envelope, run id and findings count.
+    # A review dispatch happens against the ADVANCED state, so its envelope
+    # binds the unit's current snapshot, not the implementation-time one.
+    review_envelope = _signed_for(
+        missionId="code-reviewer",
+        agentId="reviewer-agent",
+        packetRole="reviewer",
+        runKind="review",
+        unitStateSha256=_unit_snapshot_sha256(),
+    )
+    review_start = [
+        *base,
+        "--action",
+        "start-run",
+        "--kind",
+        "review",
+        "--event-key",
+        "evt-review-run",
+        "--timestamp",
+        stamp,
+        "--envelope",
+        _envelope_file("review-envelope.json", review_envelope),
+    ]
+    assert main(review_start) == 0
+    review = [
+        *base,
+        "--action",
+        "review",
+        "--run-id",
+        "42:run-002",
+        "--findings",
+        "0",
+        "--event-key",
+        "evt-review",
+        "--timestamp",
+        stamp,
+    ]
+    capsys.readouterr()
+    assert main(review) == 2
+    assert "requires --outcome" in capsys.readouterr().err
+    review_outcome = tmp_path / "review-outcome.json"
+    assert (
+        main(
+            [
+                "attest-outcome",
+                "--unit",
+                "42",
+                "--kind",
+                "review",
+                "--result",
+                "succeeded",
+                "--findings",
+                "0",
+                "--run-id",
+                "42:run-002",
+                "--envelope-sha256",
+                review_envelope["envelopeSha256"],
+                "--attestation-key",
+                str(key_file),
+                "--output",
+                str(review_outcome),
+            ]
+        )
+        == 0
+    )
+
+    def _review_reissued(path_name: str, **changed) -> str:
+        document = {**json.loads(review_outcome.read_text(encoding="utf-8")), **changed}
+        del document["attestation"]
+        document["attestation"] = _attest_document(document, secret)
+        path = tmp_path / path_name
+        path.write_text(json.dumps(document), encoding="utf-8")
+        return str(path)
+
+    # A review WITH findings carries the report inside the attestation: the
+    # count alone is not the review, so attest-outcome demands the canonical
+    # findings array and binds its digest.
+    capsys.readouterr()
+    found_base = [
+        "attest-outcome",
+        "--unit",
+        "42",
+        "--kind",
+        "review",
+        "--result",
+        "succeeded",
+        "--findings",
+        "2",
+        "--run-id",
+        "42:run-002",
+        "--envelope-sha256",
+        review_envelope["envelopeSha256"],
+        "--attestation-key",
+        str(key_file),
+    ]
+    assert main(found_base) == 2
+    assert "requires --findings-report" in capsys.readouterr().err
+    report = tmp_path / "findings.json"
+    report.write_text(json.dumps(["finding one", "finding two"]), encoding="utf-8")
+    short_report = tmp_path / "short-findings.json"
+    short_report.write_text(json.dumps(["finding one"]), encoding="utf-8")
+    capsys.readouterr()
+    assert main([*found_base, "--findings-report", str(short_report)]) == 2
+    assert "declares 2" in capsys.readouterr().err
+    found_outcome = tmp_path / "found-outcome.json"
+    assert (
+        main([*found_base, "--findings-report", str(report), "--output", str(found_outcome)]) == 0
+    )
+    # The recorded transition verifies the report against the signed digest:
+    # a tampered report — or none at all — never rides the genuine count.
+    review_two = [
+        *base,
+        "--action",
+        "review",
+        "--run-id",
+        "42:run-002",
+        "--findings",
+        "2",
+        "--event-key",
+        "evt-review-two",
+        "--timestamp",
+        stamp,
+    ]
+    tampered_report = tmp_path / "tampered-findings.json"
+    tampered_report.write_text(json.dumps(["finding one", "tampered"]), encoding="utf-8")
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                *review_two,
+                "--outcome",
+                str(found_outcome),
+                "--findings-report",
+                str(tampered_report),
+            ]
+        )
+        == 2
+    )
+    assert "different findings report" in capsys.readouterr().err
+    capsys.readouterr()
+    assert main([*review_two, "--outcome", str(found_outcome)]) == 2
+    assert "different findings report" in capsys.readouterr().err
+
+    # The reviewing -> ready-for-human-merge edge is verdict-owned too.
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                *base,
+                "--action",
+                "transition",
+                "--event-key",
+                "evt-skip-2",
+                "--to",
+                "ready-for-human-merge",
+                "--timestamp",
+                stamp,
+                "--actor",
+                "operator",
+                "--actor-kind",
+                "human",
+            ]
+        )
+        == 2
+    )
+    assert "verification or review verdict" in capsys.readouterr().err
+    # A review signed for another run, another findings count, or another
+    # envelope must not advance this unit; a verification outcome cannot be
+    # replayed as a review, and a genuinely signed FAILED review (a crashed
+    # reviewer) proves nothing and must not pass as a zero-finding verdict.
+    for bogus in (
+        _review_reissued("review-run.json", runId="42:run-001"),
+        _review_reissued("review-count.json", findings=3),
+        _review_reissued("review-env.json", envelopeSha256=signed["envelopeSha256"]),
+        _review_reissued("review-failed.json", result="failed"),
+        str(outcome),
+    ):
+        assert main([*review, "--outcome", bogus]) == 2
+    assert main([*review, "--outcome", str(review_outcome)]) == 0
+    document = json.loads(state.read_text(encoding="utf-8"))
+    assert document["units"]["42"]["state"] == "ready-for-human-merge"
+
+
+def test_the_harness_trust_anchor_pins_the_attestation_key(tmp_path: Path, monkeypatch, capsys):
+    # The artifacts and the key that verifies them must not both be caller
+    # inputs: under the anchor, attestation cannot be switched off by
+    # omitting the flag, and a caller-minted substitute key is refused.
+    from agentic_sdlc.cli import _attest_document
+
+    secret = b"an-attestation-secret-of-at-least-32-bytes"
+    anchor_file = tmp_path / "anchor.key"
+    anchor_file.write_bytes(secret)
+    minted = tmp_path / "minted.key"
+    minted.write_bytes(b"a-caller-minted-key-of-32-bytes-or-more!")
+    monkeypatch.setenv("AGENTIC_SDLC_ATTESTATION_KEY_FILE", str(anchor_file))
+    state = tmp_path / "state.json"
+    stamp = "2026-08-06T12:00:00Z"
+    base = ["orchestrate", "--state", str(state), "--unit", "42", "--timestamp", stamp]
+    # No flag at all: the anchor still signs the written state.
+    assert main([*base, "--action", "create", "--event-key", "evt-1"]) == 0
+    document = json.loads(state.read_text(encoding="utf-8"))
+    assert document["attestation"] == _attest_document(document, secret)
+    # A caller-minted key is refused outright, not trusted for verification.
+    capsys.readouterr()
+    transition = [*base, "--action", "transition", "--to", "triaged", "--event-key", "evt-2"]
+    assert main([*transition, "--attestation-key", str(minted)]) == 2
+    assert "trust anchor" in capsys.readouterr().err
+    # The same key material passed explicitly still works.
+    assert main([*transition, "--attestation-key", str(anchor_file)]) == 0
+
+
+def test_orchestrate_attests_state_under_a_key(tmp_path: Path) -> None:
+    # With --attestation-key the written state carries an HMAC mark over
+    # everything else in it (what dispatch-packet --history verifies), the
+    # pipeline round-trips its own marks, and state edited outside
+    # orchestrate is refused on the next read.
+    from agentic_sdlc.cli import _attest_document
+
+    secret = b"an-attestation-secret-of-at-least-32-bytes"
+    key_file = tmp_path / "attestation.key"
+    key_file.write_bytes(secret)
+    state = tmp_path / "state.json"
+    base = [
+        "orchestrate",
+        "--state",
+        str(state),
+        "--unit",
+        "42",
+        "--timestamp",
+        "2026-08-06T12:00:00Z",
+        "--attestation-key",
+        str(key_file),
+    ]
+    assert main([*base, "--action", "create", "--event-key", "evt-1"]) == 0
+    document = json.loads(state.read_text(encoding="utf-8"))
+    assert document["attestation"] == _attest_document(document, secret)
+    assert main([*base, "--action", "transition", "--event-key", "evt-2", "--to", "triaged"]) == 0
+    document = json.loads(state.read_text(encoding="utf-8"))
+    document["units"]["42"]["state"] = "merged"
+    state.write_text(json.dumps(document), encoding="utf-8")
+    assert main([*base, "--action", "transition", "--event-key", "evt-3", "--to", "specified"]) == 2
+
+
 def _registry_document() -> dict:
     return {
         "schemaVersion": 1,
