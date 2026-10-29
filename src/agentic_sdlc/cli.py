@@ -44,6 +44,17 @@ from .control_center import (
     load_incident_document,
     read_control_center_inputs,
 )
+from .control_center_stream import (
+    StreamCursor,
+    StreamLog,
+    build_reconnect_response,
+)
+from .control_center_telemetry import (
+    build_telemetry_overlay,
+    export_control_center,
+    filter_usage_window,
+    load_effectiveness_document,
+)
 from .dashboard_efficiency import build_infrastructure_blocker_panel
 from .event_ledger import EventLedger, LedgerError, LifecycleStage, load_lifecycle_event
 from .events import EventError, normalize_event
@@ -2700,6 +2711,60 @@ def _require_timestamp_not_blank(option: str, supplied: str | None) -> None:
         )
 
 
+def _control_center_telemetry(args: argparse.Namespace, snapshot: Any, registry: Any) -> Any:
+    """Build the telemetry overlay for a snapshot, when inputs were declared."""
+    usage: tuple[Any, ...] = ()
+    if args.usage:
+        ledger = UsageLedger.from_dict(
+            json.loads(Path(args.usage).read_text(encoding="utf-8")), registry=registry
+        )
+        usage = filter_usage_window(ledger.records, since=args.since, until=args.until)
+    effectiveness = None
+    if args.effectiveness:
+        effectiveness = load_effectiveness_document(
+            json.loads(Path(args.effectiveness).read_text(encoding="utf-8"))
+        )
+    capacity_inputs = None
+    if args.capacity_inputs:
+        capacity_inputs = load_capacity_inputs(
+            json.loads(Path(args.capacity_inputs).read_text(encoding="utf-8"))
+        )
+    if bool(args.window_start) != bool(args.window_end):
+        raise ControlCenterError("--window-start and --window-end are required together")
+    window = ObservationWindow(args.window_start, args.window_end) if args.window_start else None
+    return build_telemetry_overlay(
+        snapshot,
+        usage_records=usage,
+        window=window,
+        capacity_inputs=capacity_inputs,
+        effectiveness=effectiveness,
+        registry=registry,
+        observed_at=args.observed_at or "",
+        age_seconds=args.age_seconds,
+        stale_after_seconds=args.stale_after_seconds,
+        project_ids=tuple(args.project_id) or None,
+    )
+
+
+def _control_center_reconnect(args: argparse.Namespace, snapshot: Any) -> tuple[Any, Any]:
+    """Build the reconnect response a push transport would send, plus the log."""
+    if args.stream and Path(args.stream).is_file():
+        log = StreamLog.from_dict(json.loads(Path(args.stream).read_text(encoding="utf-8")))
+    else:
+        log = StreamLog()
+    cursor = StreamCursor.decode(args.resume_from) if args.resume_from else None
+    response = build_reconnect_response(
+        log,
+        snapshot,
+        cursor=cursor,
+        observed_at=args.observed_at or "",
+        age_seconds=args.age_seconds,
+        stale_after_seconds=args.stale_after_seconds,
+        project_ids=tuple(args.project_id) or None,
+    )
+    return response, log
+
+
 def _control_center(args: argparse.Namespace) -> int:
     _require_path_not_blank("--registry", args.registry)
     _require_path_not_blank("--ledger", args.ledger)
@@ -2725,9 +2790,37 @@ def _control_center(args: argparse.Namespace) -> int:
         sources.append(f"ledger:{args.ledger}")
     sources.extend(f"backlog:{path}" for path in args.backlog)
     sources.extend(f"incidents:{path}" for path in args.incidents)
-    if args.output:
-        _require_not_an_input(
-            args.output, [args.registry, args.ledger, *args.backlog, *args.incidents], "--output"
+    for flag, supplied in (
+        ("--usage", args.usage),
+        ("--effectiveness", args.effectiveness),
+        ("--capacity-inputs", args.capacity_inputs),
+        ("--stream", args.stream),
+        ("--telemetry-output", args.telemetry_output),
+        ("--stream-output", args.stream_output),
+        ("--export-output", args.export_output),
+    ):
+        _require_path_not_blank(flag, supplied)
+    declared_inputs = [
+        args.registry,
+        args.ledger,
+        args.usage,
+        args.effectiveness,
+        args.capacity_inputs,
+        *args.backlog,
+        *args.incidents,
+    ]
+    for flag, destination in (
+        ("--output", args.output),
+        ("--telemetry-output", args.telemetry_output),
+        ("--stream-output", args.stream_output),
+        ("--export-output", args.export_output),
+    ):
+        if destination:
+            _require_not_an_input(destination, declared_inputs, flag)
+    if args.resume_from and not args.stream_output:
+        raise ControlCenterError(
+            "--resume-from needs --stream-output: the reconnect response is the "
+            "only place the resumed frames are reported"
         )
     _require_timestamp_not_blank("--generated-at", args.generated_at)
     generated_at = args.generated_at or datetime.datetime.now(datetime.UTC).strftime(
@@ -2742,9 +2835,35 @@ def _control_center(args: argparse.Namespace) -> int:
         sources=sources,
         project_ids=tuple(args.project_id) or None,
     )
+    # Each output flag owns one document. The snapshot still defaults to stdout
+    # when nothing else was asked for, but a caller who wanted only the
+    # reconnect response in a file is not forced to name a snapshot path too:
+    # mixing stdout with files cannot be written atomically, and the grouped
+    # writer rightly refuses it.
+    other_destinations = [args.telemetry_output, args.stream_output, args.export_output]
+    outputs: list[tuple[Any, str | None]] = []
+    if args.output or not any(other_destinations):
+        outputs.append((snapshot.as_document(), args.output))
+    overlay = None
+    if args.telemetry_output or args.export_output:
+        overlay = _control_center_telemetry(args, snapshot, registry)
+        if args.telemetry_output:
+            outputs.append((overlay, args.telemetry_output))
+    stream_document = None
+    if args.stream_output:
+        response, log = _control_center_reconnect(args, snapshot)
+        stream_document = log.as_dict()
+        outputs.append((response, args.stream_output))
+    if args.export_output:
+        outputs.append(
+            (
+                export_control_center(snapshot, overlay=overlay, stream=stream_document),
+                args.export_output,
+            )
+        )
     # Staged replacement: even an alias the guard could not see (an exotic
     # link arrangement) is replaced by a fresh inode, never truncated.
-    _write_group([(snapshot.as_document(), args.output)])
+    _write_group(outputs)
     return 0
 
 
@@ -4033,6 +4152,21 @@ def build_parser() -> argparse.ArgumentParser:
     control_center.add_argument("--project-id", action="append", default=[])
     control_center.add_argument("--generated-at")
     control_center.add_argument("--output")
+    control_center.add_argument("--usage")
+    control_center.add_argument("--effectiveness")
+    control_center.add_argument("--capacity-inputs")
+    control_center.add_argument("--window-start")
+    control_center.add_argument("--window-end")
+    control_center.add_argument("--since")
+    control_center.add_argument("--until")
+    control_center.add_argument("--observed-at")
+    control_center.add_argument("--age-seconds", type=int)
+    control_center.add_argument("--stale-after-seconds", type=int, default=900)
+    control_center.add_argument("--telemetry-output")
+    control_center.add_argument("--stream")
+    control_center.add_argument("--resume-from")
+    control_center.add_argument("--stream-output")
+    control_center.add_argument("--export-output")
     control_center.set_defaults(handler=_control_center)
 
     github_backlog = commands.add_parser("github-backlog")
