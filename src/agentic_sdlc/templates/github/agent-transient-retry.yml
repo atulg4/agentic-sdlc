@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   discover:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.FORGE_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 10
     permissions:
       actions: read
@@ -114,6 +114,7 @@ jobs:
     needs: discover
     uses: PLATFORM_REPOSITORY/.github/workflows/reusable-transient-retry.yml@PLATFORM_COMMIT_SHA
     with:
+      runs_on: ${{ toJSON(vars.FORGE_RUNNER || 'ubuntu-latest') }}
       pull_request_number: ${{ needs.discover.outputs.pull_request_number }}
       head_sha: ${{ needs.discover.outputs.head_sha }}
       run_id: ${{ needs.discover.outputs.run_id }}
