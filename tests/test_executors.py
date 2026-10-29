@@ -471,6 +471,31 @@ def test_explicit_empty_provider_allowlist_denies_every_executor() -> None:
     assert "provider not allowed" in decision.candidates[0]["rejectionReasons"]
 
 
+def test_explicit_empty_data_residency_allowlist_denies_every_executor() -> None:
+    executors = load_executors([_executor("openai-1")])
+    policy = load_routing_policy({"policyVersion": "deny-all", "allowedDataResidency": []})
+
+    assert policy.allowed_data_residency == ()
+
+    decision = route_executor(_request(), executors, policy)
+
+    assert decision.status is RouteStatus.INSUFFICIENT_BUDGET_OR_ASSURANCE
+    assert decision.selected_executor_id == ""
+    assert "data residency not allowed" in decision.candidates[0]["rejectionReasons"]
+
+
+def test_missing_data_residency_allowlist_still_defaults_to_every_known_value() -> None:
+    policy = load_routing_policy({"policyVersion": "defaults"})
+
+    assert set(policy.allowed_data_residency) == {
+        "customer-controlled",
+        "eu",
+        "local-only",
+        "unspecified",
+        "us",
+    }
+
+
 def test_missing_provider_allowlist_still_defaults_to_every_known_provider() -> None:
     policy = load_routing_policy({"policyVersion": "defaults"})
 
