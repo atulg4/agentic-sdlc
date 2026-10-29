@@ -2314,6 +2314,243 @@ def test_doctor_rejects_a_ci_gate_whose_failure_is_ignored(tmp_path, mutate):
     assert "ci.yml runs the policy gates as 'test'" in _failed(report)
 
 
+# #153: GitHub runs a step with no `shell:` key as `bash -e {0}` -- no pipefail. Only an explicit
+# `shell: bash` (`bash --noprofile --norc -eo pipefail {0}`) or the script's own `set -o pipefail`
+# makes a failure before a pipe fail the step.
+@pytest.mark.parametrize(
+    ("script", "shell", "enforced"),
+    [
+        ("pytest | tee out", None, False),
+        ("pytest |& tee out", None, False),
+        ("pytest | tee out", "sh", False),
+        ("pytest | tee out", "bash", True),
+        ("set -o pipefail\npytest | tee out", None, True),
+        ("set -euo pipefail\npytest | tee out", None, True),
+        ("set -eo pipefail; pytest | tee out", "sh", True),
+        ("set +o pipefail\npytest | tee out", "bash", False),
+        ("set -o pipefail\nset +o pipefail\npytest | tee out", None, False),
+        ("set -o errexit\npytest | tee out", None, False),
+        ("pytest", None, True),
+        # Only a `set` the parent shell runs turns pipefail ON (Codex 4250527925/-28/-32).
+        ("set +o pipefail; set -o pipefail | cat; pytest | tee out", "bash", False),
+        ("set -o pipefail & pytest | tee out", None, False),
+        ("(set -o pipefail); pytest | tee out", None, False),
+        ("( set -o pipefail ) ; pytest | tee out", None, False),
+        ("if true; then set -o pipefail; fi; pytest | tee out", None, False),
+        ("set +o pipefail; set -- -o pipefail; pytest | tee out", "bash", False),
+        ("set -e -- -o pipefail; pytest | tee out", None, False),
+        ("builtin set +o pipefail; pytest | tee out", "bash", False),
+        ("command set +o pipefail; pytest | tee out", "bash", False),
+        ("command -v set -o pipefail; pytest | tee out", None, False),
+        ("builtin set -o pipefail; pytest | tee out", None, True),
+        ("command set -euo pipefail; pytest | tee out", None, True),
+        # A `{ ...; }` group piped or backgrounded as a whole runs in a child (Codex 4250684144).
+        ("set +o pipefail; { set -o pipefail; } | cat; pytest | tee out", "bash", False),
+        ("set +o pipefail; { set -o pipefail; } & pytest | tee out", "bash", False),
+        ("{ set -o pipefail; }; pytest | tee out", None, False),
+        # Heredoc bodies and multi-line strings are text, not commands.
+        ("cat <<EOF\nset -o pipefail\nEOF\npytest | tee out", None, False),
+        ("echo 'a\nset -o pipefail\nb'\npytest | tee out", None, False),
+        ("cat <<EOF\nhi\nEOF\npytest | tee out", "bash", True),
+        # Any other command that may change the options turns both OFF (Codex 4250836628/-32).
+        (">/tmp/x set +o pipefail; pytest | tee out", "bash", False),
+        ("time -p set +o pipefail; pytest | tee out", "bash", False),
+        ("shopt -u -o pipefail; pytest | tee out", "bash", False),
+        ("trap 'set +o pipefail' DEBUG; pytest | tee out", "bash", False),
+        ('o="+o pipefail"; set $o; pytest | tee out', "bash", False),
+        ("$SETTER +o pipefail; pytest | tee out", "bash", False),
+        # A redirection may fail and skip the builtin (Codex 4251593338).
+        ("set -o pipefail >/dev/null; pytest | tee out", None, False),
+        ("set +e +o pipefail; set -e -o pipefail >/missing/out; pytest | tee out", None, False),
+        # An invalid flag or option name stops the call (Codex 4251593332).
+        ("set +e +o pipefail; set -z -e -o pipefail; pytest | tee out", None, False),
+        ("set +o pipefail; set -o bogus -o pipefail; pytest | tee out", "bash", False),
+        ("set -x -o pipefail; pytest | tee out", None, True),
+        # `trap` behind a redirection; `enable` disabling a wrapper (Codex 4251826068/-84).
+        (">/tmp/x trap 'set +o pipefail' DEBUG; pytest | tee out", "bash", False),
+        (
+            "set +e +o pipefail; enable -n command; command set -e -o pipefail; pytest | true",
+            "bash",
+            False,
+        ),
+        # `!` / `if` make the whole pipeline the condition (Codex 4251826079).
+        ("! tee /dev/null | pytest", "bash", False),
+        ("! pytest | tee /dev/null", "bash", False),
+        ("if true | pytest; then echo; fi", "bash", False),
+        # After an option change the parser cannot read, no `set` proves an option ON
+        # (Codex 4252099401/4252099389).
+        ("trap set\\ +e\\ +o\\ pipefail DEBUG; set -e -o pipefail; pytest | true", "bash", False),
+        ("set +e +o pipefail; enable -n set; set -e -o pipefail; pytest | true", "bash", False),
+        # `set -n` reads the rest without running it (Codex 4252099381).
+        ("set -n; pytest", "bash", False),
+        ("set -o noexec; pytest", "bash", False),
+        # `set -$x` may expand to `-n` (Codex 4252316079); `set -n | cat` runs in a child and
+        # leaves the parent running (Codex 4252316098).
+        ("x=n; set -$x; pytest", "bash", False),
+        ("set -n | cat; pytest", "bash", True),
+        # `a && b &` backgrounds the whole and-or list (Codex 4252316108).
+        ("true; pytest && true &", "bash", False),
+        # `command -v` only describes its operand; words after `set --` are positional
+        # parameters, never options (Codex 4398454667/4398454653).
+        ('tool=python; command -v "$tool"; pytest | tee out', "bash", True),
+        ('set -- "$PWD"; pytest | tee out', "bash", True),
+        ('set -- "$PWD"; pytest', "bash", True),
+        ("set -o pipefail $x; pytest | tee out", None, False),
+        ('set -e "$x"; pytest', "bash", False),
+        # `set -n` behind a redirection; `shopt -q` only queries; a quoted control word as an
+        # argument is a plain word (Codex 4253363484/4253363488/4253363470).
+        (">/tmp/x set -n; pytest", "bash", False),
+        ("shopt -q -o pipefail; pytest | tee out", "bash", True),
+        ("shopt -s -o pipefail; pytest | tee out", "bash", False),
+        ('echo "if"; pytest', "bash", True),
+        ('x=1 "fi"; pytest', "bash", False),
+        # Only the command bash runs counts, past redirections, `time -p` and wrappers; the same
+        # words as arguments are inert (Codex 4252463247).
+        ("2>/dev/null set +e +o pipefail; pytest | tee out", "bash", False),
+        ("command -p set +o pipefail; pytest | tee out", "bash", False),
+        ("echo set; echo trap; echo enable; pytest | tee out", "bash", True),
+        # `set -- -n` assigns positional parameters (Codex 4252615565).
+        ("set -- -n; pytest", "bash", True),
+        # Only `shopt -o` reaches errexit/pipefail (Codex 4252615579).
+        ("shopt -s nullglob; pytest | tee out", "bash", True),
+        ("shopt -uo pipefail; pytest | tee out", "bash", False),
+        # A later `||` in the same and-or list recovers the failure (Codex 4252760398).
+        ("pytest && true || true", "bash", False),
+        ("pytest && true", "bash", True),
+        # `shopt -s -o noexec` and `command -p exit` end the script (Codex 4252760388/-408).
+        ("shopt -s -o noexec; pytest", "bash", False),
+        ("command -p exit 0; pytest", "bash", False),
+        # Tilde expansion makes `set`'s arguments unreadable (Codex 4252987836).
+        ("HOME=-n; set ~; pytest", "bash", False),
+        ("cd ~/repo && pytest", "bash", True),
+        # A trap handler can turn a later failure into success (Codex 4253116046).
+        ("trap exit\\ 0 ERR; pytest", "bash", False),
+        # `-o NAME` consumes its name before `-n` (Codex 4253116041).
+        ("set -eo pipefail -n; pytest", "bash", False),
+        ("set -eo pipefail; pytest", "bash", True),
+        # A quoted control word is a plain word to bash (Codex 4253116034).
+        ('if ! true; then "fi"; pytest; fi; true', "bash", False),
+        ('echo "if x"; pytest', "bash", True),
+        # A pipeline behind a skipped `||` branch never runs; a backgrounded brace group runs
+        # its contents in the background (Codex 4253230848/4253230837).
+        ("true || true | pytest; true", "bash", False),
+        ("true && pytest | tee out", "bash", True),
+        ("{ pytest; } & true", "bash", False),
+        ("{ pytest; }; true", "bash", True),
+        ("set -o pipefail; echo ok; pytest | tee out", None, True),
+        # `o` anywhere in a cluster takes the option name (Codex 4251046345).
+        ("set +ou pipefail; pytest | tee out", "bash", False),
+        ("set -ou pipefail; pytest | tee out", None, True),
+        # Brace and pathname expansion make `set`'s arguments unreadable (Codex 4251046343).
+        ("set -o pipefail; set +o {pipefail,pipefail}; pytest | tee out", None, False),
+        ("set -o pipefail; set +o pipefai?; pytest | tee out", None, False),
+        # A `set` an and-or list may skip never turns an option ON (Codex 4251046350).
+        ("set +o pipefail; true || set -o pipefail; pytest | tee out", "bash", False),
+        ("set +o pipefail; true && set -o pipefail; pytest | tee out", "bash", False),
+        # `a | b &` backgrounds the whole pipeline (Codex 4251046354).
+        ("true; pytest | true &", "bash", False),
+        ("pytest | true & wait", "bash", False),
+        # An expansion anywhere in the command name may spell `set` (Codex 4251246556).
+        ("x=et; y=fail; s$x +o pipe$y; pytest | tee out", "bash", False),
+        ("`echo set` +o pipefail; pytest | tee out", "bash", False),
+        ('cd "$HOME" && pytest | tee out', "bash", True),
+        # shlex drops quoting: a quoted `)` must not end a subshell early (Codex 4251246570).
+        ("set +o pipefail; ( echo ')' ; set -o pipefail ) ; pytest | tee out", "bash", False),
+        ("( true ); set -o pipefail; pytest | tee out", None, False),
+        # A trap handler or a wrapped command built from an expansion (Codex 4251422330/-08).
+        ("x='set +o pipefail'; trap \"$x\" DEBUG; pytest | tee out", "bash", False),
+        ("x='set +o pipefail'; command $x; pytest | tee out", "bash", False),
+        # shlex drops quoting: a quoted `"fi"` must not close the `if` (Codex 4251422334).
+        (
+            'set +o pipefail; if false; then "fi"; set -o pipefail; fi; pytest | tee out',
+            "bash",
+            False,
+        ),
+        ('echo "hi"\nset -o pipefail\npytest | tee out', None, False),
+    ],
+)
+def test_shell_parse_enforces_a_piped_command_only_with_pipefail(script, shell, enforced):
+    from agentic_sdlc.onboard import _shell_parse
+
+    commands = _shell_parse(script, shell).commands
+    pytest_runs = [flag for argv, flag in commands if argv == ("pytest",)]
+    # A command the parser cannot isolate (`); pytest`) is never enforced: that fails closed too.
+    assert any(pytest_runs) is enforced, commands
+
+
+@pytest.mark.parametrize(
+    "script",
+    ["command eval 'set +o pipefail'; pytest | tee out", "builtin eval x; pytest"],
+)
+def test_shell_parse_sees_eval_behind_builtin_wrappers(script):
+    # Codex 4252987831: `command eval ...` evaluates in the current shell; doctor rejects it.
+    from agentic_sdlc.onboard import _shell_parse
+
+    assert _shell_parse(script, "bash").evals
+
+
+@pytest.mark.parametrize(
+    ("script", "enforced"),
+    [
+        ("set -e\nfalse\npytest", True),
+        ("builtin set -e\nfalse\npytest", True),
+        ("set -o errexit\nfalse\npytest", True),
+        ("set -- -e\nfalse\npytest", False),  # positional parameters, not an option
+        ("set -e | cat\nfalse\npytest", False),  # runs in a child of the pipe
+        ("set -e\nbuiltin set +e\nfalse\npytest", False),
+        ("set -e\n2>/dev/null set +e\nfalse\npytest", False),
+        ("set -e\ntime -p set +e\nfalse\npytest", False),
+    ],
+)
+def test_shell_parse_reads_errexit_from_set_like_bash(script, enforced):
+    from agentic_sdlc.onboard import _shell_parse
+
+    # A shell Forge does not know starts without errexit: only the script's own `set` turns it on.
+    commands = dict(_shell_parse(script, "zsh").commands)
+    assert commands[("false",)] is enforced, commands
+
+
+@pytest.mark.parametrize(
+    ("defaults", "rejected"),
+    [
+        ({"run": {"shell": "bash"}}, False),  # what onboard generates: `bash -eo pipefail`
+        (None, True),  # a ci.yml from before #153: GitHub's default `bash -e`, no pipefail
+        ({"run": {"shell": "sh"}}, True),
+    ],
+)
+def test_doctor_enforces_a_piped_gate_only_where_ci_has_pipefail(tmp_path, defaults, rejected):
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(test_command="pytest tests -q | tee test-output.txt"))
+    ci = repo / ".github/workflows/ci.yml"
+    doc = yaml.safe_load(ci.read_text())
+    assert doc["defaults"] == {"run": {"shell": "bash"}}
+    if defaults is None:
+        del doc["defaults"]
+    else:
+        doc["defaults"] = defaults
+    ci.write_text(yaml.safe_dump(doc, sort_keys=False))
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    gate = "ci.yml runs the policy gates as 'test'"
+    assert (gate in _failed(report)) is rejected
+
+
+def test_doctor_accepts_a_piped_gate_naming_an_option_in_a_path(tmp_path):
+    # Codex 4251422319: a word that merely CONTAINS `pipefail` changes no shell option.
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(test_command="pytest tests/test_pipefail.py | tee out.txt"))
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    assert "ci.yml runs the policy gates as 'test'" not in _failed(report)
+
+
+@pytest.mark.parametrize("selector", ["pipefail", "set", "trap", "enable", "shopt"])
+def test_doctor_accepts_a_piped_gate_with_an_option_name_as_an_argument(tmp_path, selector):
+    # Codex 4252316092/4252463247: `-k set` is pytest's selector, not a shell option change.
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec(test_command=f"pytest -k {selector} | tee out.txt"))
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    assert "ci.yml runs the policy gates as 'test'" not in _failed(report)
+
+
 def test_doctor_requires_the_managed_files_on_the_remote_default_branch(tmp_path):
     repo = _repo(tmp_path)
     write_onboarding(repo, spec())
@@ -3578,6 +3815,13 @@ def _mutate_ci_test_step(repo, mutate):
         lambda doc, job, step: doc.update({"env": {"PYTEST_ADDOPTS": "--co"}}),
         lambda doc, job, step: step.update({"run": "PYTEST_ADDOPTS=--co " + step["run"]}),
         lambda doc, job, step: step.update({"run": "export PYTEST_ADDOPTS=--co\n" + step["run"]}),
+        # a name built by an expansion may be PYTEST_ADDOPTS (Codex 4253230817)
+        lambda doc, job, step: step.update({"run": "export $x=--co\n" + step["run"]}),
+        # an expanded command name may be eval (Codex 4253363494)
+        lambda doc, job, step: step.update({"run": "x=eval; $x 'pytest() { :; }'\n" + step["run"]}),
+        lambda doc, job, step: step.update(
+            {"run": "`echo eval` 'pytest() { :; }'\n" + step["run"]}
+        ),
         lambda doc, job, step: step.update({"env": {"BASH_ENV": "./evil.sh"}}),
         lambda doc, job, step: job["steps"].insert(
             0, {"run": 'echo "PYTEST_ADDOPTS=--co" >> "$GITHUB_ENV"'}
@@ -3602,6 +3846,11 @@ def test_doctor_rejects_a_gate_whose_meaning_is_changed(tmp_path, mutate):
         lambda doc, job, step: step.update({"run": "source .venv/bin/activate\n" + step["run"]}),
         lambda doc, job, step: job["steps"].insert(1, {"uses": "actions/cache@v4"}),
         lambda doc, job, step: step.update({"run": "helper() { echo hi; }\n" + step["run"]}),
+        # Codex 4398454667/4398454653
+        lambda doc, job, step: step.update(
+            {"run": 'tool=python; command -v "$tool"\n' + step["run"]}
+        ),
+        lambda doc, job, step: step.update({"run": 'set -- "$PWD"\n' + step["run"]}),
     ],
 )
 def test_doctor_accepts_a_gate_with_benign_surroundings(tmp_path, mutate):
