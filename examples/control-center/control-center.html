@@ -194,6 +194,119 @@
 
   .skeleton { color: var(--ink-3); padding: 28px 0; text-align: center; }
   .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+
+  /* ---------- motion ----------
+     Only opacity and transform are animated: those are the two properties a
+     compositor can run off the main thread, so a burst of live updates cannot
+     turn into layout thrash. No state is conveyed by motion alone - every
+     transition below decorates a change that is already in the text. */
+  .fade { transition: opacity 140ms linear, transform 140ms ease-out; }
+  .enter { opacity: 0; transform: translateY(4px); }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      transition: none !important;
+      animation: none !important;
+      scroll-behavior: auto !important;
+    }
+  }
+
+  /* ---------- phone shell ----------
+     The phone view is built from its own components, not from shrinking the
+     desktop table. Everything here is additive: the desktop rules above are
+     untouched, and the two shells never render at the same time. */
+  .phone-only { display: block; }
+  .desk-only { display: none; }
+  @media (min-width: 1024px) {
+    .phone-only { display: none; }
+    .desk-only { display: block; }
+  }
+
+  nav.bottom {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 20;
+    display: flex; background: var(--panel); border-top: 1px solid var(--line);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  @media (min-width: 1024px) { nav.bottom { display: none; } }
+  .dest {
+    flex: 1 1 0; min-width: 0;
+    /* 44x44 CSS px is the floor for a touch target; the label sits inside it. */
+    min-height: 52px; padding: 6px 2px;
+    border: 0; background: transparent; color: var(--ink-3); cursor: pointer;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
+  }
+  .dest[aria-current="page"] { color: var(--accent); }
+  .dest .glyph { font-size: 17px; line-height: 1; }
+  .dest .label { font-size: 10.5px; letter-spacing: -0.01em; }
+  /* The bottom bar floats over the page: reserve its height so the last card
+     is reachable rather than parked underneath it. */
+  body.has-bottom-nav .wrap { padding-bottom: 92px; }
+  /* Below the dense-view breakpoint every control is a touch target, so the
+     44px floor applies to the small buttons too, not only the nav. */
+  @media (max-width: 1023px) {
+    .btn, .btn.sm { min-height: 44px; padding-top: 10px; padding-bottom: 10px; }
+    .ucard-btn { min-height: 44px; }
+    .twist { min-width: 44px; min-height: 44px; }
+  }
+
+  /* ---------- phone cards ---------- */
+  .ucard {
+    display: block; width: 100%; text-align: left; cursor: pointer; color: inherit;
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 12px; margin: 10px 0;
+    min-height: 44px;
+  }
+  .ucard:focus-visible, .dest:focus-visible, .seg:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .ucard-btn {
+    display: block; width: 100%; text-align: left; cursor: pointer; color: inherit;
+    background: transparent; border: 0; margin: 0; padding: 0; min-height: 44px;
+  }
+  .ucard-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .ucard-top { display: flex; gap: 8px; align-items: center; }
+  .ucard-id { font-family: var(--mono); font-size: 12.5px; color: var(--ink-2); flex: 1; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ucard-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+
+  /* Stage progress: a bar plus its own text, never colour alone. */
+  .prog { margin-top: 9px; }
+  .prog-track { height: 6px; border-radius: 999px; background: var(--mute-bg); overflow: hidden; }
+  .prog-fill { height: 100%; background: var(--accent); border-radius: 999px; }
+  .prog-fill.unknown { background: repeating-linear-gradient(90deg, var(--ink-3) 0 4px, transparent 4px 8px); }
+  .prog-text { font-size: 11.5px; color: var(--ink-3); margin-top: 4px; }
+
+  /* ---------- charts ---------- */
+  .chart { margin: 4px 0 0; }
+  .chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .seg { cursor: default; }
+  .seg:focus { outline: none; }
+  .seg-label { font-size: 11px; fill: var(--ink-2); }
+  .chart-legend { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; font-size: 11.5px; color: var(--ink-2); }
+  .chart-legend span.key { display: inline-flex; align-items: center; gap: 4px; }
+  .chart-legend i.swatch { width: 9px; height: 9px; border-radius: 2px; flex: none; }
+  .chart-unknown {
+    border: 1px dashed var(--line); border-radius: var(--radius-sm);
+    padding: 12px; font-size: 13px; color: var(--ink-3);
+  }
+  .tip {
+    position: absolute; z-index: 30; max-width: 240px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius-sm);
+    padding: 6px 8px; font-size: 12px; color: var(--ink); pointer-events: none;
+    box-shadow: 0 6px 20px rgba(0,0,0,.14);
+  }
+
+  /* ---------- drill-down ---------- */
+  .detail { background: var(--panel-2); border-radius: var(--radius-sm); padding: 11px; margin: 10px 0; }
+  .detail h4 { margin: 0 0 6px; font-size: 13px; }
+  .tl { list-style: none; margin: 0; padding: 0; }
+  .tl li { display: flex; gap: 8px; padding: 4px 0; align-items: baseline; }
+  .tl .mark { width: 10px; flex: none; color: var(--ink-3); font-family: var(--mono); }
+  .tl li.at .mark { color: var(--accent); }
+
+  /* ---------- dense desktop view ---------- */
+  table.dense { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.dense th, table.dense td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  table.dense th { color: var(--ink-3); font-weight: 600; font-size: 11.5px; text-transform: uppercase; letter-spacing: .04em; }
+  table.dense tr.sel { background: var(--panel-2); }
+  .scroller { overflow-x: auto; }
 </style>
 
 <header class="top">
@@ -207,9 +320,11 @@
 </header>
 
 <main class="wrap">
-  <div class="tabs" id="tabs" role="tablist"></div>
+  <div class="tabs desk-only" id="tabs" role="tablist"></div>
   <div id="view"><div class="skeleton">Connecting to the Control Center store…</div></div>
 </main>
+
+<nav class="bottom" id="bottom-nav" aria-label="Control Center sections"></nav>
 
 <script type="module">
   const SCHEMA = 1;
@@ -235,6 +350,12 @@
     db: null, user: null, sample: null, viewer: null, canWrite: null,
     snapshot: null, snapshotMeta: null, notes: new Map(), drafts: [],
     tab: "portfolio", project: null, open: new Set(), connecting: true, error: "",
+    // #108: the phone shell's own navigation, the open drill-down, the
+    // optional telemetry overlay and the freshness bookkeeping a degraded
+    // feed is labelled with.
+    layout: "phone", dest: "projects", detail: null, sheet: "", shown: 0,
+    telemetry: null, telemetryAt: "",
+    lastGoodAt: "", degraded: "", feedSeenAt: 0,
     // Listener failures per collection: a later snapshot adoption clears
     // state.error, but a dead notes or drafts feed stays dead until reload,
     // so its banner must survive adoption.
@@ -288,6 +409,9 @@
   }
   try { const saved = localStorage.getItem(themeKey); if (saved) applyTheme(saved); } catch {}
   document.getElementById("refresh-btn").addEventListener("click", () => {
+    // The phone shell has five destinations, so the views that are not
+    // destinations open as an overlay over whichever one is showing.
+    if (state.layout === "phone") state.sheet = "snapshot";
     state.tab = "snapshot";
     render();
     window.scrollTo({ top: 0 });
@@ -359,26 +483,16 @@
       // pasted document can never adopt after a newer live delivery (or
       // vice versa).
       state.db.doc("snapshots/current").onSnapshot(
-        async (snap) => {
-          const delivery = ++snapshotAdoptions;
-          if (!snap?.exists) {
-            // A deleted snapshot is a delivery too: it clears the view and
-            // supersedes any older digest verification still in flight. The
-            // pristine copy clears with it, so the copy action never offers
-            // a document the live store explicitly removed.
-            state.snapshot = null;
-            state.snapshotPristine = null;
-            state.snapshotMeta = null;
-            state.error = "";
-            render();
-            return;
-          }
-          const body = snap.data() || {};
-          const problem = validateSnapshot(body.document) || await digestMismatch(body.document);
-          if (delivery !== snapshotAdoptions) return; // a newer adoption superseded this one
-          if (problem) { state.error = problem; render(); return; }
-          adoptSnapshot(body.document, body.loadedAt, body.loadedBy);
-          render();
+        (snap) => {
+          // Coalesced, not dropped: one verification runs at a time and the
+          // NEWEST pending delivery wins. Verifying a document means digesting
+          // all of it, and a burst of deliveries is a burst of documents that
+          // supersede each other, so verifying every one of them spends the
+          // main thread on views nobody will ever see. Whatever is finally
+          // adopted is verified in full, and the generation counter still
+          // orders it against a manual load.
+          pending = { present: Boolean(snap?.exists), body: snap?.exists ? (snap.data() || {}) : null };
+          drainDeliveries();
         },
         (error) => {
           // A terminated subscription must be visible: the last snapshot
@@ -393,6 +507,10 @@
             + describe(error)
             + "). Showing the last loaded snapshot; reload the page to reconnect.");
           render();
+          // A terminated listener is exactly when a full reload is owed: the
+          // console cannot know what it missed, so it re-reads the whole
+          // snapshot itself rather than waiting for an operator to notice.
+          recoverSnapshot("Live updates stopped (" + describe(error) + "); reloading a full snapshot.");
         },
       );
     } catch (error) {
@@ -814,6 +932,27 @@
     }
   }
 
+  function credentialShaped(raw) {
+    // Token-shaped credentials hide in query strings and fragments with no
+    // userinfo to catch, and percent-encoding (%67hp_, ghp%5F) defeats a raw
+    // scan: bounded peeling decodes each layer before scanning, mirroring
+    // the producer's _carries_credential_token. Valid escapes are peeled
+    // INDIVIDUALLY, like the producer's urllib.parse.unquote:
+    // decodeURIComponent throws on a malformed escape elsewhere in the value
+    // (%ZZ%67hp_...), which would stop the scan before the valid escapes
+    // beside it ever decoded.
+    const peel = (text) => text.replace(/%([0-9a-fA-F]{2})/g,
+      (match, hex) => String.fromCharCode(parseInt(hex, 16)));
+    let decoded = String(raw);
+    for (let pass = 0; pass < 3; pass += 1) {
+      if (/gh[pousr]_|github_pat_|glpat-/i.test(decoded)) return true;
+      const peeled = peel(decoded);
+      if (peeled === decoded) break;
+      decoded = peeled;
+    }
+    return /gh[pousr]_|github_pat_|glpat-/i.test(decoded);
+  }
+
   function validateSnapshot(value) {
     // Deep structural validation: a malformed document saved to the shared
     // store would crash every viewer, so every shape a renderer touches is
@@ -823,22 +962,9 @@
     // userinfo to catch, and percent-encoding (%67hp_, ghp%5F) defeats a raw
     // scan: bounded peeling decodes each layer before scanning, mirroring
     // the producer's _carries_credential_token.
-    const tokenShaped = (raw) => {
-      // Valid escapes are peeled INDIVIDUALLY, like the producer's
-      // urllib.parse.unquote: decodeURIComponent throws on a malformed
-      // escape elsewhere in the value (%ZZ%67hp_...), which would stop the
-      // scan before the valid escapes beside it ever decoded.
-      const peel = (text) => text.replace(/%([0-9a-fA-F]{2})/g,
-        (match, hex) => String.fromCharCode(parseInt(hex, 16)));
-      let decoded = String(raw);
-      for (let pass = 0; pass < 3; pass += 1) {
-        if (/gh[pousr]_|github_pat_|glpat-/i.test(decoded)) return true;
-        const peeled = peel(decoded);
-        if (peeled === decoded) break;
-        decoded = peeled;
-      }
-      return /gh[pousr]_|github_pat_|glpat-/i.test(decoded);
-    };
+    // One implementation, shared with the telemetry validator below: a
+    // second copy could drift and let a credential through on one path.
+    const tokenShaped = credentialShaped;
     if (!isObj(value)) return "That is not a snapshot document.";
     if (value.schemaVersion !== SCHEMA) return `Unsupported snapshot schemaVersion: ${value.schemaVersion}. This page renders version ${SCHEMA}.`;
     if (!Array.isArray(value.projects)) return "The snapshot has no projects array.";
@@ -1289,25 +1415,1283 @@
       || hour > 23 || minute > 59 || second > 59 || offsetBad);
   }
 
+  /* ================= #108: mobile-first, chart-first layer =================
+     Everything below renders the SAME validated snapshot the desktop views
+     render. It adds no telemetry of its own: cost, parallelism and
+     effectiveness come from an OPTIONAL telemetry overlay document, and every
+     chart that has no source data behind it says so rather than drawing a
+     zero. */
+
+  /* The forward lifecycle path, in order. Progress is a position on this
+     rail, never a guess: a unit in an off-path state (blocked, failed,
+     rolled back, cancelled, superseded) has no position and reports one. */
+  const PROGRESS_RAIL = [
+    "intake", "specification", "planning", "dependency-wait", "dispatch",
+    "implementation", "deterministic-verification", "independent-review",
+    "repair", "re-review", "merge", "deploy", "deployment-verification", "live",
+  ];
+  const OFF_RAIL = new Set(["rollback", "blocked", "failed", "cancelled", "superseded"]);
+
+  /* How many work units a list renders before asking. A phone that builds
+     five hundred cards spends its frame budget on layout for rows nobody has
+     scrolled to, and every later live delivery pays that cost again. The list
+     is ordered attention-first, so the page that is rendered is the page that
+     matters - and the control says exactly how much is being withheld, so a
+     bounded list never reads as a complete one. */
+  const PAGE_SIZE = { phone: 50, desktop: 200 };
+
+  //: Phone destinations, in bar order. Five, as the console's own
+  //: navigation contract: anything else is reachable from inside them.
+  const DESTINATIONS = [
+    ["projects", "Projects", "▣"],
+    ["backlog", "Backlog", "≣"],
+    ["agents", "Agents", "◉"],
+    ["cost", "Cost", "¤"],
+    ["effectiveness", "Effectiveness", "✓"],
+  ];
+
+  //: A categorical ramp that stays distinguishable in both themes. Colour is
+  //: never the only carrier: every series is also labelled in text.
+  const SERIES = ["#1f5fd0", "#8a5cf6", "#0e8a6a", "#c2561c", "#9a1c86", "#2b7fa8", "#7a6a1e"];
+
+  function layoutMode() {
+    try {
+      return window.matchMedia("(min-width: 1024px)").matches ? "desktop" : "phone";
+    } catch { return "phone"; }
+  }
+
+  function watchLayout() {
+    try {
+      const query = window.matchMedia("(min-width: 1024px)");
+      const update = () => {
+        const next = layoutMode();
+        if (next === state.layout) return;
+        state.layout = next;
+        // The two shells are different component trees, so a width change
+        // discards the patch cache rather than trying to reconcile across
+        // them.
+        patchCache = new WeakMap();
+        render();
+      };
+      if (query.addEventListener) query.addEventListener("change", update);
+      else if (query.addListener) query.addListener(update);
+    } catch { /* no matchMedia: the phone shell is the safe default */ }
+  }
+
+  /* ---------- elapsed time ----------
+     Measured from the snapshot's own last-transition instant. An absent or
+     unparseable instant is "unknown" - never zero, which would read as
+     "just moved". */
+  function elapsed(instant, now) {
+    if (!realInstant(instant)) return { text: "unknown", known: false };
+    const then = Date.parse(instant);
+    const base = Number.isFinite(now) ? now : Date.now();
+    if (!Number.isFinite(then)) return { text: "unknown", known: false };
+    let seconds = Math.round((base - then) / 1000);
+    // A future instant is a clock disagreement, not negative elapsed time.
+    if (seconds < 0) return { text: "clock ahead", known: false };
+    if (seconds < 60) return { text: seconds + "s", known: true, seconds };
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return { text: minutes + "m", known: true, seconds };
+    const hours = Math.floor(minutes / 60);
+    if (hours < 48) return { text: hours + "h " + (minutes % 60) + "m", known: true, seconds };
+    return { text: Math.floor(hours / 24) + "d " + (hours % 24) + "h", known: true, seconds };
+  }
+
+  function progressOf(unit) {
+    const stage = unit.stage || "";
+    if (OFF_RAIL.has(stage)) {
+      return { fraction: null, text: "off the lifecycle rail (" + stage + ")" };
+    }
+    const index = PROGRESS_RAIL.indexOf(stage);
+    if (index < 0) return { fraction: null, text: "stage unknown" };
+    const step = index + 1;
+    return {
+      fraction: step / PROGRESS_RAIL.length,
+      text: "stage " + step + " of " + PROGRESS_RAIL.length + " · " + stage,
+    };
+  }
+
+  function pageSize() {
+    return PAGE_SIZE[state.layout] || PAGE_SIZE.phone;
+  }
+
+  function shownLimit() {
+    return Math.max(state.shown || 0, pageSize());
+  }
+
+  function moreCard(total, shown, label) {
+    if (total <= shown) return null;
+    return el("div", { class: "card" },
+      el("p", { class: "small", style: "margin:0 0 8px",
+        text: `Showing ${shown} of ${total} ${label}, most in need of attention first.` }),
+      el("div", { class: "row" },
+        el("button", { class: "btn", type: "button", on: { click: () => {
+          state.shown = shown + pageSize();
+          render();
+        } } }, `Show ${Math.min(pageSize(), total - shown)} more`),
+        total - shown > pageSize()
+          ? el("button", { class: "btn", type: "button", on: { click: () => {
+              state.shown = total;
+              render();
+            } } }, "Show all " + total)
+          : null,
+      ),
+    );
+  }
+
+  function unitsOf(project) {
+    // The snapshot splits units by disposition; the phone backlog shows them
+    // as one list, most-recently-moved first, with attention at the top.
+    const rank = (unit) => (unit.needsAttention ? 0 : unit.awaitsHuman ? 1 : 2);
+    return [...(project.active || []), ...(project.attention || []), ...(project.waiting || [])]
+      .sort((left, right) => rank(left) - rank(right)
+        || String(right.lastEventAt || "").localeCompare(String(left.lastEventAt || "")));
+  }
+
+  function allUnits() {
+    const out = [];
+    for (const project of projects()) {
+      for (const unit of unitsOf(project)) out.push({ project, unit });
+    }
+    return out;
+  }
+
+  /* ---------- keyed patching ----------
+     A live delivery must not rebuild the page. Every patched node carries a
+     stable key and a signature of the data it renders: a node whose key and
+     signature both match is left ALONE, so an open drill-down, a focused
+     control and the scroll position all survive an update. */
+  let patchCache = new WeakMap();
+  //: Counts DOM elements the last patch actually inserted. The performance
+  //: tests read it: a burst of live changes must not reinsert the view.
+  let patchStats = { inserted: 0, kept: 0, removed: 0, patches: 0 };
+
+  function tag(node, key, data) {
+    if (!node) return node;
+    node.dataset.key = String(key);
+    node.dataset.sig = signature(data);
+    return node;
+  }
+
+  /* Tag whatever a view returned. A section the view did not key itself gets
+     its position as a key and its own rendered markup as the signature: if
+     the markup is byte-identical the existing element already shows exactly
+     this content, so it is kept rather than replaced. Sections whose identity
+     outlives their position - a work-unit card in a list that reorders - key
+     themselves, which is what keeps an open drill-down open. */
+  function autotag(prefix, nodes) {
+    return nodes.filter(Boolean).map((node, index) => {
+      if (typeof node.build === "function") return node;
+      if (node.dataset?.key) return node;
+      return tag(node, prefix + ":" + index, node.outerHTML);
+    });
+  }
+
+  /* A section that can say what it WOULD render without rendering it. The
+     signature comes from the data, so an unchanged section is never built:
+     with 500 work units on screen, constructing every card on every delivery
+     dominated the cost of a live update even though nothing was inserted. */
+  function lazy(key, data, build) {
+    return { key: String(key), sig: signature(data), build };
+  }
+
+  function patch(parent, items) {
+    const existing = patchCache.get(parent) || new Map();
+    const next = new Map();
+    const wanted = [];
+    let inserted = 0;
+    let kept = 0;
+    for (const item of items) {
+      if (!item) continue;
+      const deferred = typeof item.build === "function";
+      const key = deferred ? item.key : item.dataset?.key;
+      const sig = deferred ? item.sig : item.dataset?.sig;
+      const previous = key === undefined ? null : existing.get(key);
+      // Same key AND same signature: the old element stays in the DOM
+      // untouched, so an open drill-down, a focused control and the scroll
+      // position all survive the update. A deferred section is not even
+      // built; an eagerly built candidate is discarded rather than swapped in.
+      if (previous && sig !== undefined && previous.dataset.sig === sig) {
+        wanted.push(previous);
+        if (key !== undefined) next.set(key, previous);
+        kept += 1;
+        continue;
+      }
+      let node = item;
+      if (deferred) {
+        node = item.build();
+        if (!node) continue;
+        node.dataset.key = item.key;
+        node.dataset.sig = item.sig;
+      }
+      wanted.push(node);
+      if (key !== undefined) next.set(key, node);
+      inserted += 1;
+    }
+    let cursor = parent.firstChild;
+    for (const node of wanted) {
+      if (cursor === node) { cursor = cursor.nextSibling; continue; }
+      parent.insertBefore(node, cursor);
+    }
+    let removed = 0;
+    while (cursor) {
+      const victim = cursor;
+      cursor = cursor.nextSibling;
+      victim.remove();
+      removed += 1;
+    }
+    patchCache.set(parent, next);
+    patchStats = { inserted, kept, removed, patches: patchStats.patches + 1 };
+    return patchStats;
+  }
+
+  function signature(value) {
+    // A cheap structural fingerprint. It only has to change when the
+    // rendered content changes; collisions would show stale content, so it
+    // covers the whole value rather than a chosen subset.
+    try { return canonicalJson(value); } catch { return String(value); }
+  }
+
+  /* ---------- feed health ----------
+     A stopped or reconnecting feed must not look live. The console keeps the
+     last-good view, labels it with the instant it was good, and reloads a
+     full snapshot by itself rather than waiting for an operator to notice. */
+  const FEED_STALL_MS = 90_000;
+  let recovering = false;
+
+  function markFeedAlive() {
+    state.feedSeenAt = Date.now();
+    if (state.snapshot) state.lastGoodAt = state.snapshot.generatedAt || state.lastGoodAt;
+    if (state.degraded) { state.degraded = ""; render(); }
+  }
+
+  function degrade(reason) {
+    if (state.degraded === reason) return;
+    state.degraded = reason;
+    render();
+  }
+
+  async function recoverSnapshot(reason) {
+    // A full snapshot, not a delta: after a gap the console cannot know what
+    // it missed, so it re-reads the whole document. The last-good view stays
+    // on screen until the replacement verifies.
+    if (recovering || !state.db) return false;
+    recovering = true;
+    degrade(reason);
+    try {
+      const snap = await state.db.doc("snapshots/current").get();
+      const body = snap?.data?.() || null;
+      if (!body?.document) return false;
+      const delivery = ++snapshotAdoptions;
+      const problem = validateSnapshot(body.document) || await digestMismatch(body.document);
+      if (delivery !== snapshotAdoptions) return false;
+      if (problem) { degrade("Recovery snapshot was refused: " + problem); return false; }
+      adoptSnapshot(body.document, body.loadedAt, body.loadedBy);
+      markFeedAlive();
+      render();
+      return true;
+    } catch (error) {
+      degrade("Snapshot recovery failed (" + describe(error) + "). Showing the last-good view.");
+      return false;
+    } finally {
+      recovering = false;
+    }
+  }
+
+  /* The newest delivery awaiting verification, and whether a verification is
+     already running. */
+  let pending = null;
+  let draining = false;
+  const lastDelivery = { validate: 0, verify: 0, adopt: 0, render: 0 };
+
+  async function drainDeliveries() {
+    if (draining) return;
+    draining = true;
+    try {
+      while (pending) {
+        const { present, body } = pending;
+        pending = null;
+        const delivery = ++snapshotAdoptions;
+        if (!present) {
+          // A deleted snapshot is a delivery too: it clears the view and
+          // supersedes any older digest verification still in flight. The
+          // pristine copy clears with it, so the copy action never offers a
+          // document the live store explicitly removed.
+          state.snapshot = null;
+          state.snapshotPristine = null;
+          state.snapshotMeta = null;
+          state.error = "";
+          render();
+          continue;
+        }
+        // Phase timings are kept for the performance budget: a regression
+        // needs to say WHICH phase got slower, not just that a delivery did.
+        let mark = performance.now();
+        let problem = validateSnapshot(body.document);
+        lastDelivery.validate = performance.now() - mark;
+        mark = performance.now();
+        if (!problem) problem = await digestMismatch(body.document);
+        lastDelivery.verify = performance.now() - mark;
+        // A newer adoption superseded this one — including a manual load,
+        // which shares the generation counter.
+        if (delivery !== snapshotAdoptions) continue;
+        if (problem) { state.error = problem; render(); continue; }
+        mark = performance.now();
+        adoptSnapshot(body.document, body.loadedAt, body.loadedBy);
+        lastDelivery.adopt = performance.now() - mark;
+        markFeedAlive();
+        mark = performance.now();
+        render();
+        lastDelivery.render = performance.now() - mark;
+      }
+    } finally {
+      draining = false;
+      // A delivery that arrived while the loop was finishing must still be
+      // served: the flag is cleared above, so one more drain picks it up.
+      if (pending) drainDeliveries();
+    }
+  }
+
+  function watchFeed() {
+    setInterval(() => {
+      if (!state.db || !state.feedSeenAt) return;
+      if (Date.now() - state.feedSeenAt < FEED_STALL_MS) return;
+      recoverSnapshot("Live updates went quiet; reloading a full snapshot.");
+    }, 15_000);
+  }
+
+  function freshnessLine() {
+    const at = state.lastGoodAt || state.snapshot?.generatedAt || "";
+    const age = elapsed(at, Date.now());
+    if (!state.degraded) {
+      return "as of " + txt(at, "unknown") + (age.known ? " · " + age.text + " ago" : "");
+    }
+    return "last good " + txt(at, "unknown") + (age.known ? " · " + age.text + " ago" : "");
+  }
+
+  /* ================= charts =================
+     Inline SVG, no charting framework. Each chart is one accessible image:
+     role="img" with an aria-label that states the whole finding in words, so
+     a screen reader never has to infer it from geometry. Every segment is
+     keyboard reachable and carries the same figure as text, so nothing is
+     conveyed by colour or position alone. */
+
+  const SVGNS = "http://www.w3.org/2000/svg";
+
+  function svgEl(tag, props, ...kids) {
+    const node = document.createElementNS(SVGNS, tag);
+    for (const [key, value] of Object.entries(props || {})) {
+      if (value === null || value === undefined || value === false) continue;
+      if (key === "text") node.textContent = String(value);
+      else if (key === "on") for (const [ev, fn] of Object.entries(value)) node.addEventListener(ev, fn);
+      else node.setAttribute(key, String(value));
+    }
+    for (const kid of kids.flat()) if (kid) node.append(kid);
+    return node;
+  }
+
+  /* One shared tooltip. Shown on hover AND on keyboard focus, because a
+     tooltip only a pointer can open is not reachable on a phone or by a
+     keyboard user. */
+  let tipNode = null;
+  function showTip(target, text) {
+    hideTip();
+    tipNode = el("div", { class: "tip", role: "status", text });
+    document.body.append(tipNode);
+    const box = target.getBoundingClientRect();
+    const tip = tipNode.getBoundingClientRect();
+    const left = Math.max(8, Math.min(window.innerWidth - tip.width - 8, box.left + box.width / 2 - tip.width / 2));
+    const top = box.top - tip.height - 8;
+    tipNode.style.left = left + window.scrollX + "px";
+    tipNode.style.top = (top < 4 ? box.bottom + 8 : top) + window.scrollY + "px";
+  }
+  function hideTip() {
+    if (tipNode) { tipNode.remove(); tipNode = null; }
+  }
+
+  function describable(node, text) {
+    // tabindex makes the segment focusable; the title element keeps the
+    // description in the accessibility tree even when no tooltip is open.
+    node.setAttribute("tabindex", "0");
+    node.setAttribute("role", "img");
+    node.setAttribute("aria-label", text);
+    node.classList.add("seg");
+    node.append(svgEl("title", { text }));
+    node.addEventListener("mouseenter", () => showTip(node, text));
+    node.addEventListener("mouseleave", hideTip);
+    node.addEventListener("focus", () => showTip(node, text));
+    node.addEventListener("blur", hideTip);
+    return node;
+  }
+
+  function chartUnknown(title, reason) {
+    // Unknown is never a zero: an absent source reads as its own state, with
+    // the reason, so nobody mistakes "no data" for "nothing happened".
+    return el("div", { class: "card" },
+      el("h3", { text: title }),
+      el("div", { class: "chart-unknown", role: "img", "aria-label": title + ": unavailable. " + reason },
+        el("div", { text: "unavailable" }),
+        el("div", { class: "tiny", style: "margin-top:4px", text: reason }),
+      ),
+    );
+  }
+
+  function legend(entries) {
+    return el("div", { class: "chart-legend" }, entries.map(([label, colour, value]) => el("span", { class: "key" },
+      el("i", { class: "swatch", style: "background:" + colour }),
+      el("span", { text: value === undefined ? label : label + " " + value }),
+    )));
+  }
+
+  /* A horizontal bar chart. Values are drawn AND printed. */
+  function barChart(title, rows, options) {
+    const opts = options || {};
+    if (!rows.length) return chartUnknown(title, opts.empty || "the snapshot carries no entries for this view.");
+    const max = Math.max(...rows.map((row) => row.value), 1);
+    const rowHeight = 26;
+    const height = rows.length * rowHeight;
+    const labelWidth = 34;
+    const summary = title + ": " + rows.map((row) => row.label + " " + row.value).join(", ");
+    const svg = svgEl("svg", {
+      viewBox: "0 0 100 " + height, preserveAspectRatio: "none",
+      role: "img", "aria-label": summary, focusable: "false",
+      style: "height:" + height + "px",
+    });
+    rows.forEach((row, index) => {
+      const width = Math.max(row.value > 0 ? 1 : 0, (row.value / max) * (100 - labelWidth));
+      const y = index * rowHeight;
+      const group = svgEl("g", {});
+      group.append(svgEl("rect", {
+        x: 0, y: y + 6, width: 100 - labelWidth, height: 12, rx: 3, fill: "var(--mute-bg)",
+      }));
+      if (width > 0) {
+        group.append(svgEl("rect", {
+          x: 0, y: y + 6, width, height: 12, rx: 3,
+          fill: row.colour || SERIES[index % SERIES.length],
+        }));
+      }
+      group.append(svgEl("text", {
+        x: 100 - labelWidth + 2, y: y + 15, class: "seg-label",
+        "font-size": "9", text: row.label + " · " + row.value,
+      }));
+      svg.append(describable(group, row.label + ": " + row.value + (row.note ? " (" + row.note + ")" : "")));
+    });
+    return el("div", { class: "card" },
+      el("h3", { text: title }),
+      el("div", { class: "chart" }, svg),
+      opts.note ? el("p", { class: "tiny muted", style: "margin:8px 0 0", text: opts.note }) : null,
+    );
+  }
+
+  /* The lifecycle rail: a funnel across the forward path, with each stage's
+     unit count. Stages with nobody in them stay visible, because a gap in
+     the funnel is the finding. */
+  function lifecycleRail(byStage, title) {
+    const stages = PROGRESS_RAIL.filter((stage) => (byStage[stage] || 0) > 0);
+    if (!stages.length) {
+      return chartUnknown(title || "Lifecycle rail", "no work unit in the snapshot carries a lifecycle stage yet.");
+    }
+    const total = stages.reduce((sum, stage) => sum + byStage[stage], 0);
+    const width = 100 / stages.length;
+    const summary = (title || "Lifecycle rail") + ": " + stages.map((stage) => byStage[stage] + " in " + stage).join(", ");
+    const svg = svgEl("svg", {
+      viewBox: "0 0 100 56", preserveAspectRatio: "none",
+      role: "img", "aria-label": summary, focusable: "false", style: "height:56px",
+    });
+    stages.forEach((stage, index) => {
+      const count = byStage[stage];
+      const share = count / total;
+      const barHeight = Math.max(4, share * 34);
+      const group = svgEl("g", {});
+      group.append(svgEl("rect", {
+        x: index * width + 0.6, y: 38 - barHeight, width: width - 1.2, height: barHeight,
+        rx: 1.5, fill: SERIES[index % SERIES.length],
+      }));
+      group.append(svgEl("text", {
+        x: index * width + width / 2, y: 34 - barHeight, "text-anchor": "middle",
+        class: "seg-label", "font-size": "7", text: String(count),
+      }));
+      group.append(svgEl("text", {
+        x: index * width + width / 2, y: 48, "text-anchor": "middle",
+        class: "seg-label", "font-size": "5.5", text: stage.slice(0, 11),
+      }));
+      svg.append(describable(group, count + " unit" + (count === 1 ? "" : "s") + " in " + stage));
+    });
+    return el("div", { class: "card" },
+      el("h3", { text: title || "Lifecycle rail" }),
+      el("div", { class: "chart" }, svg),
+      el("p", { class: "tiny muted", style: "margin:8px 0 0", text: "Stage counts from the snapshot. A stage with nobody in it is not drawn; an off-rail state is counted under blockers." }),
+    );
+  }
+
+  function tally(items, pick) {
+    const counts = new Map();
+    for (const item of items) {
+      const key = pick(item);
+      if (!key) continue;
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+    return [...counts.entries()]
+      .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+      .map(([label, value]) => ({ label, value }));
+  }
+
+  /* ================= the optional telemetry bundle =================
+     This console produces NO telemetry of its own. The cost, parallelism and
+     effectiveness views render documents the Forge CLI already emits, pasted
+     together into one bundle so a single file can be shared:
+
+       { "schemaVersion": 1,
+         "byModel":    <sdlcctl usage-report --group-by model>,
+         "byDay":      <sdlcctl usage-report --group-by day>,
+         "byWorkUnit": <sdlcctl usage-report --group-by project --group-by workUnit>,
+         "capacity":   <sdlcctl capacity-report ...>,
+         "effectiveness": <sdlcctl effectiveness-report ...> }
+
+     Every key is optional, and a view with no document behind it reads
+     "unavailable" naming the command that produces it. Each sub-document is
+     validated fail-closed on the way in, bounded, and re-scanned for
+     credential-shaped values: the bundle reaches a browser exactly like the
+     snapshot does. */
+
+  const TELEMETRY_SCHEMA = 1;
+  const TELEMETRY_BUDGETS = { buckets: 5000, segments: 5000, models: 500, projects: 500 };
+  const TELEMETRY_KEYS = ["schemaVersion", "generatedAt", "byModel", "byDay", "byWorkUnit", "capacity", "effectiveness"];
+
+  function validateTelemetry(value) {
+    const isObj = (entry) => entry !== null && typeof entry === "object" && !Array.isArray(entry);
+    if (!isObj(value)) return "That is not a telemetry bundle.";
+    if (value.schemaVersion !== TELEMETRY_SCHEMA) {
+      return `Unsupported telemetry schemaVersion: ${value.schemaVersion}. This page renders version ${TELEMETRY_SCHEMA}.`;
+    }
+    const unknown = Object.keys(value).filter((key) => !TELEMETRY_KEYS.includes(key));
+    if (unknown.length) return "The telemetry bundle declares unknown sections: " + unknown.sort().join(", ");
+    for (const name of ["byModel", "byDay", "byWorkUnit"]) {
+      const report = value[name];
+      if (report === undefined || report === null) continue;
+      if (!isObj(report)) return `telemetry ${name} must be a usage report object.`;
+      if (!Array.isArray(report.buckets)) return `telemetry ${name} has no buckets array.`;
+      if (report.buckets.length > TELEMETRY_BUDGETS.buckets) {
+        return `telemetry ${name} holds more than ${TELEMETRY_BUDGETS.buckets} buckets.`;
+      }
+      if (!Array.isArray(report.groupBy)) return `telemetry ${name} has no groupBy array.`;
+      for (const bucket of report.buckets) {
+        if (!isObj(bucket) || !isObj(bucket.key)) return `telemetry ${name} has a bucket without a key.`;
+      }
+    }
+    if (value.capacity !== undefined && value.capacity !== null) {
+      if (!isObj(value.capacity)) return "telemetry capacity must be a capacity report object.";
+      const models = value.capacity.models;
+      if (models !== undefined && models !== null && !isObj(models)) return "telemetry capacity models must be an object.";
+      if (isObj(models) && isObj(models.byModel) && Object.keys(models.byModel).length > TELEMETRY_BUDGETS.models) {
+        return `telemetry capacity names more than ${TELEMETRY_BUDGETS.models} models.`;
+      }
+      if (isObj(value.capacity.byProject) && Object.keys(value.capacity.byProject).length > TELEMETRY_BUDGETS.projects) {
+        return `telemetry capacity names more than ${TELEMETRY_BUDGETS.projects} projects.`;
+      }
+      for (const track of ["concurrency", "queue"]) {
+        const entry = value.capacity[track];
+        if (entry === undefined || entry === null) continue;
+        if (!isObj(entry)) return `telemetry capacity ${track} must be an object.`;
+        if (Array.isArray(entry.segments) && entry.segments.length > TELEMETRY_BUDGETS.segments) {
+          return `telemetry capacity ${track} holds more than ${TELEMETRY_BUDGETS.segments} segments.`;
+        }
+      }
+    }
+    if (value.effectiveness !== undefined && value.effectiveness !== null && !isObj(value.effectiveness)) {
+      return "telemetry effectiveness must be an effectiveness report object.";
+    }
+    // The whole bundle is serialized into this page, so it is scanned for
+    // credential-shaped values exactly like the snapshot. Depth is bounded:
+    // usage pricing snapshots legitimately nest, pathological structures do
+    // not get to recurse forever.
+    const scan = (entry, depth, where) => {
+      if (depth > 16) return `telemetry ${where} nests too deeply.`;
+      if (typeof entry === "string") {
+        if (entry.length > 4096) return `telemetry ${where} carries an unbounded string.`;
+        if (/:\/\/[^/?#\s]*@/.test(entry) || credentialShaped(entry)) {
+          return `telemetry ${where} must not embed credentials.`;
+        }
+        return "";
+      }
+      if (Array.isArray(entry)) {
+        for (let index = 0; index < entry.length; index += 1) {
+          const problem = scan(entry[index], depth + 1, `${where}[${index}]`);
+          if (problem) return problem;
+        }
+        return "";
+      }
+      if (isObj(entry)) {
+        for (const [key, item] of Object.entries(entry)) {
+          // `token` is matched in the SINGULAR only: `tokens`, `totalTokens`
+          // and `cacheReadTokens` are the usage ledger's own figures, and
+          // refusing them would refuse every honest cost document. Separators
+          // are stripped first so apiToken, api_token and api-token are all
+          // caught by one rule.
+          const bare = key.toLowerCase().replace(/[-_\s]/g, "");
+          if (bare.endsWith("token")
+            || /secret|password|passwd|credential|authorization|bearer|apikey|privatekey/.test(bare)) {
+            return `telemetry ${where} must not carry a credential field: ${key}`;
+          }
+          const problem = scan(item, depth + 1, `${where}.${key}`);
+          if (problem) return problem;
+        }
+      }
+      return "";
+    };
+    return scan(value, 0, "bundle");
+  }
+
+  /* A usage report's figures are {value, knownRecords, unknownRecords}, and
+     a null value means NOT OBSERVED. It is rendered as "unknown" - rendering
+     it as 0 would turn an unmeasured run into a free one. */
+  function figure(entry) {
+    if (!entry || typeof entry !== "object") return { known: false, text: "unknown", value: null };
+    const value = entry.value;
+    if (value === null || value === undefined) {
+      const missing = Number(entry.unknownRecords) || 0;
+      return { known: false, value: null, text: "unknown", note: missing ? missing + " record(s) did not observe it" : "" };
+    }
+    return { known: true, value: Number(value), text: String(value), note: Number(entry.unknownRecords) ? entry.unknownRecords + " record(s) unobserved" : "" };
+  }
+
+  function bucketLabel(bucket, dimension) {
+    const key = bucket.key || {};
+    return String(key[dimension] ?? Object.values(key)[0] ?? "unattributed") || "unattributed";
+  }
+
+  function usageRows(report, dimension, read) {
+    if (!report || !Array.isArray(report.buckets)) return null;
+    const rows = [];
+    for (const bucket of report.buckets) {
+      const amount = read(bucket);
+      rows.push({
+        label: bucketLabel(bucket, dimension),
+        value: amount.known ? amount.value : 0,
+        note: amount.known ? amount.note : "unknown",
+      });
+    }
+    return rows.sort((left, right) => right.value - left.value || left.label.localeCompare(right.label));
+  }
+
+  const MISSING = {
+    byModel: "paste a telemetry bundle whose byModel section is `sdlcctl usage-report --group-by model`.",
+    byDay: "paste a telemetry bundle whose byDay section is `sdlcctl usage-report --group-by day`.",
+    byWorkUnit: "paste a telemetry bundle whose byWorkUnit section is `sdlcctl usage-report --group-by project --group-by workUnit`.",
+    capacity: "paste a telemetry bundle whose capacity section is `sdlcctl capacity-report --usage … --window-start … --window-end …`.",
+    effectiveness: "paste a telemetry bundle whose effectiveness section is `sdlcctl effectiveness-report …`; outcomes are recorded separately and this console never infers delivery from the fact that runs happened.",
+  };
+
+  /* ================= phone destinations =================
+     Each destination is its own component tree. Charts come before prose in
+     every one of them. */
+
+  function renderBottomNav() {
+    const bar = document.getElementById("bottom-nav");
+    patch(bar, DESTINATIONS.map(([id, label, glyph]) => tag(el("button", {
+      class: "dest", type: "button",
+      "aria-current": state.dest === id ? "page" : null,
+      on: { click: () => { state.dest = id; render(); window.scrollTo({ top: 0 }); } },
+    },
+      el("span", { class: "glyph", "aria-hidden": "true", text: glyph }),
+      el("span", { class: "label", text: label }),
+    ), "dest:" + id, [id, state.dest === id])));
+  }
+
+  function freshnessCard() {
+    // A degraded feed never passes for live: the banner states it, and the
+    // view it labels is the last one that was good.
+    return el("div", { class: state.degraded ? "banner" : "card" },
+      state.degraded
+        ? el("div", null,
+            el("div", { style: "font-weight:600", text: "Showing the last-good view" }),
+            el("div", { class: "tiny", style: "margin-top:3px", text: state.degraded }),
+            el("div", { class: "tiny", style: "margin-top:3px", text: freshnessLine() }),
+          )
+        : el("div", { class: "row" },
+            el("span", { class: "chip ok" }, el("i", { class: "dot" }), "live"),
+            el("span", { class: "tiny muted", text: freshnessLine() }),
+          ),
+    );
+  }
+
+  /* ---------- Projects ---------- */
+  function phoneProjects() {
+    const nodes = [freshnessCard()];
+    const totals = state.snapshot?.totals;
+    if (totals) {
+      nodes.push(el("div", { class: "card" },
+        el("div", { class: "stats" },
+          stat(totals.projects, "projects"),
+          stat(totals.active, "running"),
+          stat(totals.attention, "attention"),
+          stat(totals.blockers, "blockers"),
+        ),
+      ));
+    }
+    nodes.push(lifecycleRail(portfolioByStage(), "Lifecycle rail, all projects"));
+    if (!projects().length) {
+      nodes.push(el("div", { class: "card" },
+        el("h2", { text: "Nothing to show yet" }),
+        el("p", { class: "small muted", text: "Load a snapshot built by `sdlcctl control-center` from the Snapshot button above, then every managed project appears here." }),
+      ));
+      return nodes;
+    }
+    for (const project of projects()) nodes.push(projectCard(project));
+    for (const warning of state.snapshot.warnings || []) {
+      nodes.push(el("div", { class: "banner", text: warning }));
+    }
+    return nodes;
+  }
+
+  function portfolioByStage() {
+    const counts = {};
+    for (const { unit } of allUnits()) {
+      if (!unit.stage) continue;
+      counts[unit.stage] = (counts[unit.stage] || 0) + 1;
+    }
+    return counts;
+  }
+
+  /* ---------- Backlog ---------- */
+  function phoneBacklog() {
+    const nodes = [freshnessCard()];
+    const project = currentProject();
+    if (!project) {
+      nodes.push(el("div", { class: "card" }, el("p", { class: "small muted", text: "No project in the snapshot yet." })));
+      return nodes;
+    }
+    nodes.push(el("div", { class: "card" },
+      el("div", { class: "between" },
+        el("h2", { text: txt(project.displayName, project.projectId) }),
+        el("span", { class: "chip " + (HEALTH[project.health] || HEALTH["no-data"]).cls },
+          el("i", { class: "dot" }), (HEALTH[project.health] || HEALTH["no-data"]).text),
+      ),
+      el("div", { class: "row", style: "margin-top:8px" }, projects().map((entry) => el("button", {
+        class: "btn sm" + (entry.projectId === project.projectId ? " primary" : ""),
+        type: "button",
+        on: { click: () => { state.project = entry.projectId; state.detail = null; render(); } },
+      }, txt(entry.displayName, entry.projectId)))),
+    ));
+    nodes.push(lifecycleRail(project.counts?.byStage || {}, "Lifecycle rail"));
+    const units = unitsOf(project);
+    if (!units.length) {
+      nodes.push(el("div", { class: "card" },
+        el("h3", { text: "No work unit is in flight" }),
+        el("p", { class: "small muted", text: "The lifecycle ledger has no open unit for this project. The epics, stories and tasks below are the exported backlog." }),
+      ));
+    }
+    const now = Date.now();
+    const limit = shownLimit();
+    for (const unit of units.slice(0, limit)) nodes.push(unitCard(project, unit, now));
+    nodes.push(moreCard(units.length, Math.min(limit, units.length), "work units"));
+    nodes.push(backlogCard(project));
+    return nodes;
+  }
+
+  function unitCard(project, unit, now) {
+    const open = state.detail === detailKey(project, unit);
+    const since = elapsed(unit.lastEventAt || unit.activityAt, now);
+    const prog = progressOf(unit);
+    // Signed from the DATA, and built only if that signature changed.
+    return lazy("unit:" + detailKey(project, unit),
+      [unit, open, since.text, prog.text, state.telemetryAt],
+      () => buildUnitCard(project, unit, open, since, prog));
+  }
+
+  function buildUnitCard(project, unit, open, since, prog) {
+    const card = el("div", { class: "ucard fade" });
+    card.setAttribute("role", "group");
+    const head = el("button", {
+      class: "ucard-btn", type: "button",
+      "aria-expanded": open ? "true" : "false",
+      on: { click: () => { state.detail = open ? null : detailKey(project, unit); render(); } },
+    },
+      el("div", { class: "ucard-top" },
+        el("span", { class: "chip " + (unit.needsAttention ? "bad" : unit.awaitsHuman ? "warn" : "ok") },
+          el("i", { class: "dot" }), txt(unit.state, "state unknown")),
+        el("span", { class: "ucard-id", text: txt(unit.workUnitId, "unit unknown") }),
+        el("span", { class: "tiny muted", "aria-hidden": "true", text: open ? "▾" : "▸" }),
+      ),
+      el("div", { class: "small", style: "margin-top:6px", text: txt(unit.activity, "no activity recorded") }),
+      el("div", { class: "ucard-meta" },
+        chip("stage " + txt(unit.stage, "unknown"), "line"),
+        chip("in state " + since.text, since.known ? "line" : "warn"),
+        chip("model " + txt(unit.model, "unknown"), "line"),
+        chip("worker " + txt(unit.worker, "unknown"), "line"),
+        unit.repairCycles ? chip(unit.repairCycles + " repair cycle" + (unit.repairCycles === 1 ? "" : "s"), "warn") : null,
+      ),
+      el("div", { class: "ucard-meta" },
+        chip("blocker: " + txt(unit.blockedReason, unit.needsAttention ? "unknown" : "none"),
+          unit.blockedReason ? "bad" : "line"),
+      ),
+      el("div", { class: "prog" },
+        el("div", { class: "prog-track", role: "img",
+          "aria-label": "Lifecycle progress: " + prog.text },
+          el("div", {
+            class: "prog-fill" + (prog.fraction === null ? " unknown" : ""),
+            style: "width:" + (prog.fraction === null ? 100 : Math.round(prog.fraction * 100)) + "%",
+          }),
+        ),
+        el("div", { class: "prog-text", text: prog.text }),
+      ),
+    );
+    card.append(head);
+    if (unit.changeRequestRef) {
+      card.append(el("div", { class: "ucard-meta" },
+        unit.url ? null : null,
+        el("span", { class: "chip line", text: unit.changeRequestRef }),
+      ));
+    }
+    if (open) card.append(unitDetail(project, unit));
+    return card;
+  }
+
+  function detailKey(project, unit) {
+    return (project.projectId || "") + "\u0000" + (unit.workUnitId || "");
+  }
+
+  /* ---------- drill-down ---------- */
+  function unitDetail(project, unit) {
+    const wrap = el("div", { class: "detail" });
+    wrap.append(el("h4", { text: "Lifecycle timeline" }));
+    const index = PROGRESS_RAIL.indexOf(unit.stage || "");
+    wrap.append(el("ul", { class: "tl" }, PROGRESS_RAIL.map((stage, position) => {
+      const here = position === index;
+      const passed = index >= 0 && position < index;
+      return el("li", { class: here ? "at" : "" },
+        el("span", { class: "mark", "aria-hidden": "true", text: here ? "◉" : passed ? "✓" : "·" }),
+        el("span", { class: here ? "small" : "tiny muted", text: stage + (here ? " — now" : passed ? " — passed" : "") }),
+        here && unit.lastEventAt ? el("span", { class: "tiny muted", text: unit.lastEventAt }) : null,
+      );
+    })));
+    if (index < 0) {
+      wrap.append(el("p", { class: "tiny muted", text: "This unit's state (" + txt(unit.state, "unknown")
+        + ") is off the forward rail, so it has no position on it." }));
+    }
+
+    wrap.append(el("h4", { style: "margin-top:12px", text: "Stage durations" }));
+    const durations = unitDurations(project, unit);
+    wrap.append(durations);
+
+    wrap.append(el("h4", { style: "margin-top:12px", text: "Worker and model" }));
+    wrap.append(el("div", { class: "row" },
+      chip("actor " + txt(unit.actor, "unknown"), "line"),
+      chip("model " + txt(unit.model, "unknown"), "line"),
+      chip("worker " + txt(unit.worker, "unknown"), "line"),
+    ));
+
+    wrap.append(el("h4", { style: "margin-top:12px", text: "Tokens and cost: estimate versus actual" }));
+    wrap.append(unitEstimateVsActual(project, unit));
+
+    wrap.append(el("h4", { style: "margin-top:12px", text: "Dependencies" }));
+    const deps = unit.dependsOn || [];
+    wrap.append(deps.length
+      ? el("div", { class: "row" }, deps.map((dep) => chip(dep, "line")))
+      : el("p", { class: "tiny muted", text: "This unit declares no dependency." }));
+
+    wrap.append(el("h4", { style: "margin-top:12px", text: "Artifacts" }));
+    const artifacts = [
+      unit.issueRef && ["issue", unit.issueRef],
+      unit.changeRequestRef && ["change request", unit.changeRequestRef],
+      unit.runRef && ["run", unit.runRef],
+      unit.repository && ["repository", unit.repository],
+    ].filter(Boolean);
+    wrap.append(artifacts.length
+      ? el("div", { class: "row" }, artifacts.map(([label, value]) => chip(label + " " + value, "line")))
+      : el("p", { class: "tiny muted", text: "No issue, change request or run is referenced yet." }));
+    return wrap;
+  }
+
+  function unitDurations(project, unit) {
+    // The snapshot records WHEN the unit last moved, not how long it spent in
+    // each earlier stage: that history lives in the lifecycle event ledger.
+    // Time in the current state is therefore reported, and the rest is named
+    // as unavailable rather than guessed from the one instant on hand.
+    const since = elapsed(unit.lastEventAt || unit.activityAt, Date.now());
+    return el("div", null,
+      el("div", { class: "row" },
+        chip("in " + txt(unit.state, "unknown") + " for " + since.text, since.known ? "line" : "warn"),
+        unit.activityAt ? chip("activity at " + unit.activityAt, "line") : null,
+      ),
+      el("p", { class: "tiny muted", style: "margin:6px 0 0", text: "Per-stage durations are unavailable: the snapshot carries the last transition instant, not the full transition history. `sdlcctl project-state` reads that history from the event ledger." }),
+    );
+  }
+
+  function unitEstimateVsActual(project, unit) {
+    const report = state.telemetry?.byWorkUnit;
+    if (!report) {
+      return el("div", { class: "chart-unknown", text: "unavailable — " + MISSING.byWorkUnit });
+    }
+    const match = (report.buckets || []).find((bucket) => {
+      const key = bucket.key || {};
+      return key.workUnitId === unit.workUnitId
+        && (key.projectId === undefined || key.projectId === project.projectId);
+    });
+    if (!match) {
+      return el("div", { class: "chart-unknown", text: "unavailable — the telemetry bundle records no usage for this work unit." });
+    }
+    const pairs = [
+      ["total tokens", figure(match.estimated?.totalTokens), figure(match.actual?.totalTokens)],
+      ["runtime seconds", figure(match.estimated?.runtimeSeconds), figure(match.actual?.runtimeSeconds)],
+      ["pay-as-you-go equivalent (USD)", figure(match.estimated?.paygEquivalentUsd), figure(match.actual?.paygEquivalentUsd)],
+    ];
+    return el("div", null,
+      el("div", { class: "row" }, chip(txt(match.runs, "unknown") + " run(s)", "line"), chip(txt(match.records, "unknown") + " record(s)", "line")),
+      el("table", { class: "dense", style: "margin-top:8px" },
+        el("thead", null, el("tr", null,
+          el("th", { text: "figure" }), el("th", { text: "estimate" }), el("th", { text: "actual" }), el("th", { text: "delta" }))),
+        el("tbody", null, pairs.map(([label, estimate, actual]) => {
+          const both = estimate.known && actual.known;
+          return el("tr", null,
+            el("td", { text: label }),
+            el("td", { text: estimate.text }),
+            el("td", { text: actual.text }),
+            el("td", { text: both ? (actual.value - estimate.value >= 0 ? "+" : "") + Math.round((actual.value - estimate.value) * 1000) / 1000 : "unknown" }),
+          );
+        })),
+      ),
+      el("p", { class: "tiny muted", style: "margin:6px 0 0", text: "A figure no run observed reads unknown, never zero: an unmeasured run is not a free one." }),
+    );
+  }
+
+  /* ---------- Agents ---------- */
+  function phoneAgents() {
+    const nodes = [freshnessCard()];
+    const units = allUnits().map((entry) => entry.unit);
+    nodes.push(barChart("Active agents by model", tally(units, (unit) => unit.model), {
+      empty: "no work unit in the snapshot names a model yet.",
+      note: "One row per model with at least one unit in flight, from the snapshot's own work-unit records.",
+    }));
+    nodes.push(barChart("Active agents by worker", tally(units, (unit) => unit.worker), {
+      empty: "no work unit in the snapshot names a worker yet.",
+    }));
+    const repair = tally(units.filter((unit) => unit.repairCycles > 0),
+      (unit) => unit.repairCycles + " cycle" + (unit.repairCycles === 1 ? "" : "s"));
+    nodes.push(repair.length
+      ? barChart("Repair loops", repair, { note: "Units grouped by how many repair cycles they have been through." })
+      : chartUnknown("Repair loops", "no unit in the snapshot has entered a repair cycle."));
+    const capacity = state.telemetry?.capacity;
+    if (!capacity) nodes.push(chartUnknown("Queue and parallelism", MISSING.capacity));
+    else nodes.push(parallelismCard(capacity));
+    return nodes;
+  }
+
+  function parallelismCard(capacity) {
+    const rows = [];
+    const concurrency = capacity.concurrency || {};
+    const queue = capacity.queue || {};
+    const add = (label, value) => {
+      if (value === null || value === undefined) return;
+      rows.push({ label, value: Number(value) });
+    };
+    add("peak concurrency", concurrency.peak);
+    add("mean concurrency", concurrency.mean);
+    add("peak queue", queue.peak);
+    add("mean queue", queue.mean);
+    if (!rows.length) return chartUnknown("Queue and parallelism", "the capacity report observed no concurrency or queueing in its window.");
+    const models = capacity.models?.byModel || {};
+    const modelRows = Object.entries(models)
+      .map(([label, track]) => ({ label, value: Number(track?.runs ?? 0) }))
+      .sort((left, right) => right.value - left.value || left.label.localeCompare(right.label));
+    return el("div", null,
+      barChart("Queue and parallelism", rows, {
+        note: "From `sdlcctl capacity-report`. Utilization appears only where the capacity it divides by was declared; anything else stays unknown.",
+      }),
+      modelRows.length ? barChart("Model usage in the capacity window", modelRows) : null,
+    );
+  }
+
+  /* ---------- Cost ---------- */
+  function phoneCost() {
+    const nodes = [freshnessCard()];
+    const byModel = state.telemetry?.byModel;
+    if (!byModel) nodes.push(chartUnknown("Cost by model", MISSING.byModel));
+    else {
+      nodes.push(barChart("Tokens by model", usageRows(byModel, "model",
+        (bucket) => figure(bucket.actual?.totalTokens)), { note: "Actual total tokens per model, from the usage ledger's own rollup." }));
+      nodes.push(barChart("Pay-as-you-go equivalent by model (USD)", usageRows(byModel, "model",
+        (bucket) => figure(bucket.actual?.paygEquivalentUsd)), {
+        note: "Subscription usage is a labelled pay-as-you-go equivalent and is never presented as billed dollars.",
+      }));
+    }
+    const byDay = state.telemetry?.byDay;
+    if (!byDay) nodes.push(chartUnknown("Time and cost trend", MISSING.byDay));
+    else {
+      const rows = (byDay.buckets || []).map((bucket) => ({
+        label: bucketLabel(bucket, "day"),
+        tokens: figure(bucket.actual?.totalTokens),
+        usd: figure(bucket.actual?.paygEquivalentUsd),
+        runtime: figure(bucket.actual?.runtimeSeconds),
+      })).sort((left, right) => left.label.localeCompare(right.label));
+      nodes.push(trendChart("Pay-as-you-go equivalent per day (USD)", rows, (row) => row.usd));
+      nodes.push(trendChart("Runtime per day (seconds)", rows, (row) => row.runtime));
+    }
+    return nodes;
+  }
+
+  /* A sparkline-style trend. A day whose figure was never observed is drawn
+     as a GAP with its own marker, not as a zero. */
+  function trendChart(title, rows, read) {
+    if (!rows.length) return chartUnknown(title, "the usage report carries no day buckets.");
+    const values = rows.map(read);
+    const known = values.filter((entry) => entry.known).map((entry) => entry.value);
+    if (!known.length) return chartUnknown(title, "no day in the usage report observed this figure.");
+    const max = Math.max(...known, 1);
+    const step = rows.length > 1 ? 100 / (rows.length - 1) : 0;
+    const summary = title + ": " + rows.map((row, index) =>
+      row.label + " " + values[index].text).join(", ");
+    const svg = svgEl("svg", {
+      viewBox: "0 0 100 44", preserveAspectRatio: "none", role: "img",
+      "aria-label": summary, focusable: "false", style: "height:64px",
+    });
+    // Each contiguous run of observed days is its own polyline, so a gap
+    // never gets bridged by a line that implies data nobody measured.
+    let run = [];
+    const flush = () => {
+      if (run.length > 1) {
+        svg.append(svgEl("polyline", {
+          points: run.map(([x, y]) => x + "," + y).join(" "),
+          fill: "none", stroke: SERIES[0], "stroke-width": "1.2",
+        }));
+      }
+      run = [];
+    };
+    rows.forEach((row, index) => {
+      const entry = values[index];
+      const x = index * step;
+      if (!entry.known) { flush(); return; }
+      const y = 36 - (entry.value / max) * 30;
+      run.push([x, y]);
+    });
+    flush();
+    rows.forEach((row, index) => {
+      const entry = values[index];
+      const x = index * step;
+      const node = entry.known
+        ? svgEl("circle", { cx: x, cy: 36 - (entry.value / max) * 30, r: "1.6", fill: SERIES[0] })
+        : svgEl("text", { x, y: 38, "text-anchor": "middle", class: "seg-label", "font-size": "6", text: "?" });
+      svg.append(describable(node, row.label + ": " + entry.text
+        + (entry.known ? "" : " — not observed, so no point is drawn")));
+    });
+    const gaps = values.filter((entry) => !entry.known).length;
+    return el("div", { class: "card" },
+      el("h3", { text: title }),
+      el("div", { class: "chart" }, svg),
+      el("div", { class: "chart-legend" },
+        el("span", { class: "key" }, el("i", { class: "swatch", style: "background:" + SERIES[0] }), el("span", { text: "observed" })),
+        el("span", { class: "key" }, el("span", { text: "? unobserved" })),
+      ),
+      el("p", { class: "tiny muted", style: "margin:8px 0 0", text: rows.length + " day(s), "
+        + gaps + " with no observation. Peak " + max + ". A gap is never bridged: an unmeasured day is not a zero one." }),
+    );
+  }
+
+  /* ---------- Effectiveness ---------- */
+  function phoneEffectiveness() {
+    const nodes = [freshnessCard()];
+    const report = state.telemetry?.effectiveness;
+    if (!report) {
+      nodes.push(chartUnknown("Outcome effectiveness", MISSING.effectiveness));
+      nodes.push(el("div", { class: "card" },
+        el("h3", { text: "Why this is not derived from the snapshot" }),
+        el("p", { class: "small muted", text: "Delivery is an observation, not a by-product of activity. This console will not infer that a capability landed from the fact that runs happened, so until an effectiveness report is loaded these views stay unavailable." }),
+      ));
+      return nodes;
+    }
+    const quality = report.quality || {};
+    const rows = [];
+    const rate = (label, entry) => {
+      if (!entry || entry.value === null || entry.value === undefined) return;
+      rows.push({ label, value: Math.round(Number(entry.value) * 1000) / 10 });
+    };
+    rate("first-pass verification %", quality.firstPassVerificationRate);
+    rate("review acceptance %", quality.firstPassReviewAcceptanceRate);
+    rate("revert %", quality.revertRate);
+    rate("rollback %", quality.rollbackRate);
+    nodes.push(rows.length
+      ? barChart("Outcome quality", rows, { note: "Percentages, straight from `sdlcctl effectiveness-report`. A rate it reported as unknown is not drawn." })
+      : chartUnknown("Outcome quality", "the effectiveness report observed no rate it could compute."));
+    const byProject = report.byProject || {};
+    const projectRows = Object.entries(byProject)
+      .map(([label, entry]) => ({ label, value: Number(entry?.accepted ?? 0) }))
+      .sort((left, right) => right.value - left.value || left.label.localeCompare(right.label));
+    if (projectRows.length) nodes.push(barChart("Accepted outcomes by project", projectRows));
+    const limits = report.limitations || [];
+    if (limits.length) {
+      nodes.push(el("div", { class: "card" },
+        el("h3", { text: "What these figures do not say" }),
+        el("ul", { class: "small muted" }, limits.map((line) => el("li", { text: String(line) }))),
+      ));
+    }
+    return nodes;
+  }
+
+  function phoneView() {
+    if (state.sheet) return autotag("sheet:" + state.sheet, phoneSheet());
+    const build = state.dest === "backlog" ? phoneBacklog
+      : state.dest === "agents" ? phoneAgents
+      : state.dest === "cost" ? phoneCost
+      : state.dest === "effectiveness" ? phoneEffectiveness
+      : phoneProjects;
+    return autotag("phone:" + state.dest, build());
+  }
+
+  function phoneSheet() {
+    const close = el("div", { class: "card" },
+      el("div", { class: "between" },
+        el("h2", { text: state.sheet === "add" ? "Add a project" : state.sheet === "blockers" ? "Blockers" : "Snapshot and telemetry" }),
+        el("button", { class: "btn sm", type: "button", on: { click: () => { state.sheet = ""; render(); window.scrollTo({ top: 0 }); } } }, "Close"),
+      ),
+    );
+    const body = state.sheet === "add" ? addProjectView()
+      : state.sheet === "blockers" ? blockersView()
+      : snapshotView();
+    return [close, ...body];
+  }
+
+  /* ================= dense desktop view =================
+     A different component tree, not the phone cards at a wider breakpoint: a
+     table of every unit beside the same charts. */
+  function denseView() {
+    return autotag("dense", denseSections());
+  }
+
+  function denseSections() {
+    const nodes = [freshnessCard()];
+    const rows = allUnits();
+    nodes.push(lifecycleRail(portfolioByStage(), "Lifecycle rail, all projects"));
+    if (!rows.length) {
+      nodes.push(el("div", { class: "card" },
+        el("h3", { text: "No work unit is in flight" }),
+        el("p", { class: "small muted", text: "The lifecycle ledger has no open unit in this snapshot." }),
+      ));
+      return nodes;
+    }
+    const now = Date.now();
+    const limit = shownLimit();
+    const shown = rows.slice(0, limit);
+    const table = el("table", { class: "dense" },
+      el("thead", null, el("tr", null, [
+        "project", "unit", "state", "stage", "progress", "in state", "model", "worker", "repairs", "blocker", "change request",
+      ].map((label) => el("th", { text: label })))),
+      el("tbody", null, shown.map(({ project, unit }) => {
+        const since = elapsed(unit.lastEventAt || unit.activityAt, now);
+        const prog = progressOf(unit);
+        const key = detailKey(project, unit);
+        return el("tr", {
+          class: state.detail === key ? "sel" : "", tabindex: "0", role: "button",
+          "aria-expanded": state.detail === key ? "true" : "false",
+          on: {
+            click: () => { state.detail = state.detail === key ? null : key; render(); },
+            keydown: (event) => {
+              if (event.key !== "Enter" && event.key !== " ") return;
+              event.preventDefault();
+              state.detail = state.detail === key ? null : key;
+              render();
+            },
+          },
+        },
+          el("td", { text: txt(project.displayName, project.projectId) }),
+          el("td", { class: "mono", text: txt(unit.workUnitId) }),
+          el("td", null, el("span", { class: "chip " + (unit.needsAttention ? "bad" : unit.awaitsHuman ? "warn" : "ok"), text: txt(unit.state, "unknown") })),
+          el("td", { text: txt(unit.stage, "unknown") }),
+          el("td", { text: prog.text }),
+          el("td", { text: since.text }),
+          el("td", { text: txt(unit.model, "unknown") }),
+          el("td", { text: txt(unit.worker, "unknown") }),
+          el("td", { text: unit.repairCycles ? String(unit.repairCycles) : "0" }),
+          el("td", { text: txt(unit.blockedReason, unit.needsAttention ? "unknown" : "none") }),
+          el("td", { class: "mono", text: txt(unit.changeRequestRef, "") }),
+        );
+      })),
+    );
+    nodes.push(el("div", { class: "card" },
+      el("h3", { text: "Work units (" + shown.length + " of " + rows.length + ")" }),
+      el("div", { class: "scroller" }, table),
+      el("p", { class: "tiny muted", style: "margin:8px 0 0", text: "Select a row to open its drill-down. A missing value reads unknown, never zero." }),
+    ));
+    nodes.push(moreCard(rows.length, shown.length, "work units"));
+    const open = rows.find(({ project, unit }) => detailKey(project, unit) === state.detail);
+    if (open) {
+      nodes.push(el("div", { class: "card" },
+        el("h3", { text: "Drill-down: " + txt(open.unit.workUnitId) }),
+        unitDetail(open.project, open.unit),
+      ));
+    }
+    const units = rows.map((entry) => entry.unit);
+    nodes.push(el("div", { class: "grid two" },
+      barChart("Active agents by model", tally(units, (unit) => unit.model), {
+        empty: "no work unit in the snapshot names a model yet.",
+      }),
+      barChart("Active agents by worker", tally(units, (unit) => unit.worker), {
+        empty: "no work unit in the snapshot names a worker yet.",
+      }),
+    ));
+    return nodes;
+  }
+
   /* ---------- render ---------- */
   const viewNode = document.getElementById("view");
   const tabsNode = document.getElementById("tabs");
 
+  let renderCount = 0;
+
   function render() {
+    renderCount += 1;
     renderSubtitle();
     if (state.connecting) return;
     renderTabs();
-    viewNode.replaceChildren();
-    if (state.error) viewNode.append(el("div", { class: "banner bad", text: state.error }));
-    for (const message of state.feedErrors.values()) {
-      viewNode.append(el("div", { class: "banner bad", text: message }));
+    renderBottomNav();
+    document.body.classList.toggle("has-bottom-nav", state.layout === "phone");
+    // Keyed patching, not replaceChildren: a live delivery that changes one
+    // unit must leave every other node — and the scroll position, the open
+    // drill-down and whatever has focus — exactly where they were.
+    const nodes = [];
+    if (state.error) {
+      nodes.push(tag(el("div", { class: "banner bad", text: state.error }), "error", state.error));
     }
-    if (!state.db && !state.snapshot) viewNode.append(offlineNotice());
-    if (state.tab === "portfolio") viewNode.append(...portfolioView());
-    else if (state.tab === "project") viewNode.append(...projectView());
-    else if (state.tab === "blockers") viewNode.append(...blockersView());
-    else if (state.tab === "add") viewNode.append(...addProjectView());
-    else if (state.tab === "snapshot") viewNode.append(...snapshotView());
+    for (const [collection, message] of state.feedErrors) {
+      nodes.push(tag(el("div", { class: "banner bad", text: message }), "feed:" + collection, message));
+    }
+    if (!state.db && !state.snapshot) nodes.push(tag(offlineNotice(), "offline", "offline"));
+    // The phone shell owns its own destinations and tags each section itself;
+    // the desktop tabs keep the views they have always had, with the dense
+    // table as a sixth, wrapped in one tagged host.
+    if (state.layout === "phone") {
+      nodes.push(...phoneView());
+    } else {
+      let sections = [];
+      if (state.tab === "portfolio") sections = portfolioView();
+      else if (state.tab === "project") sections = projectView();
+      else if (state.tab === "blockers") sections = blockersView();
+      else if (state.tab === "add") sections = addProjectView();
+      else if (state.tab === "snapshot") sections = snapshotView();
+      else if (state.tab === "dense") { nodes.push(...sections, ...denseView()); sections = null; }
+      if (sections) {
+        const host = el("div");
+        host.append(...sections);
+        // The legacy views are not keyed internally, so they travel as one
+        // node whose signature covers everything they read.
+        nodes.push(tag(host, "legacy:" + state.tab, legacySignature()));
+      }
+    }
+    patch(viewNode, nodes);
+  }
+
+  /* What a legacy desktop view reads. A delivery that changes none of it must
+     not rebuild the view; a delivery that changes any of it must. */
+  function legacySignature() {
+    return [
+      state.snapshot?.snapshotSha256 || "",
+      state.snapshot?.generatedAt || "",
+      state.project, state.degraded, state.lastGoodAt, state.telemetryAt,
+      [...state.open].sort().join("|"), state.shown,
+      state.snapshotMeta?.loadedAt || "",
+      // The add-project and blockers views read the store-backed collections.
+      state.drafts.length, state.notes.size, state.canWrite, state.viewer?.id || "",
+    ];
   }
 
   function renderSubtitle() {
@@ -1328,6 +2712,7 @@
       ["portfolio", "Portfolio"],
       ["project", "Project"],
       ["blockers", "Blockers"],
+      ["dense", "All units"],
       ["add", "Add project"],
       ["snapshot", "Snapshot"],
     ];
@@ -2248,12 +3633,77 @@
         (state.snapshot.sources || []).length ? el("div", { class: "small muted", style: "margin-top:8px", text: "sources: " + state.snapshot.sources.join(", ") }) : null,
       ));
     }
+    nodes.push(telemetryCard());
     nodes.push(el("div", { class: "card" },
       el("h3", { text: "What this page will not do" }),
       el("p", { class: "small muted", text: "It will not merge a change request, scale a runner pool, apply a label, or write to any repository. Those remain with the authority that owns them, and the snapshot names that authority on every remediation. Recording a note or a project draft here changes only this console's own store." }),
     ));
     return nodes;
   }
+
+  function telemetryCard() {
+    // The bundle is a composition of documents the CLI already emits. This
+    // console computes none of them: it renders what each producer published,
+    // and a section nobody published reads unavailable.
+    const area = el("textarea", { placeholder: "Paste the telemetry bundle JSON" });
+    const result = el("div");
+    const loaded = state.telemetry
+      ? el("div", { class: "row", style: "margin-top:8px" },
+          chip("loaded " + txt(state.telemetryAt), "ok"),
+          ...["byModel", "byDay", "byWorkUnit", "capacity", "effectiveness"].map(
+            (name) => chip(name + (state.telemetry[name] ? " ✓" : " —"), state.telemetry[name] ? "line" : "warn")),
+          el("button", { class: "btn sm", type: "button", on: { click: () => {
+            state.telemetry = null;
+            state.telemetryAt = "";
+            render();
+          } } }, "Unload"),
+        )
+      : null;
+    return el("div", { class: "card" },
+      el("h3", { text: "Cost, capacity and effectiveness (optional)" }),
+      el("p", { class: "small", text: "The Cost, Agents and Effectiveness views render documents the Forge CLI emits. Paste them together as one bundle; every section is optional and an absent one reads unavailable rather than zero." }),
+      el("pre", { class: "cmd", text: TELEMETRY_RECIPE }),
+      el("div", { class: "row", style: "margin-top:8px" }, copyButton(TELEMETRY_RECIPE, "Copy the commands")),
+      el("label", { class: "field" }, el("span", { text: "Telemetry bundle JSON" }), area),
+      el("div", { class: "row" },
+        el("button", { class: "btn primary", type: "button", on: { click: () => {
+          result.replaceChildren();
+          let parsed;
+          try { parsed = JSON.parse(area.value); }
+          catch (error) { result.append(el("div", { class: "banner bad", text: "That is not valid JSON: " + describe(error) })); return; }
+          const problem = validateTelemetry(parsed);
+          if (problem) { result.append(el("div", { class: "banner bad", text: problem })); return; }
+          state.telemetry = parsed;
+          state.telemetryAt = new Date().toISOString();
+          // Never written to the shared store: a bundle can be far larger
+          // than one snapshot, and it is a per-viewer analysis aid.
+          result.append(el("div", { class: "banner ok", text: "Loaded in this view only. It was not saved for other viewers." }));
+          render();
+        } } }, "Load the bundle"),
+      ),
+      loaded,
+      result,
+    );
+  }
+
+  const TELEMETRY_RECIPE = [
+    "# Each section is a document the CLI already produces; none is computed here.",
+    "sdlcctl usage-report --ledger usage.json --group-by model   > by-model.json",
+    "sdlcctl usage-report --ledger usage.json --group-by day     > by-day.json",
+    "sdlcctl usage-report --ledger usage.json \\",
+    "  --group-by project --group-by workUnit                    > by-work-unit.json",
+    "sdlcctl capacity-report --usage usage.json \\",
+    "  --window-start 2026-10-29T00:00:00Z \\",
+    "  --window-end   2026-10-30T00:00:00Z                       > capacity.json",
+    "# Effectiveness is optional and comes from its own producer.",
+    "sdlcctl effectiveness-report --outcomes outcomes.json       > effectiveness.json",
+    "",
+    "jq -n --slurpfile m by-model.json --slurpfile d by-day.json \\",
+    "      --slurpfile w by-work-unit.json --slurpfile c capacity.json \\",
+    "      --slurpfile e effectiveness.json \\",
+    "  '{schemaVersion:1, byModel:$m[0], byDay:$d[0], byWorkUnit:$w[0],",
+    "    capacity:$c[0], effectiveness:$e[0]}' > telemetry.json",
+  ].join("\n");
 
   const SNAPSHOT_RECIPE = [
     "# fail closed: any failed request aborts before a partial snapshot is built",
@@ -2278,6 +3728,37 @@
     "  --backlog backlog.json --incidents incidents.json --output snapshot.json",
   ].join("\n");
 
+  /* A read-only diagnostics seam. The browser tests read render counts and
+     the patch tally through it; nothing here mutates state, and no view
+     depends on it, so a console without it behaves identically. */
+  window.__forgeConsole = {
+    get patchStats() { return { ...patchStats }; },
+    get deliveryTimings() { return { ...lastDelivery }; },
+    get renders() { return renderCount; },
+    get layout() { return state.layout; },
+    get dest() { return state.dest; },
+    get detail() { return state.detail; },
+    get degraded() { return state.degraded; },
+    get lastGoodAt() { return state.lastGoodAt; },
+    get units() { return allUnits().length; },
+    get shown() { return shownLimit(); },
+    showAll() { state.shown = allUnits().length; render(); },
+    get telemetryLoaded() { return Boolean(state.telemetry); },
+    loadTelemetry(bundle) {
+      const problem = validateTelemetry(bundle);
+      if (problem) return problem;
+      state.telemetry = bundle;
+      state.telemetryAt = new Date().toISOString();
+      render();
+      return "";
+    },
+  };
+
+  window.addEventListener("scroll", hideTip, { passive: true });
+  window.addEventListener("resize", hideTip);
+  state.layout = layoutMode();
+  watchLayout();
+  watchFeed();
   render();
   connect();
 </script>
