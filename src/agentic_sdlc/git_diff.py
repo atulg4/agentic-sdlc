@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
+import tempfile
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -103,7 +107,9 @@ def _git_program() -> str:
         raise GitDiffError(str(exc)) from exc
 
 
-def _exec(arguments: list[str], cwd: str, label: str) -> subprocess.CompletedProcess[bytes]:
+def _exec(
+    arguments: list[str], cwd: str, label: str, stdin: bytes | None = None
+) -> subprocess.CompletedProcess[bytes]:
     result = subprocess.run(
         arguments,
         cwd=cwd,
@@ -111,6 +117,7 @@ def _exec(arguments: list[str], cwd: str, label: str) -> subprocess.CompletedPro
         capture_output=True,
         check=False,
         timeout=120,
+        input=stdin,
     )
     if result.returncode != 0:
         message = result.stderr.decode("utf-8", errors="replace")[-1000:]
@@ -144,7 +151,9 @@ def _bind(repository: str | Path) -> _Repository:
 
 
 def _run(
-    arguments: list[str], repository: str | Path | _Repository
+    arguments: list[str],
+    repository: str | Path | _Repository,
+    stdin: bytes | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     if arguments[:1] != ["git"]:
         raise GitDiffError(f"not a git command: {arguments[:1]!r}")
@@ -168,7 +177,7 @@ def _run(
         "core.fsmonitor=false",
         *subcommand,
     ]
-    return _exec(command, repo.top, arguments[1] if len(arguments) > 1 else "")
+    return _exec(command, repo.top, arguments[1] if len(arguments) > 1 else "", stdin=stdin)
 
 
 def _decode_path(value: bytes) -> str:
@@ -415,6 +424,82 @@ def collect_commit_diff(repository: str | Path, base: str, head: str = "HEAD") -
     )
 
 
+def default_branch_name(repository: str | Path) -> str:
+    """The branch the repository's ``origin/HEAD`` symref names, or ``""``.
+
+    Set by ``git clone`` (and refreshed with ``git remote set-head origin
+    --auto``), the symref is TARGET-side state: it names the remote's
+    default branch without consulting any committed policy, so base
+    authentication can anchor on it instead of a branch name the candidate
+    — or a stale branch tip's own policy — wrote.
+    """
+    try:
+        out = (
+            _run(["git", "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], repository)
+            .stdout.decode("utf-8", errors="surrogateescape")
+            .strip()
+        )
+    except GitDiffError:
+        return ""
+    prefix = "refs/remotes/origin/"
+    return out[len(prefix) :] if out.startswith(prefix) else ""
+
+
+def collect_series_patch(repository: str | Path, base: str, head: str) -> bytes:
+    """Every published change of ``base..head`` as per-commit patches.
+
+    A push of ``head`` publishes the whole series, not only its end state: a
+    commit that adds content a later commit removes leaves the endpoint tree
+    diff empty while the pushed history still carries the blob. The reviewer
+    therefore reads the per-commit patches (``git log --patch``), which show
+    every intermediate change the endpoint diff can hide. No external diff
+    or textconv program runs."""
+    for rev in (base, head):
+        if not rev or rev.startswith("-"):
+            raise GitDiffError(f"not a revision: {rev!r}")
+    root = _bind(repository)
+    return _run(
+        [
+            "git",
+            "log",
+            # The repository's own config is the candidate's to write:
+            # `log.showSignature` would make this log VERIFY signed commits
+            # by executing the configured `gpg.program` — a
+            # candidate-controlled executable — before any gate sandbox is
+            # entered, so signature rendering is disabled outright.
+            "--no-show-signature",
+            # --no-show-signature does not cover a signature REQUESTED BY THE
+            # FORMAT: a repository-local `format.pretty = %G?` would make
+            # this log verify signatures anyway, executing the candidate's
+            # `gpg.program` on the host, so the format is pinned explicitly
+            # to git's default instead of inherited from candidate config.
+            "--pretty=medium",
+            "--no-ext-diff",
+            "--no-textconv",
+            # The candidate's committed .gitattributes is honored by default:
+            # a `*.py -diff` rule would render source changes as an opaque
+            # "GIT binary patch" the reviewer cannot read, while the packet
+            # still labels the evidence ordinary text. Every file is forced
+            # to render AS TEXT; genuinely non-UTF-8 bytes still travel
+            # losslessly through the evidence's base64 encoding.
+            "--text",
+            "--binary",
+            "--full-index",
+            # A repository-local `diff.ignoreSubmodules = all` would omit a
+            # gitlink change from the patch entirely, concealing the
+            # dependency revision the series introduces while the diff
+            # summary still names the path — the same override `_run` gives
+            # every `git diff`, which `git log --patch` does not inherit.
+            "--ignore-submodules=none",
+            "--patch",
+            "--reverse",
+            f"{base}..{head}",
+            "--",
+        ],
+        root,
+    ).stdout
+
+
 def committed_path(repository: str | Path, path: str | Path) -> str:
     """`path` as a path inside the repository at `repository` (POSIX, relative to its top
     level), for reading it from a commit. A relative `path` is taken relative to the top level;
@@ -442,6 +527,146 @@ def resolve_commit(repository: str | Path, rev: str) -> str:
     if not _OBJECT_NAME.fullmatch(commit):
         raise GitDiffError(f"{rev} does not name a commit")
     return commit
+
+
+def repository_identity(repository: str | Path) -> str:
+    """The canonical identity of the repository's object store.
+
+    The realpath of its COMMON git directory: one repository, every worktree
+    linked to it, and every symlink alias of either all share this identity,
+    so two paths with equal identities are the same mutable store however
+    they are spelled."""
+    root = _bind(repository)
+    out = (
+        _run(["git", "rev-parse", "--git-common-dir"], root)
+        .stdout.decode("utf-8", errors="surrogateescape")
+        .strip()
+    )
+    common = out if os.path.isabs(out) else os.path.join(root.top, out)
+    return os.path.realpath(common)
+
+
+@contextmanager
+def derivation_tree(
+    repository: str | Path, rev: str, *, pin_refs: Mapping[str, str] | None = None
+) -> Iterator[Path]:
+    """A disposable checkout of commit `rev` under pristine configuration.
+
+    For callers about to RUN programs against a commit (gate commands): the
+    caller's own checkout is not evidence — it can carry uncommitted edits,
+    ignored files a gate would read, or repository-local configuration that
+    suppresses status output or defines smudge filters for a committed
+    ``.gitattributes`` — and a gate run leaves its own caches behind, so two
+    derivations in one checkout would observe each other. The tree is a
+    fresh CLONE (``--no-local``, then a detached checkout): its brand-new
+    configuration defines no filter drivers and no hooks, so the committed
+    bytes materialize unaltered, while the clone still carries full Git
+    metadata and the origin refs a repository-aware gate (one diffing
+    against ``origin/<branch>``, say) needs. Every committed entry —
+    symlinks included — materializes exactly as a real checkout would, so
+    gates test the candidate tree itself, and the whole directory is removed
+    afterwards. The commit must be reachable from the source repository's
+    refs, as any published candidate is."""
+    commit = resolve_commit(repository, rev)
+    root = _bind(repository)
+    program = _git_program()
+    base = tempfile.mkdtemp(prefix="agentic-sdlc-derivation-")
+    tree = Path(base) / "tree"
+    try:
+        _exec(
+            [
+                program,
+                "clone",
+                "--quiet",
+                "--no-local",
+                "--no-checkout",
+                "--",
+                root.git_dir,
+                str(tree),
+            ],
+            base,
+            "clone",
+        )
+        # An ordinary clone maps only the source's HEADS to origin/*: a CI
+        # checkout often carries the candidate solely on remote-tracking
+        # refs, so the source's refs/remotes/* and refs/tags/* are mirrored
+        # in verbatim — gates diffing against origin/<branch> find the ref,
+        # and a head reachable only through those refs transfers too.
+        _exec(
+            [
+                program,
+                "-C",
+                str(tree),
+                "--no-replace-objects",
+                "-c",
+                "core.fsmonitor=false",
+                "fetch",
+                "--quiet",
+                "origin",
+                "+refs/remotes/*:refs/remotes/*",
+                "+refs/tags/*:refs/tags/*",
+            ],
+            str(tree),
+            "fetch",
+        )
+        # Caller-pinned refs OVERRIDE what the mirror carried: the source's
+        # own remote-tracking refs are source-mutable, so a caller that has
+        # authenticated a commit elsewhere (the review base) pins the tree's
+        # ref to that exact value rather than trusting the imported one.
+        for ref_name, value in sorted((pin_refs or {}).items()):
+            if not ref_name.startswith("refs/") or not _OBJECT_NAME.fullmatch(value):
+                raise GitDiffError("pinned refs must map refs/* names to full commit object names")
+            _exec(
+                [
+                    program,
+                    "-C",
+                    str(tree),
+                    "--no-replace-objects",
+                    "-c",
+                    "core.fsmonitor=false",
+                    "update-ref",
+                    ref_name,
+                    value,
+                ],
+                str(tree),
+                "update-ref",
+            )
+        # The clone's origin URL names the caller's real Git directory: a
+        # gate — or candidate code a gate runs — could push refs or edit that
+        # repository through it. The refs are mirrored already, so the remote
+        # is repointed at an inert, non-writable location.
+        _exec(
+            [
+                program,
+                "-C",
+                str(tree),
+                "remote",
+                "set-url",
+                "origin",
+                "/var/empty/agentic-sdlc-derivation-disconnected",
+            ],
+            str(tree),
+            "remote",
+        )
+        _exec(
+            [
+                program,
+                "-C",
+                str(tree),
+                "--no-replace-objects",
+                "-c",
+                "core.fsmonitor=false",
+                "checkout",
+                "--quiet",
+                "--detach",
+                commit,
+            ],
+            str(tree),
+            "checkout",
+        )
+        yield tree
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
 
 
 def read_committed_file(

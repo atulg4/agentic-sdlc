@@ -29,6 +29,7 @@ import subprocess
 import sys
 import time
 import tomllib
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -72,6 +73,10 @@ _BASE_ENVIRONMENT = {
 _FORBIDDEN_ENVIRONMENT = {
     "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
     "ACTIONS_RUNTIME_TOKEN",
+    # The attestation trust anchor: handing gate code the key-file PATH on a
+    # host-sharing launcher hands it the HMAC key itself, with which every
+    # authorization, state, completion and outcome artifact could be forged.
+    "AGENTIC_SDLC_ATTESTATION_KEY_FILE",
     "ANTHROPIC_API_KEY",
     "GH_TOKEN",
     "GITHUB_ENV",
@@ -118,7 +123,10 @@ GATE_PYTHON_NAMES = ("python3", "python")
 
 
 def gate_python_version(
-    environment: dict[str, str], root: Path, name: str = "python3"
+    environment: dict[str, str],
+    root: Path,
+    name: str = "python3",
+    command_prefix: Sequence[str] = (),
 ) -> tuple[str, str]:
     """(path, `X.Y.Z`) of the `name` interpreter the gates run: the first on the gate
     environment's PATH, asked for its version in that same environment. GateError when there is
@@ -128,7 +136,11 @@ def gate_python_version(
         raise GateError(f"no {name} on the verification gates' PATH")
     try:
         probe = subprocess.run(
-            [found, "-I", "-c", _VERSION_PROBE],
+            # The probe EXECUTES whatever interpreter the gate PATH resolves
+            # first — on a runner with a repository-local virtualenv, a
+            # candidate-writable program — so it runs under the same
+            # isolation wrapper the gates themselves do.
+            [*command_prefix, found, "-I", "-c", _VERSION_PROBE],
             cwd=root,
             env=environment,
             capture_output=True,
@@ -146,7 +158,10 @@ def gate_python_version(
 
 
 def check_gate_python(
-    python_version: str | None, environment: dict[str, str], root: Path
+    python_version: str | None,
+    environment: dict[str, str],
+    root: Path,
+    command_prefix: Sequence[str] = (),
 ) -> str | None:
     """A warning (never a failure) when an interpreter the gates may run -- `python3` or
     `python`, each the first on the gate PATH -- is not the policy's `[ci] python_version`
@@ -160,7 +175,9 @@ def check_gate_python(
     errors: list[str] = []
     for name in GATE_PYTHON_NAMES:
         try:
-            found.append(gate_python_version(environment, root, name))
+            found.append(
+                gate_python_version(environment, root, name, command_prefix=command_prefix)
+            )
         except GateError as error:
             if shutil.which(name, path=environment.get("PATH", os.defpath)):
                 errors.append(str(error))  # present but unreadable: say so
@@ -233,7 +250,18 @@ def gate_shell() -> list[str]:
 def run_gates(
     config: str | Path,
     repository: str | Path,
+    *,
+    environment_overrides: Mapping[str, str | None] | None = None,
+    command_prefix: Sequence[str] | None = None,
 ) -> dict[str, Any]:
+    # The prefix runs OUTSIDE the gate shell: an isolation wrapper (a
+    # container or sandbox launcher) must contain the shell and the gate
+    # command alike, and it travels into each gate entry's recorded argv so
+    # the report shows what actually ran.
+    if command_prefix is not None and (
+        not all(isinstance(entry, str) and entry for entry in command_prefix)
+    ):
+        raise GateError("command prefix entries must be non-empty strings")
     commands, verification, python_version = _load(config)
     names = verification.get("gates", list(commands))
     allowed_exit_codes = verification.get("allowed_exit_codes", {})
@@ -246,7 +274,24 @@ def run_gates(
 
     results = []
     root = Path(repository)
-    warning = check_gate_python(python_version, environment, root)
+    # A gate that uses the standard Actions variable must observe the tree
+    # the gates run in: the ambient value points at whatever workspace
+    # invoked this process, which for an isolated derivation is the caller's
+    # checkout, not the tree under test.
+    if "GITHUB_WORKSPACE" in environment:
+        environment["GITHUB_WORKSPACE"] = str(root.resolve())
+    # Isolated derivations rebind the standard revision variables too: the
+    # ambient workflow's SHA and refs describe the caller's checkout, not
+    # the tree under test, and a gate reading them would test — or fail on —
+    # another revision while the report binds to the candidate head.
+    for name, value in (environment_overrides or {}).items():
+        if value is None:
+            environment.pop(name, None)
+        else:
+            environment[name] = value
+    warning = check_gate_python(
+        python_version, environment, root, command_prefix=tuple(command_prefix or ())
+    )
     if warning:
         print(f"::warning::{warning}", file=sys.stderr, flush=True)
     for name in names:
@@ -257,7 +302,7 @@ def run_gates(
             raise GateError(f"verification command is empty: {name}")
         if "\n" in command or "\r" in command or "\0" in command:
             raise GateError(f"verification command must be a single line: {name}")
-        arguments = [*gate_shell(), command]
+        arguments = [*(command_prefix or ()), *gate_shell(), command]
         accepted = allowed_exit_codes.get(name, [0])
         if not isinstance(accepted, list) or not all(isinstance(code, int) for code in accepted):
             raise GateError(f"allowed exit codes are invalid: {name}")
