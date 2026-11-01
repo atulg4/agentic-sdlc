@@ -281,14 +281,25 @@ jobs:
           CONFIG_PATH: ${{ inputs.config_path }}
         run: |
           set -euo pipefail
-          # --no-renames lists BOTH sides of a rename: a security-sensitive
-          # or policy-protected file moved to a neutral path must still
-          # select the security reviewer, and the default rename detection
-          # reports only the post-image name. -z emits literal NUL-delimited
-          # pathnames: git's default quoting would spell a non-ASCII
-          # protected path as an escaped C string, which matches no
-          # protected-path pattern.
-          git diff --name-only --no-renames -z "${BASE_SHA}...${HEAD_SHA}" > .agentic-review/changed-paths.txt
+          # The changed paths come from the packet's derived verification —
+          # collect_commit_diff's union of the endpoint diff (both sides of
+          # every rename) and every path any commit of the series touches —
+          # because merging publishes the whole series: a protected file
+          # changed in one commit and restored in a later one must still
+          # select the security reviewer, and an endpoint-only `git diff`
+          # listing omits it. Written NUL-delimited, so a non-ASCII
+          # protected path stays literal instead of C-quoted.
+          python3 -P - <<'PY'
+          import json
+          from pathlib import Path
+
+          packet = json.loads(Path(".agentic-review/packet.json").read_text(encoding="utf-8"))
+          paths = packet["verification"]["diffPaths"]
+          assert paths, "the reviewer packet records no changed paths"
+          Path(".agentic-review/changed-paths.txt").write_bytes(
+              b"".join(path.encode("utf-8") + b"\0" for path in paths)
+          )
+          PY
           git show "${BASE_SHA}:${CONFIG_PATH}" > .agentic-review/trusted-policy.toml
           label_args=()
           while IFS= read -r label; do

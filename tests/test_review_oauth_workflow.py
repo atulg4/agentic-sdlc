@@ -211,7 +211,7 @@ def test_trusted_python_steps_cannot_import_candidate_code() -> None:
     # off the import path while the user-site engine install stays visible.
     assert "python3 - <<'PY'" not in document
     assert "python3 -m pip" not in document
-    assert document.count("python3 -P - <<'PY'") == 6
+    assert document.count("python3 -P - <<'PY'") == 7
     assert "python3 -P -m pip install" in document
 
 
@@ -243,15 +243,22 @@ def test_trusted_inputs_are_sealed_before_review_and_verified_after() -> None:
     assert review.index(seal_check) < review.index("sha256sum -c -")
 
 
-def test_role_selection_sees_both_sides_of_a_rename() -> None:
-    # A security-sensitive or policy-protected file renamed to a neutral
-    # path must still select the security reviewer: default rename
-    # detection lists only the post-image name (Codex 4434056701). -z keeps
-    # the pathnames literal, so git's default quoting cannot mis-spell a
-    # non-ASCII protected path out of its pattern (Codex 4434104201).
+def test_role_selection_sees_the_full_published_series_of_paths() -> None:
+    # Role selection reads the packet's derived verification paths —
+    # collect_commit_diff's union of the endpoint diff (both rename sides,
+    # Codex 4434056701) and every per-commit path (Codex 4434134599: a
+    # protected file changed and restored mid-series is still published by
+    # the merge) — never a workflow-side endpoint-only git listing. The
+    # paths travel NUL-delimited so git quoting cannot mis-spell a
+    # non-ASCII protected path (Codex 4434104201).
     review = _review_job()
-    assert 'git diff --name-only --no-renames -z "${BASE_SHA}...${HEAD_SHA}"' in review
+    assert "git diff --name-only --no-renames" not in review
+    assert "> .agentic-review/changed-paths.txt" not in review
+    assert 'packet["verification"]["diffPaths"]' in review
+    assert 'path.encode("utf-8") + b"\\0"' in review
     assert "--changed-paths-file0 .agentic-review/changed-paths.txt" in review
+    # The packet must exist before the selection that reads it.
+    assert review.index("sdlcctl context-packet") < review.index("sdlcctl review-roles")
 
 
 def test_the_code_verdict_is_sealed_before_the_security_reviewer_runs() -> None:
