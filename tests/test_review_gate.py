@@ -118,6 +118,71 @@ def test_a_legacy_review_without_the_versioned_fields_fails_closed() -> None:
     assert not extra.allowed
 
 
+def test_the_criteria_verdict_must_cover_exactly_the_packets_criteria() -> None:
+    expected = ("Exporter streams rows", "Tests cover the empty file")
+    # Exact coverage passes, and line wrapping is not a different criterion.
+    assert evaluate_review_document(_review(), expected_criteria=expected).allowed
+    wrapped = _review(
+        acceptanceCriteriaVerdict=[
+            {"criterion": "Exporter\n  streams   rows", "verdict": "met"},
+            {"criterion": "Tests cover the empty file", "verdict": "met"},
+        ]
+    )
+    assert evaluate_review_document(wrapped, expected_criteria=expected).allowed
+    # An omitted criterion blocks by name: the reviewer cannot skip the one
+    # criterion it could not verify.
+    omitted = _review(
+        acceptanceCriteriaVerdict=[{"criterion": "Exporter streams rows", "verdict": "met"}]
+    )
+    decision = evaluate_review_document(omitted, expected_criteria=expected)
+    assert not decision.allowed
+    assert "no verdict covers acceptance criterion: Tests cover the empty file" in decision.reasons
+    # A fabricated criterion blocks: met-marking an invented requirement is
+    # not verification of the work item.
+    fabricated = _review(
+        acceptanceCriteriaVerdict=[
+            {"criterion": "Exporter streams rows", "verdict": "met"},
+            {"criterion": "Tests cover the empty file", "verdict": "met"},
+            {"criterion": "Code compiles", "verdict": "met"},
+        ]
+    )
+    invented = evaluate_review_document(fabricated, expected_criteria=expected)
+    assert not invented.allowed
+    assert any("Code compiles" in reason for reason in invented.reasons)
+    # A duplicated entry blocks: two verdicts for one criterion could carry
+    # conflicting answers.
+    duplicated = _review(
+        acceptanceCriteriaVerdict=[
+            {"criterion": "Exporter streams rows", "verdict": "met"},
+            {"criterion": "Exporter streams rows", "verdict": "met"},
+            {"criterion": "Tests cover the empty file", "verdict": "met"},
+        ]
+    )
+    doubled = evaluate_review_document(duplicated, expected_criteria=expected)
+    assert not doubled.allowed
+    assert any("duplicate acceptance criterion" in reason for reason in doubled.reasons)
+
+
+def test_enforcement_applies_criteria_coverage_to_every_role() -> None:
+    selection = select_review_roles("Rotate the token", (), ())
+    expected = ("Exporter streams rows", "Tests cover the empty file")
+    code = _review()
+    security = _review(
+        role="security-reviewer",
+        acceptanceCriteriaVerdict=[{"criterion": "Exporter streams rows", "verdict": "met"}],
+    )
+    decision = enforce_reviews(selection, [code, security], HEAD, expected_criteria=expected)
+    assert not decision.allowed
+    assert any(
+        reason.startswith("security-reviewer: no verdict covers acceptance criterion")
+        for reason in decision.reasons
+    )
+    full_security = _review(role="security-reviewer")
+    assert enforce_reviews(
+        selection, [code, full_security], HEAD, expected_criteria=expected
+    ).allowed
+
+
 def test_changes_requested_never_passes_even_without_findings() -> None:
     decision = evaluate_review_document(_review(verdict="changes_requested"))
     assert not decision.allowed

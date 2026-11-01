@@ -41,7 +41,12 @@ pinned platform engine (`sdlcctl context-packet … --prompt-output`): the
 acceptance criteria, required tests, non-goals, policy limits, diff summary
 and trusted gate report all reach the reviewer as the packet renders them —
 inside untrusted-data boundaries — never by the workflow re-parsing the
-issue. Each selected role additionally gets its own checklist
+issue. The packet's gate report runs candidate-controlled gate commands, so
+the workflow confines them in a bubblewrap sandbox (a root-owned
+`forge-gate-sandbox` launcher): the host is read-only, the runner home (the
+installed engine), the checkout and the runner temp are hidden, and only
+the disposable derivation tree is writable — candidate gate code cannot
+rewrite the engine or the review control files later steps enforce with. Each selected role additionally gets its own checklist
 (`ROLE_CHECKLISTS`), which is trusted pipeline text. Reviewers get no write
 instructions; builders get no reviewer checklist and no verdict schema.
 
@@ -70,7 +75,11 @@ exactly `head_sha` and that review satisfies all three:
 2. no finding is blocking — `blocking: true`, `gateOutcome: block`, or
    severity `critical`/`high` (a medium advisory finding alone does not
    block);
-3. every acceptance criterion is marked `met` — `not_verifiable` blocks,
+3. the criteria verdict covers **exactly** the packet's acceptance criteria
+   (compared whitespace-insensitively): an omitted, duplicated, or
+   fabricated criterion entry blocks by name, so a reviewer can neither
+   skip the criterion it could not verify nor invent one marked met;
+4. every acceptance criterion is marked `met` — `not_verifiable` blocks,
    because unverified is not verified.
 
 Each refusal names the finding or criterion. When `security-reviewer` was

@@ -180,19 +180,26 @@ jobs:
             --prompt-output .agentic-repair/findings.md
           # The repair agent receives the #118 BUILDER context packet for the
           # approved work item, pinned at the trusted base so the candidate's
-          # own head cannot shape the policy or knowledge it reads.
+          # own head cannot shape the policy or knowledge it reads. A builder
+          # pin must be the candidate repository's CURRENT checkout, so the
+          # packet derives from a disposable worktree checked out at the
+          # exact base — never from this job's PR-head checkout.
           gh api --method GET "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}" > .agentic-repair/issue.json
           jq -e '.pull_request | not' .agentic-repair/issue.json > /dev/null
           jq --arg repo "$GITHUB_REPOSITORY" --arg issue "$ISSUE_NUMBER" --arg base "$BASE_SHA" \
             '{missionId: "repair-agent", workRef: ($repo + "#" + $issue), task: {title: (.title // ""), body: (.body // ""), labels: [.labels[].name]}, records: [], repositoryRevision: $base}' \
             .agentic-repair/issue.json > .agentic-repair/request.json
+          base_tree="${RUNNER_TEMP}/agentic-repair-base"
+          rm -rf "$base_tree"
+          git worktree add --detach "$base_tree" "$BASE_SHA"
           sdlcctl context-packet \
             --config "$CONFIG_PATH" \
             --knowledge "$KNOWLEDGE_PATH" \
             --request .agentic-repair/request.json \
-            --candidate-repository . \
+            --candidate-repository "$base_tree" \
             --output .agentic-repair/packet.json \
             --prompt-output .agentic-repair/packet-prompt.md
+          git worktree remove --force "$base_tree"
           {
             printf 'Repair pull request #%s at exact head %s.\n' "$PR_NUMBER" "$HEAD_SHA"
             printf 'This is bounded repair cycle %s.\n' "$REPAIR_CYCLE"

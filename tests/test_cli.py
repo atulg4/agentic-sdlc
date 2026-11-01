@@ -2419,3 +2419,128 @@ def test_github_backlog_withholds_credentialed_urls_from_errors(tmp_path, capsys
     err = capsys.readouterr().err
     assert "ghp_0123456789" not in err
     assert "withheld" in err
+
+
+# Issue #119: the review-gate CLI surface the workflows invoke.
+
+
+def _role_review(role: str, head: str) -> dict:
+    return {
+        "schemaVersion": 2,
+        "role": role,
+        "headSha": head,
+        "verdict": "changes_requested",
+        "summary": "Blocked.",
+        "findings": [
+            {
+                "severity": "high",
+                "title": f"{role} blocker",
+                "body": "Fix it.",
+                "file": "src/app.py",
+                "line": 3,
+                "blocking": True,
+                "gateOutcome": "block",
+                "repairRecommendation": "Rename the helper.",
+            },
+            {
+                "severity": "low",
+                "title": f"{role} nit",
+                "body": "Cosmetic.",
+                "file": "",
+                "line": None,
+                "blocking": False,
+                "gateOutcome": "advise",
+                "repairRecommendation": "",
+            },
+        ],
+        "residualRisks": [],
+        "acceptanceCriteriaVerdict": [{"criterion": "Exporter streams rows", "verdict": "met"}],
+    }
+
+
+def test_repair_findings_cli_accepts_repeated_reviews_and_prompt_output(tmp_path: Path) -> None:
+    # The repair workflow invokes exactly this shape: one --review per role
+    # document plus --output and --prompt-output (Codex 4433905453).
+    head = "a" * 40
+    code = tmp_path / "review-code-reviewer.json"
+    security = tmp_path / "review-security-reviewer.json"
+    code.write_text(json.dumps(_role_review("code-reviewer", head)), encoding="utf-8")
+    security.write_text(json.dumps(_role_review("security-reviewer", head)), encoding="utf-8")
+    output = tmp_path / "blocking.json"
+    prompt = tmp_path / "findings.md"
+    result = main(
+        [
+            "repair-findings",
+            "--review",
+            str(code),
+            "--review",
+            str(security),
+            "--output",
+            str(output),
+            "--prompt-output",
+            str(prompt),
+        ]
+    )
+    assert result == 0
+    document = json.loads(output.read_text(encoding="utf-8"))
+    titles = [finding["title"] for finding in document["findings"]]
+    assert titles == ["code-reviewer blocker", "security-reviewer blocker"]
+    assert {finding["role"] for finding in document["findings"]} == {
+        "code-reviewer",
+        "security-reviewer",
+    }
+    rendered = prompt.read_text(encoding="utf-8")
+    assert "<untrusted-evidence>" in rendered
+    assert "code-reviewer blocker" in rendered
+    assert "Recommended repair: Rename the helper." in rendered
+    assert "nit" not in rendered
+
+
+def test_enforce_review_cli_covers_the_packets_acceptance_criteria(tmp_path: Path, capsys) -> None:
+    from agentic_sdlc.review_roles import select_review_roles
+
+    head = "a" * 40
+    roles = tmp_path / "roles.json"
+    roles.write_text(
+        json.dumps(select_review_roles("Refactor the exporter", (), ()).as_dict()),
+        encoding="utf-8",
+    )
+    review = _role_review("code-reviewer", head)
+    review["verdict"] = "approve"
+    review["findings"] = []
+    review_path = tmp_path / "review-code-reviewer.json"
+    review_path.write_text(json.dumps(review), encoding="utf-8")
+    packet = tmp_path / "packet.json"
+    packet.write_text(
+        json.dumps(
+            {
+                "task": {
+                    "acceptanceCriteria": [
+                        "Exporter streams rows",
+                        "Tests cover the empty file",
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    base = [
+        "enforce-review",
+        "--roles",
+        str(roles),
+        "--head-sha",
+        head,
+        "--review",
+        str(review_path),
+    ]
+    # Without the packet the verdict passes; with it, the omitted second
+    # criterion blocks by name (Codex 4433905459).
+    assert main(base) == 0
+    assert main([*base, "--packet", str(packet)]) == 2
+    err = capsys.readouterr().err
+    assert "no verdict covers acceptance criterion: Tests cover the empty file" in err
+    # A packet without criteria fails closed rather than enforcing nothing.
+    empty = tmp_path / "empty-packet.json"
+    empty.write_text(json.dumps({"task": {"acceptanceCriteria": []}}), encoding="utf-8")
+    assert main([*base, "--packet", str(empty)]) == 2
+    assert "names no acceptance criteria" in capsys.readouterr().err

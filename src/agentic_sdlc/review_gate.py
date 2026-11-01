@@ -178,13 +178,55 @@ def _finding_blocks(finding: Mapping[str, Any]) -> bool:
     )
 
 
-def evaluate_review_document(document: Mapping[str, Any]) -> ReviewGateDecision:
+def _normalized_criterion(text: str) -> str:
+    """Whitespace-insensitive comparison key for one acceptance criterion.
+
+    The reviewer copies criteria out of a rendered prompt, so line wrapping
+    must not read as a different criterion — but any WORD difference still
+    does, so an omitted criterion can never hide behind a reworded one.
+    """
+    return " ".join(text.split())
+
+
+def _coverage_errors(document: Mapping[str, Any], expected_criteria: Iterable[str]) -> list[str]:
+    """Why the verdict does not cover EXACTLY the packet's criteria.
+
+    The reviewer writes ``acceptanceCriteriaVerdict`` itself, so without this
+    check a review could omit the criterion it could not verify, or fabricate
+    an extra one marked met: coverage must be total — every expected
+    criterion exactly once, and nothing the work item never asked for.
+    """
+    errors: list[str] = []
+    expected = [_normalized_criterion(criterion) for criterion in expected_criteria]
+    expected_set = set(expected)
+    seen: set[str] = set()
+    for entry in document["acceptanceCriteriaVerdict"]:
+        key = _normalized_criterion(entry["criterion"])
+        if key in seen:
+            errors.append(f"duplicate acceptance criterion verdict: {entry['criterion']}")
+        seen.add(key)
+        if key not in expected_set:
+            errors.append(f"verdict names a criterion the work item does not: {entry['criterion']}")
+    for criterion, key in zip(expected_criteria, expected, strict=True):
+        if key not in seen:
+            errors.append(f"no verdict covers acceptance criterion: {criterion}")
+    return errors
+
+
+def evaluate_review_document(
+    document: Mapping[str, Any],
+    *,
+    expected_criteria: Iterable[str] | None = None,
+) -> ReviewGateDecision:
     """Does ONE review document pass the gate? Reasons name what does not.
 
     Passing requires all three: an ``approve`` verdict, zero blocking
     findings (``blocking: true``, ``gateOutcome: block``, or severity
     critical/high), and every acceptance criterion marked ``met`` — a
     ``not_verifiable`` criterion blocks, because unverified is not verified.
+    With ``expected_criteria`` (the packet's own acceptance criteria), the
+    verdict must also cover exactly those criteria: an omitted, duplicated,
+    or fabricated criterion entry blocks with a named reason.
     """
     errors = _structural_errors(document)
     if errors:
@@ -195,6 +237,8 @@ def evaluate_review_document(document: Mapping[str, Any]) -> ReviewGateDecision:
     for finding in document["findings"]:
         if _finding_blocks(finding):
             reasons.append(f"blocking finding ({finding['severity']}): {finding['title']}")
+    if expected_criteria is not None:
+        reasons.extend(_coverage_errors(document, tuple(expected_criteria)))
     for entry in document["acceptanceCriteriaVerdict"]:
         if entry["verdict"] != "met":
             reasons.append(f"acceptance criterion {entry['verdict']}: {entry['criterion']}")
@@ -205,13 +249,19 @@ def enforce_reviews(
     selection: RoleSelection,
     documents: Iterable[Mapping[str, Any]],
     head_sha: str,
+    *,
+    expected_criteria: Iterable[str] | None = None,
 ) -> ReviewGateDecision:
     """Does the WHOLE review gate pass for ``head_sha``?
 
     Every selected role must have a passing review document bound to exactly
     this head: when the security reviewer was selected, a code review alone
     never passes, and a verdict for any other head is not a verdict at all.
+    ``expected_criteria`` — the packet's acceptance criteria — makes coverage
+    total per role: a review that omits, duplicates, or fabricates a
+    criterion entry blocks with a named reason.
     """
+    criteria = tuple(expected_criteria) if expected_criteria is not None else None
     if not _HEAD_SHA.fullmatch(head_sha or ""):
         return ReviewGateDecision(False, ("enforcement requires the exact 40-hex head SHA",))
     by_role: dict[str, list[Mapping[str, Any]]] = {}
@@ -227,7 +277,7 @@ def enforce_reviews(
             reasons.append(f"no {role} verdict exists for head {head_sha}")
             continue
         for document in candidates:
-            decision = evaluate_review_document(document)
+            decision = evaluate_review_document(document, expected_criteria=criteria)
             if not decision.allowed:
                 reasons.extend(f"{role}: {reason}" for reason in decision.reasons)
     return ReviewGateDecision(not reasons, tuple(reasons))

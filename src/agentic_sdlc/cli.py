@@ -1872,7 +1872,28 @@ def _enforce_review(args: argparse.Namespace) -> int:
             _status(f"BLOCKED: review document is not a JSON object: {path}")
             return 2
         documents.append(document)
-    decision = enforce_reviews(selection, documents, args.head_sha)
+    expected_criteria: tuple[str, ...] | None = None
+    if getattr(args, "packet", None):
+        # The packet is the work item's authoritative #118 rendering, so its
+        # acceptance criteria — not the reviewer's own list — define what a
+        # criteria verdict must cover.
+        packet_document = json.loads(Path(args.packet).read_text(encoding="utf-8"))
+        criteria = None
+        if isinstance(packet_document, dict):
+            task_entry = packet_document.get("task")
+            if isinstance(task_entry, dict):
+                criteria = task_entry.get("acceptanceCriteria")
+        if (
+            not isinstance(criteria, list)
+            or not criteria
+            or not all(isinstance(item, str) and item.strip() for item in criteria)
+        ):
+            _status("BLOCKED: the packet names no acceptance criteria to cover")
+            return 2
+        expected_criteria = tuple(criteria)
+    decision = enforce_reviews(
+        selection, documents, args.head_sha, expected_criteria=expected_criteria
+    )
     if not decision.allowed:
         for reason in decision.reasons:
             _status(f"BLOCKED: {reason}")
@@ -4004,16 +4025,28 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         help="a review document to judge (repeat for each role's document)",
     )
+    enforce_review_parser.add_argument(
+        "--packet",
+        help="the reviewer context packet whose acceptance criteria every "
+        "review's criteria verdict must cover exactly",
+    )
     enforce_review_parser.set_defaults(handler=_enforce_review)
 
     repair_findings_parser = commands.add_parser("repair-findings")
     repair_findings_parser.add_argument(
         "--review",
+        action="append",
         required=True,
-        help="the version-2 review document whose blocking findings repair "
-        "receives; non-blocking and low findings stay out of repair",
+        help="a version-2 review document whose blocking findings repair "
+        "receives (repeat for each role's document); non-blocking and low "
+        "findings stay out of repair",
     )
     repair_findings_parser.add_argument("--output")
+    repair_findings_parser.add_argument(
+        "--prompt-output",
+        help="also render the blocking findings as untrusted prompt text "
+        "for the bounded repair run",
+    )
     repair_findings_parser.set_defaults(handler=_repair_findings)
 
     dispatch_packet = commands.add_parser("dispatch-packet")

@@ -150,11 +150,39 @@ def test_review_prompt_content_comes_from_the_context_packet() -> None:
     assert "--review-target-repository" in review
     assert "--prompt-output .agentic-review/context.md" in review
     assert "Read .agentic-review/context.md" in review
-    assert "--gate-sandbox trusted-host" in review
     # The issue text is bound as DATA for the packet request; nothing splices
     # it into prompt text.
     assert "request.json" in review
     assert "${{ inputs.head_sha }}" in review
+
+
+def test_derived_gates_run_sandboxed_never_on_the_trusted_host() -> None:
+    review = _review_job()
+    # Derived gates execute candidate-controlled commands (Codex 4433905461):
+    # trusted-host would run them directly where they could rewrite the
+    # installed engine or the review control files later steps enforce with.
+    assert "--gate-sandbox trusted-host" not in review
+    assert "--gate-sandbox forge-gate-sandbox" in review
+    launcher = "Install the derived-gate sandbox launcher"
+    derive = "Derive the reviewer context packet from the exact candidate"
+    install = "Install and verify Claude subprocess isolation"
+    assert launcher in review
+    # bubblewrap exists and is verified BEFORE the launcher and the first
+    # gate execution, and the launcher is installed before the derivation.
+    assert review.index(install) < review.index(launcher) < review.index(derive)
+    # The launcher is root-owned in a root-only directory, so the engine's
+    # strict launcher trust accepts it and a candidate cannot rewrite it.
+    assert (
+        "sudo install -o root -g root -m 0755"
+        ' "${RUNNER_TEMP}/forge-gate-sandbox" /usr/local/bin/forge-gate-sandbox' in review
+    )
+    # The confinement itself: read-only host, hidden home/checkout/temp,
+    # only the disposable derivation tree writable.
+    assert "--ro-bind / /" in review
+    assert '--tmpfs "$hidden"' in review
+    assert '"${HOME:-}" "${GITHUB_WORKSPACE:-}" "${RUNNER_TEMP:-}"' in review
+    assert '--bind "$PWD" "$PWD" --chdir "$PWD"' in review
+    assert "/usr/local/bin/forge-gate-sandbox /bin/true" in review
 
 
 def test_roles_are_selected_deterministically_and_recorded() -> None:
@@ -192,6 +220,10 @@ def test_the_gate_is_computed_by_the_pinned_engine_and_applied_without_checkout(
     enforce = document[document.index("\n  enforce_review:\n") :]
     assert "from agentic_sdlc.review_gate import enforce_reviews" in review
     assert ".agentic-review/gate.json" in review
+    # Coverage is total: the packet's own acceptance criteria — never the
+    # reviewer's self-chosen list — define what the verdicts must cover.
+    assert "packet['task']['acceptanceCriteria']" in review
+    assert "expected_criteria=expected_criteria" in review
     # The publisher job stays checkout-free: it applies the recorded
     # decision, it never recomputes it beside candidate code.
     assert "actions/checkout" not in enforce

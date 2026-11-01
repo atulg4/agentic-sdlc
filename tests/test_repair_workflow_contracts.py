@@ -32,6 +32,13 @@ def test_repair_receives_only_blocking_findings_plus_the_builder_packet() -> Non
     assert "sdlcctl context-packet" in text
     assert "--prompt-output .agentic-repair/packet-prompt.md" in text
     assert "repositoryRevision: $base" in text
+    # A builder pin must be the candidate repository's CURRENT checkout, so
+    # the packet derives from a disposable worktree at the exact base — the
+    # PR-head checkout would make the engine reject the historical pin
+    # (Codex 4433905458).
+    assert 'git worktree add --detach "$base_tree" "$BASE_SHA"' in text
+    assert '--candidate-repository "$base_tree"' in text
+    assert "--candidate-repository . \\" not in text
     assert "cat .agentic-repair/packet-prompt.md" in text
     assert "cat .agentic-repair/findings.md" in text
     # The work item comes from the PR's single Closes marker, matched as a
