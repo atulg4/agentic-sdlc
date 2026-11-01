@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   classify:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.FORGE_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 10
     permissions:
       actions: read
@@ -144,6 +144,7 @@ jobs:
     needs: classify
     uses: PLATFORM_REPOSITORY/.github/workflows/reusable-repair.yml@PLATFORM_COMMIT_SHA
     with:
+      runs_on: ${{ toJSON(vars.FORGE_RUNNER || 'ubuntu-latest') }}
       pull_request_number: ${{ needs.classify.outputs.pull_request_number }}
       base_sha: ${{ needs.classify.outputs.base_sha }}
       head_sha: ${{ needs.classify.outputs.head_sha }}
@@ -162,7 +163,7 @@ jobs:
   mark_repair:
     if: needs.classify.outputs.action == 'repair' && needs.repair.result == 'success'
     needs: [classify, repair]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.FORGE_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 5
     permissions:
       issues: write
@@ -186,7 +187,7 @@ jobs:
   report_block:
     if: needs.classify.outputs.action == 'block'
     needs: classify
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.FORGE_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 5
     permissions:
       issues: write
@@ -213,6 +214,7 @@ jobs:
     needs: classify
     uses: PLATFORM_REPOSITORY/.github/workflows/reusable-protected-merge.yml@PLATFORM_COMMIT_SHA
     with:
+      runs_on: ${{ toJSON(vars.FORGE_RUNNER || 'ubuntu-latest') }}
       pull_request_number: ${{ needs.classify.outputs.pull_request_number }}
       expected_head_sha: ${{ needs.classify.outputs.head_sha }}
       platform_ref: PLATFORM_COMMIT_SHA

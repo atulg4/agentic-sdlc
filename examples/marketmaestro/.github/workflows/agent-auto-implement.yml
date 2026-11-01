@@ -13,7 +13,7 @@ jobs:
       github.event.issue.pull_request == null &&
       contains(github.event.issue.labels.*.name, 'claude-ready') &&
       contains(github.event.issue.labels.*.name, 'human-review-required')
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.FORGE_RUNNER || 'ubuntu-latest' }}
     permissions: {}
     steps:
       - name: Require Claude Max OAuth and publisher configuration
@@ -36,6 +36,7 @@ jobs:
       id-token: write
     uses: atulg4/agentic-sdlc/.github/workflows/reusable-implement.yml@PLATFORM_COMMIT_SHA
     with:
+      runs_on: ${{ toJSON(vars.FORGE_RUNNER || 'ubuntu-latest') }}
       issue_number: ${{ format('{0}', github.event.issue.number) }}
       trigger_actor: ${{ github.actor }}
       config_path: agentic-sdlc.toml
