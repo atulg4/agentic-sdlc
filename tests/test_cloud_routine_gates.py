@@ -324,6 +324,39 @@ def test_check_request_passes_a_valid_request_without_dependencies(
     assert result["ready"] is True and result["dependencies"] == []
 
 
+def test_check_request_attests_its_result_under_a_key(monkeypatch, policy_file, tmp_path):
+    # With --attestation-key the written result carries the HMAC mark that
+    # dispatch-packet --authorization verifies: a hand-authored result has no
+    # way to mint it without the secret.
+    from agentic_sdlc.cli import _attest_document
+
+    gh = FakeGh(VALID.format(deps="None"))
+    monkeypatch.setattr(cli, "run_gh", gh)
+    secret = b"an-attestation-secret-of-at-least-32-bytes"
+    key_file = tmp_path / "attestation.key"
+    key_file.write_bytes(secret)
+    assert (
+        cli.main(
+            [
+                "check-request",
+                "--project",
+                PROJECT,
+                "--issue",
+                "7",
+                "--config",
+                str(policy_file),
+                "--output",
+                str(tmp_path / "request.json"),
+                "--attestation-key",
+                str(key_file),
+            ]
+        )
+        == 0
+    )
+    result = json.loads((tmp_path / "request.json").read_text())
+    assert result["attestation"] == _attest_document(result, secret)
+
+
 def test_check_request_passes_when_every_dependency_is_closed(monkeypatch, policy_file):
     gh = FakeGh(VALID.format(deps="- #3\n- #5"), states={3: "closed", 5: "closed"})
     assert _check_request(monkeypatch, policy_file, gh) == 0
@@ -1500,6 +1533,60 @@ def test_final_gate_refuses_an_issue_that_has_an_open_pr(monkeypatch, policy_fil
     assert _final_gate(monkeypatch, policy_file, gh, digest, tmp_path) == cli.PULL_REQUEST_OPEN
     result = json.loads((tmp_path / "gate.json").read_text())
     assert result["ready"] is False and result["openPullRequests"] == ["https://x/pr/20"]
+
+
+def test_final_gate_continuation_tolerates_only_the_units_own_pr(
+    monkeypatch, policy_file, tmp_path
+):
+    # Post-publication review and repair re-authorize against the unit's OWN
+    # open PR (the ordering the harness plane supports): --continuation-pr
+    # names it, the check passes and records the tolerance in the signed
+    # result — while any OTHER open PR, or a near-miss number, still refuses.
+    body = VALID.format(deps="None")
+    digest = cli.request_digest("Do the thing", body)
+    argv = [
+        "check-request",
+        "--project",
+        PROJECT,
+        "--issue",
+        "7",
+        "--config",
+        str(policy_file),
+        "--expect-digest",
+        digest,
+        "--authorize-labels",
+        "--output",
+        str(tmp_path / "gate.json"),
+    ]
+    gh = HistoryGh(body)
+    gh.prs = [dict(_PR)]
+    monkeypatch.setattr(cli, "run_gh", gh)
+    assert cli.main([*argv, "--continuation-pr", "https://x/pr/20"]) == 0
+    result = json.loads((tmp_path / "gate.json").read_text())
+    assert result["ready"] is True
+    assert result["continuationPullRequest"] == "https://x/pr/20"
+
+    # The bare number matches as a whole trailing segment only: 20 passes,
+    # 2 can never excuse 20.
+    def _gh_with(prs: list[dict]) -> HistoryGh:
+        fresh = HistoryGh(body)
+        fresh.prs = prs
+        return fresh
+
+    monkeypatch.setattr(cli, "run_gh", _gh_with([dict(_PR)]))
+    assert cli.main([*argv, "--continuation-pr", "20"]) == 0
+    monkeypatch.setattr(cli, "run_gh", _gh_with([dict(_PR)]))
+    assert cli.main([*argv, "--continuation-pr", "2"]) == cli.PULL_REQUEST_OPEN
+    # Another unit's PR beside the continuation still refuses, and only the
+    # genuinely blocking PR is reported.
+    other = {"number": 21, "url": "https://x/pr/21", "title": "o", "body": "Fixes #7"}
+    monkeypatch.setattr(cli, "run_gh", _gh_with([dict(_PR), other]))
+    assert cli.main([*argv, "--continuation-pr", "https://x/pr/20"]) == cli.PULL_REQUEST_OPEN
+    result = json.loads((tmp_path / "gate.json").read_text())
+    assert result["openPullRequests"] == ["https://x/pr/21"]
+    # The flag is meaningless outside the authorization gate.
+    plain = [entry for entry in argv if entry != "--authorize-labels"]
+    assert cli.main([*plain, "--continuation-pr", "20"]) == 2
 
 
 def test_final_gate_refuses_a_pr_opened_between_its_reads(monkeypatch, policy_file, capsys):
