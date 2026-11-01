@@ -14,8 +14,10 @@ from typing import Protocol
 __all__ = [
     "CheckpointError",
     "CheckpointRecord",
+    "CheckpointSnapshot",
     "CheckpointStore",
     "SQLiteCheckpointStore",
+    "read_checkpoint_snapshot",
 ]
 
 
@@ -189,3 +191,62 @@ class SQLiteCheckpointStore:
                 )
         except sqlite3.Error as exc:
             raise CheckpointError(f"unable to persist dispatcher checkpoint: {exc}") from exc
+
+
+@dataclass(frozen=True)
+class CheckpointSnapshot:
+    """Everything a status reader may see: the heartbeat and every checkpoint,
+    in journal order (oldest first), so "latest" ties break exactly as
+    :meth:`SQLiteCheckpointStore.get_unit` breaks them."""
+
+    last_heartbeat: str
+    records: tuple[CheckpointRecord, ...]
+
+
+_REQUIRED_TABLES = frozenset({"dispatcher_checkpoints", "dispatcher_metadata"})
+
+
+def read_checkpoint_snapshot(path: str | Path) -> CheckpointSnapshot:
+    """Read a dispatcher checkpoint journal without ever writing to it.
+
+    :class:`SQLiteCheckpointStore` creates its file and schema on open, which a
+    status reader must not do: a mistyped path would report an empty, healthy
+    dispatcher instead of failing. The journal is therefore opened read-only,
+    and a missing file or a database without the dispatcher tables fails closed.
+    """
+
+    location = Path(path)
+    if not location.is_file():
+        raise CheckpointError(f"dispatcher checkpoint database not found: {location}")
+    uri = location.resolve().as_uri() + "?mode=ro"
+    try:
+        connection = sqlite3.connect(uri, uri=True, timeout=5)
+        try:
+            connection.row_factory = sqlite3.Row
+            tables = {
+                str(row["name"])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
+            missing = sorted(_REQUIRED_TABLES - tables)
+            if missing:
+                raise CheckpointError(
+                    f"{location} is not a dispatcher checkpoint database "
+                    f"(missing tables: {', '.join(missing)})"
+                )
+            heartbeat = connection.execute(
+                "SELECT value FROM dispatcher_metadata WHERE key = 'last_heartbeat'"
+            ).fetchone()
+            rows = connection.execute(
+                "SELECT * FROM dispatcher_checkpoints ORDER BY timestamp ASC, rowid ASC"
+            ).fetchall()
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        raise CheckpointError(f"unable to read dispatcher checkpoints: {exc}") from exc
+    records = tuple(
+        record for record in (SQLiteCheckpointStore._row_to_record(row) for row in rows) if record
+    )
+    return CheckpointSnapshot(
+        last_heartbeat="" if heartbeat is None else str(heartbeat["value"]),
+        records=records,
+    )

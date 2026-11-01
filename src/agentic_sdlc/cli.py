@@ -26,6 +26,7 @@ from .capacity_metrics import (
     build_capacity_report,
     load_capacity_inputs,
 )
+from .checkpoints import CheckpointError, read_checkpoint_snapshot
 from .context_builder import (
     DEFAULT_PACKET_BYTES,
     ContextBuilderError,
@@ -45,6 +46,7 @@ from .control_center import (
     read_control_center_inputs,
 )
 from .dashboard_efficiency import build_infrastructure_blocker_panel
+from .dispatcher_status import build_dispatcher_status
 from .event_ledger import EventLedger, LedgerError, LifecycleStage, load_lifecycle_event
 from .events import EventError, normalize_event
 from .executors import (
@@ -3057,6 +3059,30 @@ def _estimate_usage(args: argparse.Namespace) -> int:
     return 0
 
 
+def _dispatcher_status(args: argparse.Namespace) -> int:
+    snapshot = read_checkpoint_snapshot(args.checkpoints)
+    aggregate = None
+    if args.ledger:
+        registry = read_optional_project_registry(args.registry)
+        ledger = EventLedger.from_dict(
+            json.loads(Path(args.ledger).read_text(encoding="utf-8")), registry=registry
+        )
+        aggregate = ledger.aggregate(project_ids=tuple(args.project_id) or None)
+    elif args.project_id or args.registry:
+        raise ValueError("--project-id and --registry apply only with --ledger")
+    _write(
+        build_dispatcher_status(
+            snapshot,
+            now=args.now,
+            stale_after_seconds=args.stale_after_seconds,
+            blocked_event_limit=args.blocked_limit,
+            ledger_aggregate=aggregate,
+        ),
+        args.output,
+    )
+    return 0
+
+
 def _schedule_forecast(args: argparse.Namespace) -> int:
     registry = read_optional_project_registry(args.registry)
     projects = load_forecast_document(json.loads(Path(args.graph).read_text(encoding="utf-8")))
@@ -4116,6 +4142,17 @@ def build_parser() -> argparse.ArgumentParser:
     estimate_usage.add_argument("--output")
     estimate_usage.set_defaults(handler=_estimate_usage)
 
+    dispatcher_status = commands.add_parser("dispatcher-status")
+    dispatcher_status.add_argument("--checkpoints", required=True)
+    dispatcher_status.add_argument("--now", required=True)
+    dispatcher_status.add_argument("--stale-after-seconds", type=int, default=3600)
+    dispatcher_status.add_argument("--blocked-limit", type=int, default=20)
+    dispatcher_status.add_argument("--ledger")
+    dispatcher_status.add_argument("--registry")
+    dispatcher_status.add_argument("--project-id", action="append", default=[])
+    dispatcher_status.add_argument("--output")
+    dispatcher_status.set_defaults(handler=_dispatcher_status)
+
     schedule_forecast = commands.add_parser("schedule-forecast")
     schedule_forecast.add_argument("--graph", required=True)
     schedule_forecast.add_argument("--usage", required=True)
@@ -4464,6 +4501,7 @@ def main(argv: list[str] | None = None) -> int:
         TaskSpecError,
         ArtifactError,
         CapacityError,
+        CheckpointError,
         ContextBuilderError,
         ControlCenterError,
         EventError,
