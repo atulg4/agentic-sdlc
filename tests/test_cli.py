@@ -2514,3 +2514,118 @@ def test_dispatcher_status_cli_fails_closed(tmp_path: Path, capsys: pytest.Captu
     assert main([*base, "--now", "2026-10-29T09:00:00Z", "--stale-after-seconds", "0"]) == 2
     assert main([*base, "--now", "2026-10-29T09:00:00Z", "--project-id", "alpha"]) == 2
     assert "only with --ledger" in capsys.readouterr().err
+
+
+def _forecast_usage_ledger(tmp_path: Path) -> Path:
+    ledger = tmp_path / "usage.json"
+    record = tmp_path / "record.json"
+    for index in range(5):
+        start = f"2026-10-0{index + 1}T10:00:00Z"
+        document = _timed_usage_document(
+            f"run-{index}", "w1", start, start, f"2026-10-0{index + 1}T10:10:00Z"
+        )
+        document["missionId"] = "worker"
+        record.write_text(json.dumps(document), encoding="utf-8")
+        assert main(["record-usage", "--ledger", str(ledger), "--record", str(record)]) == 0
+    return ledger
+
+
+def _forecast_unit(unit_id: str, depends_on: tuple[str, ...] = (), **observed) -> dict:
+    return {
+        "unitId": unit_id,
+        "missionId": "worker",
+        "missionVersion": "1.0.0",
+        "outputArtifact": "patch",
+        "dependsOn": list(depends_on),
+        "writePaths": [f"src/{unit_id}/**"],
+        "ownedPaths": [f"src/{unit_id}"],
+        **observed,
+    }
+
+
+def test_schedule_forecast_cli_forecasts_a_graph_from_usage_history(
+    tmp_path: Path, policy_file: Path
+) -> None:
+    usage = _forecast_usage_ledger(tmp_path)
+    graph = tmp_path / "graph.json"
+    output = tmp_path / "forecast.json"
+    graph.write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "graphs": [
+                    {
+                        "projectId": "alpha",
+                        "units": [
+                            _forecast_unit("a", status="completed"),
+                            _forecast_unit("b", ("a",)),
+                            _forecast_unit("c", ("b",)),
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    argv = [
+        "schedule-forecast",
+        "--graph",
+        str(graph),
+        "--usage",
+        str(usage),
+        "--policy",
+        str(policy_file),
+        "--now",
+        "2026-11-01T12:00:00Z",
+        "--output",
+        str(output),
+    ]
+
+    assert main(argv) == 0
+    document = json.loads(output.read_text(encoding="utf-8"))
+    project = document["projects"][0]
+    assert project["criticalPath"] == ["b", "c"]
+    assert project["etaRange"]["p50"] == "2026-11-01T12:20:00Z"
+    units = {unit["unitId"]: unit for unit in project["units"]}
+    assert units["b"]["expectedDuration"]["basis"] == "history"
+    assert units["b"]["runnable"] is True
+    assert units["c"]["blockingReason"] == "dependency_blocked"
+
+    first = output.read_bytes()
+    assert main(argv) == 0
+    assert output.read_bytes() == first
+
+
+def test_schedule_forecast_cli_fails_closed(
+    tmp_path: Path, policy_file: Path, capsys: pytest.CaptureFixture
+) -> None:
+    usage = _forecast_usage_ledger(tmp_path)
+    graph = tmp_path / "graph.json"
+    graph.write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "graphs": [{"projectId": "alpha", "units": [_forecast_unit("a", ("ghost",))]}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    base = ["schedule-forecast", "--policy", str(policy_file), "--now", "2026-11-01T12:00:00Z"]
+
+    assert main([*base, "--graph", str(graph), "--usage", str(usage)]) == 2
+    assert "missing dependencies" in capsys.readouterr().err
+    assert main([*base, "--graph", str(graph), "--usage", str(tmp_path / "none.json")]) == 2
+    assert main([*base, "--graph", str(tmp_path / "none.json"), "--usage", str(usage)]) == 2
+    registry = tmp_path / "projects.json"
+    registry.write_text(json.dumps(_registry_document()), encoding="utf-8")
+    graph.write_text(
+        json.dumps(
+            {"schemaVersion": 1, "graphs": [{"projectId": "gamma", "units": [_forecast_unit("a")]}]}
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        main([*base, "--graph", str(graph), "--usage", str(usage), "--registry", str(registry)])
+        == 2
+    )
+    assert "unregistered project" in capsys.readouterr().err
