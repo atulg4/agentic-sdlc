@@ -48,10 +48,11 @@ A routing policy must declare only known top-level keys: `policyVersion`,
 security field such as `deniedProvider` or `requireNoTrainingStore` can never be
 silently ignored.
 
-`allowedProviders` distinguishes a missing value from an explicitly empty one.
-Omitting the key allows every known provider. Setting `allowedProviders: []` is
-a deny-all decision for incident response or maintenance: no executor is
-eligible and the route fails closed instead of falling back to every provider.
+`allowedProviders` and `allowedDataResidency` each distinguish a missing value
+from an explicitly empty one. Omitting the key allows every known value. Setting
+either to `[]` is a deny-all decision for incident response or maintenance: no
+executor is eligible on that axis and the route fails closed instead of falling
+back to allowing everything.
 
 Budgets must be finite. A `--budget-usd` value of `nan` or `inf` is rejected by
 both the CLI and the router rather than silently disabling the maximum-spend
