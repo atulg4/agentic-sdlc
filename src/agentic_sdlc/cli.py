@@ -1834,8 +1834,20 @@ def _context_packet(args: argparse.Namespace) -> int:
 def _review_roles(args: argparse.Namespace) -> int:
     """Select reviewer roles for one candidate change, deterministically."""
     task_text = Path(args.task_file).read_text(encoding="utf-8") if args.task_file else ""
+    if args.changed_paths_file and args.changed_paths_file0:
+        _status("BLOCKED: pass --changed-paths-file or --changed-paths-file0, not both")
+        return 2
     changed_paths: list[str] = []
-    if args.changed_paths_file:
+    if args.changed_paths_file0:
+        # NUL-delimited literal pathnames (git ... -z): line-based quoting
+        # would spell a non-ASCII protected path as an escaped C string
+        # that matches no protected-path pattern.
+        changed_paths = [
+            path
+            for path in Path(args.changed_paths_file0).read_text(encoding="utf-8").split("\0")
+            if path
+        ]
+    elif args.changed_paths_file:
         changed_paths = [
             line
             for line in Path(args.changed_paths_file).read_text(encoding="utf-8").splitlines()
@@ -4017,6 +4029,12 @@ def build_parser() -> argparse.ArgumentParser:
     review_roles_parser.add_argument(
         "--changed-paths-file",
         help="file listing the candidate's changed paths, one per line",
+    )
+    review_roles_parser.add_argument(
+        "--changed-paths-file0",
+        help="file listing the candidate's changed paths NUL-delimited "
+        "(git ... -z), so git path quoting can never mis-spell a protected "
+        "path out of its pattern",
     )
     review_roles_parser.add_argument(
         "--config",

@@ -136,7 +136,19 @@ jobs:
           # it to the repository's real default branch, read from the API as
           # data, never from candidate-controlled configuration.
           default_branch="$(gh api --method GET "repos/${GITHUB_REPOSITORY}" --jq .default_branch)"
-          [[ "$default_branch" =~ ^[A-Za-z0-9._/-]+$ ]]
+          # Validate with the engine's own branch-name contract: a narrower
+          # inline alphabet would refuse supported names like release+next
+          # or feature@two and fail every review for such a project, while
+          # the contract still refuses shell-dangerous characters.
+          DEFAULT_BRANCH="$default_branch" python3 -P - <<'PY'
+          import os
+
+          from agentic_sdlc.policy import branch_name_problem
+
+          problem = branch_name_problem(os.environ["DEFAULT_BRANCH"])
+          if problem:
+              raise SystemExit("default branch " + problem)
+          PY
           target="${RUNNER_TEMP}/agentic-review-target"
           rm -rf "$target"
           mv .agentic-review-target-checkout "$target"
@@ -272,8 +284,11 @@ jobs:
           # --no-renames lists BOTH sides of a rename: a security-sensitive
           # or policy-protected file moved to a neutral path must still
           # select the security reviewer, and the default rename detection
-          # reports only the post-image name.
-          git diff --name-only --no-renames "${BASE_SHA}...${HEAD_SHA}" > .agentic-review/changed-paths.txt
+          # reports only the post-image name. -z emits literal NUL-delimited
+          # pathnames: git's default quoting would spell a non-ASCII
+          # protected path as an escaped C string, which matches no
+          # protected-path pattern.
+          git diff --name-only --no-renames -z "${BASE_SHA}...${HEAD_SHA}" > .agentic-review/changed-paths.txt
           git show "${BASE_SHA}:${CONFIG_PATH}" > .agentic-review/trusted-policy.toml
           label_args=()
           while IFS= read -r label; do
@@ -282,7 +297,7 @@ jobs:
           sdlcctl review-roles \
             --task-file .agentic-review/task.txt \
             "${label_args[@]}" \
-            --changed-paths-file .agentic-review/changed-paths.txt \
+            --changed-paths-file0 .agentic-review/changed-paths.txt \
             --config .agentic-review/trusted-policy.toml \
             --output .agentic-review/roles.json
           python3 -P - <<'PY'
@@ -370,6 +385,16 @@ jobs:
             --model claude-opus-5
             --max-turns 80
             --allowedTools "Read,Write,Glob,Grep"
+      - name: Seal the code-reviewer verdict
+        id: seal-code-verdict
+        run: |
+          set -euo pipefail
+          # The security reviewer runs NEXT, in this same checkout, with a
+          # Write tool: without this seal a prompt-injected second reviewer
+          # could replace the completed code verdict with a schema-valid
+          # approval and supply both approvals itself. The digest is a step
+          # output, so no later file write can alter it.
+          echo "sha256=$(sha256sum .agentic-review/review-code-reviewer.json | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - name: Independently review the exact diff as security-reviewer
         if: contains(steps.roles.outputs.roles, 'security-reviewer')
         uses: anthropics/claude-code-action@6fed3ca145920b639991cb756090506e1bcaf515 # v1
@@ -396,14 +421,17 @@ jobs:
         env:
           EXPECTED_DIFF_SHA256: ${{ steps.review-diff.outputs.sha256 }}
           EXPECTED_SEAL_SHA256: ${{ steps.seal.outputs.sha256 }}
+          EXPECTED_CODE_VERDICT_SHA256: ${{ steps.seal-code-verdict.outputs.sha256 }}
           BASE_SHA: ${{ inputs.base_sha }}
           HEAD_SHA: ${{ inputs.head_sha }}
         run: |
           set -euo pipefail
-          # The seal FIRST: nothing below — the control files, the python
+          # The seals FIRST: nothing below — the control files, the python
           # snippets' engine imports, the gate evaluation — is trusted until
           # every sealed input matches the digest recorded before the
-          # reviewers ran.
+          # reviewers ran, and the code verdict still matches the digest
+          # recorded before the security reviewer ran: one compromised
+          # reviewer must never supply both approvals.
           engine_dir=$(python3 -P -c 'import importlib.util; print(importlib.util.find_spec("agentic_sdlc").submodule_search_locations[0])')
           digest=$(
             {
@@ -412,6 +440,7 @@ jobs:
             } | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1
           )
           test "$digest" = "$EXPECTED_SEAL_SHA256"
+          echo "${EXPECTED_CODE_VERDICT_SHA256}  .agentic-review/review-code-reviewer.json" | sha256sum -c -
           echo "${EXPECTED_DIFF_SHA256}  .agentic-review/change.diff" | sha256sum -c -
 
           # claude-code-action intentionally replaces executable agent-control

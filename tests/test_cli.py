@@ -2591,3 +2591,35 @@ def test_repair_findings_cli_carries_unverified_criteria_to_repair(tmp_path: Pat
     review["acceptanceCriteriaVerdict"] = [{"criterion": "Exporter streams rows", "verdict": "met"}]
     path.write_text(json.dumps(review), encoding="utf-8")
     assert main(["repair-findings", "--review", str(path), "--output", str(output)]) == 2
+
+
+def test_review_roles_cli_reads_nul_delimited_literal_paths(tmp_path: Path) -> None:
+    # git's default path quoting spells a non-ASCII security-sensitive path
+    # as an escaped C string that matches no pattern (Codex 4434104201);
+    # the NUL-delimited form carries the literal pathname.
+    paths_file = tmp_path / "changed-paths.txt"
+    paths_file.write_text("src/añadir_tokens.py\0docs/readme.md\0", encoding="utf-8")
+    output = tmp_path / "roles.json"
+    result = main(
+        ["review-roles", "--changed-paths-file0", str(paths_file), "--output", str(output)]
+    )
+    assert result == 0
+    document = json.loads(output.read_text(encoding="utf-8"))
+    assert document["roles"] == ["code-reviewer", "security-reviewer"]
+    assert any("añadir_tokens" in reason for reason in document["reasons"]["security-reviewer"])
+    # The two spellings are mutually exclusive: silently preferring one
+    # could drop the other's paths.
+    assert (
+        main(
+            [
+                "review-roles",
+                "--changed-paths-file",
+                str(paths_file),
+                "--changed-paths-file0",
+                str(paths_file),
+                "--output",
+                str(output),
+            ]
+        )
+        == 2
+    )

@@ -211,7 +211,7 @@ def test_trusted_python_steps_cannot_import_candidate_code() -> None:
     # off the import path while the user-site engine install stays visible.
     assert "python3 - <<'PY'" not in document
     assert "python3 -m pip" not in document
-    assert document.count("python3 -P - <<'PY'") == 5
+    assert document.count("python3 -P - <<'PY'") == 6
     assert "python3 -P -m pip install" in document
 
 
@@ -246,15 +246,45 @@ def test_trusted_inputs_are_sealed_before_review_and_verified_after() -> None:
 def test_role_selection_sees_both_sides_of_a_rename() -> None:
     # A security-sensitive or policy-protected file renamed to a neutral
     # path must still select the security reviewer: default rename
-    # detection lists only the post-image name (Codex 4434056701).
+    # detection lists only the post-image name (Codex 4434056701). -z keeps
+    # the pathnames literal, so git's default quoting cannot mis-spell a
+    # non-ASCII protected path out of its pattern (Codex 4434104201).
     review = _review_job()
-    assert 'git diff --name-only --no-renames "${BASE_SHA}...${HEAD_SHA}"' in review
+    assert 'git diff --name-only --no-renames -z "${BASE_SHA}...${HEAD_SHA}"' in review
+    assert "--changed-paths-file0 .agentic-review/changed-paths.txt" in review
+
+
+def test_the_code_verdict_is_sealed_before_the_security_reviewer_runs() -> None:
+    review = _review_job()
+    # The security reviewer runs in the same checkout with a Write tool
+    # (Codex 4434104192): the completed code verdict is hashed into a step
+    # output before it starts and re-verified afterward, so one compromised
+    # reviewer can never supply both approvals.
+    seal = "Seal the code-reviewer verdict"
+    code = "Independently review the exact diff as code-reviewer"
+    security = "Independently review the exact diff as security-reviewer"
+    assert review.index(code) < review.index(seal) < review.index(security)
+    assert "EXPECTED_CODE_VERDICT_SHA256: ${{ steps.seal-code-verdict.outputs.sha256 }}" in review
+    check = (
+        'echo "${EXPECTED_CODE_VERDICT_SHA256}  '
+        '.agentic-review/review-code-reviewer.json" | sha256sum -c -'
+    )
+    assert check in review
+
+
+def test_the_anchor_accepts_every_branch_the_policy_loader_accepts() -> None:
+    review = _review_job()
+    # Names like release+next and feature@two are supported by the policy's
+    # branch-name contract; a narrower inline alphabet would fail every
+    # review for such a project (Codex 4434104198).
+    assert '[[ "$default_branch" =~ ' not in review
+    assert "from agentic_sdlc.policy import branch_name_problem" in review
 
 
 def test_roles_are_selected_deterministically_and_recorded() -> None:
     review = _review_job()
     assert "sdlcctl review-roles" in review
-    assert "--changed-paths-file .agentic-review/changed-paths.txt" in review
+    assert "--changed-paths-file0 .agentic-review/changed-paths.txt" in review
     # The policy whose protected paths escalate to the security reviewer is
     # the BASE-committed one, never the candidate head's.
     assert 'git show "${BASE_SHA}:${CONFIG_PATH}"' in review
