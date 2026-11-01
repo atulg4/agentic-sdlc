@@ -371,7 +371,7 @@ jobs:
       # release_lease_on_failure whether a claim may have been posted.
       - name: Create short-lived issue-lease token (publisher App, issues + PR read)
         id: lease-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
         with:
           client-id: ${{ inputs.publisher_app_client_id }}
           private-key: ${{ secrets.PUBLISHER_APP_PRIVATE_KEY }}
@@ -483,7 +483,7 @@ jobs:
       - name: Generate patch with Claude Code using Max/Pro OAuth
         id: claude-oauth
         if: needs.prepare.outputs.selected_provider == 'anthropic' && needs.prepare.outputs.selected_auth_mode == 'oauth'
-        uses: anthropics/claude-code-action@6fed3ca145920b639991cb756090506e1bcaf515 # v1
+        uses: anthropics/claude-code-action@d70510b174a1244958df0b03166a54912811f3e6 # v1
         env:
           CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
         with:
@@ -500,7 +500,7 @@ jobs:
       - name: Generate patch with Claude Code using direct API billing
         id: claude-api
         if: needs.prepare.outputs.selected_provider == 'anthropic' && needs.prepare.outputs.selected_auth_mode == 'api-key'
-        uses: anthropics/claude-code-action@6fed3ca145920b639991cb756090506e1bcaf515 # v1
+        uses: anthropics/claude-code-action@d70510b174a1244958df0b03166a54912811f3e6 # v1
         env:
           CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
         with:
@@ -613,7 +613,7 @@ jobs:
           path: ${{ runner.temp }}/lease/policy
       - name: Create short-lived issue-lease token (publisher App, issues + PR read)
         id: lease-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
         with:
           client-id: ${{ inputs.publisher_app_client_id }}
           private-key: ${{ secrets.PUBLISHER_APP_PRIVATE_KEY }}
@@ -725,7 +725,7 @@ jobs:
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
       - name: Install the policy's CI Python for the gates
         if: steps.ci-python.outputs.version != ''
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ steps.ci-python.outputs.version }}
       - name: Run project-defined deterministic gates
@@ -759,7 +759,7 @@ jobs:
           path: ${{ runner.temp }}/lease/policy
       - name: Create short-lived issue-lease token (publisher App, issues + PR read)
         id: lease-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
         with:
           client-id: ${{ inputs.publisher_app_client_id }}
           private-key: ${{ secrets.PUBLISHER_APP_PRIVATE_KEY }}
@@ -866,7 +866,7 @@ jobs:
     steps:
       - name: Create short-lived repository publisher token
         id: publisher-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
         with:
           client-id: ${{ inputs.publisher_app_client_id }}
           private-key: ${{ secrets.PUBLISHER_APP_PRIVATE_KEY }}
@@ -1089,7 +1089,7 @@ jobs:
           exit 1
       - name: Create short-lived issue-lease token (publisher App, issues only)
         id: lease-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
         with:
           client-id: ${{ inputs.publisher_app_client_id }}
           private-key: ${{ secrets.PUBLISHER_APP_PRIVATE_KEY }}
