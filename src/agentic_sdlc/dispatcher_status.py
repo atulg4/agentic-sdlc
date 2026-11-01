@@ -15,10 +15,10 @@ reported per event, never folded into the per-unit counts.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
-from .checkpoints import CheckpointSnapshot
+from .checkpoints import CheckpointRecord, CheckpointSnapshot
 from .event_ledger import FactoryState, carries_credential_token
 
 __all__ = [
@@ -79,6 +79,17 @@ def _instant(value: str, label: str) -> datetime:
     if parsed.tzinfo is None:
         raise DispatcherStatusError(f"{label} must carry a UTC offset: {value!r}")
     return parsed
+
+
+def _recency(record: CheckpointRecord) -> tuple[int, datetime, str]:
+    """Order by the instant a timestamp names, not its spelling: callers supply
+    timestamps, and ``10:00+02:00`` is earlier than ``09:00Z`` though it sorts
+    later as text. Unreadable timestamps rank oldest, ties break by event key."""
+
+    try:
+        return (1, _instant(record.timestamp, "checkpoint timestamp"), record.event_key)
+    except DispatcherStatusError:
+        return (0, datetime.min.replace(tzinfo=UTC), record.event_key)
 
 
 def _safe_reason(reason: str) -> str:
@@ -156,7 +167,7 @@ def build_dispatcher_status(
         rejected_states[record.state] = rejected_states.get(record.state, 0) + 1
     blocked = sorted(
         (record for record in rejected if record.state == "blocked"),
-        key=lambda record: (record.timestamp, record.event_key),
+        key=_recency,
         reverse=True,
     )
 

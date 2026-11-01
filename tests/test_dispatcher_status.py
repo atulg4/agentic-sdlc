@@ -298,3 +298,40 @@ def test_malformed_requests_are_rejected(tmp_path: Path, kwargs: dict, message: 
 
     with pytest.raises(DispatcherStatusError, match=message):
         _status(path, **kwargs)
+
+
+def _blocked(event_key: str, timestamp: str) -> CheckpointRecord:
+    return CheckpointRecord(
+        event_key=event_key,
+        unit_id="",
+        state="blocked",
+        accepted=False,
+        reason=f"blocked {event_key}",
+        timestamp=timestamp,
+    )
+
+
+def test_blocked_events_order_by_instant_not_timestamp_spelling() -> None:
+    snapshot = CheckpointSnapshot(
+        last_heartbeat=T1,
+        records=(
+            # 08:00Z: earlier than the Z record below, though it sorts later as text.
+            _blocked("forge-event:offset", "2026-10-29T10:00:00+02:00"),
+            _blocked("forge-event:utc", "2026-10-29T09:00:00Z"),
+            _blocked("forge-event:unreadable", "not-a-time"),
+        ),
+    )
+
+    document = build_dispatcher_status(
+        snapshot, now=NOW, stale_after_seconds=3600, blocked_event_limit=1
+    )
+
+    assert [item["eventKey"] for item in document["dispatcher"]["blockedEvents"]] == [
+        "forge-event:utc"
+    ]
+    full = build_dispatcher_status(snapshot, now=NOW, stale_after_seconds=3600)
+    assert [item["eventKey"] for item in full["dispatcher"]["blockedEvents"]] == [
+        "forge-event:utc",
+        "forge-event:offset",
+        "forge-event:unreadable",
+    ]
