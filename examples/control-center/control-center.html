@@ -365,6 +365,11 @@
   // manual loads): whichever validation finishes under a stale generation is
   // discarded, so an older document can never adopt after a newer one.
   let snapshotAdoptions = 0;
+  /* Bumped whenever a store-backed collection this console renders changes.
+     The legacy views are signed as one node, so a same-size edit - a note
+     reworded, a draft replaced - has to invalidate that signature or the
+     stale text stays on screen for good. */
+  let collectionsRevision = 0;
 
   /* ---------- tiny DOM helper: text is always set as text ---------- */
   function el(tag, props, ...kids) {
@@ -491,7 +496,15 @@
           // main thread on views nobody will ever see. Whatever is finally
           // adopted is verified in full, and the generation counter still
           // orders it against a manual load.
-          pending = { present: Boolean(snap?.exists), body: snap?.exists ? (snap.data() || {}) : null };
+          // The generation is claimed HERE, when the delivery arrives, not
+          // when the drain gets to it. Stamping it at processing time would
+          // let a queued delivery become "newer" than a manual load that
+          // adopted while it waited, and the older document would win.
+          pending = {
+            generation: ++snapshotAdoptions,
+            present: Boolean(snap?.exists),
+            body: snap?.exists ? (snap.data() || {}) : null,
+          };
           drainDeliveries();
         },
         (error) => {
@@ -614,13 +627,14 @@
       // for these, and refreshes everything else on each adoption.
       liveNoteKeys = live;
       state.notes = next;
+      collectionsRevision += 1;
     // Recency-ordered like drafts: once the store exceeds the bound, an
     // unordered window could permanently exclude a note another viewer just
     // recorded (notes written by this console always carry "at"; older
     // documents without it are covered by the per-adoption exact backfill).
     }, 1000, "at");
     // Recency-ordered window: a newly saved draft is always retrievable.
-    subscribe("projectDrafts", (docs) => { state.drafts = docs; }, 500, "at");
+    subscribe("projectDrafts", (docs) => { state.drafts = docs; collectionsRevision += 1; }, 500, "at");
     render();
   }
 
@@ -647,6 +661,7 @@
             // reopen can recover a stopped feed, and a stale "updates
             // stopped" banner would send operators reloading for nothing.
             if (state.feedErrors.delete(collection)) render();
+            collectionsRevision += 1;
             // Each entry carries its document id, so adopters can tell a
             // legacy-id document from a scoped one.
             await adopt(snapshot.docs.map((entry) => {
@@ -1557,6 +1572,27 @@
     return out;
   }
 
+  /* Only the units the producer itself calls active. A blocked, failed or
+     human-gated unit still carries the model and worker that last touched it;
+     counting those as active agents reports execution that is not happening. */
+  function activeUnits() {
+    const out = [];
+    for (const project of projects()) {
+      for (const unit of project.active || []) out.push(unit);
+    }
+    return out;
+  }
+
+  function heldUnits() {
+    const out = [];
+    for (const project of projects()) {
+      for (const unit of [...(project.attention || []), ...(project.waiting || [])]) {
+        out.push(unit);
+      }
+    }
+    return out;
+  }
+
   /* ---------- keyed patching ----------
      A live delivery must not rebuild the page. Every patched node carries a
      stable key and a signature of the data it renders: a node whose key and
@@ -1710,9 +1746,11 @@
     draining = true;
     try {
       while (pending) {
-        const { present, body } = pending;
+        const { generation: delivery, present, body } = pending;
         pending = null;
-        const delivery = ++snapshotAdoptions;
+        // Superseded while it waited — by a newer delivery or a manual load,
+        // which share this counter.
+        if (delivery !== snapshotAdoptions) continue;
         if (!present) {
           // A deleted snapshot is a delivery too: it clears the view and
           // supersedes any older digest verification still in flight. The
@@ -1764,10 +1802,9 @@
   function freshnessLine() {
     const at = state.lastGoodAt || state.snapshot?.generatedAt || "";
     const age = elapsed(at, Date.now());
-    if (!state.degraded) {
-      return "as of " + txt(at, "unknown") + (age.known ? " · " + age.text + " ago" : "");
-    }
-    return "last good " + txt(at, "unknown") + (age.known ? " · " + age.text + " ago" : "");
+    const stamp = txt(at, "unknown") + (age.known ? " · " + age.text + " ago" : "");
+    if (state.degraded) return "last good " + stamp;
+    return "as of " + stamp;
   }
 
   /* ================= charts =================
@@ -1847,23 +1884,41 @@
   /* A horizontal bar chart. Values are drawn AND printed. */
   function barChart(title, rows, options) {
     const opts = options || {};
-    if (!rows.length) return chartUnknown(title, opts.empty || "the snapshot carries no entries for this view.");
-    const max = Math.max(...rows.map((row) => row.value), 1);
+    if (!rows || !rows.length) {
+      return chartUnknown(title, opts.empty || "the snapshot carries no entries for this view.");
+    }
+    // A null value is a figure nobody observed. It is drawn as no bar, read
+    // as "unknown" everywhere it is written, and left out of the scale: an
+    // unmeasured row must not set or share the maximum.
+    const known = rows.filter((row) => row.value !== null && row.value !== undefined);
+    if (!known.length) {
+      return chartUnknown(title, opts.empty
+        || "no entry in this view observed the figure it would be ranked by.");
+    }
+    const max = Math.max(...known.map((row) => row.value), 1);
     const rowHeight = 26;
     const height = rows.length * rowHeight;
     const labelWidth = 34;
-    const summary = title + ": " + rows.map((row) => row.label + " " + row.value).join(", ");
+    const reading = (row) => (row.value === null || row.value === undefined
+      ? "unknown" : String(row.value));
+    const summary = title + ": " + rows.map((row) => row.label + " " + reading(row)).join(", ");
     const svg = svgEl("svg", {
       viewBox: "0 0 100 " + height, preserveAspectRatio: "none",
       role: "img", "aria-label": summary, focusable: "false",
       style: "height:" + height + "px",
     });
     rows.forEach((row, index) => {
-      const width = Math.max(row.value > 0 ? 1 : 0, (row.value / max) * (100 - labelWidth));
+      const unknown = row.value === null || row.value === undefined;
+      const width = unknown ? 0 : Math.max(row.value > 0 ? 1 : 0, (row.value / max) * (100 - labelWidth));
       const y = index * rowHeight;
       const group = svgEl("g", {});
       group.append(svgEl("rect", {
-        x: 0, y: y + 6, width: 100 - labelWidth, height: 12, rx: 3, fill: "var(--mute-bg)",
+        x: 0, y: y + 6, width: 100 - labelWidth, height: 12, rx: 3,
+        fill: "var(--mute-bg)",
+        // A hatched track, so an unknown row is not read as a zero-length bar.
+        "stroke-dasharray": unknown ? "2 2" : null,
+        stroke: unknown ? "var(--ink-3)" : null,
+        "stroke-width": unknown ? "0.4" : null,
       }));
       if (width > 0) {
         group.append(svgEl("rect", {
@@ -1873,13 +1928,19 @@
       }
       group.append(svgEl("text", {
         x: 100 - labelWidth + 2, y: y + 15, class: "seg-label",
-        "font-size": "9", text: row.label + " · " + row.value,
+        "font-size": "9", text: row.label + " · " + reading(row),
       }));
-      svg.append(describable(group, row.label + ": " + row.value + (row.note ? " (" + row.note + ")" : "")));
+      svg.append(describable(group, row.label + ": " + reading(row)
+        + (row.note ? " (" + row.note + ")" : "")));
     });
     return el("div", { class: "card" },
       el("h3", { text: title }),
       el("div", { class: "chart" }, svg),
+      rows.length > known.length
+        ? el("p", { class: "tiny muted", style: "margin:8px 0 0",
+            text: (rows.length - known.length) + " of " + rows.length
+              + " entries did not observe this figure and are shown as unknown, not as zero." })
+        : null,
       opts.note ? el("p", { class: "tiny muted", style: "margin:8px 0 0", text: opts.note }) : null,
     );
   }
@@ -2068,11 +2129,18 @@
       const amount = read(bucket);
       rows.push({
         label: bucketLabel(bucket, dimension),
-        value: amount.known ? amount.value : 0,
-        note: amount.known ? amount.note : "unknown",
+        // Unknown is carried, not flattened: substituting 0 here would print
+        // "claude-opus-5 · 0" in the chart's own label and announce a figure
+        // nobody measured as zero dollars.
+        value: amount.known ? amount.value : null,
+        note: amount.known ? amount.note : amount.note || "not observed",
       });
     }
-    return rows.sort((left, right) => right.value - left.value || left.label.localeCompare(right.label));
+    // Unknown rows sort last: they have no magnitude to rank by.
+    return rows.sort((left, right) =>
+      (left.value === null) - (right.value === null)
+      || (right.value ?? 0) - (left.value ?? 0)
+      || left.label.localeCompare(right.label));
   }
 
   const MISSING = {
@@ -2099,20 +2167,40 @@
     ), "dest:" + id, [id, state.dest === id])));
   }
 
+  function liveFeed() {
+    // A feed is established only when there is a store AND it has delivered.
+    // Without both, nothing will ever update this view.
+    return Boolean(state.db) && state.feedSeenAt > 0;
+  }
+
   function freshnessCard() {
-    // A degraded feed never passes for live: the banner states it, and the
-    // view it labels is the last one that was good.
-    return el("div", { class: state.degraded ? "banner" : "card" },
-      state.degraded
-        ? el("div", null,
-            el("div", { style: "font-weight:600", text: "Showing the last-good view" }),
-            el("div", { class: "tiny", style: "margin-top:3px", text: state.degraded }),
-            el("div", { class: "tiny", style: "margin-top:3px", text: freshnessLine() }),
-          )
-        : el("div", { class: "row" },
-            el("span", { class: "chip ok" }, el("i", { class: "dot" }), "live"),
-            el("span", { class: "tiny muted", text: freshnessLine() }),
-          ),
+    // Three honest states, and "live" is the narrowest of them: a degraded
+    // feed shows the last-good view, and a document pasted into a tab with no
+    // store is session-local however fresh its own generatedAt reads.
+    if (state.degraded) {
+      return el("div", { class: "banner" },
+        el("div", { style: "font-weight:600", text: "Showing the last-good view" }),
+        el("div", { class: "tiny", style: "margin-top:3px", text: state.degraded }),
+        el("div", { class: "tiny", style: "margin-top:3px", text: freshnessLine() }),
+      );
+    }
+    if (!liveFeed()) {
+      return el("div", { class: "card" },
+        el("div", { class: "row" },
+          el("span", { class: "chip warn" }, el("i", { class: "dot" }), "no live feed"),
+          el("span", { class: "tiny muted", text: freshnessLine() }),
+        ),
+        el("div", { class: "tiny muted", style: "margin-top:6px", text: state.db
+          ? "No snapshot has been delivered yet, so nothing here is receiving updates."
+          : "This is a session-local document: this view has no Control Center store, so it "
+            + "is not receiving updates and nothing is saved for other viewers." }),
+      );
+    }
+    return el("div", { class: "card" },
+      el("div", { class: "row" },
+        el("span", { class: "chip ok" }, el("i", { class: "dot" }), "live"),
+        el("span", { class: "tiny muted", text: freshnessLine() }),
+      ),
     );
   }
 
@@ -2130,6 +2218,24 @@
         ),
       ));
     }
+    const blockers = state.snapshot?.totals?.blockers ?? 0;
+    nodes.push(el("div", { class: "card" },
+      el("div", { class: "row" },
+        el("button", {
+          class: "btn" + (blockers ? " primary" : ""), type: "button",
+          on: { click: () => { state.sheet = "blockers"; state.tab = "blockers"; render(); window.scrollTo({ top: 0 }); } },
+        }, blockers ? `Blockers (${blockers})` : "Blockers"),
+        el("button", {
+          class: "btn", type: "button",
+          on: { click: () => { state.sheet = "add"; state.tab = "add"; render(); window.scrollTo({ top: 0 }); } },
+        }, "Add project"),
+        el("button", {
+          class: "btn", type: "button",
+          on: { click: () => { state.sheet = "snapshot"; state.tab = "snapshot"; render(); window.scrollTo({ top: 0 }); } },
+        }, "Snapshot"),
+      ),
+      el("p", { class: "tiny muted", style: "margin:8px 0 0", text: "The bottom bar holds the five views an operator watches. Blockers, with its remediations and notes, and project registration open from here: their desktop tabs are hidden at this width, so without these they would be unreachable." }),
+    ));
     nodes.push(lifecycleRail(portfolioByStage(), "Lifecycle rail, all projects"));
     if (!projects().length) {
       nodes.push(el("div", { class: "card" },
@@ -2259,17 +2365,29 @@
     const index = PROGRESS_RAIL.indexOf(unit.stage || "");
     wrap.append(el("ul", { class: "tl" }, PROGRESS_RAIL.map((stage, position) => {
       const here = position === index;
-      const passed = index >= 0 && position < index;
+      // Only the current position is asserted. An earlier stage is marked
+      // "earlier on the rail", never "passed": the forward path has legal
+      // shortcuts - review straight to ready-for-human-merge, no repair, no
+      // dependency wait - and the snapshot carries the current stage, not the
+      // transition history, so position cannot establish that a stage
+      // happened.
+      const earlier = index >= 0 && position < index;
       return el("li", { class: here ? "at" : "" },
-        el("span", { class: "mark", "aria-hidden": "true", text: here ? "◉" : passed ? "✓" : "·" }),
-        el("span", { class: here ? "small" : "tiny muted", text: stage + (here ? " — now" : passed ? " — passed" : "") }),
+        el("span", { class: "mark", "aria-hidden": "true", text: here ? "◉" : "·" }),
+        el("span", { class: here ? "small" : "tiny muted",
+          text: stage + (here ? " — now" : earlier ? " — earlier on the rail" : "") }),
         here && unit.lastEventAt ? el("span", { class: "tiny muted", text: unit.lastEventAt }) : null,
       );
     })));
-    if (index < 0) {
-      wrap.append(el("p", { class: "tiny muted", text: "This unit's state (" + txt(unit.state, "unknown")
-        + ") is off the forward rail, so it has no position on it." }));
-    }
+    wrap.append(el("p", { class: "tiny muted", text: index < 0
+      ? "This unit's state (" + txt(unit.state, "unknown") + ") is off the forward rail, so it "
+        + "has no position on it. The snapshot carries no transition history, so which stages it "
+        + "went through cannot be confirmed here."
+      : "The rail is the forward path, not this unit's history. Stages before the current one "
+        + "are earlier on the rail, not necessarily stages it entered: the path has legal "
+        + "shortcuts, and the snapshot carries no transition history, so whether a stage "
+        + "happened cannot be confirmed here. `sdlcctl project-state` reads that history from "
+        + "the event ledger." }));
 
     wrap.append(el("h4", { style: "margin-top:12px", text: "Stage durations" }));
     const durations = unitDurations(project, unit);
@@ -2359,15 +2477,28 @@
   /* ---------- Agents ---------- */
   function phoneAgents() {
     const nodes = [freshnessCard()];
-    const units = allUnits().map((entry) => entry.unit);
-    nodes.push(barChart("Active agents by model", tally(units, (unit) => unit.model), {
-      empty: "no work unit in the snapshot names a model yet.",
-      note: "One row per model with at least one unit in flight, from the snapshot's own work-unit records.",
+    const running = activeUnits();
+    const held = heldUnits();
+    nodes.push(barChart("Active agents by model", tally(running, (unit) => unit.model), {
+      empty: "no unit in the snapshot's active collection names a model yet.",
+      note: "One row per model actually executing, from the snapshot's active collection. "
+        + held.length + " held unit(s) - blocked, failed, human-gated or waiting on a "
+        + "dependency - are excluded: the model that last touched them is not running them now.",
     }));
-    nodes.push(barChart("Active agents by worker", tally(units, (unit) => unit.worker), {
-      empty: "no work unit in the snapshot names a worker yet.",
+    nodes.push(barChart("Active agents by worker", tally(running, (unit) => unit.worker), {
+      empty: "no unit in the snapshot's active collection names a worker yet.",
     }));
-    const repair = tally(units.filter((unit) => unit.repairCycles > 0),
+    if (held.length) {
+      nodes.push(barChart("Held work, by why it is held",
+        tally(held, (unit) => unit.blockedReason
+          || (unit.awaitsHuman ? "awaiting a person" : unit.state || "unknown")), {
+          note: "Not agents: these units are not executing. Shown separately so the "
+            + "active counts above stay honest.",
+        }));
+    }
+    // Repair loops are a property of the whole backlog, held work included.
+    const everyUnit = allUnits().map((entry) => entry.unit);
+    const repair = tally(everyUnit.filter((unit) => unit.repairCycles > 0),
       (unit) => unit.repairCycles + " cycle" + (unit.repairCycles === 1 ? "" : "s"));
     nodes.push(repair.length
       ? barChart("Repair loops", repair, { note: "Units grouped by how many repair cycles they have been through." })
@@ -2419,16 +2550,59 @@
     const byDay = state.telemetry?.byDay;
     if (!byDay) nodes.push(chartUnknown("Time and cost trend", MISSING.byDay));
     else {
-      const rows = (byDay.buckets || []).map((bucket) => ({
-        label: bucketLabel(bucket, "day"),
+      const rows = dailyRows(byDay);
+      if (typeof rows === "string") nodes.push(chartUnknown("Time and cost trend", rows));
+      else {
+        nodes.push(trendChart("Pay-as-you-go equivalent per day (USD)", rows, (row) => row.usd));
+        nodes.push(trendChart("Runtime per day (seconds)", rows, (row) => row.runtime));
+      }
+    }
+    return nodes;
+  }
+
+  //: A trend longer than this is not a range anyone reads day by day, and
+  //: filling it would generate thousands of points for a handful of runs.
+  const MAX_TREND_DAYS = 400;
+
+  function dailyRows(byDay) {
+    const unknown = { known: false, value: null, text: "unknown" };
+    const observed = new Map();
+    for (const bucket of byDay.buckets || []) {
+      const day = bucketLabel(bucket, "day");
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+        return "the usage report's day buckets are not calendar days, so a trend "
+          + "cannot be placed on a time axis.";
+      }
+      observed.set(day, {
+        label: day,
         tokens: figure(bucket.actual?.totalTokens),
         usd: figure(bucket.actual?.paygEquivalentUsd),
         runtime: figure(bucket.actual?.runtimeSeconds),
-      })).sort((left, right) => left.label.localeCompare(right.label));
-      nodes.push(trendChart("Pay-as-you-go equivalent per day (USD)", rows, (row) => row.usd));
-      nodes.push(trendChart("Runtime per day (seconds)", rows, (row) => row.runtime));
+      });
     }
-    return nodes;
+    const days = [...observed.keys()].sort();
+    if (!days.length) return "the usage report carries no day buckets.";
+    // Every calendar day between the first and last observation gets a row.
+    // The producer emits a bucket only for a day that carried records, so a
+    // quiet day is ABSENT rather than zero - and drawing the survivors as
+    // neighbours would hide exactly the quiet day a reader is looking for.
+    const first = Date.parse(days[0] + "T00:00:00Z");
+    const last = Date.parse(days[days.length - 1] + "T00:00:00Z");
+    if (!Number.isFinite(first) || !Number.isFinite(last)) {
+      return "the usage report's day buckets are not calendar days.";
+    }
+    const span = Math.round((last - first) / 86_400_000) + 1;
+    if (span > MAX_TREND_DAYS) {
+      return "the usage report spans " + span + " days, past the " + MAX_TREND_DAYS
+        + "-day trend bound; narrow it with --since and --until.";
+    }
+    const rows = [];
+    for (let offset = 0; offset < span; offset += 1) {
+      const day = new Date(first + offset * 86_400_000).toISOString().slice(0, 10);
+      rows.push(observed.get(day)
+        || { label: day, tokens: unknown, usd: unknown, runtime: unknown, absent: true });
+    }
+    return rows;
   }
 
   /* A sparkline-style trend. A day whose figure was never observed is drawn
@@ -2472,8 +2646,10 @@
       const node = entry.known
         ? svgEl("circle", { cx: x, cy: 36 - (entry.value / max) * 30, r: "1.6", fill: SERIES[0] })
         : svgEl("text", { x, y: 38, "text-anchor": "middle", class: "seg-label", "font-size": "6", text: "?" });
-      svg.append(describable(node, row.label + ": " + entry.text
-        + (entry.known ? "" : " — not observed, so no point is drawn")));
+      svg.append(describable(node, row.label + ": " + entry.text + (entry.known ? ""
+        : row.absent
+          ? " — the usage report carries no record for this day, so no point is drawn"
+          : " — not observed, so no point is drawn")));
     });
     const gaps = values.filter((entry) => !entry.known).length;
     return el("div", { class: "card" },
@@ -2484,7 +2660,8 @@
         el("span", { class: "key" }, el("span", { text: "? unobserved" })),
       ),
       el("p", { class: "tiny muted", style: "margin:8px 0 0", text: rows.length + " day(s), "
-        + gaps + " with no observation. Peak " + max + ". A gap is never bridged: an unmeasured day is not a zero one." }),
+        + gaps + " with no observation. Peak " + max + ". Every calendar day in the range has "
+        + "a place on the axis, and a gap is never bridged: an unmeasured day is not a zero one." }),
     );
   }
 
@@ -2620,13 +2797,14 @@
         unitDetail(open.project, open.unit),
       ));
     }
-    const units = rows.map((entry) => entry.unit);
+    const running = activeUnits();
     nodes.push(el("div", { class: "grid two" },
-      barChart("Active agents by model", tally(units, (unit) => unit.model), {
-        empty: "no work unit in the snapshot names a model yet.",
+      barChart("Active agents by model", tally(running, (unit) => unit.model), {
+        empty: "no unit in the snapshot's active collection names a model yet.",
+        note: "From the active collection only: held work is not executing.",
       }),
-      barChart("Active agents by worker", tally(units, (unit) => unit.worker), {
-        empty: "no work unit in the snapshot names a worker yet.",
+      barChart("Active agents by worker", tally(running, (unit) => unit.worker), {
+        empty: "no unit in the snapshot's active collection names a worker yet.",
       }),
     ));
     return nodes;
@@ -2689,7 +2867,13 @@
       state.project, state.degraded, state.lastGoodAt, state.telemetryAt,
       [...state.open].sort().join("|"), state.shown,
       state.snapshotMeta?.loadedAt || "",
-      // The add-project and blockers views read the store-backed collections.
+      // The add-project and blockers views render these collections, so the
+      // signature covers their CONTENT: an edit that leaves the collection
+      // the same size would otherwise keep the stale note or draft on screen
+      // for good. The revision counter is bumped on every delivery and local
+      // mutation, so the content digests below never have to be exhaustive to
+      // be correct.
+      collectionsRevision,
       state.drafts.length, state.notes.size, state.canWrite, state.viewer?.id || "",
     ];
   }
@@ -2775,7 +2959,18 @@
     const running = (project.active || [])[0];
     return el("button", {
       class: "proj", type: "button",
-      on: { click: () => { state.project = project.projectId; state.tab = "project"; render(); window.scrollTo({ top: 0 }); } },
+      on: { click: () => {
+        state.project = project.projectId;
+        state.tab = "project";
+        // The phone shell reads state.dest, not state.tab: without this the
+        // tap would select a project and leave the user on the Projects
+        // screen, looking at the card they just pressed.
+        state.dest = "backlog";
+        state.detail = null;
+        state.shown = 0;
+        render();
+        window.scrollTo({ top: 0 });
+      } },
     },
       el("div", { class: "between" },
         el("div", null,
@@ -3374,6 +3569,7 @@
       // even when it falls outside that window, across later deliveries.
       backfilledEntries.set(key, entry);
       state.notes.set(key, entry);
+      collectionsRevision += 1;
       return "Recorded";
     } catch (error) {
       const code = error?.code || "";
@@ -3741,6 +3937,13 @@
     get degraded() { return state.degraded; },
     get lastGoodAt() { return state.lastGoodAt; },
     get units() { return allUnits().length; },
+    get snapshotProjects() { return projects(); },
+    get legacySignature() { return legacySignature(); },
+    adoptForTest(document_) {
+      // The manual-load path without the store write: used by the test that
+      // has no store at all.
+      return adoptSnapshot(document_, new Date().toISOString(), "") || (render(), "");
+    },
     get shown() { return shownLimit(); },
     showAll() { state.shown = allUnits().length; render(); },
     get telemetryLoaded() { return Boolean(state.telemetry); },

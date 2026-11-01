@@ -597,6 +597,275 @@ test("the desktop view is a dense table beside the same charts", async (browser)
   } finally { await context.close(); }
 });
 
+/* ================= review regressions =================
+   One case per finding from the review of 7cc6f21. Each was reproduced here
+   before the fix landed. */
+
+test("Blockers and Add project stay reachable on a phone", async (browser) => {
+  const { context, page } = await openConsole(browser);
+  try {
+    // Their desktop tabs are hidden below 1024px, so the phone shell has to
+    // offer them itself or the console loses project registration and the
+    // whole blocker remediation workflow at phone width.
+    const reachable = await page.evaluate(() =>
+      [...document.querySelectorAll("#view button, #bottom-nav button")]
+        .map((node) => (node.textContent || "").trim()));
+    assert(reachable.some((text) => /blocker/i.test(text)),
+      "nothing on the phone Projects screen opens the blockers view: " + JSON.stringify(reachable));
+    assert(reachable.some((text) => /add project/i.test(text)),
+      "nothing on the phone Projects screen opens Add project");
+    await page.locator('#view button:text-matches("blocker", "i")').first().click();
+    await page.waitForTimeout(80);
+    assert((await page.locator("#view").innerText()).includes("Blockers"),
+      "the blockers sheet did not open");
+    await page.locator('#view button:text("Close")').first().click();
+    await page.waitForTimeout(60);
+    await page.locator('#view button:text-matches("add project", "i")').first().click();
+    await page.waitForTimeout(80);
+    assert((await page.locator("#view").innerText()).includes("Add a project"),
+      "the add-project sheet did not open");
+  } finally { await context.close(); }
+});
+
+test("tapping a phone project card opens that project's backlog", async (browser) => {
+  const { context, page } = await openConsole(browser);
+  try {
+    const cards = page.locator("#view button.proj");
+    assert(await cards.count() > 1, "need more than one project to switch between");
+    const second = (await cards.nth(1).innerText()).split("\n")[0];
+    await cards.nth(1).click();
+    await page.waitForTimeout(80);
+    const after = await page.evaluate(() => ({
+      dest: window.__forgeConsole.dest,
+      text: document.querySelector("#view").innerText,
+    }));
+    assertEqual(after.dest, "backlog", "the tap left the user on the Projects screen");
+    assert(after.text.includes(second),
+      `the backlog is not showing ${JSON.stringify(second)}`);
+  } finally { await context.close(); }
+});
+
+test("the timeline marks the current stage and claims nothing about the rest", async (browser) => {
+  const { context, page } = await openConsole(browser);
+  try {
+    await page.locator("#bottom-nav .dest").nth(1).click();
+    await page.waitForTimeout(40);
+    // A unit mid-rail, not the blocked one: an off-rail unit has no position
+    // and so asserts nothing either way.
+    const onRail = page.locator("#view .ucard-btn").filter({ hasText: /stage \d+ of \d+/ });
+    assert(await onRail.count() > 0, "no card in the fixture sits on the forward rail");
+    await onRail.first().click();
+    await page.waitForTimeout(80);
+    const timeline = await page.locator("#view .detail .tl").first().innerText();
+    // A unit accepted straight from review into ready-for-human-merge never
+    // entered repair or re-review, and the snapshot carries no transition
+    // history, so no earlier stage may be reported as passed.
+    assert(!/passed/i.test(timeline),
+      `the timeline asserts stages were passed: ${JSON.stringify(timeline)}`);
+    assert(/now/.test(timeline), "the timeline does not mark the current stage");
+    const note = await page.locator("#view .detail").first().innerText();
+    assert(/no transition history|cannot be confirmed/i.test(note),
+      "the drill-down does not say why earlier stages are unconfirmed");
+  } finally { await context.close(); }
+});
+
+test("active-agent charts count only units the producer calls active", async (browser) => {
+  const { context, page } = await openConsole(browser);
+  try {
+    await page.locator("#bottom-nav .dest").nth(2).click();
+    await page.waitForTimeout(80);
+    const counts = await page.evaluate(() => {
+      const totals = { active: 0, held: 0 };
+      for (const project of window.__forgeConsole.snapshotProjects) {
+        totals.active += (project.active || []).length;
+        totals.held += (project.attention || []).length + (project.waiting || []).length;
+      }
+      const label = [...document.querySelectorAll('#view svg[role="img"]')]
+        .map((node) => node.getAttribute("aria-label"))
+        .find((text) => /active agents by model/i.test(text)) || "";
+      const charted = [...label.matchAll(/ (\d+)(?:,|$)/g)].reduce(
+        (sum, match) => sum + Number(match[1]), 0);
+      return { ...totals, label, charted };
+    });
+    assert(counts.held > 0, "the fixture carries no held work to mis-count");
+    assertEqual(counts.charted, counts.active,
+      `the chart counts ${counts.charted} agents for ${counts.active} active units `
+      + `(${counts.held} held): ${counts.label}`);
+  } finally { await context.close(); }
+});
+
+test("a session-local snapshot is never labelled live", async (browser) => {
+  // No store at all: window.claude.use returns nothing, so the console can
+  // only hold a document someone pasted into this tab.
+  const context = await browser.newContext({
+    viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true,
+  });
+  const page = await context.newPage();
+  const problems = [];
+  page.on("pageerror", (error) => problems.push(String(error)));
+  await page.addInitScript("window.claude = { use: () => Promise.resolve(null) };");
+  await page.goto(PAGE);
+  try {
+    await page.waitForFunction(() => window.__forgeConsole && window.__forgeConsole.renders > 0);
+    const loaded = await page.evaluate(
+      (document_) => window.__forgeConsole.adoptForTest(document_), SNAPSHOT);
+    assertEqual(loaded, "", "the fixture snapshot was refused without a store");
+    await page.waitForTimeout(80);
+    const badge = await page.evaluate(() => {
+      const chip = document.querySelector("#view .chip");
+      return { text: (chip?.textContent || "").trim(), cls: chip?.className || "" };
+    });
+    const text = await page.locator("#view").innerText();
+    assertEqual(badge.text, "no live feed", "the freshness badge is wrong");
+    assert(!badge.cls.includes("ok"),
+      `a pasted document with no feed carries the live badge: ${badge.cls}`);
+    assert(/session-local/i.test(text) && /not receiving updates/i.test(text),
+      "the console does not say the document is session-local");
+    assertEqual(problems.length, 0, "page errors: " + problems.join(" | "));
+  } finally { await context.close(); }
+});
+
+test("a daily trend breaks across a calendar day nobody observed", async (browser) => {
+  const { context, page } = await openConsole(browser);
+  try {
+    // The producer emits buckets only for days that carried records, so two
+    // non-consecutive days arrive adjacent. Drawing them as neighbours would
+    // bridge the missing day the chart claims never to bridge.
+    const gapped = structuredClone(TELEMETRY);
+    gapped.byDay.buckets = gapped.byDay.buckets.filter(
+      (bucket) => bucket.key.day !== "2026-10-27");
+    assertEqual(gapped.byDay.buckets.length, 2, "the fixture no longer has three day buckets");
+    const problem = await page.evaluate(
+      (bundle) => window.__forgeConsole.loadTelemetry(bundle), gapped);
+    assertEqual(problem, "", "the gapped bundle was refused");
+    await page.locator("#bottom-nav .dest").nth(3).click();
+    await page.waitForTimeout(80);
+    const trend = await page.evaluate(() => {
+      const label = [...document.querySelectorAll('#view svg[role="img"]')]
+        .map((node) => node.getAttribute("aria-label"))
+        .find((text) => /per day/i.test(text)) || "";
+      const summary = [...document.querySelectorAll("#view .card")]
+        .map((node) => node.innerText).find((text) => /per day/i.test(text)) || "";
+      return { label, summary };
+    });
+    assert(trend.label.includes("2026-10-27"),
+      `the missing day is absent from the chart: ${trend.label}`);
+    assert(/2026-10-27: unknown|2026-10-27 unknown/.test(trend.label),
+      `the missing day is not reported unknown: ${trend.label}`);
+    assert(/1 with no observation|1 day with no observation/.test(trend.summary),
+      `the gap is not counted: ${JSON.stringify(trend.summary)}`);
+  } finally { await context.close(); }
+});
+
+test("an unobserved cost is never charted or announced as zero", async (browser) => {
+  const { context, page } = await openConsole(browser);
+  try {
+    const blind = structuredClone(TELEMETRY);
+    const bucket = blind.byModel.buckets[0];
+    bucket.actual.paygEquivalentUsd = { value: null, knownRecords: 0, unknownRecords: 3 };
+    const problem = await page.evaluate(
+      (bundle) => window.__forgeConsole.loadTelemetry(bundle), blind);
+    assertEqual(problem, "", "the bundle was refused");
+    await page.locator("#bottom-nav .dest").nth(3).click();
+    await page.waitForTimeout(80);
+    const model = bucket.key.model;
+    const chart = await page.evaluate((name) => {
+      const card = [...document.querySelectorAll("#view .card")]
+        .find((node) => /pay-as-you-go equivalent by model/i.test(node.innerText));
+      const svg = card?.querySelector('svg[role="img"]');
+      const row = [...(card?.querySelectorAll("svg .seg") || [])]
+        .map((node) => node.getAttribute("aria-label"))
+        .find((text) => text && text.startsWith(name));
+      return { label: svg?.getAttribute("aria-label") || "", text: card?.innerText || "", row };
+    }, model);
+    assert(!new RegExp(model + " 0(?!\\\\d)").test(chart.label),
+      `the accessible summary announces an unobserved cost as zero: ${chart.label}`);
+    assert(!new RegExp(model + " · 0(?!\\\\d)").test(chart.text),
+      `the visible label prints an unobserved cost as zero: ${JSON.stringify(chart.text)}`);
+    assert(chart.label.includes(model + " unknown") || chart.label.includes(model + ": unknown"),
+      `the summary does not report it unknown: ${chart.label}`);
+  } finally { await context.close(); }
+});
+
+test("an edited note reaches the desktop blockers view", async (browser) => {
+  const { context, page } = await openConsole(browser, { width: 1280, height: 900 });
+  try {
+    await page.locator('#tabs .tab:text("Blockers")').click();
+    await page.waitForTimeout(80);
+    const note = {
+      id: "note-1",
+      data: {
+        incidentId: "acme/forge!200",
+        projectId: "forge",
+        sourceProvider: "github",
+        status: "acknowledged",
+        note: "first wording",
+        at: "2026-10-29T09:00:00Z",
+      },
+    };
+    await page.evaluate((entry) => window.__store.deliverCollection("notes", [entry]), note);
+    await page.waitForTimeout(150);
+    const before = await page.evaluate(() => ({
+      sign: JSON.stringify(window.__forgeConsole.legacySignature),
+      text: document.querySelector("#view").innerText,
+    }));
+    // The same collection SIZE, different content. A signature built from
+    // counts alone is identical here, patch() keeps the old host, and the
+    // stale wording stays on screen for good.
+    const edited = structuredClone(note);
+    edited.data.note = "second wording";
+    edited.data.at = "2026-10-29T09:05:00Z";
+    await page.evaluate((entry) => window.__store.deliverCollection("notes", [entry]), edited);
+    await page.waitForTimeout(200);
+    const after = await page.evaluate(() => ({
+      sign: JSON.stringify(window.__forgeConsole.legacySignature),
+      text: document.querySelector("#view").innerText,
+    }));
+    assert(after.sign !== before.sign,
+      "a same-size collection edit left the legacy view signature unchanged, so the view "
+      + "would keep the stale note: " + after.sign);
+    if (before.text.includes("first wording")) {
+      assert(after.text.includes("second wording"),
+        "the edited note never reached the view; the stale wording is still showing");
+    }
+  } finally { await context.close(); }
+});
+
+test("a queued delivery cannot overtake a newer adoption", async (browser) => {
+  const { context, page } = await openConsole(browser);
+  try {
+    // Two deliveries back to back: the newer document must win, whichever
+    // order their digest verifications happen to settle in.
+    const winner = await page.evaluate(async (document_) => {
+      const older = structuredClone(document_);
+      const newer = structuredClone(document_);
+      const project = older.projects.find((entry) => (entry.active || []).length);
+      const index = older.projects.indexOf(project);
+      older.projects[index].active[0].activity = "older delivery";
+      newer.projects[index].active[0].activity = "newer delivery";
+      const [sealedOlder, sealedNewer] = await Promise.all(
+        [window.__reseal(older), window.__reseal(newer)]);
+      window.__store.deliver("snapshots/current", {
+        document: sealedOlder, loadedAt: "2026-10-29T09:00:00Z", loadedBy: "a",
+      });
+      window.__store.deliver("snapshots/current", {
+        document: sealedNewer, loadedAt: "2026-10-29T09:01:00Z", loadedBy: "b",
+      });
+      for (let tick = 0; tick < 100; tick += 1) {
+        await new Promise((resolve_) => setTimeout(resolve_, 10));
+      }
+      const text = document.querySelector("#view").innerText;
+      return {
+        older: text.includes("older delivery"),
+        newer: text.includes("newer delivery"),
+        error: document.querySelector("#view .banner.bad")?.innerText || "",
+      };
+    }, SNAPSHOT);
+    assertEqual(winner.error, "", "a delivery was refused");
+    assert(!winner.older, "the older queued delivery overtook the newer one");
+  } finally { await context.close(); }
+});
+
 /* ---------- runner ---------- */
 const browser = await chromium.launch({ args: ["--no-sandbox"] });
 let failed = 0;

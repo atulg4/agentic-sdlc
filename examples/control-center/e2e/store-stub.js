@@ -19,12 +19,21 @@
     data: () => docs.get(path) || null,
   });
 
-  const collection = () => {
+  const collections = new Map();
+  const collectionDocs = new Map();
+
+  const collection = (name) => {
     const query = {
       where: () => query,
       orderBy: () => query,
       limit: () => query,
-      onSnapshot: (next) => { try { next({ docs: [] }); } catch { /* ignored */ } return () => {}; },
+      onSnapshot: (next) => {
+        const bucket = collections.get(name) || [];
+        bucket.push(next);
+        collections.set(name, bucket);
+        try { next({ docs: collectionDocs.get(name) || [] }); } catch { /* ignored */ }
+        return () => {};
+      },
     };
     return query;
   };
@@ -46,6 +55,16 @@
       }
     },
     set(path, body) { docs.set(path, body); },
+    // Deliver a bounded collection window, the way the console's note and
+    // draft subscriptions receive one. Each entry is { id, data } so an
+    // adopter can tell a scoped document from a legacy one.
+    deliverCollection(name, entries) {
+      const shaped = entries.map((entry) => ({ id: entry.id, data: () => entry.data }));
+      collectionDocs.set(name, shaped);
+      for (const next of collections.get(name) || []) {
+        try { next({ docs: shaped }); } catch (error) { window.__store.lastThrow = error; }
+      }
+    },
   };
 
   const db = {

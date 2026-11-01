@@ -192,9 +192,12 @@ designs, and shrinking either into the other produces neither.
 
 Phone widths get a bottom bar with five destinations — Projects, Backlog,
 Agents, Cost, Effectiveness — and every touch target is at least 44×44 CSS px.
-The views that are not destinations (Snapshot, Add project) open as an overlay
-over whichever destination is showing. The desktop tab bar keeps every view it
-had, plus **All units** for the dense table.
+The views that are not destinations (Blockers, Add project, Snapshot) open as
+an overlay, reached from buttons on the Projects destination: their desktop
+tabs are hidden at this width, so without those the console would lose project
+registration and the whole blocker remediation workflow on a phone. The
+desktop tab bar keeps every view it had, plus **All units** for the dense
+table.
 
 ### What a backlog card shows
 
@@ -204,12 +207,18 @@ request, and a progress indicator that is a *position on the lifecycle rail* —
 failed, rolled back, cancelled, superseded) says so instead of being given a
 fraction. Every missing value reads `unknown`; none reads `0`.
 
-Tapping a card opens a drill-down: the lifecycle timeline with the current
-stage marked, time in the current state, worker and model, token and cost
-estimate versus actual, dependencies, and artifacts. Per-stage durations are
-reported as **unavailable**, because the snapshot carries the last transition
-instant rather than the full transition history — `sdlcctl project-state`
-reads that history from the event ledger.
+Tapping a card opens a drill-down: the lifecycle timeline, time in the current
+state, worker and model, token and cost estimate versus actual, dependencies,
+and artifacts.
+
+The timeline marks **only the current stage**. A stage earlier on the rail is
+labelled as exactly that, never as *passed*: the forward path has legal
+shortcuts — independent review straight to ready-for-human-merge, with no
+repair and no re-review; dependency-wait skipped entirely — and the snapshot
+carries the current stage rather than the transition history, so a position on
+a display rail cannot establish that a stage happened. Per-stage durations are
+reported **unavailable** for the same reason. `sdlcctl project-state` reads
+that history from the event ledger.
 
 ### Charts
 
@@ -222,16 +231,32 @@ colour or position alone.
 | View | Chart | Source |
 |---|---|---|
 | Projects, Backlog | lifecycle rail / funnel | the snapshot's stage census |
-| Agents | active agents by model, by worker, repair loops | the snapshot's work units |
+| Agents | active agents by model, by worker | the snapshot's **active** collection |
+| Agents | held work by why it is held, repair loops | the snapshot's work units |
 | Agents | queue and parallelism, model usage | `sdlcctl capacity-report` |
 | Cost | tokens and pay-as-you-go equivalent by model | `sdlcctl usage-report --group-by model` |
 | Cost | daily cost and runtime trend | `sdlcctl usage-report --group-by day` |
 | Effectiveness | outcome quality, accepted outcomes | `sdlcctl effectiveness-report` |
 
 A chart whose source document was not loaded reads **unavailable** and names
-the command that produces it. A daily trend never bridges a day nobody
-observed: the line breaks and the gap is marked, because an unmeasured day is
-not a zero one.
+the command that produces it. A figure the producer reported as unobserved
+(`value: null`) stays `unknown` everywhere it is written — the bar, the visible
+label and the accessible summary — and is left out of the chart's scale, so an
+unmeasured cost is never announced as zero dollars.
+
+**Active agents means executing.** Those two charts read the snapshot's
+`active` collection only. A blocked, failed, human-gated or dependency-waiting
+unit still names the model and worker that last touched it, and counting those
+would report execution that is not happening; held work gets its own chart
+instead, grouped by why it is held.
+
+A daily trend never bridges a day nobody observed. The usage report emits a
+bucket only for a day that carried records, so a quiet day is *absent* rather
+than zero — plotting the survivors side by side would hide exactly the quiet
+day a reader is looking for. Every calendar day between the first and last
+observation therefore gets a place on the axis, absent ones marked `?`, and the
+line breaks across them. A range longer than 400 days reads unavailable and
+says to narrow it with `--since`/`--until`.
 
 ### The telemetry bundle
 
@@ -268,8 +293,21 @@ Deliveries are **coalesced**: one verification runs at a time and the newest
 pending document wins. Verifying a document means digesting all of it, and a
 burst of deliveries is a burst of documents that supersede each other.
 Whatever is finally adopted is verified in full — structural validation and
-the `snapshotSha256` digest — and the adoption generation still orders it
-against a manual load.
+the `snapshotSha256` digest.
+
+Each delivery claims its adoption generation **when it arrives**, not when the
+drain reaches it. Stamping it at processing time would make a document that had
+been waiting *newer* than a manual load that adopted while it waited, and the
+older document would win.
+
+A view's signature covers everything it renders, including the contents of the
+store-backed note and draft collections. A note reworded or a draft replaced
+leaves the collection the same size, so a signature built from counts alone
+would keep the stale text on screen for good.
+
+**"Live" means a feed is established** — a store is present *and* has delivered.
+A document pasted into a tab with no store is labelled a session-local document
+that is not receiving updates, however fresh its own `generatedAt` reads.
 
 When the feed stops or goes quiet for 90 seconds, the console **re-reads a
 full snapshot by itself**. It cannot know what it missed, so it does not try

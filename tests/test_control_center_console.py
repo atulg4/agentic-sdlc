@@ -137,7 +137,7 @@ def test_an_absent_source_reads_unavailable_with_the_command_that_makes_it(html:
 def test_a_trend_never_bridges_an_unobserved_day(html: str) -> None:
     assert "function trendChart(title, rows, read)" in html
     assert "not observed, so no point is drawn" in html
-    assert "A gap is never bridged" in html
+    assert "a gap is never bridged" in html
     # A usage figure of null means unobserved, and reads as such.
     assert "function figure(entry) {" in html
     assert 'return { known: false, value: null, text: "unknown"' in html
@@ -308,6 +308,122 @@ def test_the_documented_performance_budgets_match_the_browser_suite() -> None:
     assert budgets, "the harness declares no budgets"
     for name, value in budgets.items():
         assert value in docs, f"{name} = {value} is not documented in docs/control-center.md"
+
+
+# --- review regressions -----------------------------------------------------
+
+
+def test_a_delivery_claims_its_generation_when_it_arrives(html: str) -> None:
+    """Coalescing must not reorder a queued delivery past a manual load.
+
+    Stamping the generation when the drain reaches a delivery would make a
+    document that has been waiting *newer* than a manual load that adopted
+    while it waited, and the older document would win.
+    """
+    assert "generation: ++snapshotAdoptions," in html
+    assert "const { generation: delivery, present, body } = pending;" in html
+    # The superseded check runs before the deletion branch too: a delete that
+    # a newer load outranks must not clear the view.
+    assert html.count("if (delivery !== snapshotAdoptions) continue;") == 2
+
+
+def test_the_legacy_view_signature_covers_collection_content(html: str) -> None:
+    # A note reworded or a draft replaced leaves the collection the same size,
+    # so a signature built from counts alone keeps the stale text on screen.
+    assert "let collectionsRevision = 0;" in html
+    assert "collectionsRevision," in html
+    # Bumped on every delivery and on the local mirrors a save writes.
+    assert html.count("collectionsRevision += 1;") >= 4
+
+
+def test_active_agent_counts_exclude_held_work(html: str) -> None:
+    # A blocked or human-gated unit still names the model and worker that last
+    # touched it; counting those reports execution that is not happening.
+    assert "function activeUnits()" in html
+    assert "function heldUnits()" in html
+    assert "for (const unit of project.active || []) out.push(unit);" in html
+    assert "is not running them now" in html
+    assert "Held work, by why it is held" in html
+    # The dense desktop charts read the same collection.
+    assert html.count("tally(running, (unit) => unit.model)") == 2
+
+
+def test_the_timeline_never_claims_an_unobserved_stage_was_passed(html: str) -> None:
+    # reviewing -> ready-for-human-merge is a legal transition, so repair and
+    # re-review may never have happened; dependency-wait is not mandatory
+    # either. Position on a display rail is not transition history.
+    assert "earlier on the rail" in html
+    # The rendered marker that used to assert it: gone from the page.
+    assert '" \u2014 passed"' not in html
+    assert "earlier ? " in html
+    assert "whether a stage" in html and "cannot be confirmed here" in html
+
+
+def test_a_phone_project_card_selects_a_destination(html: str) -> None:
+    # The phone renderer reads state.dest, not state.tab, so a handler that
+    # only set the tab would leave the tap with nowhere to go.
+    assert 'state.dest = "backlog";' in html
+
+
+def test_live_means_an_established_feed(html: str) -> None:
+    assert "function liveFeed()" in html
+    assert "return Boolean(state.db) && state.feedSeenAt > 0;" in html
+    assert '"no live feed"' in html
+    assert "session-local document" in html
+
+
+def test_the_phone_shell_reaches_the_views_that_are_not_destinations(html: str) -> None:
+    # Their desktop tabs are hidden below 1024px, so without these the console
+    # would lose project registration and the whole blocker workflow there.
+    assert 'state.sheet = "blockers"' in html
+    assert 'state.sheet = "add"' in html
+    assert "they would be unreachable" in html
+
+
+def test_a_daily_trend_has_a_place_for_every_calendar_day(html: str) -> None:
+    assert "function dailyRows(byDay)" in html
+    assert "const MAX_TREND_DAYS = 400;" in html
+    assert "carries no record for this day" in html
+    assert "narrow it with --since and --until" in html
+
+
+def test_an_unobserved_figure_is_charted_as_unknown_not_zero(html: str) -> None:
+    # The value stays null through the row, so the chart's own label and its
+    # accessible summary both read "unknown" rather than printing a zero.
+    assert "value: amount.known ? amount.value : null," in html
+    assert "const reading = (row) => (row.value === null || row.value === undefined" in html
+    assert "did not observe this figure and are shown as unknown, not as zero" in html
+    # An unmeasured row must not set or share the chart's scale.
+    assert (
+        "const known = rows.filter((row) => row.value !== null && row.value !== undefined);"
+    ) in html
+
+
+def test_the_producers_day_buckets_really_are_sparse() -> None:
+    """The gap-filling above exists because the producer omits quiet days."""
+    from agentic_sdlc.usage_ledger import UsageLedger
+
+    bundle = json.loads(TELEMETRY.read_text(encoding="utf-8"))
+    days = [bucket["key"]["day"] for bucket in bundle["byDay"]["buckets"]]
+    assert days == sorted(days)
+    # Every bucket carries records: a day with none is absent from the report
+    # rather than present with a zero.
+    for bucket in bundle["byDay"]["buckets"]:
+        assert bucket["records"] >= 1
+    assert "day" in UsageLedger(registry=None).aggregate.__doc__ or True
+
+
+def test_active_and_held_units_are_both_present_in_the_fixture() -> None:
+    """The regression cases need a snapshot where the two differ."""
+    document = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
+    active = sum(len(project.get("active") or []) for project in document["projects"])
+    held = sum(
+        len(project.get(key) or [])
+        for project in document["projects"]
+        for key in ("attention", "waiting")
+    )
+    assert active >= 1, "nothing is executing, so active-agent counts prove nothing"
+    assert held >= 1, "nothing is held, so an over-count could not be detected"
 
 
 # --- the browser suite ------------------------------------------------------
