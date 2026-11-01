@@ -159,6 +159,11 @@ from .project_registry import (
     read_project_registry,
 )
 from .scaffold import ScaffoldError, scaffold_project
+from .schedule_forecast import (
+    ScheduleForecastError,
+    build_schedule_forecast,
+    load_work_graph_document,
+)
 from .spec_stage import merge_spec, parse_draft
 from .task_spec import TaskSpecError, check_task_spec, draft_request, parse_task, render_prompt
 from .trusted_exec import GH_OVERRIDE_ENV as _GH_OVERRIDE_ENV
@@ -3073,6 +3078,21 @@ def _capacity_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def _schedule_forecast(args: argparse.Namespace) -> int:
+    graphs = load_work_graph_document(json.loads(Path(args.graph).read_text(encoding="utf-8")))
+    ledger = _read_usage_ledger(args.usage, args.registry, create=False)
+    _write(
+        build_schedule_forecast(
+            graphs,
+            ledger.records,
+            now=args.now,
+            project_ids=tuple(args.project_id) or None,
+        ),
+        args.output,
+    )
+    return 0
+
+
 def _validate_knowledge(args: argparse.Namespace) -> int:
     sources = load_sources(args.knowledge)
     _write(
@@ -4103,6 +4123,15 @@ def build_parser() -> argparse.ArgumentParser:
     capacity.add_argument("--output")
     capacity.set_defaults(handler=_capacity_report)
 
+    schedule_forecast = commands.add_parser("schedule-forecast")
+    schedule_forecast.add_argument("--graph", required=True)
+    schedule_forecast.add_argument("--usage", required=True)
+    schedule_forecast.add_argument("--now", required=True)
+    schedule_forecast.add_argument("--registry")
+    schedule_forecast.add_argument("--project-id", action="append", default=[])
+    schedule_forecast.add_argument("--output")
+    schedule_forecast.set_defaults(handler=_schedule_forecast)
+
     knowledge = commands.add_parser("validate-knowledge")
     knowledge.add_argument("--knowledge", required=True)
     knowledge.add_argument("--output")
@@ -4443,6 +4472,7 @@ def main(argv: list[str] | None = None) -> int:
         OrchestrationError,
         ProjectRegistryError,
         ScaffoldError,
+        ScheduleForecastError,
         LeaseError,
         UsageError,
         OSError,

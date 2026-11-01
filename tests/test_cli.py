@@ -2013,6 +2013,108 @@ def test_capacity_report_cli_fails_closed(tmp_path: Path) -> None:
     )
 
 
+def _work_graph_document(*, project_id: str = "proj") -> dict:
+    return {
+        "schemaVersion": 1,
+        "projects": {
+            project_id: {
+                "units": {
+                    "a": {
+                        "missionId": "m",
+                        "missionVersion": "1",
+                        "outputArtifact": "sha256:" + "a" * 64,
+                    },
+                    "b": {
+                        "missionId": "m",
+                        "missionVersion": "1",
+                        "outputArtifact": "sha256:" + "b" * 64,
+                        "dependsOn": ["a"],
+                    },
+                }
+            }
+        },
+    }
+
+
+def test_schedule_forecast_cli_reports_an_eta_and_critical_path(tmp_path: Path) -> None:
+    graph = tmp_path / "graph.json"
+    ledger = tmp_path / "usage.json"
+    record = tmp_path / "record.json"
+    output = tmp_path / "forecast.json"
+
+    graph.write_text(json.dumps(_work_graph_document()), encoding="utf-8")
+    for i, seconds in enumerate([10, 20, 30, 40, 50]):
+        document = _usage_document(f"run-a-{i}", project_id="proj")
+        document["workUnit"]["workUnitId"] = "a"
+        document["usageId"] = f"usage-a-{i}"
+        document["runId"] = f"run-a-{i}"
+        document["actual"] = {
+            "startedAt": "2026-10-28T00:00:00Z",
+            "finishedAt": "2026-10-28T00:00:00Z",
+            "runtimeSeconds": seconds,
+            "result": "completed",
+        }
+        record.write_text(json.dumps(document), encoding="utf-8")
+        assert main(["record-usage", "--ledger", str(ledger), "--record", str(record)]) == 0
+
+    command = [
+        "schedule-forecast",
+        "--graph",
+        str(graph),
+        "--usage",
+        str(ledger),
+        "--now",
+        "2026-10-29T00:00:00Z",
+    ]
+    assert main([*command, "--output", str(output)]) == 0
+    forecast = json.loads(output.read_text(encoding="utf-8"))
+    project = forecast["byProject"]["proj"]
+    assert project["criticalPath"]["p50"] == ["a", "b"]
+    assert project["units"]["a"]["expectedDuration"] == {
+        "p50": 30,
+        "p80": 40,
+        "p95": 50,
+        "sampleSize": 5,
+        "basis": "history",
+    }
+    assert project["units"]["b"]["blockingReason"] == "dependency_blocked"
+
+    # --project-id filters which projects are forecast.
+    assert main([*command, "--project-id", "ghost", "--output", str(output)]) == 2
+
+
+def test_schedule_forecast_cli_fails_closed(tmp_path: Path) -> None:
+    graph = tmp_path / "graph.json"
+    ledger = tmp_path / "usage.json"
+    graph.write_text(json.dumps(_work_graph_document()), encoding="utf-8")
+    ledger.write_text(
+        json.dumps({"schemaVersion": 1, "usageSchemaVersion": 1, "records": []}),
+        encoding="utf-8",
+    )
+
+    command = [
+        "schedule-forecast",
+        "--graph",
+        str(graph),
+        "--usage",
+        str(ledger),
+        "--now",
+        "2026-10-29T00:00:00Z",
+    ]
+    assert main(command) == 0
+
+    # A graph file with no projects at all is refused.
+    graph.write_text(json.dumps({"schemaVersion": 1, "projects": {}}), encoding="utf-8")
+    assert main(command) == 2
+
+    # An unparseable timestamp is refused.
+    graph.write_text(json.dumps(_work_graph_document()), encoding="utf-8")
+    assert main([*command[:-1], "not-a-timestamp"]) == 2
+
+    # A missing graph file is refused.
+    assert main([*command[:2], str(tmp_path / "absent.json"), *command[3:]]) == 2
+
+
 def test_control_center_joins_registry_backlog_and_incidents(tmp_path):
     registry = tmp_path / "registry.json"
     registry.write_text(
