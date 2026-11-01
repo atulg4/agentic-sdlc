@@ -269,7 +269,11 @@ jobs:
           CONFIG_PATH: ${{ inputs.config_path }}
         run: |
           set -euo pipefail
-          git diff --name-only "${BASE_SHA}...${HEAD_SHA}" > .agentic-review/changed-paths.txt
+          # --no-renames lists BOTH sides of a rename: a security-sensitive
+          # or policy-protected file moved to a neutral path must still
+          # select the security reviewer, and the default rename detection
+          # reports only the post-image name.
+          git diff --name-only --no-renames "${BASE_SHA}...${HEAD_SHA}" > .agentic-review/changed-paths.txt
           git show "${BASE_SHA}:${CONFIG_PATH}" > .agentic-review/trusted-policy.toml
           label_args=()
           while IFS= read -r label; do
@@ -323,6 +327,28 @@ jobs:
           test -s .agentic-review/change.diff
           diff_sha256=$(sha256sum .agentic-review/change.diff | cut -d' ' -f1)
           echo "sha256=$diff_sha256" >> "$GITHUB_OUTPUT"
+      - name: Seal trusted review inputs
+        id: seal
+        run: |
+          set -euo pipefail
+          # The reviewers run with a Write tool: a prompt-injected reviewer
+          # could rewrite packet.json (dropping an unmet acceptance
+          # criterion), the role selection, the schema, a checklist — or the
+          # installed engine the gate snippets import — before enforcement
+          # reads them. The combined digest of every trusted input is
+          # therefore recorded as a STEP OUTPUT, runner-held state that no
+          # later file write can alter, and verified after the reviews
+          # before any control file or engine import is trusted again. Only
+          # the review-<role>.json verdicts are legitimately written during
+          # review.
+          engine_dir=$(python3 -P -c 'import importlib.util; print(importlib.util.find_spec("agentic_sdlc").submodule_search_locations[0])')
+          digest=$(
+            {
+              find .agentic-review -type f ! -name 'review-*.json' -print0
+              find "$engine_dir" -type f -print0
+            } | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1
+          )
+          echo "sha256=$digest" >> "$GITHUB_OUTPUT"
       - name: Independently review the exact diff as code-reviewer
         uses: anthropics/claude-code-action@6fed3ca145920b639991cb756090506e1bcaf515 # v1
         env:
@@ -369,10 +395,23 @@ jobs:
       - name: Verify review scope and repository integrity
         env:
           EXPECTED_DIFF_SHA256: ${{ steps.review-diff.outputs.sha256 }}
+          EXPECTED_SEAL_SHA256: ${{ steps.seal.outputs.sha256 }}
           BASE_SHA: ${{ inputs.base_sha }}
           HEAD_SHA: ${{ inputs.head_sha }}
         run: |
           set -euo pipefail
+          # The seal FIRST: nothing below — the control files, the python
+          # snippets' engine imports, the gate evaluation — is trusted until
+          # every sealed input matches the digest recorded before the
+          # reviewers ran.
+          engine_dir=$(python3 -P -c 'import importlib.util; print(importlib.util.find_spec("agentic_sdlc").submodule_search_locations[0])')
+          digest=$(
+            {
+              find .agentic-review -type f ! -name 'review-*.json' -print0
+              find "$engine_dir" -type f -print0
+            } | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1
+          )
+          test "$digest" = "$EXPECTED_SEAL_SHA256"
           echo "${EXPECTED_DIFF_SHA256}  .agentic-review/change.diff" | sha256sum -c -
 
           # claude-code-action intentionally replaces executable agent-control

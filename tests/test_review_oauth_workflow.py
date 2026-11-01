@@ -215,6 +215,42 @@ def test_trusted_python_steps_cannot_import_candidate_code() -> None:
     assert "python3 -P -m pip install" in document
 
 
+def test_trusted_inputs_are_sealed_before_review_and_verified_after() -> None:
+    review = _review_job()
+    # The reviewers hold a Write tool (Codex 4434056699): a prompt-injected
+    # reviewer could rewrite packet.json, roles, schema, checklists, or the
+    # installed engine before enforcement reads them. The combined digest is
+    # recorded as a step output BEFORE the reviewers run and re-verified
+    # FIRST after them, so tampering fails closed.
+    seal = "Seal trusted review inputs"
+    invoke = "Independently review the exact diff as code-reviewer"
+    verify = "Verify review scope and repository integrity"
+    assert seal in review
+    assert review.index("sdlcctl context-packet") < review.index(seal) < review.index(invoke)
+    assert review.index(invoke) < review.index(verify)
+    # The digest covers every control file except the verdicts the
+    # reviewers legitimately write, plus the installed engine package —
+    # located without importing it, so a tampered engine never runs first.
+    assert review.count("find .agentic-review -type f ! -name 'review-*.json' -print0") == 2
+    assert review.count('find "$engine_dir" -type f -print0') == 2
+    assert 'importlib.util.find_spec("agentic_sdlc")' in review
+    assert "import agentic_sdlc, os" not in review
+    # Recorded as a step output (runner-held state no later file write can
+    # alter) and compared before anything else in the verification step.
+    assert "EXPECTED_SEAL_SHA256: ${{ steps.seal.outputs.sha256 }}" in review
+    seal_check = 'test "$digest" = "$EXPECTED_SEAL_SHA256"'
+    assert seal_check in review
+    assert review.index(seal_check) < review.index("sha256sum -c -")
+
+
+def test_role_selection_sees_both_sides_of_a_rename() -> None:
+    # A security-sensitive or policy-protected file renamed to a neutral
+    # path must still select the security reviewer: default rename
+    # detection lists only the post-image name (Codex 4434056701).
+    review = _review_job()
+    assert 'git diff --name-only --no-renames "${BASE_SHA}...${HEAD_SHA}"' in review
+
+
 def test_roles_are_selected_deterministically_and_recorded() -> None:
     review = _review_job()
     assert "sdlcctl review-roles" in review
