@@ -38,6 +38,7 @@ from .executors import (
     request_from_mission,
     route_executor,
 )
+from .knowledge import KnowledgeError, load_sources
 from .leases import IN_PROGRESS_LABEL, LEASE_BOT_LOGINS_ENV, publisher_bot_login_problem
 from .missions import MissionError, load_registry
 from .openai_compatible import PROVIDERS as OPENAI_COMPATIBLE_PROVIDERS
@@ -7927,6 +7928,24 @@ def doctor(
     if (base / ".github/workflows/ci.yml").exists() and (base / "agentic-sdlc.toml").exists():
         ci = _ci_problems(base)
         add(Check(f"ci.yml runs the policy gates as '{REQUIRED_CHECK}'", not ci, "; ".join(ci)))
+    if (base / ".github/workflows/agent-review.yml").exists():
+        # The independent review and repair workflows build #118 context
+        # packets from the COMMITTED knowledge.toml: a repo provisioned
+        # before the review gate existed has none, and every packet build
+        # there fails closed until one is committed.
+        try:
+            load_sources(base / "knowledge.toml")
+            add(Check("knowledge.toml declares the review packet's sources", True))
+        except (OSError, KnowledgeError, tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+            add(
+                Check(
+                    "knowledge.toml declares the review packet's sources",
+                    False,
+                    "the review/repair workflows build #118 context packets from "
+                    "committed knowledge.toml; commit one declaring at least one "
+                    f"[[source]] ({str(exc)[:160]})",
+                )
+            )
 
     policy = None
     try:
