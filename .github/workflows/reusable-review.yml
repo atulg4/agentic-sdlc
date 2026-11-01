@@ -376,7 +376,7 @@ jobs:
           )
           echo "sha256=$digest" >> "$GITHUB_OUTPUT"
       - name: Independently review the exact diff as code-reviewer
-        uses: anthropics/claude-code-action@6fed3ca145920b639991cb756090506e1bcaf515 # v1
+        uses: anthropics/claude-code-action@d70510b174a1244958df0b03166a54912811f3e6 # v1
         env:
           CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
         with:
@@ -408,7 +408,7 @@ jobs:
           echo "sha256=$(sha256sum .agentic-review/review-code-reviewer.json | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - name: Independently review the exact diff as security-reviewer
         if: contains(steps.roles.outputs.roles, 'security-reviewer')
-        uses: anthropics/claude-code-action@6fed3ca145920b639991cb756090506e1bcaf515 # v1
+        uses: anthropics/claude-code-action@d70510b174a1244958df0b03166a54912811f3e6 # v1
         env:
           CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
         with:

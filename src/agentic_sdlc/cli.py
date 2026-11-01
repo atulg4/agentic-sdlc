@@ -161,6 +161,7 @@ from .project_registry import (
 from .review_gate import enforce_reviews, select_repair_criteria, select_repair_findings
 from .review_roles import render_role_checklists, select_review_roles, selection_from_dict
 from .scaffold import ScaffoldError, scaffold_project
+from .schedule_forecast import build_schedule_forecast, load_forecast_document
 from .spec_stage import merge_spec, parse_draft
 from .task_spec import TaskSpecError, check_task_spec, draft_request, parse_task, render_prompt
 from .trusted_exec import GH_OVERRIDE_ENV as _GH_OVERRIDE_ENV
@@ -3221,6 +3222,28 @@ def _estimate_usage(args: argparse.Namespace) -> int:
     return 0
 
 
+def _schedule_forecast(args: argparse.Namespace) -> int:
+    registry = read_optional_project_registry(args.registry)
+    projects = load_forecast_document(json.loads(Path(args.graph).read_text(encoding="utf-8")))
+    if not registry.is_empty:
+        unregistered = sorted(project for project in projects if project not in registry)
+        if unregistered:
+            raise ValueError("graph names unregistered project(s): " + ", ".join(unregistered))
+    ledger = _read_usage_ledger(args.usage, args.registry, create=False)
+    _write(
+        build_schedule_forecast(
+            projects,
+            ledger.records,
+            policy=load_policy(args.policy),
+            now=args.now,
+            min_samples=args.min_samples,
+            project_ids=tuple(args.project_id) or None,
+        ),
+        args.output,
+    )
+    return 0
+
+
 def _capacity_report(args: argparse.Namespace) -> int:
     ledger = _read_usage_ledger(args.usage, args.registry, create=False)
     inputs = None
@@ -4336,6 +4359,17 @@ def build_parser() -> argparse.ArgumentParser:
     estimate_usage.add_argument("--plan-capacity-units", type=float)
     estimate_usage.add_argument("--output")
     estimate_usage.set_defaults(handler=_estimate_usage)
+
+    schedule_forecast = commands.add_parser("schedule-forecast")
+    schedule_forecast.add_argument("--graph", required=True)
+    schedule_forecast.add_argument("--usage", required=True)
+    schedule_forecast.add_argument("--policy", required=True)
+    schedule_forecast.add_argument("--now", required=True)
+    schedule_forecast.add_argument("--min-samples", type=int, default=5)
+    schedule_forecast.add_argument("--registry")
+    schedule_forecast.add_argument("--project-id", action="append", default=[])
+    schedule_forecast.add_argument("--output")
+    schedule_forecast.set_defaults(handler=_schedule_forecast)
 
     capacity = commands.add_parser("capacity-report")
     capacity.add_argument("--usage", required=True)
