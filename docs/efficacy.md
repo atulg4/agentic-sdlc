@@ -53,3 +53,14 @@ always exposes its components, weights, sample count, and limitations.
 The efficacy manager holds no merge, deploy, permission, or secret
 authority; its outputs are reports, proposals, and experiments that feed the
 #16 lifecycle and #20 intake queue as ordinary reviewable work.
+
+## Scope: pipeline, not product
+
+This module scores the *pipeline* — per-run outcomes, quality findings,
+bounded self-correction experiments, and policy promotion.
+`src/agentic_sdlc/effectiveness.py` scores the *product* of that pipeline:
+whether an intended capability was delivered, what it took per accepted
+outcome, and what was learned. The two are complementary and share no state —
+a `RunOutcome` is one agent run, an `OutcomeRecord` is one delivered outcome
+across however many runs produced it. See
+[docs/effectiveness.md](effectiveness.md).
