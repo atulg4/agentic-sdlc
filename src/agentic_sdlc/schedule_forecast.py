@@ -21,21 +21,25 @@ This module never dispatches, reorders, or changes concurrency, leases,
 routing, or policy. It only reads a work graph and usage history and reports
 what they already imply.
 
-Scope of what is derived versus declared: ``dependency_blocked`` and
-``conflicting_change_scope`` come straight from the work graph; ``unknown``
-and ``test_or_verification_failed`` come from the unit's own usage-record
-history. The remaining :class:`BlockingReason` values name causes this module
-cannot itself observe — human approval, policy, provider/subscription/runner
-capacity, budget, quality floor, environment and security/compliance gates
+Scope of what is derived versus declared: ``dependency_blocked`` comes
+straight from the work graph; ``exclusive_resource_locked`` comes from an
+actually held lease on a declared owned path or shared resource — the same
+resources ``work_graph.GraphExecutor`` leases, so this module invents no
+exclusion a composition strategy does not itself impose; ``unknown`` and
+``test_or_verification_failed`` come from the unit's own usage-record
+history. The remaining :class:`BlockingReason` values, including
+``conflicting_change_scope``, name causes this module cannot itself observe
+— human approval, policy, provider/subscription/runner capacity, budget,
+quality floor, environment, security/compliance, and real fan-in conflicts
 each live in a different subsystem (the event ledger, executors, gates,
-policy). A caller that has that evidence declares it through
-``declared_blocks``, the same "declare what the records cannot carry" pattern
-``CapacityInputs`` uses; what is not declared is never guessed.
+policy, the composition/fan-in step itself). A caller that has that
+evidence declares it through ``declared_blocks``, the same "declare what the
+records cannot carry" pattern ``CapacityInputs`` uses; what is not declared
+is never guessed.
 """
 
 from __future__ import annotations
 
-import fnmatch
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -183,34 +187,28 @@ def _finished_durations(records: Sequence[UsageRecord]) -> list[float]:
 
 
 def _duration_forecast(
-    class_samples: Sequence[float],
-    pooled_samples: Sequence[float],
+    tiers: Sequence[tuple[Sequence[float], DurationBasis]],
     declared_max_seconds: float,
     *,
     min_sample_size: int,
 ) -> DurationForecast:
     """Pick the narrowest basis that still has enough samples to trust.
 
-    Below ``min_sample_size`` real observations, a basis is not used at all —
-    not even to compute a degenerate, falsely narrow range — and the forecast
-    falls through to the next, broader source.
+    ``tiers`` is tried narrowest-first (the unit's own stage history, then
+    its project's stage-wide pool, then its project-wide pool, ...). Below
+    ``min_sample_size`` real observations, a tier is not used at all — not
+    even to compute a degenerate, falsely narrow range — and the forecast
+    falls through to the next, broader tier.
     """
-    if len(class_samples) >= min_sample_size:
-        return DurationForecast(
-            p50=quantile(class_samples, 0.50),
-            p80=quantile(class_samples, 0.80),
-            p95=quantile(class_samples, 0.95),
-            sample_size=len(class_samples),
-            basis=DurationBasis.HISTORY,
-        )
-    if len(pooled_samples) >= min_sample_size:
-        return DurationForecast(
-            p50=quantile(pooled_samples, 0.50),
-            p80=quantile(pooled_samples, 0.80),
-            p95=quantile(pooled_samples, 0.95),
-            sample_size=len(pooled_samples),
-            basis=DurationBasis.POOLED_HISTORY,
-        )
+    for samples, basis in tiers:
+        if len(samples) >= min_sample_size:
+            return DurationForecast(
+                p50=quantile(samples, 0.50),
+                p80=quantile(samples, 0.80),
+                p95=quantile(samples, 0.95),
+                sample_size=len(samples),
+                basis=basis,
+            )
     # No real evidence: scale the declared ceiling into a widening range
     # instead of repeating one number across p50/p80/p95, which would read as
     # a confident, zero-width forecast with no data behind it at all.
@@ -232,6 +230,9 @@ class _UnitStatus:
     active: bool
     stuck: BlockingReason | None  # TEST_OR_VERIFICATION_FAILED or UNKNOWN, else None
     current_stage: LifecycleStage
+    #: When active, the in-flight attempt's observed start — used to credit
+    #: elapsed time against its forecast rather than restarting the clock.
+    started_at: str = ""
 
 
 def _unit_status(records: Sequence[UsageRecord], spec: WorkUnitSpec) -> _UnitStatus:
@@ -255,10 +256,18 @@ def _unit_status(records: Sequence[UsageRecord], spec: WorkUnitSpec) -> _UnitSta
     if done:
         return _UnitStatus(done=True, active=False, stuck=None, current_stage=_DONE_STAGE)
 
-    latest = max(records, key=lambda record: (record.recorded_at, record.attempt))
-    if latest.actual is None or not latest.actual.finished_at:
-        # Dispatched but not yet observed finished: a run is in flight.
-        return _UnitStatus(done=False, active=True, stuck=None, current_stage=latest.stage)
+    # Compare parsed instants, not raw strings: differing but equivalent RFC
+    # 3339 offsets (``+02:00`` vs ``Z``) do not sort the same way as text.
+    latest = max(
+        records, key=lambda record: (_instant(record.recorded_at, "recordedAt"), record.attempt)
+    )
+    if latest.actual is None or latest.actual.result is UsageResult.UNKNOWN:
+        # No outcome recorded yet: a run is in flight, whether or not a
+        # finish timestamp happens to be populated.
+        started_at = latest.actual.started_at if latest.actual is not None else ""
+        return _UnitStatus(
+            done=False, active=True, stuck=None, current_stage=latest.stage, started_at=started_at
+        )
 
     if latest.actual.result is UsageResult.COMPLETED:
         # This attempt finished cleanly but has not reached the done stage
@@ -271,7 +280,9 @@ def _unit_status(records: Sequence[UsageRecord], spec: WorkUnitSpec) -> _UnitSta
     attempts_for_stage = max(
         (record.attempt for record in records if record.stage == latest.stage), default=1
     )
-    exhausted = attempts_for_stage >= max(spec.max_retries, 1)
+    # One initial attempt plus max_retries retries, matching MissionLedger's
+    # own "attempts >= max_retries + 1" exhaustion rule in missions.py.
+    exhausted = attempts_for_stage > spec.max_retries
     if not exhausted:
         # A retry is still available; this reads as active, not blocked —
         # the repair/retry loop owns dispatching the next attempt.
@@ -400,45 +411,6 @@ def load_work_graph_document(document: Any) -> dict[str, WorkGraph]:
 # -- blocking-reason derivation -------------------------------------------------
 
 
-def _writes_overlap(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
-    return any(
-        a == b or fnmatch.fnmatch(a, b) or fnmatch.fnmatch(b, a) for a in left for b in right
-    )
-
-
-def _conflicting_partner(
-    unit_id: str,
-    graph: WorkGraph,
-    done: Mapping[str, bool],
-) -> str | None:
-    """The unordered unit this one must wait behind for a shared write/resource.
-
-    A validated graph already orders or explicitly strategizes every
-    overlapping writer; this reports the still-pending case at forecast time:
-    an explicit composition strategy means the two units compose together
-    rather than depend on each other, so without a dependency edge, the one
-    that is not done yet still blocks the other from being called runnable.
-    Deterministic tie-break: the lexicographically smaller unit id proceeds.
-    """
-    spec = graph.get(unit_id)
-    for other_id, other in graph.units.items():
-        if other_id == unit_id or graph.ordered(unit_id, other_id):
-            continue
-        if done.get(other_id, False):
-            continue
-        shares_scope = _writes_overlap(spec.write_paths, other.write_paths) or bool(
-            set(spec.shared_resources) & set(other.shared_resources)
-        )
-        if not shares_scope:
-            continue
-        shared_strategy = (
-            spec.composition == other.composition and spec.composition != DEFAULT_COMPOSITION
-        )
-        if shared_strategy and other_id < unit_id:
-            return other_id
-    return None
-
-
 def _blocking_reason(
     unit_id: str,
     graph: WorkGraph,
@@ -448,7 +420,18 @@ def _blocking_reason(
     held_resources: Mapping[str, str],
 ) -> BlockingReason | None:
     """``None`` means runnable. Order matters: each rule is evidence this
-    module actually has; later rules never override an earlier, firmer one."""
+    module actually has; later rules never override an earlier, firmer one.
+
+    An explicit, shared composition strategy is deliberately *not* treated
+    as mutual exclusion: ``GraphExecutor.start`` leases only ``ownedPaths``
+    and ``sharedResources``, never ``writePaths``, so two units a validated
+    graph lets share a composition strategy over overlapping write scope are
+    free to run concurrently and compose afterward. Only an actual held
+    lease — the same resources the real executor leases — blocks a unit
+    here; this module invents no serialization a composition strategy does
+    not itself impose. A caller with real fan-in-conflict evidence declares
+    ``conflicting_change_scope`` directly.
+    """
     if done.get(unit_id, False):
         return None
     for ancestor in graph.ancestors[unit_id]:
@@ -460,12 +443,10 @@ def _blocking_reason(
     if declared is not None:
         return declared
     spec = graph.get(unit_id)
-    for resource in spec.shared_resources:
+    for resource in (*spec.owned_paths, *spec.shared_resources):
         holder = held_resources.get(resource, "")
         if holder and holder != unit_id:
             return BlockingReason.EXCLUSIVE_RESOURCE_LOCKED
-    if _conflicting_partner(unit_id, graph, done) is not None:
-        return BlockingReason.CONFLICTING_CHANGE_SCOPE
     return None
 
 
@@ -476,18 +457,40 @@ def _forward_pass(
     graph: WorkGraph,
     durations: Mapping[str, DurationForecast],
     done: Mapping[str, bool],
+    elapsed: Mapping[str, float],
     quantile_name: str,
-) -> tuple[dict[str, float], dict[str, str | None]]:
-    """One weighting's earliest-finish offsets (seconds from ``now``) and, for
-    each unit, which predecessor put it on the longest path to get there."""
+) -> tuple[dict[str, float], dict[str, float], dict[str, str | None]]:
+    """One weighting's start/finish offsets (seconds from ``now``) and, for
+    each unit, which predecessor put it on the longest path to get there.
+
+    ``elapsed`` carries, for a unit already observed running, how much of
+    its current stage has already passed: its remaining duration is credited
+    for that time rather than restarting the forecast's clock at ``now`` on
+    every refresh, and its start offset is its real (possibly negative, i.e.
+    already-past) start rather than a dependency-derived one — the real
+    world already dispatched it, independent of what the forward pass would
+    otherwise infer from its dependencies.
+    """
+    start_offset: dict[str, float] = {}
     finish: dict[str, float] = {}
     critical_predecessor: dict[str, str | None] = {}
     for unit_id in graph.order:
         spec = graph.get(unit_id)
-        remaining = 0.0 if done.get(unit_id, False) else getattr(durations[unit_id], quantile_name)
-        if not spec.depends_on:
+        duration_value = getattr(durations[unit_id], quantile_name)
+        is_done = done.get(unit_id, False)
+        if unit_id in elapsed:
+            # Already running: its start already happened — independent of
+            # what the forward pass would otherwise infer from dependencies,
+            # since the real world already dispatched it. Its finish credits
+            # that elapsed time against the *full* duration rather than
+            # restarting the clock at "now" on every refresh.
+            start = -elapsed[unit_id]
+            predecessor = None
+            finish_value = 0.0 if is_done else max(0.0, duration_value - elapsed[unit_id])
+        elif not spec.depends_on:
             start = 0.0
             predecessor = None
+            finish_value = 0.0 if is_done else duration_value
         else:
             # Ties break on the smaller unit id, so the reported path is
             # reproducible rather than depending on dict/set iteration order.
@@ -496,9 +499,12 @@ def _forward_pass(
                 dependency for dependency in spec.depends_on if finish[dependency] == best_finish
             )
             start = best_finish
-        finish[unit_id] = start + remaining
+            finish_value = start if is_done else start + duration_value
+        start_offset[unit_id] = start
+        finish[unit_id] = finish_value
         critical_predecessor[unit_id] = predecessor
-    return finish, critical_predecessor
+        critical_predecessor[unit_id] = predecessor
+    return start_offset, finish, critical_predecessor
 
 
 def _critical_path(
@@ -555,6 +561,12 @@ def _forecast_project(
     stuck = {
         unit_id: status.stuck for unit_id, status in statuses.items() if status.stuck is not None
     }
+    elapsed: dict[str, float] = {}
+    for unit_id, status in statuses.items():
+        if status.active and status.started_at:
+            elapsed[unit_id] = max(
+                0.0, (start - _instant(status.started_at, "startedAt")).total_seconds()
+            )
 
     pooled = _finished_durations(records)
     durations: dict[str, DurationForecast] = {}
@@ -566,8 +578,11 @@ def _forecast_project(
             [record for record in records if record.stage is status.current_stage]
         )
         durations[unit_id] = _duration_forecast(
-            class_samples,
-            stage_pool if stage_pool else pooled,
+            [
+                (class_samples, DurationBasis.HISTORY),
+                (stage_pool, DurationBasis.POOLED_HISTORY),
+                (pooled, DurationBasis.POOLED_HISTORY),
+            ],
             float(graph.get(unit_id).timeout_seconds),
             min_sample_size=min_sample_size,
         )
@@ -577,30 +592,39 @@ def _forecast_project(
         for unit_id in graph.units
     }
 
+    # A unit resolves at a time this module can compute only when neither it
+    # nor anything upstream of it is blocked for a reason with an unknown
+    # resolution time: dependency blocking alone still has a computable
+    # finish (as soon as the ancestor chain finishes), but it propagates any
+    # indeterminacy *that chain* carries, so a dependent never reports a
+    # concrete ETA built on an ancestor's unknown release time.
+    indeterminate: dict[str, bool] = {}
+    for unit_id in graph.order:
+        reason = blocking[unit_id]
+        own_indeterminate = reason is not None and reason is not BlockingReason.DEPENDENCY_BLOCKED
+        indeterminate[unit_id] = own_indeterminate or any(
+            indeterminate[dependency] for dependency in graph.get(unit_id).depends_on
+        )
+
     finish_by_quantile = {
-        name: _forward_pass(graph, durations, done, name) for name in ("p50", "p80", "p95")
+        name: _forward_pass(graph, durations, done, elapsed, name) for name in ("p50", "p80", "p95")
     }
 
     units_out: dict[str, Any] = {}
     for unit_id in graph.order:
-        finish50 = finish_by_quantile["p50"][0]
+        start50 = finish_by_quantile["p50"][0]
         duration = durations[unit_id]
-        earliest_start_offset = finish50[unit_id] - (0.0 if done[unit_id] else duration.p50)
         reason = blocking[unit_id]
-        # Dependency blocking resolves at a time this module can compute (as
-        # soon as the ancestor chain finishes); every other blocking reason
-        # resolves at a time outside this module's evidence, so the ETA
-        # fields stay null rather than implying a known clock.
-        computable = reason is None or reason is BlockingReason.DEPENDENCY_BLOCKED
+        computable = not indeterminate[unit_id]
         spec = graph.get(unit_id)
         units_out[unit_id] = {
             "unitId": unit_id,
             "projectId": project_id,
             "done": done[unit_id],
-            "earliestStart": at(earliest_start_offset) if computable else None,
+            "earliestStart": at(start50[unit_id]) if computable else None,
             "expectedDuration": duration.as_dict(),
             "etaRange": (
-                {name: at(finish_by_quantile[name][0][unit_id]) for name in ("p50", "p80", "p95")}
+                {name: at(finish_by_quantile[name][1][unit_id]) for name in ("p50", "p80", "p95")}
                 if computable
                 else {"p50": None, "p80": None, "p95": None}
             ),
@@ -611,15 +635,23 @@ def _forecast_project(
 
     critical_paths: dict[str, tuple[str, ...]] = {}
     for name in ("p50", "p80", "p95"):
-        finish, predecessor = finish_by_quantile[name]
+        _, finish, predecessor = finish_by_quantile[name]
         critical_paths[name] = _critical_path(finish, predecessor)
     for unit_id in critical_paths["p50"]:
         units_out[unit_id]["onCriticalPath"] = True
 
-    project_eta = {
-        name: at(max(finish_by_quantile[name][0].values(), default=0.0))
-        for name in ("p50", "p80", "p95")
-    }
+    project_eta = {}
+    for name in ("p50", "p80", "p95"):
+        path = critical_paths[name]
+        # The project's own ETA is only as firm as the unit it is longest
+        # through: if that unit's resolution time is unknown, so is the
+        # project's, rather than quietly assuming an indeterminate blocker
+        # clears immediately.
+        project_eta[name] = (
+            at(finish_by_quantile[name][1][path[-1]])
+            if path and not indeterminate[path[-1]]
+            else None
+        )
     blockers_by_reason: dict[str, list[str]] = {}
     active_count = 0
     queued_count = 0

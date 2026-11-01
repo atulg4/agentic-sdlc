@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 
 import pytest
 
@@ -91,6 +92,10 @@ def unit_out(doc: dict, project_id: str, unit_id: str) -> dict:
     return doc["byProject"][project_id]["units"][unit_id]
 
 
+def _parse_iso(value: str) -> datetime:
+    return datetime.fromisoformat(value)
+
+
 # -- hand-computed quantiles ----------------------------------------------------
 
 
@@ -138,6 +143,27 @@ def test_below_minimum_samples_falls_back_to_pooled_project_history() -> None:
     assert duration["sampleSize"] == 7
     # Real quantiles over the pooled 7 samples, not a narrow range from 2.
     assert duration["p50"] != duration["p95"]
+
+
+def test_an_insufficient_stage_pool_still_falls_through_to_the_project_pool() -> None:
+    # "a" has 1 sample of its own stage (implementation); the project's
+    # implementation-stage pool is also just that 1 sample, since "b" runs a
+    # different stage. Only the full, cross-stage project pool clears the
+    # minimum — the fallback must not stop at the insufficient stage pool.
+    g = graph(unit("a", timeout_seconds=1000), unit("b", timeout_seconds=1000))
+    records = [record("a", runtime_seconds=100)] + [
+        record(
+            "b",
+            stage=LifecycleStage.INDEPENDENT_REVIEW,
+            runtime_seconds=s,
+            recorded_at=f"2026-10-2{i}T00:00:00Z",
+        )
+        for i, s in enumerate([10, 20, 30, 40, 50])
+    ]
+    doc = build_schedule_forecast({"proj": g}, records, now=NOW, min_sample_size=5)
+    duration = unit_out(doc, "proj", "a")["expectedDuration"]
+    assert duration["basis"] == "pooled-history"
+    assert duration["sampleSize"] == 6
 
 
 def test_no_history_at_all_falls_back_to_a_widening_declared_limit_range() -> None:
@@ -267,7 +293,9 @@ def test_critical_path_recomputes_after_a_unit_completes() -> None:
 
 
 def test_critical_path_recomputes_after_a_unit_fails_and_retries() -> None:
-    g = graph(unit("a", timeout_seconds=100, max_retries=3))
+    # max_retries=2 allows 3 total attempts (one initial plus two retries),
+    # matching MissionLedger's own "attempts >= max_retries + 1" rule.
+    g = graph(unit("a", timeout_seconds=100, max_retries=2))
     failing = _fixed_duration_records("a", 10) + [
         record(
             "a",
@@ -278,7 +306,7 @@ def test_critical_path_recomputes_after_a_unit_fails_and_retries() -> None:
         )
     ]
     doc = build_schedule_forecast({"proj": g}, failing, now=NOW)
-    # A retry is still available (attempt 1 of 3): this reads as active.
+    # A retry is still available (attempt 1 of 3 allowed): this reads as active.
     assert unit_out(doc, "proj", "a")["blockingReason"] is None
 
     exhausted = failing + [
@@ -311,14 +339,17 @@ def test_dependency_blocked_from_an_unfinished_ancestor() -> None:
 
 
 def test_test_or_verification_failed_from_exhausted_review_retries() -> None:
+    # max_retries=1 allows 2 total attempts; both must fail to be exhausted.
     g = graph(unit("a", timeout_seconds=100, max_retries=1))
     records = [
         record(
             "a",
             stage=LifecycleStage.INDEPENDENT_REVIEW,
             result=UsageResult.FAILED,
-            attempt=1,
+            attempt=attempt,
+            recorded_at=f"2026-10-28T0{attempt}:00:00Z",
         )
+        for attempt in (1, 2)
     ]
     doc = build_schedule_forecast({"proj": g}, records, now=NOW)
     assert unit_out(doc, "proj", "a")["blockingReason"] == "test_or_verification_failed"
@@ -331,8 +362,10 @@ def test_unknown_from_exhausted_non_verification_retries() -> None:
             "a",
             stage=LifecycleStage.IMPLEMENTATION,
             result=UsageResult.FAILED,
-            attempt=1,
+            attempt=attempt,
+            recorded_at=f"2026-10-28T0{attempt}:00:00Z",
         )
+        for attempt in (1, 2)
     ]
     doc = build_schedule_forecast({"proj": g}, records, now=NOW)
     assert unit_out(doc, "proj", "a")["blockingReason"] == "unknown"
@@ -349,15 +382,19 @@ def test_exclusive_resource_locked_from_a_held_resource() -> None:
     assert unit_out(doc, "proj", "a")["blockingReason"] == "exclusive_resource_locked"
 
 
-def test_conflicting_change_scope_from_an_unordered_shared_composition_strategy() -> None:
+def test_a_shared_composition_strategy_alone_does_not_block_either_unit() -> None:
+    # GraphExecutor.start leases only ownedPaths/sharedResources, never
+    # writePaths, so two units sharing an explicit composition strategy over
+    # overlapping write scope are free to run concurrently in the real
+    # pipeline — this module must not invent a serialization that isn't
+    # actually enforced.
     g = graph(
         unit("a", timeout_seconds=100, write_paths=("src/x.py",), composition="last-writer"),
         unit("b", timeout_seconds=100, write_paths=("src/x.py",), composition="last-writer"),
     )
     doc = build_schedule_forecast({"proj": g}, [], now=NOW)
-    # "a" sorts first and proceeds; "b" waits behind it.
     assert unit_out(doc, "proj", "a")["blockingReason"] is None
-    assert unit_out(doc, "proj", "b")["blockingReason"] == "conflicting_change_scope"
+    assert unit_out(doc, "proj", "b")["blockingReason"] is None
 
 
 @pytest.mark.parametrize(
@@ -370,6 +407,7 @@ def test_conflicting_change_scope_from_an_unordered_shared_composition_strategy(
         BlockingReason.RUNNER_CAPACITY_EXHAUSTED,
         BlockingReason.BUDGET_BLOCKED,
         BlockingReason.QUALITY_FLOOR_UNMET,
+        BlockingReason.CONFLICTING_CHANGE_SCOPE,
         BlockingReason.ENVIRONMENT_UNAVAILABLE,
         BlockingReason.SECURITY_OR_COMPLIANCE_BLOCKED,
     ],
@@ -383,7 +421,14 @@ def test_every_declared_blocking_reason_is_reported_verbatim(reason: BlockingRea
 def test_unknown_is_never_counted_as_active_or_queued() -> None:
     g = graph(unit("a", timeout_seconds=100, max_retries=1))
     records = [
-        record("a", stage=LifecycleStage.IMPLEMENTATION, result=UsageResult.FAILED, attempt=1)
+        record(
+            "a",
+            stage=LifecycleStage.IMPLEMENTATION,
+            result=UsageResult.FAILED,
+            attempt=attempt,
+            recorded_at=f"2026-10-28T0{attempt}:00:00Z",
+        )
+        for attempt in (1, 2)
     ]
     doc = build_schedule_forecast({"proj": g}, records, now=NOW)
     project = doc["byProject"]["proj"]
@@ -394,7 +439,7 @@ def test_unknown_is_never_counted_as_active_or_queued() -> None:
 
 def test_a_runnable_unit_in_flight_counts_as_active_not_queued() -> None:
     g = graph(unit("a", timeout_seconds=100))
-    records = [record("a", runtime_seconds=None, finished=False)]
+    records = [record("a", runtime_seconds=None, result=UsageResult.UNKNOWN, finished=False)]
     doc = build_schedule_forecast({"proj": g}, records, now=NOW)
     project = doc["byProject"]["proj"]
     assert project["activeCount"] == 1
@@ -410,6 +455,83 @@ def test_declared_blocks_must_reference_a_real_unit() -> None:
             now=NOW,
             declared_blocks={"proj": {"does-not-exist": BlockingReason.POLICY_BLOCKED}},
         )
+
+
+def test_an_indeterminate_block_propagates_through_dependents_and_the_project_eta() -> None:
+    # "a" is blocked on something with no knowable resolution time; "b"
+    # depends on "a" and is itself only dependency_blocked. Even so, "b"'s
+    # ETA must not assume "a"'s approval arrives immediately, and neither
+    # should the project's own rollup ETA.
+    g = graph(unit("a", timeout_seconds=100), unit("b", depends_on=("a",), timeout_seconds=100))
+    doc = build_schedule_forecast(
+        {"proj": g},
+        [],
+        now=NOW,
+        declared_blocks={"proj": {"a": BlockingReason.HUMAN_APPROVAL_REQUIRED}},
+    )
+    assert unit_out(doc, "proj", "a")["etaRange"] == {"p50": None, "p80": None, "p95": None}
+    assert unit_out(doc, "proj", "b")["blockingReason"] == "dependency_blocked"
+    assert unit_out(doc, "proj", "b")["earliestStart"] is None
+    assert unit_out(doc, "proj", "b")["etaRange"] == {"p50": None, "p80": None, "p95": None}
+    assert doc["byProject"]["proj"]["etaRange"] == {"p50": None, "p80": None, "p95": None}
+    # The critical path is still reported structurally; only its timing is unknown.
+    assert doc["byProject"]["proj"]["criticalPath"]["p50"] == ["a", "b"]
+
+
+def test_recorded_at_offsets_are_compared_as_instants_not_text() -> None:
+    # A later UTC timestamp ("...09:00:00Z") can sort after an earlier one
+    # with a positive offset ("...10:00:00+02:00" == 08:00 UTC) as plain
+    # text; the actual instant order is the reverse.
+    g = graph(unit("a", timeout_seconds=100, max_retries=1))
+    earlier_but_textually_later = record(
+        "a",
+        stage=LifecycleStage.INDEPENDENT_REVIEW,
+        result=UsageResult.FAILED,
+        attempt=2,
+        recorded_at="2026-10-28T10:00:00+02:00",  # 08:00 UTC
+    )
+    later_but_textually_earlier = record(
+        "a",
+        stage=LifecycleStage.IMPLEMENTATION,
+        result=UsageResult.COMPLETED,
+        attempt=1,
+        recorded_at="2026-10-28T09:00:00Z",  # 09:00 UTC, genuinely later
+    )
+    doc = build_schedule_forecast(
+        {"proj": g}, [earlier_but_textually_later, later_but_textually_earlier], now=NOW
+    )
+    # The genuinely latest record completed cleanly; it is not misread as
+    # the exhausted-retry failure that happened earlier.
+    assert unit_out(doc, "proj", "a")["blockingReason"] is None
+
+
+def test_an_active_units_eta_credits_elapsed_time_instead_of_restarting() -> None:
+    g = graph(unit("a", timeout_seconds=1000))
+    history = [
+        record("a", runtime_seconds=100, recorded_at=f"2026-10-2{i}T00:00:00Z") for i in range(5)
+    ]
+    # Dispatched 40 seconds before "now", with a p50 history of 100s: about
+    # 60s of its own duration forecast should remain, not a fresh 100s.
+    in_flight = UsageRecord(
+        usage_id="a-impl-running",
+        work_unit=WorkUnitRef(project_id="proj", work_unit_id="a"),
+        stage=LifecycleStage.IMPLEMENTATION,
+        run_id="run-a-running",
+        attempt=1,
+        recorded_at=NOW,
+        actor=EventActor(name="claude", kind="agent"),
+        actual=UsageActual(
+            result=UsageResult.UNKNOWN,
+            started_at="2026-10-28T23:59:20Z",
+        ),
+    )
+    doc = build_schedule_forecast({"proj": g}, [*history, in_flight], now=NOW)
+    unit_doc = unit_out(doc, "proj", "a")
+    assert unit_doc["expectedDuration"]["p50"] == 100
+    remaining = (
+        _parse_iso(unit_doc["etaRange"]["p50"]) - _parse_iso(NOW.replace("Z", "+00:00"))
+    ).total_seconds()
+    assert 55 <= remaining <= 65
 
 
 # -- cross-project isolation ------------------------------------------------------
