@@ -28,7 +28,7 @@ def test_review_uses_subscription_oauth_without_paid_api_fallbacks() -> None:
 def test_trusted_workflow_materializes_and_hashes_exact_review_diff() -> None:
     review = _review_job()
     materialize = "Materialize exact immutable review diff"
-    invoke = "Independently review the exact diff with Claude Max OAuth"
+    invoke = "Independently review the exact diff as code-reviewer"
 
     assert materialize in review
     assert 'git diff --find-renames "${BASE_SHA}...${HEAD_SHA}"' in review
@@ -41,7 +41,7 @@ def test_trusted_workflow_materializes_and_hashes_exact_review_diff() -> None:
 def test_sandbox_is_prepared_and_verified_before_isolated_claude_review() -> None:
     review = _review_job()
     install = "Install and verify Claude subprocess isolation"
-    invoke = "Independently review the exact diff with Claude Max OAuth"
+    invoke = "Independently review the exact diff as code-reviewer"
 
     assert install in review
     assert "sudo apt-get -o DPkg::Lock::Timeout=300 install -y -q bubblewrap socat" in review
@@ -95,7 +95,7 @@ def test_review_scope_and_repository_mutation_are_deterministically_verified() -
     assert "unexpected tracked repository mutation during review" in review
     assert "git ls-files --others --exclude-standard" in review
     assert "actual == expected" in review
-    assert "'schema.json', 'change.diff', 'review.json'" in review
+    assert "expected.add(f'review-{role}.json')" in review
 
 
 def test_expected_claude_action_hardening_is_narrow_and_base_pinned() -> None:
@@ -135,3 +135,73 @@ def test_ai_review_job_remains_read_only_to_repository() -> None:
     assert "contents: write" not in review
     assert "pull-requests: write" not in review
     assert "issues: write" not in review
+
+
+# Issue #119: role-aware, acceptance-criteria-aware review gates.
+
+
+def test_review_prompt_content_comes_from_the_context_packet() -> None:
+    review = _review_job()
+    # The task sections, policy limits, diff summary and trusted gate report
+    # reach the reviewer through the #118 packet contract, built by the
+    # pinned engine against the authenticated review target — the workflow
+    # never re-parses the issue into the prompt.
+    assert "sdlcctl context-packet" in review
+    assert "--review-target-repository" in review
+    assert "--prompt-output .agentic-review/context.md" in review
+    assert "Read .agentic-review/context.md" in review
+    assert "--gate-sandbox trusted-host" in review
+    # The issue text is bound as DATA for the packet request; nothing splices
+    # it into prompt text.
+    assert "request.json" in review
+    assert "${{ inputs.head_sha }}" in review
+
+
+def test_roles_are_selected_deterministically_and_recorded() -> None:
+    review = _review_job()
+    assert "sdlcctl review-roles" in review
+    assert "--changed-paths-file .agentic-review/changed-paths.txt" in review
+    # The policy whose protected paths escalate to the security reviewer is
+    # the BASE-committed one, never the candidate head's.
+    assert 'git show "${BASE_SHA}:${CONFIG_PATH}"' in review
+    assert "--config .agentic-review/trusted-policy.toml" in review
+    # The selection travels with the review run.
+    assert ".agentic-review/roles.json" in review
+
+
+def test_the_security_reviewer_runs_conditionally_with_its_own_checklist() -> None:
+    review = _review_job()
+    assert "Independently review the exact diff as security-reviewer" in review
+    assert "contains(steps.roles.outputs.roles, 'security-reviewer')" in review
+    assert "checklist-code-reviewer.md" in review
+    assert "checklist-security-reviewer.md" in review
+    # Reviewers get no write instructions: both prompts forbid modification.
+    assert review.count("Do not modify repository files.") == 2
+
+
+def test_the_schema_is_the_versioned_platform_schema() -> None:
+    review = _review_job()
+    assert "from agentic_sdlc.review_gate import load_review_schema" in review
+    assert "schemaVersion 2" in review
+    assert "acceptanceCriteriaVerdict" in review
+
+
+def test_the_gate_is_computed_by_the_pinned_engine_and_applied_without_checkout() -> None:
+    document = WORKFLOW.read_text(encoding="utf-8")
+    review = _review_job()
+    enforce = document[document.index("\n  enforce_review:\n") :]
+    assert "from agentic_sdlc.review_gate import enforce_reviews" in review
+    assert ".agentic-review/gate.json" in review
+    # The publisher job stays checkout-free: it applies the recorded
+    # decision, it never recomputes it beside candidate code.
+    assert "actions/checkout" not in enforce
+    assert "jq -e '.allowed == true'" in enforce
+    assert "jq -e --arg head \"$HEAD_SHA\" '.headSha == $head'" in enforce
+
+
+def test_every_selected_role_must_produce_a_structurally_valid_review() -> None:
+    review = _review_job()
+    assert "Verify every selected role produced a structurally valid review" in review
+    assert "_structural_errors(document)" in review
+    assert "document['role'] == role" in review
+    assert "document['headSha'] == os.environ['HEAD_SHA']" in review
