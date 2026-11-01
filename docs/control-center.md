@@ -179,6 +179,191 @@ Parent links come from the declared `PARENT=path` pairing or from GitHub's
 `parent_issue_url` on each sub-issue — never from a title or a checklist. An
 epic is recognised from the title convention or from owning sub-issues.
 
+## The console: mobile-first, chart-first
+
+`examples/control-center/control-center.html` is a single file with no
+framework and no build step. Below 1024px it renders a **phone shell** built
+from its own components; at and above it, a **dense analytical view**. These
+are two component trees, not one layout at two widths: a backlog that reads
+well under a thumb and a table that reads well on a monitor are different
+designs, and shrinking either into the other produces neither.
+
+### Navigation
+
+Phone widths get a bottom bar with five destinations — Projects, Backlog,
+Agents, Cost, Effectiveness — and every touch target is at least 44×44 CSS px.
+The views that are not destinations (Blockers, Add project, Snapshot) open as
+an overlay, reached from buttons on the Projects destination: their desktop
+tabs are hidden at this width, so without those the console would lose project
+registration and the whole blocker remediation workflow on a phone. The
+desktop tab bar keeps every view it had, plus **All units** for the dense
+table.
+
+### What a backlog card shows
+
+Stage, state, blocker, model, worker, time in the current state, the change
+request, and a progress indicator that is a *position on the lifecycle rail* —
+"stage 6 of 14 · implementation". A unit in an off-rail state (blocked,
+failed, rolled back, cancelled, superseded) says so instead of being given a
+fraction. Every missing value reads `unknown`; none reads `0`.
+
+Tapping a card opens a drill-down: the lifecycle timeline, time in the current
+state, worker and model, token and cost estimate versus actual, dependencies,
+and artifacts.
+
+The timeline marks **only the current stage**. A stage earlier on the rail is
+labelled as exactly that, never as *passed*: the forward path has legal
+shortcuts — independent review straight to ready-for-human-merge, with no
+repair and no re-review; dependency-wait skipped entirely — and the snapshot
+carries the current stage rather than the transition history, so a position on
+a display rail cannot establish that a stage happened. Per-stage durations are
+reported **unavailable** for the same reason. `sdlcctl project-state` reads
+that history from the event ledger.
+
+### Charts
+
+Inline SVG, drawn before the prose that explains them, and each one is a
+single accessible image: `role="img"` with an `aria-label` that states the
+finding in words. Every segment is focusable, opens its tooltip on focus as
+well as hover, and carries its figure as text, so nothing is conveyed by
+colour or position alone.
+
+| View | Chart | Source |
+|---|---|---|
+| Projects, Backlog | lifecycle rail / funnel | the snapshot's stage census |
+| Agents | active agents by model, by worker | the snapshot's **active** collection |
+| Agents | held work by why it is held, repair loops | the snapshot's work units |
+| Agents | queue and parallelism, model usage | `sdlcctl capacity-report` |
+| Cost | tokens and pay-as-you-go equivalent by model | `sdlcctl usage-report --group-by model` |
+| Cost | daily cost and runtime trend | `sdlcctl usage-report --group-by day` |
+| Effectiveness | outcome quality, accepted outcomes | `sdlcctl effectiveness-report` |
+
+A chart whose source document was not loaded reads **unavailable** and names
+the command that produces it. A figure the producer reported as unobserved
+(`value: null`) stays `unknown` everywhere it is written — the bar, the visible
+label and the accessible summary — and is left out of the chart's scale, so an
+unmeasured cost is never announced as zero dollars.
+
+**Active agents means executing.** Those two charts read the snapshot's
+`active` collection only. A blocked, failed, human-gated or dependency-waiting
+unit still names the model and worker that last touched it, and counting those
+would report execution that is not happening; held work gets its own chart
+instead, grouped by why it is held.
+
+A daily trend never bridges a day nobody observed. The usage report emits a
+bucket only for a day that carried records, so a quiet day is *absent* rather
+than zero — plotting the survivors side by side would hide exactly the quiet
+day a reader is looking for. Every calendar day between the first and last
+observation therefore gets a place on the axis, absent ones marked `?`, and the
+line breaks across them. A range longer than 400 days reads unavailable and
+says to narrow it with `--since`/`--until`.
+
+### The telemetry bundle
+
+The console computes no telemetry. The Cost, Agents and Effectiveness views
+render documents the CLI already emits, pasted together as one optional
+bundle:
+
+```json
+{ "schemaVersion": 1,
+  "byModel":    "<sdlcctl usage-report --group-by model>",
+  "byDay":      "<sdlcctl usage-report --group-by day>",
+  "byWorkUnit": "<sdlcctl usage-report --group-by project --group-by workUnit>",
+  "capacity":   "<sdlcctl capacity-report ...>",
+  "effectiveness": "<sdlcctl effectiveness-report ...>" }
+```
+
+Every section is optional. The bundle is validated fail-closed on the way in —
+an unsupported version, an unknown section, an over-budget collection, a
+credential-shaped value or a secret-shaped key is refused rather than rendered
+— and it is never written to the shared store: it is a per-viewer analysis
+aid, and it can be far larger than one snapshot. `tokens`, `totalTokens` and
+`cacheReadTokens` are the usage ledger's own figures and are *not* treated as
+credentials; `token`, `apiToken` and their kin are.
+
+### Live updates
+
+Deliveries patch the DOM rather than replacing the view. Each section carries
+a key and a signature of the data it renders; a section whose signature is
+unchanged is not rebuilt, and a work-unit card is not even *constructed*. So
+the scroll position, the focused control and an open drill-down all survive an
+update.
+
+Deliveries are **coalesced**: one verification runs at a time and the newest
+pending document wins. Verifying a document means digesting all of it, and a
+burst of deliveries is a burst of documents that supersede each other.
+Whatever is finally adopted is verified in full — structural validation and
+the `snapshotSha256` digest.
+
+Each delivery claims its adoption generation **when it arrives**, not when the
+drain reaches it. Stamping it at processing time would make a document that had
+been waiting *newer* than a manual load that adopted while it waited, and the
+older document would win.
+
+A view's signature covers everything it renders, including the contents of the
+store-backed note and draft collections. A note reworded or a draft replaced
+leaves the collection the same size, so a signature built from counts alone
+would keep the stale text on screen for good.
+
+**"Live" means a feed is established** — a store is present *and* has delivered.
+A document pasted into a tab with no store is labelled a session-local document
+that is not receiving updates, however fresh its own `generatedAt` reads.
+
+When the feed stops or goes quiet for 90 seconds, the console **re-reads a
+full snapshot by itself**. It cannot know what it missed, so it does not try
+to catch up from deltas. Until the replacement verifies, the last-good view
+stays on screen labelled with the instant it was good, so a degraded console
+never passes for a live one.
+
+A unit list is bounded: 50 cards on a phone, 200 rows on the desktop, ordered
+attention-first, with a control that says how many of how many are showing. A
+phone that lays out five hundred cards spends its frame budget on rows nobody
+scrolled to, and every later delivery pays that cost again.
+
+### Motion
+
+Only `opacity` and `transform` are animated — the two properties a compositor
+can run off the main thread — and no state change is conveyed by motion alone.
+`@media (prefers-reduced-motion: reduce)` disables every transition and
+animation in the page.
+
+### Performance budgets
+
+Measured by the browser suite against the example fixtures, and enforced by it:
+
+| Budget | Limit |
+|---|---|
+| Initial render of a 500-unit snapshot (validated, digest-verified, rendered) | **1000** ms |
+| Longest single task on the main thread | **400** ms |
+| A burst of 100 live deliveries, applied | **6000** ms |
+| Mean latency of one delivery in that burst | **60** ms |
+| DOM elements one single-unit change may insert | **40** |
+
+The suite also reports each delivery's phases — validate, verify, adopt,
+render — so a regression says *which* phase got slower rather than only that
+something did.
+
+### Testing the console
+
+`examples/control-center/e2e/console.e2e.mjs` drives the real page in bundled
+Chromium against the fixtures in `examples/control-center/`, through a fake
+store injected before the console's own module runs. It covers the phone
+viewports (360×780, 390×844, 412×915), the five destinations, touch-target
+sizes, an accessibility audit, the drill-down, duplicate and single-unit
+deliveries, feed recovery, reduced motion, credential refusal, the performance
+budgets, and the dense desktop view.
+
+```sh
+node examples/control-center/e2e/console.e2e.mjs
+```
+
+`tests/test_control_center_console.py` runs it, and **skips** when Node or
+Playwright is absent: this project ships no JavaScript dependency and its CI
+image carries no browser, so a browser check cannot be a required one. The
+same file also pins the console's structural contracts — the rail matching the
+producer's own lifecycle stages, the budgets matching this document, the
+credential rules — and those run everywhere.
+
 ## What the Control Center deliberately cannot do
 
 The read model is read-only by construction, and a console built on it inherits
