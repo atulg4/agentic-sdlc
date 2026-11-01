@@ -42,7 +42,14 @@ it concerns, and a bounded payload.
 - **Replay is idempotent.** A frame already recorded is recognised by its
   `eventId` and changes nothing, so a redelivered event, a retried flush or a
   double-subscribed client cannot double-count. The same ID with a *different*
-  payload fails closed.
+  payload fails closed — including through `record`, which builds the frame at
+  the known sequence and compares it rather than returning the stored one, so a
+  producer that changed the content is told instead of being quietly ignored.
+- **A frame only reconciles what it could have changed.** A digest that differs
+  is tolerated only when the pending frames carry content — a change or a
+  snapshot. A pending heartbeat says *nothing changed*, so it can never explain
+  a difference, and treating it as if it could would hand the client the current
+  digest while its stale view went undetected.
 - **A cursor that cannot be served says so.** Retention is bounded. A client
   resuming from before the window gets a `reset` frame naming the reason and
   the frames that were dropped, then a full snapshot — never a silent
@@ -121,6 +128,18 @@ an hour ago on another runner is still the report. It is validated fail-closed
 on the way in: an unsupported version, an unknown section, a secret-shaped key
 or a credential-shaped value is refused rather than rendered.
 
+### Scope and the portfolio's own aggregates
+
+`project_ids` narrows every section at once. The per-project breakdown filters
+cleanly, but a report's **portfolio-wide** figures — a first-pass rate, a
+time-to-live percentile, a value per unit of effort — are aggregates over the
+whole population it measured. They cannot be re-derived for a subset, and this
+overlay adds no arithmetic of its own, so under a partial scope they are
+reported as `portfolio.status: "unavailable"` with the reason. A scoped console
+is never shown the portfolio's number wearing one project's label, and the
+reason names no project it cannot already see. A scope covering the whole
+report gets them as published.
+
 ### Unknown is never a zero
 
 A section with no data behind it reports `status: "unknown"` with the reason:
@@ -140,14 +159,21 @@ asserts they match.
 
 ## Historical ranges and export
 
-`filter_usage_window` narrows telemetry to a half-open time range, comparing
-**instants** rather than strings — RFC 3339 offsets and fractional seconds do
-not sort chronologically as text, and an inverted window fails closed.
+`filter_usage_window` narrows telemetry to a half-open range — the lower bound
+included, the upper excluded — comparing **instants** rather than strings. RFC
+3339 offsets and fractional seconds do not sort chronologically as text, an
+inverted window fails closed, and a window whose bounds coincide contains
+nothing. Half-open matters for the common case: adjacent months *partition* the
+records, so a run that finished exactly at midnight is counted once rather than
+in both.
 
 `export_control_center` produces one self-contained document — snapshot,
 telemetry and stream state — for offline analysis. The snapshot keeps its own
 content digest, so an exported file can be checked against the console that
-produced it rather than trusted.
+produced it rather than trusted. A scoped export carries a scoped frame log:
+its frames are filtered, so it declares `scopedTo` and is a **view**, which
+`StreamLog.from_dict` refuses to rehydrate rather than failing later on a gap
+in the sequence it was never going to have.
 
 ## No credentials, ever
 
@@ -183,6 +209,11 @@ sdlcctl control-center --usage usage.json \
   --since 2026-10-01T00:00:00Z --until 2026-11-01T00:00:00Z \
   --telemetry-output october.json
 ```
+
+A supplied `--stream` is read, never probed: an unreadable or absent path fails
+rather than standing in an empty log, because "nothing happened since your
+cursor" and "the frames could not be consulted" are different answers. It is
+also an input, so it cannot double as an output destination.
 
 Each output flag owns one document. The snapshot still defaults to stdout when
 no other output is requested, so a caller who wants only the reconnect

@@ -29,6 +29,9 @@ module adds no arithmetic of its own to break them:
   ``status: "unknown"`` with the reason, never a zero.
 - **Subscriptions are not dollars**, and remaining plan capacity appears only
   where a provider actually reported it.
+- **An aggregate is not re-derived for a subset.** A report's portfolio-wide
+  figures cover the population it measured, so under a partial project scope
+  they are withheld with a reason rather than relabeled as that scope's.
 - **Freshness is labeled.** Every overlay carries the instant its data was last
   good, so a console shows "as of" rather than implying live truth.
 - **No credentials.** The overlay is serialized to a browser, so every
@@ -217,7 +220,7 @@ def filter_usage_window(
         occurred = parse_timestamp(record.occurred_at, f"usage {record.usage_id} occurredAt")
         if after is not None and occurred < after:
             continue
-        if before is not None and occurred > before:
+        if before is not None and occurred >= before:
             continue
         kept.append(record)
     return tuple(kept)
@@ -329,16 +332,54 @@ def _effectiveness_section(
     }
     return {
         "status": "observed",
-        "sampleCount": document.get("sampleCount"),
         "window": document.get("window"),
+        "byProject": scoped,
+        "portfolio": _effectiveness_portfolio(document, by_project, scope),
+        "limitations": list(document.get("limitations") or ()),
+    }
+
+
+def _effectiveness_portfolio(
+    document: Mapping[str, Any],
+    by_project: Mapping[str, Any],
+    scope: frozenset[str] | None,
+) -> dict[str, Any]:
+    """The report's portfolio-wide figures, offered only where they apply.
+
+    These are aggregates the report computed over its own population: a
+    first-pass rate, a time-to-live percentile, a value per unit of effort.
+    None of them can be re-derived from a subset, and this overlay adds no
+    arithmetic of its own, so when the caller's scope covers only part of the
+    report the honest answer is that the figures are unavailable -- never the
+    portfolio's number wearing one project's label.
+    """
+    if scope is not None and not by_project:
+        return {
+            "status": "unavailable",
+            "reason": (
+                "the report carries no per-project breakdown, so its "
+                "portfolio-wide figures cannot be attributed to a scope"
+            ),
+        }
+    if scope is not None and not scope.issuperset(by_project):
+        return {
+            "status": "unavailable",
+            "reason": (
+                "these are aggregates over the whole report, which covers "
+                "projects outside this scope; they cannot be re-derived for a "
+                "narrower one"
+            ),
+            "scopedProjectCount": len(scope.intersection(by_project)),
+        }
+    return {
+        "status": "observed",
+        "sampleCount": document.get("sampleCount"),
         "outcomes": document.get("outcomes"),
         "quality": document.get("quality"),
         "observations": document.get("observations"),
         "value": document.get("value"),
         "estimateVsActual": document.get("estimateVsActual"),
         "learnings": document.get("learnings"),
-        "byProject": scoped,
-        "limitations": list(document.get("limitations") or ()),
     }
 
 
@@ -426,6 +467,8 @@ def build_telemetry_overlay(
             "every figure is composed from the usage, capacity and effectiveness "
             "layers; this overlay adds no arithmetic of its own",
             "a section with no data behind it reads unknown with its reason, never as a zero",
+            "portfolio-wide effectiveness figures are offered only where the scope "
+            "covers the whole report; a subset cannot re-derive them",
             "subscription usage is a labeled pay-as-you-go equivalent and is never "
             "presented as billed dollars",
             "remaining plan capacity appears only where a provider reported it",

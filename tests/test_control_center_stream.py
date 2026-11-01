@@ -540,3 +540,87 @@ def test_a_large_stream_stays_bounded_and_resumable() -> None:
     )
     assert response["mode"] == "snapshot"
     assert response["resetReason"] == ResetReason.BEYOND_RETENTION.value
+
+
+# --- regressions ------------------------------------------------------------
+
+
+def test_a_pending_heartbeat_does_not_explain_a_stale_digest() -> None:
+    """A heartbeat says nothing changed, so it cannot account for a difference.
+
+    Treating one as reconciling would resume the client, hand it the current
+    digest, and leave its stale content undetected for good.
+    """
+    log = StreamLog()
+    log.record(FrameKind.CHANGE, event_id="f-1", project_id="forge", change=ChangeKind.WORK_UNIT)
+    log.record(FrameKind.HEARTBEAT, event_id="hb-1", occurred_at=NOW)
+    snapshot = _snapshot()
+    cursor = StreamCursor(sequence=1, snapshot_sha256="b" * 64)
+
+    response = build_reconnect_response(
+        log, snapshot, cursor=cursor, observed_at=NOW, age_seconds=5
+    )
+
+    assert response["mode"] == "snapshot"
+    assert response["resetReason"] == ResetReason.SNAPSHOT_MISMATCH.value
+    assert response["snapshot"] is not None
+
+
+def test_recording_a_known_event_id_with_new_content_fails_closed() -> None:
+    """``record`` must not silently discard the new content of a replay.
+
+    The same ID with a different payload is a producer bug, and answering with
+    the stored frame would make the caller believe its change was recorded.
+    """
+    log = _log(frames=1)
+
+    with pytest.raises(ControlCenterError, match="already recorded with a different payload"):
+        log.record(
+            FrameKind.CHANGE,
+            event_id="f-1",
+            project_id="forge",
+            change=ChangeKind.WORK_UNIT,
+            occurred_at=NOW,
+            work_unit_id="wu-1",
+            payload={"state": "done"},
+        )
+
+    assert log.frames[0].payload == {"state": "implementing"}
+
+
+def test_a_scoped_log_document_carries_only_its_projects_frames() -> None:
+    log = StreamLog()
+    log.record(
+        FrameKind.CHANGE, event_id="f-forge", project_id="forge", change=ChangeKind.WORK_UNIT
+    )
+    log.record(
+        FrameKind.CHANGE, event_id="f-atlas", project_id="atlas", change=ChangeKind.WORK_UNIT
+    )
+    log.record(FrameKind.HEARTBEAT, event_id="hb-1", occurred_at=NOW)
+
+    document = log.as_dict(project_ids=("forge",))
+
+    assert document["scopedTo"] == ["forge"]
+    # A heartbeat belongs to no project, so it stays; another project's change
+    # never appears in a scoped view.
+    assert [frame["eventId"] for frame in document["frames"]] == ["f-forge", "hb-1"]
+    assert "atlas" not in json.dumps(document)
+    # The resume bookkeeping still describes the whole log: that is what a
+    # reader needs to judge a cursor against.
+    assert document["assigned"] == 3
+
+
+def test_a_scoped_log_document_cannot_be_rehydrated() -> None:
+    """Its frames are filtered, so its sequence numbering has gaps."""
+    log = StreamLog()
+    log.record(
+        FrameKind.CHANGE, event_id="f-forge", project_id="forge", change=ChangeKind.WORK_UNIT
+    )
+    log.record(
+        FrameKind.CHANGE, event_id="f-atlas", project_id="atlas", change=ChangeKind.WORK_UNIT
+    )
+
+    with pytest.raises(ControlCenterError, match="a view for analysis, not a log"):
+        StreamLog.from_dict(log.as_dict(project_ids=("forge",)))
+
+    assert StreamLog.from_dict(log.as_dict()).frames == log.frames

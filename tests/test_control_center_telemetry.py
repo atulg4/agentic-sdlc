@@ -336,6 +336,7 @@ def test_project_scoping_narrows_every_section_at_once() -> None:
     assert overlay["projectIds"] == ["forge"]
     assert list(overlay["workUnits"]) == ["forge/wu-1"]
     assert list(overlay["effectiveness"]["byProject"]) == ["forge"]
+    assert overlay["effectiveness"]["portfolio"]["status"] == "unavailable"
     serialized = json.dumps(overlay)
     assert "atlas" not in serialized
     assert "wu-9" not in serialized
@@ -366,11 +367,15 @@ def test_the_effectiveness_report_is_surfaced_as_published() -> None:
     section = overlay["effectiveness"]
 
     assert section["status"] == "observed"
-    assert section["sampleCount"] == 2
-    assert section["quality"] == document["quality"]
-    assert section["value"] == document["value"]
-    assert section["learnings"]["advisory"] is True
     assert section["limitations"] == document["limitations"]
+    # Unscoped, the report's own population is the portfolio, so its
+    # portfolio-wide figures are exactly what it published.
+    portfolio = section["portfolio"]
+    assert portfolio["status"] == "observed"
+    assert portfolio["sampleCount"] == 2
+    assert portfolio["quality"] == document["quality"]
+    assert portfolio["value"] == document["value"]
+    assert portfolio["learnings"]["advisory"] is True
 
 
 def test_an_absent_effectiveness_report_never_infers_delivery_from_runs() -> None:
@@ -652,3 +657,189 @@ def test_control_center_cli_fails_closed_on_telemetry_inputs(tmp_path) -> None:
     assert (
         main([*base, "--effectiveness", bad, "--telemetry-output", str(tmp_path / "t2.json")]) == 2
     )
+
+
+# --- regressions ------------------------------------------------------------
+
+
+def test_the_windows_upper_bound_is_exclusive() -> None:
+    """Adjacent windows must partition, not overlap.
+
+    A record on the boundary counted in both October and November would be
+    double-counted by anyone summing month by month.
+    """
+    boundary = "2026-11-01T00:00:00Z"
+    records = (
+        _record("october", started_at="2026-10-31T23:00:00Z", finished_at="2026-10-31T23:30:00Z"),
+        _record("boundary", started_at="2026-10-31T23:30:00Z", finished_at=boundary),
+        _record("november", started_at=boundary, finished_at="2026-11-01T00:30:00Z"),
+    )
+
+    october = filter_usage_window(records, since="2026-10-01T00:00:00Z", until=boundary)
+    november = filter_usage_window(records, since=boundary, until="2026-12-01T00:00:00Z")
+
+    assert [item.run_id for item in october] == ["october"]
+    assert [item.run_id for item in november] == ["boundary", "november"]
+    # Every record lands in exactly one of the two windows.
+    assert len(october) + len(november) == len(records)
+
+
+def test_an_empty_window_selects_nothing() -> None:
+    """A half-open range whose bounds coincide contains no instant."""
+    records = (_record("run-1", started_at="2026-10-29T08:30:00Z", finished_at=NOW),)
+
+    assert filter_usage_window(records, since=NOW, until=NOW) == ()
+
+
+def test_scoped_effectiveness_withholds_the_portfolios_own_aggregates() -> None:
+    """A first-pass rate over the whole report is not one project's rate.
+
+    The overlay adds no arithmetic of its own, so it cannot re-derive these for
+    a subset; labelling the portfolio's number as the scope's would be a lie.
+    """
+    document = _effectiveness_document()
+    overlay = build_telemetry_overlay(
+        _snapshot(), effectiveness=document, registry=REGISTRY, project_ids=("forge",)
+    )
+    portfolio = overlay["effectiveness"]["portfolio"]
+
+    assert portfolio["status"] == "unavailable"
+    assert "cannot be re-derived" in portfolio["reason"]
+    assert portfolio["scopedProjectCount"] == 1
+    assert "quality" not in portfolio
+    serialized = json.dumps(overlay["effectiveness"])
+    # The withheld figures never travel, and neither do the other projects'
+    # names: a scoped console learns nothing about what it cannot see.
+    assert "firstPassVerificationRate" not in serialized
+    assert "atlas" not in serialized
+
+
+def test_a_scope_covering_the_whole_report_keeps_its_aggregates() -> None:
+    overlay = build_telemetry_overlay(
+        _snapshot(),
+        effectiveness=_effectiveness_document(),
+        registry=REGISTRY,
+        project_ids=("forge", "atlas"),
+    )
+    portfolio = overlay["effectiveness"]["portfolio"]
+
+    assert portfolio["status"] == "observed"
+    assert portfolio["sampleCount"] == 2
+
+
+def test_a_scoped_report_without_a_breakdown_cannot_be_attributed() -> None:
+    """Without byProject the report never says whom its figures describe."""
+    document = _effectiveness_document()
+    document.pop("byProject")
+    overlay = build_telemetry_overlay(
+        _snapshot(), effectiveness=document, registry=REGISTRY, project_ids=("forge",)
+    )
+    portfolio = overlay["effectiveness"]["portfolio"]
+
+    assert portfolio["status"] == "unavailable"
+    assert "no per-project breakdown" in portfolio["reason"]
+
+
+def test_control_center_cli_export_never_leaks_another_projects_frames(tmp_path) -> None:
+    from agentic_sdlc.cli import main
+    from agentic_sdlc.control_center_stream import ChangeKind, FrameKind, StreamLog
+
+    log = StreamLog()
+    for project in ("forge", "atlas"):
+        log.record(
+            FrameKind.CHANGE,
+            event_id=f"f-{project}",
+            project_id=project,
+            change=ChangeKind.WORK_UNIT,
+            occurred_at=NOW,
+            work_unit_id="wu-1",
+            payload={"state": "implementing"},
+        )
+    stream_in = _write(tmp_path / "frames.json", log.as_dict())
+    export_out = tmp_path / "export.json"
+    registry = _write(tmp_path / "registry.json", REGISTRY.as_dict())
+
+    assert (
+        main(
+            [
+                "control-center",
+                "--generated-at",
+                NOW,
+                "--registry",
+                registry,
+                "--project-id",
+                "forge",
+                "--stream",
+                stream_in,
+                "--stream-output",
+                str(tmp_path / "reconnect.json"),
+                "--export-output",
+                str(export_out),
+            ]
+        )
+        == 0
+    )
+
+    export = json.loads(export_out.read_text(encoding="utf-8"))
+    frames = export["stream"]["frames"]
+    assert [frame["eventId"] for frame in frames] == ["f-forge"]
+    assert export["stream"]["scopedTo"] == ["forge"]
+    assert "atlas" not in json.dumps(export)
+
+
+def test_control_center_cli_refuses_an_unreadable_frame_log(tmp_path) -> None:
+    """Substituting an empty log would answer "nothing changed" from silence."""
+    from agentic_sdlc.cli import main
+
+    assert (
+        main(
+            [
+                "control-center",
+                "--generated-at",
+                NOW,
+                "--stream",
+                str(tmp_path / "absent.json"),
+                "--resume-from",
+                "1",
+                "--stream-output",
+                str(tmp_path / "reconnect.json"),
+            ]
+        )
+        == 2
+    )
+
+
+def test_control_center_cli_refuses_to_overwrite_the_frame_log_it_reads(tmp_path) -> None:
+    from agentic_sdlc.cli import main
+    from agentic_sdlc.control_center_stream import ChangeKind, FrameKind, StreamLog
+
+    log = StreamLog()
+    log.record(
+        FrameKind.CHANGE,
+        event_id="f-1",
+        project_id="forge",
+        change=ChangeKind.WORK_UNIT,
+        occurred_at=NOW,
+        work_unit_id="wu-1",
+        payload={"state": "implementing"},
+    )
+    frames = tmp_path / "frames.json"
+    _write(frames, log.as_dict())
+
+    assert (
+        main(
+            [
+                "control-center",
+                "--generated-at",
+                NOW,
+                "--stream",
+                str(frames),
+                "--stream-output",
+                str(frames),
+            ]
+        )
+        == 2
+    )
+
+    # The log is still the log, not a reconnect response written over it.
+    assert StreamLog.from_dict(json.loads(frames.read_text(encoding="utf-8"))).frames == log.frames

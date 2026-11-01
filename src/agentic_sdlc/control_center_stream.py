@@ -447,12 +447,17 @@ class StreamLog:
         reset_reason: ResetReason | str | None = None,
         payload: Mapping[str, Any] | None = None,
     ) -> StreamFrame:
-        """Append one frame, assigning its sequence. Replay is a no-op."""
-        existing = self._event_ids.get(event_id.strip())
-        if existing is not None:
-            return existing
+        """Append one frame, assigning its sequence. Replay is a no-op.
+
+        A known event ID is built at its *existing* sequence and handed to
+        ``append``, so a genuine replay compares equal and is a no-op while a
+        changed payload, kind or project conflicts. Returning the stored frame
+        without comparing would silently discard the new content, which is the
+        opposite of the fail-closed replay contract.
+        """
+        known = self._event_ids.get(event_id.strip())
         frame = StreamFrame(
-            sequence=self.next_sequence,
+            sequence=known.sequence if known is not None else self.next_sequence,
             event_id=event_id,
             kind=FrameKind(kind),
             occurred_at=occurred_at,
@@ -527,16 +532,33 @@ class StreamLog:
             return ResetReason.BEYOND_RETENTION
         return None
 
-    def as_dict(self) -> dict[str, Any]:
-        return {
+    def as_dict(self, *, project_ids: Sequence[str] | None = None) -> dict[str, Any]:
+        """The log as a document, optionally scoped to some projects.
+
+        A scoped document is a **view**: its frames are filtered, so the
+        sequence numbering has gaps and it cannot be rehydrated into a log. It
+        says so through ``scopedTo``, and ``from_dict`` refuses it rather than
+        failing later on contiguity. The resume bookkeeping still describes the
+        whole log, because that is what a reader needs to judge a cursor.
+        """
+        scope = None if project_ids is None else frozenset(project_ids)
+        frames = [
+            frame
+            for frame in self._frames
+            if scope is None or not frame.project_id or frame.project_id in scope
+        ]
+        document: dict[str, Any] = {
             "schemaVersion": STREAM_SCHEMA_VERSION,
             "retain": self._retain,
             "assigned": self._assigned,
             "dropped": self._dropped,
             "earliestResumable": self.earliest_resumable,
             "cursor": self.cursor.as_dict(),
-            "frames": [frame.as_dict() for frame in self._frames],
+            "frames": [frame.as_dict() for frame in frames],
         }
+        if scope is not None:
+            document["scopedTo"] = sorted(scope)
+        return document
 
     @classmethod
     def from_dict(cls, document: Any) -> StreamLog:
@@ -559,9 +581,15 @@ class StreamLog:
                     "earliestResumable",
                     "cursor",
                     "frames",
+                    "scopedTo",
                 }
             ),
             "stream log",
+        )
+        _require(
+            not entry.get("scopedTo"),
+            "a project-scoped stream document is a view for analysis, not a log: "
+            "its frames are filtered, so it cannot be rehydrated",
         )
         version = entry.get("schemaVersion")
         _require(
@@ -594,6 +622,16 @@ class StreamLog:
         )
         log._dropped = dropped
         return log
+
+
+#: Frames that carry content a client can apply. A heartbeat or a reset says
+#: nothing about the view, so neither can explain a digest difference.
+_CONTENT_FRAMES = frozenset({FrameKind.CHANGE, FrameKind.SNAPSHOT})
+
+
+def _reconciles(frames: Sequence[StreamFrame]) -> bool:
+    """Whether pending frames could actually account for changed content."""
+    return any(frame.kind in _CONTENT_FRAMES for frame in frames)
 
 
 def _freshness(
@@ -663,15 +701,18 @@ def build_reconnect_response(
     )
 
     reason = ResetReason.NO_CURSOR if cursor is None else log.resume_problem(cursor)
-    # The client reconciled against different content, yet no frame explains the
-    # difference: applying nothing would leave it showing a view this snapshot
-    # contradicts, so it must take the snapshot instead.
+    # The client reconciled against different content, yet nothing it is about
+    # to receive explains the difference: applying those frames would leave it
+    # showing a view this snapshot contradicts, so it must take the snapshot.
+    # Only content frames count — a pending heartbeat says nothing about the
+    # view, and treating one as reconciling would hand the client the current
+    # digest while its stale content went undetected.
     if (
         reason is None
         and cursor is not None
         and cursor.snapshot_sha256
         and cursor.snapshot_sha256 != digest
-        and not log.since(cursor, project_ids=project_ids)
+        and not _reconciles(log.since(cursor, project_ids=project_ids))
     ):
         reason = ResetReason.SNAPSHOT_MISMATCH
 

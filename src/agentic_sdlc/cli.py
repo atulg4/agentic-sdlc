@@ -2748,7 +2748,10 @@ def _control_center_telemetry(args: argparse.Namespace, snapshot: Any, registry:
 
 def _control_center_reconnect(args: argparse.Namespace, snapshot: Any) -> tuple[Any, Any]:
     """Build the reconnect response a push transport would send, plus the log."""
-    if args.stream and Path(args.stream).is_file():
+    # A supplied path is read, never probed: substituting an empty log for an
+    # unreadable one would answer "nothing happened since your cursor" when the
+    # truth is that the frames could not be consulted at all.
+    if args.stream:
         log = StreamLog.from_dict(json.loads(Path(args.stream).read_text(encoding="utf-8")))
     else:
         log = StreamLog()
@@ -2806,6 +2809,7 @@ def _control_center(args: argparse.Namespace) -> int:
         args.usage,
         args.effectiveness,
         args.capacity_inputs,
+        args.stream,
         *args.backlog,
         *args.incidents,
     ]
@@ -2852,7 +2856,7 @@ def _control_center(args: argparse.Namespace) -> int:
     stream_document = None
     if args.stream_output:
         response, log = _control_center_reconnect(args, snapshot)
-        stream_document = log.as_dict()
+        stream_document = log.as_dict(project_ids=tuple(args.project_id) or None)
         outputs.append((response, args.stream_output))
     if args.export_output:
         outputs.append(
