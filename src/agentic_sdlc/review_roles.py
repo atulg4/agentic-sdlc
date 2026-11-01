@@ -42,8 +42,9 @@ CODE_REVIEWER = "code-reviewer"
 SECURITY_REVIEWER = "security-reviewer"
 
 #: Casefolded keywords that mark a task, or a label, security-sensitive.
-#: Matched on word boundaries, so "token" matches "rotate the API token"
-#: and "tokenizer" does not.
+#: Matched on word boundaries, with hyphen/underscore compounds contributing
+#: their parts: "token" matches "rotate the API token" and "token-based
+#: sessions", and "tokenizer" does not.
 SECURITY_TEXT_PATTERNS: tuple[str, ...] = (
     "auth",
     "authentication",
@@ -121,7 +122,18 @@ class RoleSelection:
 
 
 def _words(text: str) -> set[str]:
-    return set(_WORD.findall(text.casefold()))
+    """The comparison vocabulary of ``text``: tokens AND their compound parts.
+
+    ``token-based`` and ``security-sensitive`` must match the documented
+    keywords ``token`` and ``security``, so every hyphen/underscore compound
+    also contributes its constituent words. Lexical containment alone still
+    never matches: ``tokenizer`` is one undivided word, not ``token``.
+    """
+    words: set[str] = set()
+    for token in _WORD.findall(text.casefold()):
+        words.add(token)
+        words.update(re.split(r"[-_]", token))
+    return words
 
 
 def select_review_roles(

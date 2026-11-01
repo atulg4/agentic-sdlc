@@ -29,6 +29,7 @@ __all__ = [
     "enforce_reviews",
     "evaluate_review_document",
     "load_review_schema",
+    "select_repair_criteria",
     "select_repair_findings",
 ]
 
@@ -295,3 +296,20 @@ def select_repair_findings(document: Mapping[str, Any]) -> tuple[dict[str, Any],
     if errors:
         raise ValueError("; ".join(errors))
     return tuple(dict(finding) for finding in document["findings"] if _finding_blocks(finding))
+
+
+def select_repair_criteria(document: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
+    """The not-met and not-verifiable criterion verdicts, for the repair prompt.
+
+    A criterion verdict blocks the gate independently of any finding, so a
+    review that reports ``not_met`` without adding a blocking finding must
+    still reach repair — otherwise the gate blocks on a reason the bounded
+    repair run is never told about. The document must be a valid version-2
+    review, exactly like ``select_repair_findings``.
+    """
+    errors = _structural_errors(document)
+    if errors:
+        raise ValueError("; ".join(errors))
+    return tuple(
+        dict(entry) for entry in document["acceptanceCriteriaVerdict"] if entry["verdict"] != "met"
+    )

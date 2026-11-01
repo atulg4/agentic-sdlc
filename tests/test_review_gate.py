@@ -11,6 +11,7 @@ from agentic_sdlc.review_gate import (
     enforce_reviews,
     evaluate_review_document,
     load_review_schema,
+    select_repair_criteria,
     select_repair_findings,
 )
 from agentic_sdlc.review_roles import select_review_roles
@@ -234,6 +235,29 @@ def test_repair_receives_only_blocking_findings() -> None:
     assert titles == ["High bug", "Flagged blocker", "Gated blocker"]
     with pytest.raises(ValueError, match="schemaVersion"):
         select_repair_findings({"verdict": "changes_requested", "findings": []})
+
+
+def test_repair_also_receives_the_unverified_acceptance_criteria() -> None:
+    # A criterion verdict blocks the gate independently of any finding, so
+    # an ordinary acceptance failure must still reach repair.
+    document = _review(
+        verdict="changes_requested",
+        acceptanceCriteriaVerdict=[
+            {"criterion": "Exporter streams rows", "verdict": "met"},
+            {"criterion": "Tests cover the empty file", "verdict": "not_met"},
+            {"criterion": "Exporter handles BOMs", "verdict": "not_verifiable"},
+        ],
+    )
+    entries = select_repair_criteria(document)
+    assert [entry["criterion"] for entry in entries] == [
+        "Tests cover the empty file",
+        "Exporter handles BOMs",
+    ]
+    assert [entry["verdict"] for entry in entries] == ["not_met", "not_verifiable"]
+    assert select_repair_criteria(_review()) == ()
+    # Like the findings filter, a legacy document fails closed.
+    with pytest.raises(ValueError, match="schemaVersion"):
+        select_repair_criteria({"verdict": "changes_requested", "findings": []})
 
 
 def test_the_packaged_schema_is_versioned_and_loads(tmp_path: Path) -> None:

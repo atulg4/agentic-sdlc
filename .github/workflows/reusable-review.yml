@@ -120,7 +120,7 @@ jobs:
         run: |
           set -euo pipefail
           printf '/.agentic-platform/\n' >> .git/info/exclude
-          python3 -m pip install --disable-pip-version-check -q ./.agentic-platform
+          python3 -P -m pip install --disable-pip-version-check -q ./.agentic-platform
       - name: Check out trusted review target at the authenticated base branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -213,7 +213,23 @@ jobs:
               args+=(--tmpfs "$hidden")
             fi
           done
-          args+=(--bind "$PWD" "$PWD" --chdir "$PWD" --setenv HOME /tmp)
+          # Gates run as SEPARATE launcher invocations (setup, then quality,
+          # then test): what a setup gate installs must survive into the
+          # later gates, and the system site is read-only here. HOME
+          # therefore lives BESIDE the derivation tree (pip falls back to a
+          # user install under it when site-packages refuses writes), joins
+          # the sandbox as the only other writable path, persists across
+          # invocations, and stays outside the git tree so a
+          # cleanliness-checking gate never sees it.
+          home_dir="$(dirname "$PWD")/.agentic-sandbox-home"
+          mkdir -p "$home_dir/.local/bin"
+          args+=(
+            --bind "$PWD" "$PWD"
+            --bind "$home_dir" "$home_dir"
+            --chdir "$PWD"
+            --setenv HOME "$home_dir"
+            --setenv PATH "$home_dir/.local/bin:${PATH:-/usr/local/bin:/usr/bin:/bin}"
+          )
           exec bwrap "${args[@]}" "$@"
           LAUNCHER
           # Root-owned in a root-only directory: the engine's strict launcher
@@ -265,7 +281,7 @@ jobs:
             --changed-paths-file .agentic-review/changed-paths.txt \
             --config .agentic-review/trusted-policy.toml \
             --output .agentic-review/roles.json
-          python3 - <<'PY'
+          python3 -P - <<'PY'
           import json
           from pathlib import Path
 
@@ -286,7 +302,7 @@ jobs:
           # The schema the reviewer is held to IS the versioned platform
           # schema: materialized from the pinned engine, so the workflow can
           # never drift from what enforce-review validates.
-          python3 - <<'PY'
+          python3 -P - <<'PY'
           import json
           from pathlib import Path
 
@@ -382,7 +398,7 @@ jobs:
 
           unexpected=$(git ls-files --others --exclude-standard | grep -v '^\.agentic-review/' | grep -v '^\.agentic-platform/' || true)
           test -z "$unexpected"
-          python3 - <<'PY'
+          python3 -P - <<'PY'
           import json
           from pathlib import Path
 
@@ -407,7 +423,7 @@ jobs:
           HEAD_SHA: ${{ inputs.head_sha }}
         run: |
           set -euo pipefail
-          python3 - <<'PY'
+          python3 -P - <<'PY'
           import json
           import os
           from pathlib import Path
@@ -436,7 +452,7 @@ jobs:
           # RECORDED for the publisher job: the publisher must stay
           # checkout-free, and the comment must publish even when the gate
           # blocks, so the verdict travels as data.
-          python3 - <<'PY'
+          python3 -P - <<'PY'
           import json
           import os
           from pathlib import Path

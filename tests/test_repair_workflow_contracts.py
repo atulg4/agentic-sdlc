@@ -49,6 +49,19 @@ def test_repair_receives_only_blocking_findings_plus_the_builder_packet() -> Non
     assert text.index("Install pinned policy engine") < text.index("sdlcctl repair-findings")
 
 
+def test_trusted_python_in_repair_cannot_import_candidate_code() -> None:
+    # Every python3 here runs from the PR-head checkout, where stdin/-m
+    # execution would put the candidate tree first on sys.path: a committed
+    # root-level agentic_sdlc/ or pip/ package would shadow the pinned
+    # engine the verification steps run (Codex 4434015133). -P keeps the
+    # checkout off the import path; PYTHONPATH (the restored engine) stays.
+    text = REUSABLE.read_text(encoding="utf-8")
+    assert "python3 -m pip" not in text
+    assert "python3 -m agentic_sdlc" not in text
+    assert "python3 -P -m pip install" in text
+    assert text.count("python3 -P -m agentic_sdlc") == 6
+
+
 def test_ai_repair_job_has_no_repository_write_or_publisher_secret() -> None:
     document = _yaml(REUSABLE)
     generate = document["jobs"]["generate_patch"]

@@ -177,12 +177,42 @@ def test_derived_gates_run_sandboxed_never_on_the_trusted_host() -> None:
         ' "${RUNNER_TEMP}/forge-gate-sandbox" /usr/local/bin/forge-gate-sandbox' in review
     )
     # The confinement itself: read-only host, hidden home/checkout/temp,
-    # only the disposable derivation tree writable.
+    # only the disposable derivation tree (and the sandbox-private home
+    # beside it) writable.
     assert "--ro-bind / /" in review
     assert '--tmpfs "$hidden"' in review
     assert '"${HOME:-}" "${GITHUB_WORKSPACE:-}" "${RUNNER_TEMP:-}"' in review
-    assert '--bind "$PWD" "$PWD" --chdir "$PWD"' in review
+    assert '--bind "$PWD" "$PWD"' in review
+    assert '--chdir "$PWD"' in review
     assert "/usr/local/bin/forge-gate-sandbox /bin/true" in review
+
+
+def test_gate_sandbox_persists_setup_installs_across_gate_invocations() -> None:
+    review = _review_job()
+    # run_gates launches setup, quality and test as SEPARATE launcher
+    # invocations: a per-invocation tmpfs HOME would throw away what the
+    # setup gate installed (Codex 4434015126). HOME lives beside the
+    # derivation tree, is bind-mounted writable, and its .local/bin joins
+    # PATH so user-installed entry points resolve.
+    assert 'home_dir="$(dirname "$PWD")/.agentic-sandbox-home"' in review
+    assert 'mkdir -p "$home_dir/.local/bin"' in review
+    assert '--bind "$home_dir" "$home_dir"' in review
+    assert '--setenv HOME "$home_dir"' in review
+    assert '--setenv PATH "$home_dir/.local/bin:' in review
+    assert "--setenv HOME /tmp" not in review
+
+
+def test_trusted_python_steps_cannot_import_candidate_code() -> None:
+    document = WORKFLOW.read_text(encoding="utf-8")
+    # Trusted snippets execute from the PR-head checkout, where stdin and -m
+    # execution would otherwise put the candidate tree first on sys.path: a
+    # committed root-level agentic_sdlc/ (or pip/) package would shadow the
+    # pinned engine (Codex 4434015133). -P (safe path) keeps the checkout
+    # off the import path while the user-site engine install stays visible.
+    assert "python3 - <<'PY'" not in document
+    assert "python3 -m pip" not in document
+    assert document.count("python3 -P - <<'PY'") == 5
+    assert "python3 -P -m pip install" in document
 
 
 def test_roles_are_selected_deterministically_and_recorded() -> None:

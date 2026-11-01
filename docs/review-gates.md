@@ -22,9 +22,11 @@ documented triggers fire, and records the exact reason for each role with
 the review run (`roles.json` in the review artifact):
 
 - the task text or a label contains a security keyword, matched on word
-  boundaries (`SECURITY_TEXT_PATTERNS`): auth, authentication,
-  authorization, credential(s), oauth, password, permission(s), policy,
-  privacy, secret(s), security, token(s);
+  boundaries with hyphen/underscore compounds contributing their parts —
+  `token-based` and `security-sensitive` match, `tokenizer` does not
+  (`SECURITY_TEXT_PATTERNS`): auth, authentication, authorization,
+  credential(s), oauth, password, permission(s), policy, privacy,
+  secret(s), security, token(s);
 - a changed path matches a security path pattern
   (`SECURITY_PATH_PATTERNS`): `.github/workflows/*`, or any path containing
   auth, credential, oauth, permission, policy, privacy, secret, or token;
@@ -45,8 +47,12 @@ issue. The packet's gate report runs candidate-controlled gate commands, so
 the workflow confines them in a bubblewrap sandbox (a root-owned
 `forge-gate-sandbox` launcher): the host is read-only, the runner home (the
 installed engine), the checkout and the runner temp are hidden, and only
-the disposable derivation tree is writable — candidate gate code cannot
-rewrite the engine or the review control files later steps enforce with. Each selected role additionally gets its own checklist
+the disposable derivation tree plus a sandbox-private home beside it (so a
+setup gate's user-level installs survive into the quality and test gates)
+are writable — candidate gate code cannot rewrite the engine or the review
+control files later steps enforce with. The workflow's own trusted Python
+steps run with `-P`, so a candidate-committed `agentic_sdlc` package in the
+checkout can never shadow the pinned engine they import. Each selected role additionally gets its own checklist
 (`ROLE_CHECKLISTS`), which is trusted pipeline text. Reviewers get no write
 instructions; builders get no reviewer checklist and no verdict schema.
 
@@ -89,11 +95,14 @@ is computed in the review job by the pinned engine and recorded as
 
 ## Repair receives only what blocks
 
-`sdlcctl repair-findings` filters the role reviews down to the blocking
-findings (with each finding's `repairRecommendation`), and the repair
-prompt is the #118 **builder context packet** — pinned at the trusted base
-— plus those findings inside an untrusted boundary. Low-severity and
-advisory findings never spend the bounded repair budget.
+`sdlcctl repair-findings` filters the role reviews down to what actually
+gates the merge: the blocking findings (with each finding's
+`repairRecommendation`) **and** every `not_met` / `not_verifiable`
+acceptance-criterion verdict — a criterion blocks independently of any
+finding, so an ordinary acceptance failure still reaches repair. The
+repair prompt is the #118 **builder context packet** — pinned at the
+trusted base — plus that input inside an untrusted boundary. Low-severity
+and advisory findings never spend the bounded repair budget.
 
 ## What this deliberately does not change
 

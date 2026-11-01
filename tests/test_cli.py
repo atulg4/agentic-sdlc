@@ -2544,3 +2544,50 @@ def test_enforce_review_cli_covers_the_packets_acceptance_criteria(tmp_path: Pat
     empty.write_text(json.dumps({"task": {"acceptanceCriteria": []}}), encoding="utf-8")
     assert main([*base, "--packet", str(empty)]) == 2
     assert "names no acceptance criteria" in capsys.readouterr().err
+
+
+def test_repair_findings_cli_carries_unverified_criteria_to_repair(tmp_path: Path) -> None:
+    # A review can block the gate purely through a not_met / not_verifiable
+    # criterion verdict; repair must still receive input instead of the
+    # continuation dispatching a repair that exits with nothing to do
+    # (Codex 4434015131).
+    head = "b" * 40
+    review = _role_review("code-reviewer", head)
+    review["findings"] = []
+    review["acceptanceCriteriaVerdict"] = [
+        {"criterion": "Exporter streams rows", "verdict": "met"},
+        {"criterion": "Tests cover the empty file", "verdict": "not_met"},
+    ]
+    path = tmp_path / "review-code-reviewer.json"
+    path.write_text(json.dumps(review), encoding="utf-8")
+    output = tmp_path / "blocking.json"
+    prompt = tmp_path / "findings.md"
+    result = main(
+        [
+            "repair-findings",
+            "--review",
+            str(path),
+            "--output",
+            str(output),
+            "--prompt-output",
+            str(prompt),
+        ]
+    )
+    assert result == 0
+    document = json.loads(output.read_text(encoding="utf-8"))
+    assert document["findings"] == []
+    assert document["unmetCriteria"] == [
+        {
+            "role": "code-reviewer",
+            "criterion": "Tests cover the empty file",
+            "verdict": "not_met",
+        }
+    ]
+    rendered = prompt.read_text(encoding="utf-8")
+    assert "[code-reviewer/criterion not_met] Tests cover the empty file" in rendered
+    assert "Exporter streams rows" not in rendered
+    # Fully met and nothing blocking still refuses: there is nothing to
+    # repair.
+    review["acceptanceCriteriaVerdict"] = [{"criterion": "Exporter streams rows", "verdict": "met"}]
+    path.write_text(json.dumps(review), encoding="utf-8")
+    assert main(["repair-findings", "--review", str(path), "--output", str(output)]) == 2

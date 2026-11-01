@@ -146,7 +146,7 @@ jobs:
         run: |
           set -euo pipefail
           printf '/.agentic-platform/\n' >> .git/info/exclude
-          python3 -m pip install --disable-pip-version-check -q ./.agentic-platform
+          python3 -P -m pip install --disable-pip-version-check -q ./.agentic-platform
       - name: Restore exact independent-review artifact
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -318,7 +318,7 @@ jobs:
         run: |
           set -euo pipefail
           export PYTHONPATH="${GITHUB_WORKSPACE}/.agentic-platform/src"
-          python3 -m agentic_sdlc inspect-diff \
+          python3 -P -m agentic_sdlc inspect-diff \
             --config .agentic-repair/trusted-policy.toml \
             --repository . \
             --base "$HEAD_SHA" \
@@ -326,7 +326,7 @@ jobs:
             --paths-output .agentic-output/paths.txt \
             --decision-output .agentic-output/decision.json
           test -s .agentic-output/change.patch
-          python3 -m agentic_sdlc create-manifest \
+          python3 -P -m agentic_sdlc create-manifest \
             --patch .agentic-output/change.patch \
             --base-sha "$HEAD_SHA" \
             --repository "$GITHUB_REPOSITORY" \
@@ -376,7 +376,7 @@ jobs:
         run: |
           set -euo pipefail
           export PYTHONPATH="${GITHUB_WORKSPACE}/.agentic-platform/src"
-          python3 -m agentic_sdlc verify-artifact \
+          python3 -P -m agentic_sdlc verify-artifact \
             --patch "${RUNNER_TEMP}/repair-patch/change.patch" \
             --manifest "${RUNNER_TEMP}/repair-patch/manifest.json" \
             --base-sha "$HEAD_SHA" \
@@ -392,14 +392,14 @@ jobs:
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/verified-repair"
           export PYTHONPATH="${GITHUB_WORKSPACE}/.agentic-platform/src"
-          python3 -m agentic_sdlc inspect-diff \
+          python3 -P -m agentic_sdlc inspect-diff \
             --config .agentic-repair/trusted-policy.toml \
             --repository . \
             --base "$HEAD_SHA" \
             --patch-output "${RUNNER_TEMP}/verified-repair/change.patch" \
             --paths-output "${RUNNER_TEMP}/verified-repair/paths.txt" \
             --decision-output "${RUNNER_TEMP}/verified-repair/decision.json"
-          python3 -m agentic_sdlc create-manifest \
+          python3 -P -m agentic_sdlc create-manifest \
             --patch "${RUNNER_TEMP}/verified-repair/change.patch" \
             --base-sha "$HEAD_SHA" \
             --repository "$GITHUB_REPOSITORY" \
@@ -416,7 +416,7 @@ jobs:
         run: |
           set -euo pipefail
           PYTHONPATH="${GITHUB_WORKSPACE}/.agentic-platform/src" \
-            python3 -m agentic_sdlc run-gates \
+            python3 -P -m agentic_sdlc run-gates \
               --config .agentic-repair/trusted-policy.toml \
               --repository . \
               --output "${RUNNER_TEMP}/verified-repair/gates.json"

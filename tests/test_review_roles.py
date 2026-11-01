@@ -44,6 +44,31 @@ def test_keyword_matching_is_word_bounded() -> None:
     assert selection.roles == ("code-reviewer",)
 
 
+def test_hyphenated_compounds_contribute_their_keyword_parts() -> None:
+    # "token-based" carries "token" and "security-sensitive" carries
+    # "security": a hyphenated phrase must not hide a documented keyword
+    # (Codex 4434015132) — while "tokenizer" stays one undivided word.
+    task = select_review_roles(
+        "Fix token-based session validation",
+        (),
+        ("src/session.py",),
+    )
+    assert task.roles == ("code-reviewer", "security-reviewer")
+    assert any("token" in reason for reason in task.reasons["security-reviewer"])
+    label = select_review_roles(
+        "Refactor the CSV exporter",
+        ("security-sensitive",),
+        ("src/exporter.py",),
+    )
+    assert label.roles == ("code-reviewer", "security-reviewer")
+    underscored = select_review_roles(
+        "Rework the oauth_callback flow",
+        (),
+        ("src/session.py",),
+    )
+    assert underscored.roles == ("code-reviewer", "security-reviewer")
+
+
 def test_security_labels_select_the_security_reviewer() -> None:
     selection = select_review_roles(
         "Refactor the CSV exporter",
