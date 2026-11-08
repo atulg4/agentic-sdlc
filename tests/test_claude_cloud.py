@@ -69,6 +69,51 @@ def test_concurrent_dispatchers_make_one_request(configured, monkeypatch):
         assert first.result()["state"] == "started"
 
 
+def test_live_cse_response_is_recorded_without_relaunch(configured, monkeypatch):
+    response = {
+        "type": "routine_fire",
+        "claude_code_session_id": "cse_example",
+        "claude_code_session_url": "https://claude.ai/code/cse_example",
+    }
+    calls = []
+    monkeypatch.setattr(cloud, "_post", lambda *_: calls.append(1) or response)
+    result = cloud.dispatch(TASK, configured)
+    assert result["state"] == "started"
+    assert result["session_id"] == "cse_example"
+    assert result["session_url"] == response["claude_code_session_url"]
+    assert cloud.dispatch(TASK, configured)["deduplicated"]
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "identifier,url",
+    [
+        ("cse_example", "https://claude.ai/code/session_example"),
+        ("cse_example", "https://claude.ai/code/cse_example?token=secret"),
+        ("cse_example", "https://evil.test/code/cse_example"),
+        ("other_example", "https://claude.ai/code/other_example"),
+    ],
+)
+def test_live_session_format_still_requires_exact_safe_url(
+    configured, monkeypatch, identifier, url
+):
+    response = {
+        "type": "routine_fire",
+        "claude_code_session_id": identifier,
+        "claude_code_session_url": url,
+    }
+    monkeypatch.setattr(cloud, "_post", lambda *_: response)
+    assert cloud.dispatch(TASK, configured)["state"] == "unknown"
+
+
+def test_reconciliation_accepts_live_cse_session_url(configured):
+    configured.reserve(TASK, "trig_example", False)
+    result = configured.reconcile(
+        TASK.request_id, "https://claude.ai/code/cse_example", TASK.head_sha
+    )
+    assert result["session_id"] == "cse_example" and result["state"] == "started"
+
+
 @pytest.mark.parametrize(
     "failure",
     [

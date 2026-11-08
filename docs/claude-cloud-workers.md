@@ -156,6 +156,9 @@ and [routines guide](https://code.claude.com/docs/en/routines):
 - `POST /v1/claude_code/routines/{trig_id}/fire` on `https://api.anthropic.com`;
   per-routine bearer token; `anthropic-version: 2026-10-21`.
 - Body `{"text":"..."}`; response supplies a session ID and URL, not its output.
+  Both the documented `session_` and observed live `cse_` ID prefixes are accepted,
+  only with the exact matching `https://claude.ai/code/ID` URL. The API URL is
+  preserved rather than guessing a corresponding UI alias.
 - Shared subscription usage limits and API fire rate limits still apply.
 - No idempotency key and no session-read access from the fire token.
 
@@ -174,3 +177,11 @@ and that exact SHA. The observed session was reconciled locally. The reviewer
 returned advisory findings and explicitly reported that pytest was unavailable;
 its response was not counted as test evidence. Token contents are never recorded
 in these documents or the dispatch journal.
+
+A subsequent review of `a3a87c06dcd082ec43fc455786f099f7a4e4cab5` found no concrete
+blocking/high/medium defect in the updated code (also static-only). Further live
+inspection identified the compatibility cause: the API returned a `cse_` ID and
+matching URL, while its documentation shows `session_`. Regression tests first
+reproduced the rejection, then verified both supported formats while rejecting
+cross-ID, foreign-host, unknown-prefix, and query-bearing URLs. Neither ambiguous
+task was resent.

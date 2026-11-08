@@ -4,12 +4,18 @@ Repository audit snapshot: November 8, 2026, main
 `379e5ab50c8d03e249c73f96c962e14d784c2b3d`. Open PRs are proposed work, not delivered
 capabilities. Recheck their heads, reviews, and checks before integrating.
 
+Progress update, November 8: #155 is merged. The helper integration in #179 now
+includes main `8e584d00f3031e6dd68e50320df648f067a24080`, and its Forge-only Claude
+review routine has completed real API-triggered reviews. The audit snapshot above
+remains the original audit baseline, not the integration's current base.
+
 ## Ownership and budget
 
 Codex leads coding, integration, verification, and coordination. Claude Max
 provides scoped independent reviews, regression tests, and design research.
-The [cloud helper adapter](claude-cloud-workers.md) implements explicit dispatch;
-account setup and a real smoke run are required before calling it operational.
+The [cloud helper adapter](claude-cloud-workers.md) implements explicit dispatch.
+Routine setup and live review are verified; durable credential storage, the
+test-development role, and automatic queue wiring remain rollout work.
 
 Keep the existing owner merge policy, branch protections, leases, publication
 gates, and CI. Keep subscription-only execution: no paid-provider fallback and

@@ -25,6 +25,9 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 ROLES = ("review", "tests", "research")
 API_ROOT = "https://api.anthropic.com/v1/claude_code/routines"
 API_VERSION = "2026-10-21"
+# The docs show session_; the live routine API also returns cse_ identifiers.
+# Retain the API's identifier and require its exact matching, pinned-host URL.
+SESSION_ID_PATTERN = r"(?:session|cse)_[A-Za-z0-9_-]+"
 
 
 class CloudDispatchError(ValueError):
@@ -99,7 +102,7 @@ def _session(response: object) -> dict:
     if not isinstance(response, dict) or response.get("type") != "routine_fire":
         raise CloudDispatchError("invalid routine response")
     identifier = response.get("claude_code_session_id")
-    if not isinstance(identifier, str) or not re.fullmatch(r"session_[A-Za-z0-9_-]+", identifier):
+    if not isinstance(identifier, str) or not re.fullmatch(SESSION_ID_PATTERN, identifier):
         raise CloudDispatchError("invalid session identifier")
     url = f"https://claude.ai/code/{identifier}"
     if response.get("claude_code_session_url") != url:
@@ -201,7 +204,7 @@ class DispatchJournal:
 
     def reconcile(self, request_id: str, session_url: str, observed_head_sha: str) -> dict:
         """Record an operator-observed launch; this never asserts review completion."""
-        match = re.fullmatch(r"https://claude\.ai/code/(session_[A-Za-z0-9_-]+)", session_url)
+        match = re.fullmatch(rf"https://claude\.ai/code/({SESSION_ID_PATTERN})", session_url)
         if not match:
             raise CloudDispatchError("provide a canonical Claude Code session URL without a query")
         with closing(self._connect()) as db, db:
