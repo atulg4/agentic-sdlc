@@ -251,3 +251,138 @@ def test_corrupt_journal_fails_without_dispatch(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(cloud, "_post", lambda *_: pytest.fail("must not send"))
     assert main(["claude-cloud-status", "--journal", str(journal), "--request-id", "x"]) == 2
     assert "journal could not be read or committed" in capsys.readouterr().err
+
+
+def test_status_does_not_create_a_missing_journal(tmp_path, capsys):
+    path = tmp_path / "typo" / "journal.sqlite"
+    assert main(["claude-cloud-status", "--journal", str(path), "--request-id", "x"]) == 2
+    assert not path.parent.exists()
+    assert "journal could not be read or committed" in capsys.readouterr().err
+
+
+def test_retry_after_naive_date_uses_utc(monkeypatch):
+    import os
+    import time
+
+    previous = os.environ.get("TZ")
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+    time.tzset()
+    try:
+        assert cloud._retry_at({"Retry-After": "Thu, 01 Jan 1970 00:20:00 -0000"}, 1000) == 1200
+    finally:
+        if previous is None:
+            monkeypatch.delenv("TZ")
+        else:
+            monkeypatch.setenv("TZ", previous)
+        time.tzset()
+
+
+def test_finish_failure_preserves_session_and_prevents_redispatch(configured, monkeypatch):
+    import sqlite3
+
+    calls = []
+    monkeypatch.setattr(cloud, "_post", lambda *_: calls.append(1) or RESPONSE)
+    monkeypatch.setattr(
+        configured, "finish", lambda *_: (_ for _ in ()).throw(sqlite3.OperationalError("secret"))
+    )
+    result = cloud.dispatch(TASK, configured)
+    assert result["state"] == "started"
+    assert result["session_url"] == RESPONSE["claude_code_session_url"]
+    assert result["journal_committed"] is False
+    assert "secret" not in json.dumps(result)
+    assert cloud.dispatch(TASK, configured)["deduplicated"] is True
+    assert len(calls) == 1
+
+
+def test_operator_reconciles_observed_session_without_sending(configured, monkeypatch):
+    record, _ = configured.reserve(TASK, "trig_example", False)
+    configured.finish({**record, "state": "unknown"})
+    monkeypatch.setattr(cloud, "_post", lambda *_: pytest.fail("must not POST"))
+    result = configured.reconcile(
+        TASK.request_id, RESPONSE["claude_code_session_url"], TASK.head_sha
+    )
+    assert result["state"] == "started" and result["reconciliation_source"] == "operator"
+    assert result["session_id"] == "session_example"
+    assert cloud.dispatch(TASK, configured)["deduplicated"] is True
+    # A late network error from an in-flight request cannot undo observed evidence.
+    assert configured.finish({**record, "state": "unknown"})["state"] == "started"
+
+
+@pytest.mark.parametrize(
+    "url,sha",
+    [
+        ("https://evil.test/session_example", "a" * 40),
+        (RESPONSE["claude_code_session_url"] + "?token=secret", "a" * 40),
+        (RESPONSE["claude_code_session_url"], "b" * 40),
+    ],
+)
+def test_reconciliation_refuses_unverified_identity(configured, url, sha):
+    configured.reserve(TASK, "trig_example", False)
+    with pytest.raises(cloud.CloudDispatchError):
+        configured.reconcile(TASK.request_id, url, sha)
+    assert configured.get(TASK.request_id)["state"] == "dispatching"
+
+
+def test_reconciliation_cannot_replace_an_existing_session(configured, monkeypatch):
+    monkeypatch.setattr(cloud, "_post", lambda *_: RESPONSE)
+    cloud.dispatch(TASK, configured)
+    with pytest.raises(cloud.CloudDispatchError, match="different session"):
+        configured.reconcile(TASK.request_id, "https://claude.ai/code/session_other", TASK.head_sha)
+
+
+def test_cli_reconciles_only_an_existing_request(configured, monkeypatch, capsys):
+    configured.reserve(TASK, "trig_example", False)
+    monkeypatch.setattr(cloud, "_post", lambda *_: pytest.fail("must not send"))
+    assert (
+        main(
+            [
+                "claude-cloud-reconcile",
+                "--journal",
+                str(configured.path),
+                "--request-id",
+                TASK.request_id,
+                "--session-url",
+                RESPONSE["claude_code_session_url"],
+                "--observed-head-sha",
+                TASK.head_sha,
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["reconciliation_source"] == "operator"
+    with pytest.raises(cloud.CloudDispatchError, match="not present"):
+        configured.reconcile("missing", RESPONSE["claude_code_session_url"], TASK.head_sha)
+
+
+def test_cli_reports_known_session_but_nonzero_on_commit_failure(configured, monkeypatch, capsys):
+    import sqlite3
+
+    monkeypatch.setattr(cloud, "_post", lambda *_: RESPONSE)
+
+    def fail_finish(*_):
+        raise sqlite3.OperationalError("secret")
+
+    monkeypatch.setattr(cloud.DispatchJournal, "finish", fail_finish)
+    assert (
+        main(
+            [
+                "claude-cloud-dispatch",
+                "--project",
+                TASK.repository,
+                "--target-type",
+                "pull",
+                "--number",
+                "155",
+                "--head-sha",
+                TASK.head_sha,
+                "--role",
+                "review",
+                "--execute",
+                "--journal",
+                str(configured.path),
+            ]
+        )
+        == 3
+    )
+    result = json.loads(capsys.readouterr().out)
+    assert result["session_id"] == "session_example" and not result["journal_committed"]

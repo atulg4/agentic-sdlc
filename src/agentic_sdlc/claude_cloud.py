@@ -15,6 +15,7 @@ import sqlite3
 import time
 from contextlib import closing
 from dataclasses import asdict, dataclass
+from datetime import UTC
 from email.utils import parsedate_to_datetime
 from http.client import HTTPException
 from pathlib import Path
@@ -113,7 +114,10 @@ def _retry_at(headers, now: float) -> float:
         return now + max(60, seconds)
     except ValueError:
         try:
-            return max(now + 60, parsedate_to_datetime(value).timestamp())
+            parsed = parsedate_to_datetime(value)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            return max(now + 60, parsed.timestamp())
         except (TypeError, ValueError, OverflowError):
             return now + 60
 
@@ -125,8 +129,11 @@ class DispatchJournal:
     duplicate suppression. The journal never stores credentials or remote errors.
     """
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, create: bool = True):
         self.path = path
+        self.create = create
+        if not create:
+            return
         path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._connect()) as db:
             db.execute(
@@ -135,11 +142,12 @@ class DispatchJournal:
             )
             db.commit()
 
-    def _connect(self):
-        return sqlite3.connect(self.path, timeout=10)
+    def _connect(self, *, read_only: bool = False):
+        mode = "ro" if read_only else "rwc" if self.create else "rw"
+        return sqlite3.connect(f"{self.path.resolve().as_uri()}?mode={mode}", uri=True, timeout=10)
 
     def get(self, request_id: str) -> dict | None:
-        with closing(self._connect()) as db:
+        with closing(self._connect(read_only=True)) as db:
             row = db.execute(
                 "SELECT record FROM cloud_dispatches WHERE request_id = ?", (request_id,)
             ).fetchone()
@@ -175,9 +183,53 @@ class DispatchJournal:
     def finish(self, record: dict) -> dict:
         record = {**record, "updated_at": time.time()}
         with closing(self._connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT record FROM cloud_dispatches WHERE request_id = ?", (record["request_id"],)
+            ).fetchone()
+            if row:
+                previous = json.loads(row[0])
+                if previous.get("reconciliation_source") == "operator":
+                    # An in-flight request can fail after the operator observed
+                    # its session. Never overwrite that evidence with uncertainty.
+                    return previous
             db.execute(
                 "UPDATE cloud_dispatches SET record = ? WHERE request_id = ?",
                 (_json(record), record["request_id"]),
+            )
+        return record
+
+    def reconcile(self, request_id: str, session_url: str, observed_head_sha: str) -> dict:
+        """Record an operator-observed launch; this never asserts review completion."""
+        match = re.fullmatch(r"https://claude\.ai/code/(session_[A-Za-z0-9_-]+)", session_url)
+        if not match:
+            raise CloudDispatchError("provide a canonical Claude Code session URL without a query")
+        with closing(self._connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT record FROM cloud_dispatches WHERE request_id = ?", (request_id,)
+            ).fetchone()
+            if not row:
+                raise CloudDispatchError("request is not present in this journal")
+            record = json.loads(row[0])
+            if record["task"]["head_sha"] != observed_head_sha.lower():
+                raise CloudDispatchError("observed SHA does not match the recorded task")
+            if record["state"] == "started":
+                if record.get("session_url") != session_url:
+                    raise CloudDispatchError("request already has a different session")
+                return record
+            if record["state"] not in {"dispatching", "unknown"}:
+                raise CloudDispatchError("only an ambiguous dispatch can be reconciled")
+            record.update(
+                state="started",
+                session_id=match[1],
+                session_url=session_url,
+                reconciliation_source="operator",
+                updated_at=time.time(),
+            )
+            db.execute(
+                "UPDATE cloud_dispatches SET record = ? WHERE request_id = ?",
+                (_json(record), request_id),
             )
         return record
 
@@ -204,17 +256,35 @@ def dispatch(task: CloudTask, journal: DispatchJournal, *, retry_rejected: bool 
         if error.code == 429:
             record["retry_at"] = _retry_at(error.headers, time.time())
         error.close()
-    except (URLError, OSError, ValueError, HTTPException):
+    except (URLError, OSError, ValueError, HTTPException) as error:
         # Do not include exception messages: URLs/headers/bodies may contain secrets.
-        record.update(state="unknown")
-    return {**journal.finish(record), "deduplicated": False}
+        record.update(
+            state="unknown",
+            failure_kind=(
+                "invalid_response"
+                if isinstance(error, ValueError)
+                else "timeout"
+                if isinstance(error, TimeoutError)
+                else "transport"
+            ),
+        )
+    try:
+        return {**journal.finish(record), "deduplicated": False}
+    except sqlite3.Error:
+        # Reservation still blocks a duplicate POST. Preserve known session data
+        # so the operator can reconcile after repairing the journal.
+        return {**record, "deduplicated": False, "journal_committed": False}
 
 
 def _command(args) -> int:
     if args.command == "claude-cloud-status":
-        result = DispatchJournal(Path(args.journal)).get(args.request_id)
+        result = DispatchJournal(Path(args.journal), create=False).get(args.request_id)
         if result is None:
             raise CloudDispatchError("request is not present in this journal")
+    elif args.command == "claude-cloud-reconcile":
+        result = DispatchJournal(Path(args.journal), create=False).reconcile(
+            args.request_id, args.session_url, args.observed_head_sha
+        )
     else:
         task = CloudTask(args.project, args.target_type, args.number, args.head_sha, args.role)
         if not args.execute:
@@ -226,7 +296,7 @@ def _command(args) -> int:
             task, DispatchJournal(Path(args.journal)), retry_rejected=args.retry_rejected
         )
     print(_json(result))
-    return 0 if result["state"] == "started" else 3
+    return 0 if result["state"] == "started" and result.get("journal_committed", True) else 3
 
 
 def command(args) -> int:
@@ -251,3 +321,11 @@ def add_commands(commands) -> None:
     status.add_argument("--journal", required=True)
     status.add_argument("--request-id", required=True)
     status.set_defaults(handler=command)
+    reconcile = commands.add_parser(
+        "claude-cloud-reconcile", help="record an observed session without launching another"
+    )
+    reconcile.add_argument("--journal", required=True)
+    reconcile.add_argument("--request-id", required=True)
+    reconcile.add_argument("--session-url", required=True)
+    reconcile.add_argument("--observed-head-sha", required=True)
+    reconcile.set_defaults(handler=command)

@@ -67,6 +67,28 @@ or accepted**. The fire token has no session-read capability; result collection
 still uses the Claude session and subsequent Codex review. No result is entered
 as CI evidence or usage-accounting data without observation.
 
+The status command opens an existing journal read-only and never creates a file.
+If saving a POST result fails, the CLI returns exit 3 with
+`journal_committed=false`, preserving any known session URL in its JSON output.
+The earlier reservation still prevents a second POST.
+
+To recover an ambiguous launch, inspect the routine's run history. Match the
+session's reported request ID and inspected SHA to the journal entry. Only then
+record the observed session (this makes no network request):
+
+```sh
+sdlcctl claude-cloud-reconcile --journal /persistent/forge/cloud.sqlite \
+  --request-id REQUEST_ID --observed-head-sha FULL_40_CHARACTER_SHA \
+  --session-url https://claude.ai/code/session_ID
+```
+
+Use the canonical session URL without query parameters. Reconciliation requires
+an existing ambiguous entry and matching SHA; it cannot replace a different
+known session or turn a rejected request into a launch. It records operator
+evidence of a launch, not a completed review or approval. A late transport error
+cannot overwrite this observation. Never reconcile just because a similar task
+appears in the history.
+
 The API has no idempotency key. Forge commits a reservation before its single
 POST and does not retry ambiguous outcomes. Do not delete/reset the journal to
 force retries; that removes this protection. Losing the journal, using separate
@@ -140,3 +162,15 @@ and [routines guide](https://code.claude.com/docs/en/routines):
 Forge pins the host/path, refuses redirects, never logs the credential or remote
 error body, and has no automatic POST retry. Tests use fake transport only;
 credential setup and a real end-to-end smoke run are separate rollout steps.
+
+## Initial live verification
+
+On November 8, 2026, the Forge-only review routine launched a real review of
+PR #179 at `9e9e3c4eb00526fad85f553a93790626351f6807` through this adapter.
+The initial HTTP result was ambiguous; duplicate suppression prevented retries.
+Claude's run history showed a completed API-triggered session whose report
+matched request `04a6139b1a42bca7b1a36282ef812d2d237138b37004ef12e8089768d5886309`
+and that exact SHA. The observed session was reconciled locally. The reviewer
+returned advisory findings and explicitly reported that pytest was unavailable;
+its response was not counted as test evidence. Token contents are never recorded
+in these documents or the dispatch journal.
