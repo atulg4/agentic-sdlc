@@ -6668,6 +6668,8 @@ def _may_change_shell_options(argv: list[str]) -> bool:
     words = _effective_command(argv)
     if not words:
         return False
+    if _trap_is_query(words):
+        return False
     if words[0] == "shopt":
         # Only `shopt -o` reaches the `set -o` options (`help shopt`); `shopt -s nullglob`
         # changes neither errexit nor pipefail (Codex 4252615579). Without `-s`/`-u` it only
@@ -6677,6 +6679,28 @@ def _may_change_shell_options(argv: list[str]) -> bool:
         flags = {c for word in words[1:] if word.startswith("-") for c in word[1:]}
         return "o" in flags and bool(flags & {"s", "u"})
     return bool(set(words[0]) & _SHELL_EXPANSION_CHARS or words[0] in _SHELL_OPTION_COMMANDS)
+
+
+def _trap_is_query(words: list[str]) -> bool:
+    """Literal `trap`, `trap -p` and `trap -l` only display handlers/signals.
+
+    Stop option parsing at `--` or the first operand: `trap -- -p EXIT` installs
+    a handler. Expanded arguments remain opaque, even for a query flag.
+    """
+    if words[:1] != ["trap"]:
+        return False
+    if len(words) == 1:
+        return True
+    if any(set(word) & _SHELL_EXPANSION_CHARS for word in words[1:]):
+        return False
+    query = False
+    for word in words[1:]:
+        if word in {"--", "-"} or not word.startswith("-"):
+            break
+        if set(word[1:]) - {"p", "l"}:
+            return False
+        query = True
+    return query
 
 
 #: Prefixes that run the next word as the shell builtin itself, in the current shell.
@@ -6727,24 +6751,43 @@ _SHELL_CONTROL_WORDS = {
 }  # fmt: skip
 
 
+# Preserve the original spelling of a shell word while honoring escapes within
+# double quotes. Non-POSIX shlex preserves quotes but cannot parse e.g.
+# `python -c "print(\"ready\")"`; POSIX shlex alone loses quote provenance.
+_RAW_SHELL_WORD = re.compile(
+    r"""(?:[^\s'"\\();<>|&#]+|'[^']*'|"(?:[^"\\]|\\.)*"|\\.)+|[();<>|&]+"""
+)
+
+
 def _quotes_a_control_word(line: str) -> bool:
     """Whether `line` quotes or escapes a control word (`"fi"`, `'done'`, `\\fi`): the POSIX
     tokenizing the parser uses drops that quoting and would read it as the keyword."""
-    lexer = shlex.shlex(line, posix=False, punctuation_chars=True)
-    lexer.whitespace_split = True
-    try:
-        tokens = list(lexer)
-    except ValueError:
-        return True
+    tokens = []
+    offset = 0
+    while offset < len(line):
+        if line[offset].isspace():
+            offset += 1
+            continue
+        if line[offset] == "#":
+            break
+        match = _RAW_SHELL_WORD.match(line, offset)
+        if match is None:
+            return True  # incomplete quote/escape: no trusted continuation
+        tokens.append(match.group())
+        offset = match.end()
     # Only where the parser reads a keyword: the head of a command, past keywords and `VAR=x`
     # prefixes. `pytest -k "if"` passes `if` as an argument (Codex 4253363470).
     command_position = True
     for token in tokens:
-        bare = token.replace("\\", "").replace('"', "").replace("'", "")
+        try:
+            words = shlex.split(token, posix=True)
+        except ValueError:
+            return True
+        bare = words[0] if len(words) == 1 else token
         if bare != token:
             if command_position and bare in _SHELL_CONTROL_WORDS:
                 return True
-            command_position = False
+            command_position = bool(command_position and _ASSIGNMENT_WORD.match(bare))
         elif not set(token) - set("();<>|&"):
             command_position = bool(set(token) & set(";|&()"))
         elif not (
@@ -7003,7 +7046,9 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                     # backticks is an empty substitution, not a name: a policy command may
                     # start with one (`test_every_template_round_trips_hostile_values`).
                     out.evals = True
-                invocation = _set_invocation(tuple(argv))
+                # A `command -v/-V set ...` query has no effective command. It
+                # cannot enable noexec, regardless of its description operands.
+                invocation = _set_invocation(tuple(argv)) if effective[0] == "set" else None
                 ends_script = False  # applied after this command is recorded, as `exit` is
                 # Whether this command may run in the parent shell at all: not piped,
                 # backgrounded or in a subshell (Codex 4252316098: `set -n | cat` leaves the
@@ -7043,7 +7088,7 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                     invocation = None
                 if _effective_command(argv)[:1] == ["enable"]:
                     wrappers_untrusted = True
-                if (_effective_command(argv) or [""])[0] == "trap":
+                if effective[0] == "trap" and not _trap_is_query(effective):
                     # An ERR/EXIT/DEBUG handler can turn a later failure into success (`trap
                     # 'exit 0' ERR`): no command after a trap is proven enforced (Codex
                     # 4253116046).

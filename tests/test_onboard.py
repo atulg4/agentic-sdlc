@@ -2397,6 +2397,17 @@ def test_doctor_rejects_a_ci_gate_whose_failure_is_ignored(tmp_path, mutate):
         ('set -- "$PWD"; pytest', "bash", True),
         ("set -o pipefail $x; pytest | tee out", None, False),
         ('set -e "$x"; pytest', "bash", False),
+        # Queries cannot enable noexec or install trap handlers; escaped quotes in an
+        # ordinary argument do not turn it into a quoted control word.
+        ('command -v set "$SHELL"; pytest', "bash", True),
+        ('command -V set "$SHELL"; pytest | tee out', "bash", True),
+        ("trap -p EXIT; pytest | tee out", "bash", True),
+        ("builtin trap -p; pytest", "bash", True),
+        ("command trap -l; pytest", "bash", True),
+        ("trap; pytest", "bash", True),
+        ("trap -- -p EXIT; pytest", "bash", False),
+        ("trap $FLAGS EXIT; pytest", "bash", False),
+        (r'python -c "print(\"ready\")"; pytest', "bash", True),
         # `set -n` behind a redirection; `shopt -q` only queries; a quoted control word as an
         # argument is a plain word (Codex 4253363484/4253363488/4253363470).
         (">/tmp/x set -n; pytest", "bash", False),
@@ -2487,6 +2498,25 @@ def test_shell_parse_sees_eval_behind_builtin_wrappers(script):
     from agentic_sdlc.onboard import _shell_parse
 
     assert _shell_parse(script, "bash").evals
+
+
+@pytest.mark.parametrize(
+    "line,quoted",
+    [
+        (r'python -c "print(\"ready\")"; pytest', False),
+        (r'echo "an escaped quote: \" then if"; pytest', False),
+        ('echo "if"; pytest', False),
+        ('echo "unterminated', True),
+        ('"fi"; pytest', True),
+        (r"\fi; pytest", True),
+        ("f''i; pytest", True),
+        ('X="value with spaces" "fi"; pytest', True),
+    ],
+)
+def test_control_word_quote_provenance_honors_shell_escapes(line, quoted):
+    from agentic_sdlc.onboard import _quotes_a_control_word
+
+    assert _quotes_a_control_word(line) is quoted
 
 
 @pytest.mark.parametrize(
@@ -3851,6 +3881,11 @@ def test_doctor_rejects_a_gate_whose_meaning_is_changed(tmp_path, mutate):
             {"run": 'tool=python; command -v "$tool"\n' + step["run"]}
         ),
         lambda doc, job, step: step.update({"run": 'set -- "$PWD"\n' + step["run"]}),
+        lambda doc, job, step: step.update({"run": 'command -v set "$SHELL"\n' + step["run"]}),
+        lambda doc, job, step: step.update({"run": "trap -p EXIT\n" + step["run"]}),
+        lambda doc, job, step: step.update(
+            {"run": r'python -c "print(\"ready\")"' + "\n" + step["run"]}
+        ),
     ],
 )
 def test_doctor_accepts_a_gate_with_benign_surroundings(tmp_path, mutate):
