@@ -26,6 +26,7 @@ from .capacity_metrics import (
     build_capacity_report,
     load_capacity_inputs,
 )
+from .claude_cloud import add_commands as add_claude_cloud_commands
 from .context_builder import (
     DEFAULT_PACKET_BYTES,
     ContextBuilderError,
@@ -3633,6 +3634,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="print the installed version and the commit it was installed from",
     )
     commands = parser.add_subparsers(dest="command", required=True)
+    add_claude_cloud_commands(commands)
 
     validate = commands.add_parser("validate-task")
     validate.add_argument("--config", required=True)

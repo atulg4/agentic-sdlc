@@ -9,6 +9,18 @@ import pytest
 from agentic_sdlc.gates import GateError, gate_shell, run_gates, write_report
 
 
+@pytest.mark.parametrize("role", ["REVIEW", "TESTS", "RESEARCH"])
+def test_gate_policy_cannot_expose_claude_routine_tokens(tmp_path, monkeypatch, role):
+    name = f"FORGE_CLAUDE_{role}_ROUTINE_TOKEN"
+    monkeypatch.setenv(name, "sk-ant-oat01-must-not-leak")
+    policy = tmp_path / "policy.toml"
+    policy.write_text(
+        f'[commands]\ncheck = "true"\n[verification]\nenvironment_allowlist = ["{name}"]\n'
+    )
+    with pytest.raises(GateError, match="protected names"):
+        run_gates(policy, tmp_path)
+
+
 def _write_config(path: Path, first: str, second: str) -> None:
     path.write_text(
         f"""\
