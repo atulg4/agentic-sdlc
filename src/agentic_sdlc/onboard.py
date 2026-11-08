@@ -6793,6 +6793,23 @@ def _without_shell_comment(line: str) -> str:
     return line
 
 
+def _shell_logical_lines(script: str) -> list[str]:
+    """Join continued words after removing comments, where backslashes are inert."""
+    lines = []
+    pending = ""
+    for physical in script.splitlines(keepends=True):
+        line = _without_shell_comment(pending + physical.removesuffix("\n"))
+        trailing_backslashes = len(line) - len(line.rstrip("\\"))
+        if physical.endswith("\n") and trailing_backslashes % 2:
+            pending = line[:-1]  # bash removes the pair, without inserting a space
+            continue
+        lines.append(line)
+        pending = ""
+    if pending:
+        lines.append(pending)
+    return lines
+
+
 def _quotes_a_control_word(line: str) -> bool:
     """Whether `line` quotes or escapes a control word (`"fi"`, `'done'`, `\\fi`): the POSIX
     tokenizing the parser uses drops that quoting and would read it as the keyword."""
@@ -6977,8 +6994,7 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
     wrappers_untrusted = False
     group_starts: list[int] = []  # index in `records` where each open `{` group began
     closed_group_start: int | None = None
-    for line in script.replace("\\\n", " ").splitlines():
-        line = _without_shell_comment(line)
+    for line in _shell_logical_lines(script):
         lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
         lexer.whitespace_split = True
         lexer.commenters = ""
@@ -6986,6 +7002,10 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
             tokens = list(lexer)
         except ValueError:  # unbalanced quotes: no command we can vouch for
             opaque = True
+            terminated = True
+            # Valid Bash syntax that shlex cannot read (e.g. ANSI-C quotes)
+            # may hide exit/eval/function definitions. Never silently skip it.
+            out.evals = True
             continue
         if _quotes_a_control_word(line):
             # shlex drops quoting, so a quoted `"fi"` would close an `if` the shell keeps open:

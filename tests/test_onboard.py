@@ -2562,6 +2562,9 @@ def test_safe_shell_builtins_preserve_generated_gate_and_bash_failure(tmp_path, 
         "echo a#b; exit 0\npytest\necho end",
         "echo a#b; set +e\npytest\necho end",
         "echo args=$#; exit 0\npytest\necho end",
+        "echo hi # note \\\nexit 0\npytest\necho end",
+        "echo $'a\\'b'; exit 0\npytest\necho end",
+        "echo a\\\\\nexit 0\npytest\necho end",
     ],
 )
 def test_shell_parse_does_not_invent_gate_enforcement(script, tmp_path):
@@ -2594,6 +2597,9 @@ def test_shell_parse_does_not_invent_gate_enforcement(script, tmp_path):
         "echo args=$#; pytest\necho end",
         'echo "a"#b; pytest\necho end',
         "echo a # exit 0\npytest\necho end",
+        "echo hi # note \\\npytest\necho end",
+        "echo a\\\n#b; pytest\necho end",
+        "pyte\\\nst\necho end",
     ],
 )
 def test_shell_word_hash_preserves_real_commands_and_comments(script):
@@ -3941,6 +3947,8 @@ def _mutate_ci_test_step(repo, mutate):
             {"run": "if false; then\nX=1 fi\n" + step["run"] + "\nfi\necho end"}
         ),
         lambda doc, job, step: step.update({"run": "echo a#b; exit 0\n" + step["run"]}),
+        lambda doc, job, step: step.update({"run": "echo hi # note \\\nexit 0\n" + step["run"]}),
+        lambda doc, job, step: step.update({"run": "echo $'a\\'b'; exit 0\n" + step["run"]}),
         lambda doc, job, step: step.update(
             {"run": "echo args=$#; set +e\n" + step["run"] + "\necho end"}
         ),
