@@ -6682,12 +6682,27 @@ def _may_change_shell_options(argv: list[str]) -> bool:
         # lists or queries (`shopt -q -o pipefail`: Codex 4253363488).
         if any(set(word) & _SHELL_EXPANSION_CHARS for word in words[1:]):
             return True
-        flags = {c for word in words[1:] if word.startswith("-") and word != "--" for c in word[1:]}
-        operands = [word for word in words[1:] if not word.startswith("-")]
-        if flags <= {"u", "o", "p", "q"} and "u" in flags and operands == ["noexec"]:
-            # Disabling noexec cannot suppress execution or change errexit/pipefail.
+        flags: set[str] = set()
+        index = 1
+        while index < len(words) and words[index].startswith("-"):
+            word = words[index]
+            index += 1
+            if word == "--":
+                break
+            flags.update(word[1:])
+        if flags - {"s", "u", "o", "p", "q"}:
+            return True
+        if "o" not in flags or not flags & {"s", "u"}:
             return False
-        return "o" in flags and bool(flags & {"s", "u"})
+        options = set(words[index:])
+        if not options or options - _SET_OPTION_NAMES:
+            return True
+        # Unrelated literal options such as nounset do not change enforcement.
+        # Turning off noexec/onecmd also preserves execution; enabling them may
+        # stop the script. Unreadable names and mixed safety options fail closed.
+        return bool(options & {"errexit", "pipefail"}) or bool(
+            "s" in flags and options & {"noexec", "onecmd"}
+        )
     return _command_name_expands(words[0]) or words[0] in _SHELL_OPTION_COMMANDS
 
 
@@ -7164,7 +7179,8 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                     and may_run_in_parent
                     and _may_change_shell_options(argv)
                     and (
-                        "noexec" in argv or any(set(word) & _SHELL_EXPANSION_CHARS for word in argv)
+                        bool({"noexec", "onecmd"} & set(argv))
+                        or any(set(word) & _SHELL_EXPANSION_CHARS for word in argv)
                     )
                 ):
                     # `shopt -s -o noexec` (or an expansion that may spell it) reads the rest

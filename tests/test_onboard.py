@@ -2442,6 +2442,8 @@ def test_doctor_rejects_a_ci_gate_whose_failure_is_ignored(tmp_path, mutate):
         ("pytest && true", "bash", True),
         # `shopt -s -o noexec` and `command -p exit` end the script (Codex 4252760388/-408).
         ("shopt -s -o noexec; pytest", "bash", False),
+        ("shopt -s -o onecmd; pytest", "bash", False),
+        ("shopt -u -o onecmd; pytest", "bash", True),
         ("command -p exit 0; pytest", "bash", False),
         # Tilde expansion makes `set`'s arguments unreadable (Codex 4252987836).
         ("HOME=-n; set ~; pytest", "bash", False),
@@ -2521,6 +2523,10 @@ def test_shell_parse_sees_eval_behind_builtin_wrappers(script):
         "shopt -u -o noexec",
         "command shopt -uo noexec",
         "shopt -uo -- noexec",
+        "shopt -u -o nounset",
+        "shopt -s -o nounset",
+        "shopt -uo nounset noexec",
+        "shopt -o -s noglob",
         "[ -f pyproject.toml ]",
         "[[ -f pyproject.toml ]]",
     ],
