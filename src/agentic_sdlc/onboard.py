@@ -6630,6 +6630,12 @@ _SHELL_EXPANSION_CHARS = set("$`{}*?[]~")
 _SHELL_OPTION_COMMANDS = {"set", "shopt", "trap", "enable"}
 
 
+def _command_name_expands(word: str) -> bool:
+    # `[` is the test builtin and `[[` starts a conditional, not a glob.
+    # Other bracket-containing words (e.g. `[se]val`) can still expand.
+    return word not in {"[", "[["} and bool(set(word) & _SHELL_EXPANSION_CHARS)
+
+
 def _effective_command(argv: list[str]) -> list[str]:
     """`argv` from the word bash runs as the command: past leading redirections (`>/x`,
     `2>/dev/null`), `time`'s options (`time -p`) and the `builtin`/`command` wrappers with
@@ -6668,7 +6674,7 @@ def _may_change_shell_options(argv: list[str]) -> bool:
     words = _effective_command(argv)
     if not words:
         return False
-    if _trap_is_query(words):
+    if _trap_preserves_gate_state(words):
         return False
     if words[0] == "shopt":
         # Only `shopt -o` reaches the `set -o` options (`help shopt`); `shopt -s nullglob`
@@ -6676,13 +6682,17 @@ def _may_change_shell_options(argv: list[str]) -> bool:
         # lists or queries (`shopt -q -o pipefail`: Codex 4253363488).
         if any(set(word) & _SHELL_EXPANSION_CHARS for word in words[1:]):
             return True
-        flags = {c for word in words[1:] if word.startswith("-") for c in word[1:]}
+        flags = {c for word in words[1:] if word.startswith("-") and word != "--" for c in word[1:]}
+        operands = [word for word in words[1:] if not word.startswith("-")]
+        if flags <= {"u", "o", "p", "q"} and "u" in flags and operands == ["noexec"]:
+            # Disabling noexec cannot suppress execution or change errexit/pipefail.
+            return False
         return "o" in flags and bool(flags & {"s", "u"})
-    return bool(set(words[0]) & _SHELL_EXPANSION_CHARS or words[0] in _SHELL_OPTION_COMMANDS)
+    return _command_name_expands(words[0]) or words[0] in _SHELL_OPTION_COMMANDS
 
 
-def _trap_is_query(words: list[str]) -> bool:
-    """Literal `trap`, `trap -p` and `trap -l` only display handlers/signals.
+def _trap_preserves_gate_state(words: list[str]) -> bool:
+    """Literal queries, resets and empty handlers cannot execute handler code.
 
     Stop option parsing at `--` or the first operand: `trap -- -p EXIT` installs
     a handler. Expanded arguments remain opaque, even for a query flag.
@@ -6694,13 +6704,19 @@ def _trap_is_query(words: list[str]) -> bool:
     if any(set(word) & _SHELL_EXPANSION_CHARS for word in words[1:]):
         return False
     query = False
-    for word in words[1:]:
-        if word in {"--", "-"} or not word.startswith("-"):
+    index = 1
+    while index < len(words):
+        word = words[index]
+        if word == "--":
+            index += 1
+            break
+        if word == "-" or not word.startswith("-"):
             break
         if set(word[1:]) - {"p", "l"}:
             return False
         query = True
-    return query
+        index += 1
+    return query or (index < len(words) and words[index] in {"-", ""})
 
 
 #: Prefixes that run the next word as the shell builtin itself, in the current shell.
@@ -7040,7 +7056,7 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                 elif effective[0] in {"source", "."}:
                     out.sourced.append(effective[1] if len(effective) > 1 else "")
                 elif effective[0] == "eval" or (
-                    set(effective[0]) & _SHELL_EXPANSION_CHARS and set(effective[0]) != {"`"}
+                    _command_name_expands(effective[0]) and set(effective[0]) != {"`"}
                 ):
                     # `x=eval; $x '...'` evaluates too (Codex 4253363494). A bare run of
                     # backticks is an empty substitution, not a name: a policy command may
@@ -7088,7 +7104,7 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                     invocation = None
                 if _effective_command(argv)[:1] == ["enable"]:
                     wrappers_untrusted = True
-                if effective[0] == "trap" and not _trap_is_query(effective):
+                if effective[0] == "trap" and not _trap_preserves_gate_state(effective):
                     # An ERR/EXIT/DEBUG handler can turn a later failure into success (`trap
                     # 'exit 0' ERR`): no command after a trap is proven enforced (Codex
                     # 4253116046).

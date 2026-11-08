@@ -2405,6 +2405,18 @@ def test_doctor_rejects_a_ci_gate_whose_failure_is_ignored(tmp_path, mutate):
         ("builtin trap -p; pytest", "bash", True),
         ("command trap -l; pytest", "bash", True),
         ("trap; pytest", "bash", True),
+        ("trap - EXIT; pytest | tee out", "bash", True),
+        ("builtin trap -- - ERR EXIT; pytest", "bash", True),
+        ("trap '' EXIT; pytest", "bash", True),
+        ("trap -- 'exit 0' ERR; pytest", "bash", False),
+        ("shopt -u -o noexec; pytest | tee out", "bash", True),
+        ("command shopt -uo noexec; pytest", "bash", True),
+        ("shopt -uo -- noexec; pytest", "bash", True),
+        ("shopt -uo noexec pipefail; pytest | tee out", "bash", False),
+        ("shopt -uo $OPTION; pytest", "bash", False),
+        ("[ -f pyproject.toml ]; pytest | tee out", "bash", True),
+        ("[[ -f pyproject.toml ]]; pytest | tee out", "bash", True),
+        ("[se]val 'set +e'; pytest", "bash", False),
         ("trap -- -p EXIT; pytest", "bash", False),
         ("trap $FLAGS EXIT; pytest", "bash", False),
         (r'python -c "print(\"ready\")"; pytest', "bash", True),
@@ -2498,6 +2510,49 @@ def test_shell_parse_sees_eval_behind_builtin_wrappers(script):
     from agentic_sdlc.onboard import _shell_parse
 
     assert _shell_parse(script, "bash").evals
+
+
+@pytest.mark.parametrize(
+    "setup",
+    [
+        "trap - EXIT",
+        "builtin trap -- - ERR EXIT",
+        "trap '' EXIT",
+        "shopt -u -o noexec",
+        "command shopt -uo noexec",
+        "shopt -uo -- noexec",
+        "[ -f pyproject.toml ]",
+        "[[ -f pyproject.toml ]]",
+    ],
+)
+def test_safe_shell_builtins_preserve_generated_gate_and_bash_failure(tmp_path, setup):
+    import subprocess
+
+    from agentic_sdlc.onboard import _ci_problems
+
+    repo = _repo(tmp_path)
+    command = f"{setup}; pytest | tee /dev/null"
+    write_onboarding(repo, spec(test_command=command))
+    assert not _ci_problems(repo)
+    # Exercise actual Bash too: the setup must reach the gate and preserve its
+    # failure even when followed by a successful pipeline stage and command.
+    (repo / "pyproject.toml").touch()
+    actual = subprocess.run(
+        [
+            "bash",
+            "--noprofile",
+            "--norc",
+            "-eo",
+            "pipefail",
+            "-c",
+            f"{setup}; echo reached; false | cat; echo masked",
+        ],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    assert actual.returncode == 1, actual
+    assert actual.stdout == "reached\n"
 
 
 @pytest.mark.parametrize(
