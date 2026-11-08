@@ -13,7 +13,7 @@ import hashlib
 import json
 import re
 import tomllib
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -153,6 +153,9 @@ class AgentProfile:
     capabilities: tuple[str, ...]
     available: bool = True
     max_risk: RiskLevel = RiskLevel.HIGH
+    #: The model's declared context window; 0 means undeclared, and dispatch
+    #: then relies on the mission token budget alone.
+    context_window_tokens: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -164,6 +167,7 @@ class AgentProfile:
             "capabilities": list(self.capabilities),
             "available": self.available,
             "maxRisk": self.max_risk.value,
+            "contextWindowTokens": self.context_window_tokens,
         }
 
 
@@ -472,31 +476,51 @@ class MissionRegistry:
     def excluded_agents(
         self,
         mission: MissionSpec,
-        history: Mapping[str, str],
+        history: Mapping[str, str | Sequence[str]],
     ) -> frozenset[str]:
-        """Agent IDs that independence rules disqualify for this mission."""
-        excluded = {history[other] for other in mission.independent_of if other in history}
+        """Agent IDs that independence rules disqualify for this mission.
+
+        A history value may be one agent ID or EVERY agent that performed the
+        mission: a work item can carry multiple runs of one producing mission
+        by different agents, and collapsing them to the last would let an
+        earlier assignee review changes they produced.
+        """
+
+        def _agents(value: str | Sequence[str]) -> tuple[str, ...]:
+            return (value,) if isinstance(value, str) else tuple(value)
+
+        excluded = {
+            agent
+            for other in mission.independent_of
+            if other in history
+            for agent in _agents(history[other])
+        }
         if mission.reviews:
-            for other_id, agent_id in history.items():
+            for other_id, value in history.items():
                 other = self.missions.get(other_id)
                 if other is not None and other.writes:
-                    excluded.add(agent_id)
+                    excluded.update(_agents(value))
         return frozenset(excluded)
 
     def select_agent(
         self,
         mission_id: str,
         agents: Sequence[AgentProfile],
-        history: Mapping[str, str] | None = None,
+        history: Mapping[str, str | Sequence[str]] | None = None,
         ledger: MissionLedger | None = None,
+        excluded_agents: Collection[str] = (),
     ) -> AgentProfile:
         """Pick the first declared agent satisfying the full mission contract.
 
         Agent order expresses preference: later entries are fallbacks and must
         satisfy exactly the same capability, risk, and independence rules.
+        ``excluded_agents`` adds caller-established exclusions — agents whose
+        PERSISTED run kinds prove they produced this work item — which hold
+        even when the mission that ran no longer exists in this registry or
+        no longer declares a write capability.
         """
         mission = self.get(mission_id)
-        excluded = self.excluded_agents(mission, history or {})
+        excluded = set(self.excluded_agents(mission, history or {})) | set(excluded_agents)
         if ledger is not None:
             ledger.check(mission)
         required = set(mission.capabilities)
@@ -540,8 +564,22 @@ def load_registry(
     if path is not None:
         with Path(path).open("rb") as handle:
             document = tomllib.load(handle)
-        if document.get("version") != 1:
-            raise MissionError("mission registry version must be 1")
+    return registry_from_document(document, policy, declared=path is not None)
+
+
+def load_registry_bytes(data: bytes, policy: ProjectPolicy) -> MissionRegistry:
+    """Load the registry from committed configuration bytes (see load_registry)."""
+    return registry_from_document(tomllib.loads(data.decode("utf-8")), policy, declared=True)
+
+
+def registry_from_document(
+    document: dict[str, Any],
+    policy: ProjectPolicy,
+    *,
+    declared: bool = True,
+) -> MissionRegistry:
+    if declared and document.get("version") != 1:
+        raise MissionError("mission registry version must be 1")
 
     registry_table = document.get("registry", {})
     if not isinstance(registry_table, dict):
@@ -656,11 +694,20 @@ def create_dispatch_envelope(
     prompt: str,
     input_refs: Sequence[str] = (),
     context_pack_digest: str | None = None,
+    packet_role: str = "",
+    run_kind: str = "",
+    dispatch_nonce: str = "",
+    state_id: str = "",
+    unit_state_sha256: str = "",
 ) -> dict[str, Any]:
     """Pin one dispatch to mission version, adapter, model, and prompt digest.
 
-    The envelope is deterministic: identical mission, agent, work reference,
-    inputs, and prompt always produce the same envelope digest.
+    The envelope is deterministic GIVEN its inputs: identical mission, agent,
+    work reference, inputs, prompt — and ``dispatch_nonce`` — always produce
+    the same envelope digest. The dispatching CLI mints a fresh nonce per
+    dispatch, so one envelope digest identifies exactly one dispatch: a
+    retry of byte-identical content re-dispatches under a new digest instead
+    of colliding with the recorded one.
     """
     if not work_ref.strip():
         raise MissionError("work_ref must be a non-empty reference")
@@ -685,6 +732,40 @@ def create_dispatch_envelope(
             "maxRetries": mission.max_retries,
         },
     }
+    if packet_role:
+        # The packet role declares which run kinds this dispatch may seed
+        # (builders implement/repair, testers verify, reviewers review): an
+        # attested orchestrate run refuses an envelope recorded under any
+        # other kind, so a producing envelope can never be laundered into a
+        # non-producing run record. Inside the body BEFORE the digest, so
+        # both the envelope digest and the attestation cover it.
+        body["packetRole"] = packet_role
+    if run_kind:
+        # The EXACT lifecycle kind this dispatch seeds, not just the role's
+        # category: an implementation envelope replayed as a repair run would
+        # bypass the fresh repair dispatch with its current authorization and
+        # revision, so an attested orchestrate run requires equality.
+        body["runKind"] = run_kind
+    if dispatch_nonce:
+        # Inside the body BEFORE the digest: the nonce makes each dispatch's
+        # digest unique, so the one-digest-one-run rule can stay absolute
+        # without stranding a legitimate retry of unchanged content, and
+        # completion/outcome records (which bind envelopeSha256) bind the
+        # exact dispatch, not merely its content.
+        body["dispatchNonce"] = dispatch_nonce
+    if state_id:
+        # The orchestration state GENERATION this dispatch was issued
+        # against: an attested start-run accepts only envelopes bound to its
+        # own lineage, so a recreated state cannot replay old signed
+        # envelopes (and the completions and outcomes bound to them).
+        body["stateId"] = state_id
+    if unit_state_sha256:
+        # The dispatching snapshot of the WORK UNIT itself: the lineage id
+        # stays constant as the state advances, so an attested start-run also
+        # requires the unit's snapshot digest to match the current state —
+        # a stale snapshot of the same lineage cannot seed a run against the
+        # advanced unit.
+        body["unitStateSha256"] = unit_state_sha256
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
     body["envelopeSha256"] = _sha256_text(canonical)
     return body
@@ -727,6 +808,7 @@ def load_agents(document: object) -> tuple[AgentProfile, ...]:
                 "capabilities",
                 "available",
                 "maxRisk",
+                "contextWindowTokens",
             }
         )
         if unknown:
@@ -754,6 +836,11 @@ def load_agents(document: object) -> tuple[AgentProfile, ...]:
             max_risk = RiskLevel(str(entry.get("maxRisk", "high")))
         except ValueError as error:
             raise MissionError(f"agent {agent_id}: invalid maxRisk") from error
+        context_window = entry.get("contextWindowTokens", 0)
+        if type(context_window) is not int or context_window < 0:
+            raise MissionError(
+                f"agent {agent_id}: contextWindowTokens must be a non-negative integer"
+            )
         strings = {}
         for key in ("adapter", "adapterVersion", "provider", "model"):
             value = entry.get(key)
@@ -770,6 +857,7 @@ def load_agents(document: object) -> tuple[AgentProfile, ...]:
                 capabilities=tuple(capabilities),
                 available=available,
                 max_risk=max_risk,
+                context_window_tokens=context_window,
             )
         )
     return tuple(agents)

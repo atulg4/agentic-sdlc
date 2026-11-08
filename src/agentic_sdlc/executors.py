@@ -630,11 +630,13 @@ def load_routing_policy(document: object | None) -> RoutingPolicy:
             "deniedProviders contains unknown providers: " + ", ".join(unknown_denied)
         )
     preferred_model_aliases = _preferred_model_aliases(document.get("preferredModelAliases"))
-    allowed_data_residency = _string_tuple(
-        document.get("allowedDataResidency"), "allowedDataResidency"
-    )
-    if not allowed_data_residency:
+    if document.get("allowedDataResidency") is None:
         allowed_data_residency = tuple(sorted(DATA_RESIDENCY))
+    else:
+        # An explicit empty allowlist is a deny-all decision and must not fail open.
+        allowed_data_residency = _string_tuple(
+            document["allowedDataResidency"], "allowedDataResidency"
+        )
     unknown_residency = sorted(set(allowed_data_residency) - DATA_RESIDENCY)
     if unknown_residency:
         raise ExecutorError(
