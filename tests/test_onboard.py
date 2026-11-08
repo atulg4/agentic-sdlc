@@ -2556,6 +2556,54 @@ def test_safe_shell_builtins_preserve_generated_gate_and_bash_failure(tmp_path, 
 
 
 @pytest.mark.parametrize(
+    "script",
+    [
+        "if false; then\nX=1 fi\npytest\nfi\necho end",
+        "echo a#b; exit 0\npytest\necho end",
+        "echo a#b; set +e\npytest\necho end",
+        "echo args=$#; exit 0\npytest\necho end",
+    ],
+)
+def test_shell_parse_does_not_invent_gate_enforcement(script, tmp_path):
+    import subprocess
+
+    from agentic_sdlc.onboard import _shell_parse
+
+    actual = subprocess.run(
+        [
+            "bash",
+            "--noprofile",
+            "--norc",
+            "-e",
+            "-c",
+            "pytest() { echo PYTEST_RAN; return 1; };\n" + script,
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert actual.returncode == 0, actual
+    parsed = _shell_parse(script)
+    assert not any(enforced for argv, enforced in parsed.commands if argv == ("pytest",)), parsed
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        "echo a#b; pytest\necho end",
+        "echo args=$#; pytest\necho end",
+        'echo "a"#b; pytest\necho end',
+        "echo a # exit 0\npytest\necho end",
+    ],
+)
+def test_shell_word_hash_preserves_real_commands_and_comments(script):
+    from agentic_sdlc.onboard import _shell_parse
+
+    parsed = _shell_parse(script)
+    assert any(enforced for argv, enforced in parsed.commands if argv == ("pytest",)), parsed
+
+
+@pytest.mark.parametrize(
     "line,quoted",
     [
         (r'python -c "print(\"ready\")"; pytest', False),
@@ -3889,6 +3937,13 @@ def _mutate_ci_test_step(repo, mutate):
     "mutate",
     [
         # an uncalled function only DEFINES the gate
+        lambda doc, job, step: step.update(
+            {"run": "if false; then\nX=1 fi\n" + step["run"] + "\nfi\necho end"}
+        ),
+        lambda doc, job, step: step.update({"run": "echo a#b; exit 0\n" + step["run"]}),
+        lambda doc, job, step: step.update(
+            {"run": "echo args=$#; set +e\n" + step["run"] + "\necho end"}
+        ),
         lambda doc, job, step: step.update(
             {"run": "run_tests() {\n  " + step["run"] + "\n}\necho done"}
         ),

@@ -6770,9 +6770,27 @@ _SHELL_CONTROL_WORDS = {
 # Preserve the original spelling of a shell word while honoring escapes within
 # double quotes. Non-POSIX shlex preserves quotes but cannot parse e.g.
 # `python -c "print(\"ready\")"`; POSIX shlex alone loses quote provenance.
-_RAW_SHELL_WORD = re.compile(
-    r"""(?:[^\s'"\\();<>|&#]+|'[^']*'|"(?:[^"\\]|\\.)*"|\\.)+|[();<>|&]+"""
-)
+_RAW_SHELL_WORD = re.compile(r"""(?:[^\s'"\\();<>|&]+|'[^']*'|"(?:[^"\\]|\\.)*"|\\.)+|[();<>|&]+""")
+
+
+def _without_shell_comment(line: str) -> str:
+    """Bash starts a comment only at a word boundary; `a#b` and `$#` are words.
+
+    Scan before shlex, whose comment handling also truncates inside a word.
+    An incomplete quote is left intact for the existing fail-closed handling.
+    """
+    offset = 0
+    while offset < len(line):
+        if line[offset].isspace():
+            offset += 1
+            continue
+        if line[offset] == "#":
+            return line[:offset]
+        match = _RAW_SHELL_WORD.match(line, offset)
+        if match is None:
+            return line
+        offset = match.end()
+    return line
 
 
 def _quotes_a_control_word(line: str) -> bool:
@@ -6960,8 +6978,10 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
     group_starts: list[int] = []  # index in `records` where each open `{` group began
     closed_group_start: int | None = None
     for line in script.replace("\\\n", " ").splitlines():
+        line = _without_shell_comment(line)
         lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
         lexer.whitespace_split = True
+        lexer.commenters = ""
         try:
             tokens = list(lexer)
         except ValueError:  # unbalanced quotes: no command we can vouch for
@@ -7000,17 +7020,26 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                     opaque = True
                 continue
             condition = False
+            assignment_prefix = False
             while argv and (
-                argv[0] in _SHELL_KEYWORDS
-                or argv[0] in _SHELL_CONDITIONS
-                or argv[0] in _SHELL_CLOSERS
-                or argv[0] == "function"
+                (
+                    not assignment_prefix
+                    and (
+                        argv[0] in _SHELL_KEYWORDS
+                        or argv[0] in _SHELL_CONDITIONS
+                        or argv[0] in _SHELL_CLOSERS
+                        or argv[0] == "function"
+                    )
+                )
                 or _ASSIGNMENT_WORD.match(argv[0])
             ):
                 head = argv.pop(0)  # keywords and `VAR=value` prefixes are not the command
                 assignment = _ASSIGNMENT_WORD.match(head)
                 if assignment:
                     out.assigned.add(assignment.group(1))
+                    # After a variable assignment, `fi`/`done`/etc. are command
+                    # names, not reserved words that close a conditional body.
+                    assignment_prefix = True
                 elif head == "function" and argv:
                     out.functions.add(argv.pop(0))
                     pending_function = True
@@ -7028,7 +7057,8 @@ def _shell_parse(script: str, shell: object = None) -> ShellScript:
                     depth = max(0, depth - 1)
             nested = depth > 0
             in_function = "function" in braces
-            if argv and argv[0] in _SHELL_OPENERS:  # for/case/select open a body, run nothing
+            if argv and not assignment_prefix and argv[0] in _SHELL_OPENERS:
+                # for/case/select open a body, run nothing
                 depth += 1
                 argv = []
             following = ";" if token is None else token
