@@ -1,0 +1,83 @@
+name: Release
+
+# Tags a release and publishes its GitHub release. A push to main that changes pyproject.toml
+# releases the version it declares; a release that already exists is left alone. Run it by hand
+# (workflow_dispatch) with `ref` to release an earlier commit on main, e.g. v0.2.0.
+on:
+  push:
+    branches: [main]
+    paths: [pyproject.toml]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Commit on main to release (default: the head of main)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Read the version
+        id: version
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          module=$(python3 -c 'import re; print(re.search(r"^__version__ = \"([^\"]+)\"$", open("src/agentic_sdlc/__init__.py").read(), re.M).group(1))')
+          if [ "$version" != "$module" ]; then
+            echo "::error::pyproject.toml declares $version but agentic_sdlc.__version__ is $module"
+            exit 1
+          fi
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+      - name: Require a commit on main
+        run: |
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::$(git rev-parse HEAD) is not on main; only main is released"
+            exit 1
+          fi
+      - name: Tag and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          MANUAL: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          tagged=$(git rev-parse -q --verify "refs/tags/$TAG^{commit}" || true)
+          if [ -z "$tagged" ]; then
+            tag_object=$(gh api "repos/$GITHUB_REPOSITORY/git/tags" -f tag="$TAG" \
+              -f message="agentic-sdlc ${TAG#v}" -f object="$sha" -f type=commit --jq .sha)
+            gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$TAG" \
+              -f sha="$tag_object" --silent
+            echo "Tagged $sha as $TAG"
+          elif [ "$tagged" != "$sha" ]; then
+            if [ "$MANUAL" = true ]; then
+              echo "::error::$TAG already tags $tagged, not $sha"
+              exit 1
+            fi
+            # pyproject.toml changed without a version bump: this version is already out.
+            echo "$TAG already tags $tagged; nothing to release"
+            exit 0
+          fi
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "Release $TAG already exists"
+          elif git show "origin/main:docs/releases/$TAG.md" > "$RUNNER_TEMP/notes.md" 2>/dev/null; then
+            # Notes are read from main: an earlier release commit predates its own notes file.
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" \
+              --notes-file "$RUNNER_TEMP/notes.md"
+          else
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" \
+              --generate-notes
+          fi
