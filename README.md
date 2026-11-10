@@ -208,6 +208,10 @@ sdlcctl release --project owner/repo --issue 12 --session "$SESSION"
 sdlcctl claims  --project owner/repo          # live + expired leases
 ```
 
+Cloud workers that can reach GitHub REST but cannot use GraphQL can opt into
+`FORGE_LEASE_PR_API=rest`. See [cloud lease setup and limitations](docs/cloud-leases.md);
+unreadable manual or external PR relationships still refuse the operation.
+
 Each prints its result as one JSON document on stdout (or writes it to `--output`); the human
 status line (`claimed #12 …`, the `claims` table, a refusal) goes to stderr, so
 `sdlcctl claim … | jq .ok` always parses. GitHub logins compare case-insensitively everywhere
