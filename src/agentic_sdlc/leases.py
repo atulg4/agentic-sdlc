@@ -51,6 +51,7 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from urllib.parse import quote
 
 GhRunner = Callable[..., str]
 _log = logging.getLogger(__name__)
@@ -676,6 +677,94 @@ query($owner: String!, $name: String!, $after: String) {
 }"""
 #: A runaway cursor (an answer that never ends) stops here and refuses, never "no PR".
 _MAX_PR_PAGES = 1000
+LEASE_PR_API_ENV = "FORGE_LEASE_PR_API"
+
+
+def _lease_pr_api() -> str:
+    """REST is an explicit operator choice, never a silent fallback after a failed read."""
+    mode = os.environ.get(LEASE_PR_API_ENV, "graphql")
+    if mode not in {"graphql", "rest"}:
+        raise LeaseError(f"{LEASE_PR_API_ENV} must be graphql or rest")
+    return mode
+
+
+def _rest_open_pull_requests(project: str, gh: GhRunner) -> list[dict]:
+    """Complete REST inventory, normalized for the existing body/branch conflict signals.
+
+    REST has no closingIssuesReferences. The issue timeline is still read by
+    open_prs_for_issue; manual links and external closing references still require their
+    existing GraphQL verification and refuse when that evidence cannot be resolved.
+    """
+    what = f"unreadable REST pull request inventory for {project}"
+    try:
+        pages = json.loads(
+            gh(["api", f"repos/{project}/pulls?state=open&per_page=100", "--paginate", "--slurp"])
+            or "null"
+        )
+    except Exception as exc:  # noqa: BLE001 - every incomplete observation refuses the claim
+        raise LeaseError(f"{what}: the complete inventory could not be read") from exc
+    if not isinstance(pages, list) or not pages or len(pages) > _MAX_PR_PAGES:
+        raise LeaseError(f"{what}: missing or excessive pages")
+    prs: list[dict] = []
+    seen: set[int] = set()
+    for index, page in enumerate(pages):
+        if (
+            not isinstance(page, list)
+            or len(page) > 100
+            or (index < len(pages) - 1 and len(page) != 100)
+        ):
+            raise LeaseError(f"{what}: malformed or incomplete page")
+        for row in page:
+            if not isinstance(row, dict):
+                raise LeaseError(f"{what}: a pull request is not an object")
+            number = _number(row.get("number"))
+            base = row.get("base")
+            base_repo = base.get("repo") if isinstance(base, dict) else None
+            base_name = base_repo.get("full_name") if isinstance(base_repo, dict) else None
+            head = row.get("head")
+            head_repo = head.get("repo") if isinstance(head, dict) else None
+            head_name = head_repo.get("full_name") if isinstance(head_repo, dict) else None
+            if (
+                number is None
+                or number <= 0
+                or number in seen
+                or row.get("state") != "open"
+                or not isinstance(row.get("title"), str)
+                or "body" not in row
+                or (row["body"] is not None and not isinstance(row["body"], str))
+                or not isinstance(row.get("html_url"), str)
+                or not row["html_url"]
+                or not isinstance(base_name, str)
+                or base_name.lower() != project.lower()
+                or not isinstance(head, dict)
+                or not isinstance(head.get("ref"), str)
+                or not head["ref"]
+                or "repo" not in head
+                or (
+                    head_repo is not None
+                    and (
+                        not isinstance(head_name, str)
+                        or re.fullmatch(r"[^/\s]+/[^/\s]+", head_name) is None
+                    )
+                )
+            ):
+                raise LeaseError(f"{what}: malformed, duplicate, or unexpected pull request")
+            seen.add(number)
+            owner, _, name = (head_name or "").partition("/")
+            prs.append(
+                {
+                    "number": number,
+                    "url": row["html_url"],
+                    "title": row["title"],
+                    "body": row["body"] or "",
+                    "headRefName": head["ref"],
+                    # A deleted head repository is unknown, never proof of a same-repo PR.
+                    "isCrossRepository": head_name is None or head_name.lower() != project.lower(),
+                    "headRepository": {"name": name},
+                    "headRepositoryOwner": {"login": owner},
+                }
+            )
+    return prs
 
 
 def _open_pr_page(project: str, after: str | None, gh: GhRunner) -> tuple[list, str | None]:
@@ -730,6 +819,8 @@ def _flatten_links(pr: dict, project: str) -> dict:
 
 def open_pull_requests(project: str, gh: GhRunner) -> list[dict]:
     """EVERY open pull request of `project` (cursor-paginated to the end; see above)."""
+    if _lease_pr_api() == "rest":
+        return _rest_open_pull_requests(project, gh)
     prs: list[dict] = []
     after: str | None = None
     for _ in range(_MAX_PR_PAGES):
@@ -1063,6 +1154,38 @@ def _comment(project: str, issue: int, body: str, gh: GhRunner) -> None:
 
 def _ensure_label(project: str, gh: GhRunner) -> None:
     """Repos onboarded before the lease feature lack the label; create it idempotently."""
+    if _lease_pr_api() == "rest":
+        path = f"repos/{project}/labels/{IN_PROGRESS_LABEL}"
+        try:
+            row = json.loads(gh(["api", path]) or "null")
+        except Exception as exc:
+            if not _answered_404(exc):
+                raise
+        else:
+            if not isinstance(row, dict) or row.get("name") != IN_PROGRESS_LABEL:
+                raise LeaseError("the in-progress label could not be verified")
+            return
+        try:
+            gh(
+                ["api", "-X", "POST", f"repos/{project}/labels", "--input", "-"],
+                input=json.dumps(
+                    {
+                        "name": IN_PROGRESS_LABEL,
+                        "color": "fbca04",
+                        "description": "Leased: an agent/session is actively implementing this",
+                    }
+                ),
+            )
+        except Exception as exc:
+            from .onboard import gh_http_status
+
+            if gh_http_status(exc) != 422:
+                raise
+            # Another claimant may have created it between our GET and POST.
+            row = json.loads(gh(["api", path]) or "null")
+            if not isinstance(row, dict) or row.get("name") != IN_PROGRESS_LABEL:
+                raise LeaseError("the in-progress label could not be verified") from exc
+        return
     gh(
         [
             "label",
@@ -1080,7 +1203,52 @@ def _ensure_label(project: str, gh: GhRunner) -> None:
 
 
 def _edit(project: str, issue: int, gh: GhRunner, *flags: str) -> None:
+    if _lease_pr_api() == "rest":
+        operations = {
+            "--add-label": ("POST", "labels"),
+            "--remove-label": ("DELETE", "labels"),
+            "--add-assignee": ("POST", "assignees"),
+            "--remove-assignee": ("DELETE", "assignees"),
+        }
+        if len(flags) % 2 or any(
+            flags[i] not in operations or not flags[i + 1] for i in range(0, len(flags), 2)
+        ):
+            raise LeaseError("unsupported REST lease bookkeeping operation")
+        for index in range(0, len(flags), 2):
+            method, resource = operations[flags[index]]
+            value = flags[index + 1]
+            path = f"repos/{project}/issues/{issue}/{resource}"
+            if method == "DELETE" and resource == "labels":
+                try:
+                    gh(["api", "-X", method, f"{path}/{quote(value, safe='')}"])
+                except Exception as exc:
+                    # DELETE returns 404 for an already absent label, but also an
+                    # inaccessible issue. Only a fresh, complete issue read proves absence.
+                    if not _answered_404(exc) or not _rest_label_absent(project, issue, value, gh):
+                        raise
+            else:
+                gh(
+                    ["api", "-X", method, path, "--input", "-"],
+                    input=json.dumps({resource: [value]}),
+                )
+        return
     gh(["issue", "edit", str(issue), "--repo", project, *flags])
+
+
+def _rest_label_absent(project: str, issue: int, label: str, gh: GhRunner) -> bool:
+    target = json.loads(gh(["api", f"repos/{project}/issues/{issue}"]) or "null")
+    labels = target.get("labels") if isinstance(target, dict) else None
+    if (
+        not isinstance(target, dict)
+        or _number(target.get("number")) != issue
+        or not isinstance(labels, list)
+        or any(
+            not isinstance(row, dict) or not isinstance(row.get("name"), str) or not row["name"]
+            for row in labels
+        )
+    ):
+        raise LeaseError("could not verify the issue's labels after a failed REST label removal")
+    return all(row["name"].casefold() != label.casefold() for row in labels)
 
 
 # ---------------------------------------------------------------- operations

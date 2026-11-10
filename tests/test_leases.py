@@ -59,6 +59,18 @@ def _open_prs_page(prs, args, size=100):
     return {"data": {"repository": {"pullRequests": {"pageInfo": info, "nodes": nodes}}}}
 
 
+def _rest_pr(number, *, head="feature", head_repo=PROJECT, body=""):
+    return {
+        "number": number,
+        "state": "open",
+        "title": "A change",
+        "body": body,
+        "html_url": f"https://github.com/{PROJECT}/pull/{number}",
+        "base": {"repo": {"full_name": PROJECT}},
+        "head": {"ref": head, "repo": {"full_name": head_repo} if head_repo else None},
+    }
+
+
 def _timeline_page(timelines: dict, path: str, size: int = 100) -> list:
     """One page (`?per_page=&page=`) of an issue timeline from {issue: [events]}."""
     n = int(path.split("/")[4])
@@ -4106,3 +4118,351 @@ def test_the_commit_guard_reads_the_404_answer_like_run_gh(stderr, stdout):
     from agentic_sdlc.onboard import gh_error_http_status
 
     assert _guard()._gh_http_status(stderr, stdout) == gh_error_http_status(stderr, stdout)
+
+
+class RestGh(FakeGh):
+    """A cloud transport that serves REST and rejects all GraphQL operations."""
+
+    def __init__(self):
+        super().__init__()
+        self.rest_prs = []
+        self.label_exists = False
+        self.rest_inventory_answer = None
+
+    def __call__(self, args, input=None):
+        args = tuple(args)
+        if args[:2] == ("api", "graphql"):
+            raise GhCommandError("GraphQL unavailable", http_status=403)
+        if args[:2] == ("api", f"repos/{PROJECT}/pulls?state=open&per_page=100"):
+            self.calls.append(args)
+            assert "--paginate" in args and "--slurp" in args
+            if isinstance(self.rest_inventory_answer, Exception):
+                raise self.rest_inventory_answer
+            if self.rest_inventory_answer is not None:
+                return self.rest_inventory_answer
+            return json.dumps(
+                [self.rest_prs[i : i + 100] for i in range(0, len(self.rest_prs), 100)] or [[]]
+            )
+        if args[:2] == ("api", f"repos/{PROJECT}/labels/in-progress"):
+            self.calls.append(args)
+            if not self.label_exists:
+                raise GhCommandError("missing label", http_status=404)
+            return json.dumps({"name": IN_PROGRESS_LABEL})
+        if args[:3] == ("api", "-X", "POST") and args[3] == f"repos/{PROJECT}/labels":
+            self.calls.append(args)
+            assert json.loads(input)["name"] == IN_PROGRESS_LABEL
+            self.label_exists = True
+            return json.dumps({"name": IN_PROGRESS_LABEL})
+        if args[:2] == ("api", "-X") and "/issues/" in args[3]:
+            endpoint = args[3].split("/")
+            if endpoint[5] in {"labels", "assignees"}:
+                number = int(endpoint[4])
+                kind = "label" if endpoint[5] == "labels" else "assignee"
+                action = "add" if args[2] == "POST" else "remove"
+                values = json.loads(input)[endpoint[5]] if input else [endpoint[6]]
+                if (
+                    kind == "label"
+                    and action == "remove"
+                    and not any(row["name"] in values for row in self.issues[number]["labels"])
+                ):
+                    self.calls.append(args)
+                    raise GhCommandError("label not on issue", http_status=404)
+                # Reuse the fake's state mutation while observing only the real REST call.
+                for value in values:
+                    super().__call__(
+                        [
+                            "issue",
+                            "edit",
+                            str(number),
+                            "--repo",
+                            PROJECT,
+                            f"--{action}-{kind}",
+                            value,
+                        ]
+                    )
+                    self.calls.pop()
+                self.calls.append(args)
+                return "{}"
+        if (
+            args[0] == "api"
+            and args[1].startswith(f"repos/{PROJECT}/issues/")
+            and args[1].count("/") == 4
+        ):
+            answer = json.loads(super().__call__(args, input=input))
+            answer["labels"] = self.issues[answer["number"]]["labels"]
+            return json.dumps(answer)
+        return super().__call__(args, input=input)
+
+
+@pytest.fixture
+def rest_gh(monkeypatch):
+    monkeypatch.setenv("FORGE_LEASE_PR_API", "rest")
+    return RestGh().issue(7)
+
+
+def test_rest_cloud_claim_renew_release_keeps_normal_bookkeeping(rest_gh):
+    result = claim(
+        PROJECT,
+        7,
+        agent="cloud",
+        session="rest",
+        branch="forge/issue-7",
+        assignee="atulg4",
+        gh=rest_gh,
+        now=NOW,
+    )
+    assert result.ok
+    assert IN_PROGRESS_LABEL in [label["name"] for label in rest_gh.issues[7]["labels"]]
+    assert rest_gh.issues[7]["assignees"] == [{"login": "atulg4"}]
+    assert renew(PROJECT, 7, session="rest", gh=rest_gh, now=NOW).session == "rest"
+    release(PROJECT, 7, session="rest", gh=rest_gh, now=NOW)
+    assert rest_gh.issues[7]["labels"] == []
+    assert rest_gh.issues[7]["assignees"] == []
+    assert all(call[:2] != ("api", "graphql") for call in rest_gh.calls)
+    assert all(call[:2] != ("issue", "edit") for call in rest_gh.calls)
+
+
+def test_rest_inventory_reads_every_page_and_preserves_branch_and_closing_conflicts(rest_gh):
+    from agentic_sdlc.leases import open_prs_for_issue
+
+    rest_gh.rest_prs = [_rest_pr(n, head=f"feature/{n}") for n in range(1000, 1250)]
+    rest_gh.rest_prs[199] = _rest_pr(1199, head="forge/issue-7")
+    rest_gh.rest_prs[249] = _rest_pr(1249, head_repo="fork/repo", body="Fixes #7")
+    assert [pr["number"] for pr in open_prs_for_issue(PROJECT, 7, rest_gh)] == [1199, 1249]
+    assert not claim(PROJECT, 7, agent="cloud", session="rest", branch="b", gh=rest_gh, now=NOW).ok
+    assert rest_gh.issues[7]["comments"] == []
+
+
+@pytest.mark.parametrize("head_repo", ["fork/repo", None])
+def test_rest_inventory_does_not_infer_same_repository_for_fork_or_deleted_head(rest_gh, head_repo):
+    from agentic_sdlc.leases import open_prs_for_issue
+
+    rest_gh.rest_prs = [_rest_pr(50, head="forge/issue-7", head_repo=head_repo)]
+    assert open_prs_for_issue(PROJECT, 7, rest_gh) == []
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "not json",
+        "null",
+        "[]",
+        "[null]",
+        "[[null]]",
+        '[{"number": 1}]',
+        json.dumps([[_rest_pr(1)], [_rest_pr(2)]]),  # non-final page is partial
+        json.dumps([[_rest_pr(1), _rest_pr(1)]]),
+        json.dumps([[{**_rest_pr(1), "body": 1}]]),
+        json.dumps([[{**_rest_pr(1), "state": "closed"}]]),
+        json.dumps([[{**_rest_pr(1), "base": {"repo": {"full_name": "wrong/repo"}}}]]),
+        GhCommandError("REST unavailable", http_status=503),
+    ],
+)
+def test_rest_unknown_or_partial_pr_inventory_refuses_claim(rest_gh, answer):
+    rest_gh.rest_inventory_answer = answer
+    with pytest.raises(LeaseError, match="REST pull request"):
+        claim(PROJECT, 7, agent="cloud", session="rest", branch="b", gh=rest_gh, now=NOW)
+    assert rest_gh.issues[7]["comments"] == []
+
+
+def test_rest_keeps_live_conflicting_lease_and_post_claim_pr_recheck(rest_gh):
+    first = claim(PROJECT, 7, agent="a", session="first", branch="b", gh=rest_gh, now=NOW)
+    assert first.ok
+    second = claim(PROJECT, 7, agent="b", session="second", branch="b", gh=rest_gh, now=NOW)
+    assert not second.ok and "session=first" in second.reason
+    release(PROJECT, 7, session="first", gh=rest_gh, now=NOW)
+    rest_gh.before_post = lambda _: rest_gh.rest_prs.append(_rest_pr(50, body="Closes #7"))
+    late = claim(PROJECT, 7, agent="a", session="third", branch="b", gh=rest_gh, now=NOW)
+    assert not late.ok and "while it was being claimed" in late.reason
+    assert current_lease(PROJECT, 7, rest_gh) is None
+
+
+def test_rest_retains_same_repository_timeline_conflicts(rest_gh):
+    from agentic_sdlc.leases import open_prs_for_issue
+
+    rest_gh.timeline[7] = [
+        {
+            "event": "cross-referenced",
+            "source": {
+                "issue": {
+                    "number": 50,
+                    "state": "open",
+                    "repository": {"full_name": PROJECT},
+                    "html_url": f"https://github.com/{PROJECT}/pull/50",
+                    "pull_request": {},
+                }
+            },
+        }
+    ]
+    assert [pr["number"] for pr in open_prs_for_issue(PROJECT, 7, rest_gh)] == [50]
+
+
+@pytest.mark.parametrize("kind", ["manual", "external"])
+def test_rest_unresolvable_graphql_link_evidence_still_refuses(rest_gh, kind):
+    if kind == "manual":
+        rest_gh.timeline[7] = [_link_event("connected", "node-50")]
+    else:
+        rest_gh.timeline[7] = [
+            {
+                "event": "cross-referenced",
+                "source": {
+                    "issue": {
+                        "number": 50,
+                        "state": "open",
+                        "repository": {"full_name": "other/repo"},
+                        "pull_request": {},
+                    }
+                },
+            }
+        ]
+    with pytest.raises((LeaseError, GhCommandError)):
+        claim(PROJECT, 7, agent="cloud", session="rest", branch="b", gh=rest_gh, now=NOW)
+    assert rest_gh.issues[7]["comments"] == []
+
+
+def test_invalid_lease_api_mode_is_rejected(monkeypatch):
+    from agentic_sdlc.leases import open_pull_requests
+
+    monkeypatch.setenv("FORGE_LEASE_PR_API", "other")
+    with pytest.raises(LeaseError, match="FORGE_LEASE_PR_API"):
+        open_pull_requests(PROJECT, FakeGh())
+
+
+def test_rest_bookkeeping_preserves_other_labels_and_assignees(rest_gh):
+    rest_gh.issues[7]["labels"] = [{"name": "approved"}, {"name": "help wanted"}]
+    rest_gh.issues[7]["assignees"] = [{"login": "maintainer"}]
+    result = claim(
+        PROJECT,
+        7,
+        agent="cloud",
+        session="rest",
+        branch="b",
+        assignee="atulg4",
+        gh=rest_gh,
+        now=NOW,
+    )
+    assert result.ok
+    assert {label["name"] for label in rest_gh.issues[7]["labels"]} == {
+        "approved",
+        "help wanted",
+        IN_PROGRESS_LABEL,
+    }
+    assert {row["login"] for row in rest_gh.issues[7]["assignees"]} == {"maintainer", "atulg4"}
+    release(PROJECT, 7, session="rest", gh=rest_gh, now=NOW)
+    assert rest_gh.issues[7]["labels"] == [{"name": "approved"}, {"name": "help wanted"}]
+    assert rest_gh.issues[7]["assignees"] == [{"login": "maintainer"}]
+
+
+def test_rest_unreadable_inventory_after_claim_retracts_its_marker(rest_gh):
+    def fail_inventory(_):
+        rest_gh.rest_inventory_answer = GhCommandError("REST unavailable", http_status=503)
+
+    rest_gh.before_post = fail_inventory
+    with pytest.raises(LeaseError, match="REST pull request"):
+        claim(PROJECT, 7, agent="cloud", session="rest", branch="b", gh=rest_gh, now=NOW)
+    assert current_lease(PROJECT, 7, rest_gh) is None
+    assert rest_gh.issues[7]["labels"] == []
+
+
+def test_rest_renew_refuses_pr_created_since_claim(rest_gh):
+    assert claim(PROJECT, 7, agent="a", session="s", branch="b", gh=rest_gh, now=NOW).ok
+    before = list(rest_gh.issues[7]["comments"])
+    rest_gh.rest_prs = [_rest_pr(50, body="Resolves #7")]
+    with pytest.raises(LeaseError, match="open pull request"):
+        renew(PROJECT, 7, session="s", gh=rest_gh, now=NOW)
+    assert rest_gh.issues[7]["comments"] == before
+
+
+def test_rest_label_creation_race_requires_verified_existing_label(rest_gh):
+    from agentic_sdlc.leases import _ensure_label
+
+    def raced(args, input=None):
+        if args[:4] == ["api", "-X", "POST", f"repos/{PROJECT}/labels"]:
+            rest_gh.label_exists = True
+            raise GhCommandError("label already exists", http_status=422)
+        return rest_gh(args, input=input)
+
+    _ensure_label(PROJECT, raced)
+    assert rest_gh.calls == [
+        ("api", f"repos/{PROJECT}/labels/in-progress"),
+        ("api", f"repos/{PROJECT}/labels/in-progress"),
+    ]
+
+
+@pytest.mark.parametrize("status", [403, 500, None])
+def test_rest_label_read_failure_is_not_absence(rest_gh, status):
+    from agentic_sdlc.leases import _ensure_label
+
+    def unavailable(args, input=None):
+        assert args == ["api", f"repos/{PROJECT}/labels/in-progress"]
+        raise GhCommandError("missing label HTTP 404", http_status=status)
+
+    with pytest.raises(GhCommandError):
+        _ensure_label(PROJECT, unavailable)
+
+
+def test_rest_empty_inventory_and_null_body_are_valid(rest_gh):
+    from agentic_sdlc.leases import open_pull_requests
+
+    assert open_pull_requests(PROJECT, rest_gh) == []
+    rest_gh.rest_prs = [_rest_pr(50, body=None)]
+    assert open_pull_requests(PROJECT, rest_gh)[0]["body"] == ""
+
+
+def test_rest_repeated_release_and_already_removed_label_complete_assignee_cleanup(rest_gh):
+    assert claim(
+        PROJECT,
+        7,
+        agent="cloud",
+        session="rest",
+        branch="b",
+        assignee="atulg4",
+        gh=rest_gh,
+        now=NOW,
+    ).ok
+    rest_gh.issues[7]["labels"] = []  # a maintainer already removed the lease label
+    release(PROJECT, 7, session="rest", gh=rest_gh, now=NOW)
+    assert rest_gh.issues[7]["assignees"] == []
+    release(PROJECT, 7, session="rest", gh=rest_gh, now=NOW)
+    assert rest_gh.issues[7]["assignees"] == []
+    assert current_lease(PROJECT, 7, rest_gh) is None
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        None,
+        {},
+        {"number": 7},
+        {"number": 8, "labels": []},
+        {"number": 7, "labels": [None]},
+        {"number": 7, "labels": [{"name": ""}]},
+        GhCommandError("issue inaccessible", http_status=404),
+    ],
+)
+def test_rest_absent_label_requires_readable_complete_issue_labels(rest_gh, answer):
+    from agentic_sdlc.leases import _edit
+
+    def unreadable(args, input=None):
+        if args == ["api", f"repos/{PROJECT}/issues/7"]:
+            if isinstance(answer, Exception):
+                raise answer
+            return json.dumps(answer)
+        return rest_gh(args, input=input)
+
+    with pytest.raises((LeaseError, GhCommandError)):
+        _edit(PROJECT, 7, unreadable, "--remove-label", IN_PROGRESS_LABEL)
+
+
+def test_rest_label_removal_404_with_label_still_present_refuses(rest_gh):
+    from agentic_sdlc.leases import _edit
+
+    rest_gh.issues[7]["labels"] = [{"name": IN_PROGRESS_LABEL}]
+
+    def missing(args, input=None):
+        if args[:3] == ["api", "-X", "DELETE"]:
+            raise GhCommandError("issue inaccessible", http_status=404)
+        return rest_gh(args, input=input)
+
+    with pytest.raises(GhCommandError):
+        _edit(PROJECT, 7, missing, "--remove-label", IN_PROGRESS_LABEL)
