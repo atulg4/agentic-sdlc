@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -360,6 +362,219 @@ def test_route_executor_cli_selects_lowest_ecps_eligible_model(
     decision = json.loads(output.read_text(encoding="utf-8"))
     assert decision["selectedExecutorId"] == "deepseek-1"
     assert decision["policyVersion"] == "1.0.0"
+
+
+@pytest.mark.parametrize("execution_type", ["subscription-cloud", "subscription-runner"])
+@pytest.mark.parametrize("client_opt_in", [False, True])
+def test_codex_subscription_route_requires_explicit_client(
+    tmp_path: Path, policy_file: Path, capsys, execution_type, client_opt_in
+) -> None:
+    executors = tmp_path / "executors.json"
+    output = tmp_path / "route.json"
+    executors.write_text(
+        json.dumps(
+            [
+                {
+                    "executorId": "codex-account",
+                    "provider": "codex",
+                    "adapter": "codex-cli",
+                    "adapterVersion": "1.0.0",
+                    "executionType": execution_type,
+                    "authMode": "oauth",
+                    "model": "account-supported-model",
+                    "modelAlias": "codex",
+                    "taskClasses": ["implementation"],
+                    "capabilities": ["edit-code", "author-tests", "run-commands"],
+                    "maxRisk": "medium",
+                    "qualityLowerBound": 0.8,
+                    "shadowCostUsd": 1,
+                    "subscriptionMonthlyUsd": 200,
+                    "subscriptionCapacityRemaining": 10,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    arguments = [
+        "route-executor",
+        "--config",
+        str(policy_file),
+        "--mission-id",
+        "implementation-worker",
+        "--executors",
+        str(executors),
+        "--repository",
+        "example/project",
+        "--task-class",
+        "implementation",
+        "--budget-usd",
+        "5",
+        "--output",
+        str(output),
+    ]
+    if client_opt_in:
+        arguments.append("--codex-subscription-client")
+
+    result = main(arguments)
+
+    if client_opt_in:
+        assert result == 0
+        assert json.loads(output.read_text())["selectedExecutorId"] == "codex-account"
+    else:
+        assert result == 2
+        assert not output.exists()
+        captured = capsys.readouterr()
+        assert "supported authenticated Codex client" in captured.err
+        assert "--codex-subscription-client" in captured.err
+        assert captured.out == ""
+
+
+@pytest.mark.parametrize(
+    ("provider", "model", "execution_type", "auth_mode"),
+    [
+        ("codex", "gpt-5", "direct-api", "api-key"),
+        ("anthropic", "claude-opus-5", "subscription-runner", "oauth"),
+    ],
+)
+def test_other_executor_routes_do_not_require_codex_client_opt_in(
+    tmp_path: Path, policy_file: Path, provider, model, execution_type, auth_mode
+) -> None:
+    executors = tmp_path / "executors.json"
+    output = tmp_path / "route.json"
+    executors.write_text(
+        json.dumps(
+            [
+                {
+                    "executorId": "existing-executor",
+                    "provider": provider,
+                    "adapter": "existing-adapter",
+                    "adapterVersion": "1.0.0",
+                    "executionType": execution_type,
+                    "authMode": auth_mode,
+                    "model": model,
+                    "taskClasses": ["implementation"],
+                    "capabilities": ["edit-code", "author-tests", "run-commands"],
+                    "maxRisk": "medium",
+                    "qualityLowerBound": 0.8,
+                    "shadowCostUsd": 1,
+                    "subscriptionMonthlyUsd": 200,
+                    "subscriptionCapacityRemaining": 10,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    result = main(
+        [
+            "route-executor",
+            "--config",
+            str(policy_file),
+            "--mission-id",
+            "implementation-worker",
+            "--executors",
+            str(executors),
+            "--repository",
+            "example/project",
+            "--task-class",
+            "implementation",
+            "--budget-usd",
+            "5",
+            "--output",
+            str(output),
+        ]
+    )
+    assert result == 0
+    assert json.loads(output.read_text())["selectedExecutorId"] == "existing-executor"
+
+
+@pytest.mark.parametrize(
+    ("execute", "status", "expected_code"),
+    [(False, "dry-run", 0), (True, "completed", 0), (True, "failed", 2)],
+)
+def test_codex_subscription_run_cli_requires_execute_and_passes_bounded_inputs(
+    tmp_path: Path, monkeypatch, capsys, execute, status, expected_code
+) -> None:
+    calls = []
+
+    def describe_run(executor, **kwargs):
+        calls.append(("describe", executor.executor_id, kwargs))
+        return {"status": status}
+
+    def run_subscription(executor, **kwargs):
+        calls.append(("execute", executor.executor_id, kwargs))
+        return {"status": status}
+
+    monkeypatch.setitem(
+        sys.modules,
+        "agentic_sdlc.codex_subscription",
+        SimpleNamespace(describe_run=describe_run, run_subscription=run_subscription),
+    )
+    registry = tmp_path / "executors.json"
+    registry.write_text(
+        json.dumps(
+            [
+                {
+                    "executorId": "account-worker",
+                    "provider": "codex",
+                    "adapter": "codex-cli",
+                    "adapterVersion": "1.0.0",
+                    "executionType": "subscription-runner",
+                    "authMode": "oauth",
+                    "model": "account-model",
+                    "modelAlias": "codex",
+                    "taskClasses": ["implementation"],
+                    "capabilities": ["edit-code"],
+                    "shadowCostUsd": 1,
+                    "subscriptionMonthlyUsd": 200,
+                    "subscriptionCapacityRemaining": 1,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("Fix the café label", encoding="utf-8")
+    arguments = [
+        "codex-subscription-run",
+        "--executors",
+        str(registry),
+        "--executor-id",
+        "account-worker",
+        "--worktree",
+        str(tmp_path / "checkout"),
+        "--prompt-file",
+        str(prompt),
+        "--run-dir",
+        str(tmp_path / "run"),
+        "--timeout-seconds",
+        "45",
+        "--sandbox",
+        "workspace-write",
+    ]
+    if execute:
+        arguments.append("--execute")
+
+    assert main(arguments) == expected_code
+    method, executor_id, parameters = calls[0]
+    assert len(calls) == 1
+    assert method == ("execute" if execute else "describe")
+    assert executor_id == "account-worker"
+    assert parameters == {
+        "worktree": tmp_path / "checkout",
+        "run_dir": tmp_path / "run",
+        "timeout_seconds": 45,
+        "sandbox": "workspace-write",
+        **({"prompt": "Fix the café label"} if execute else {}),
+    }
+    assert json.loads(capsys.readouterr().out) == {"status": status}
+
+    calls.clear()
+    arguments[arguments.index("--executor-id") + 1] = "unknown-worker"
+    assert main(arguments) == 2
+    assert calls == []
+    captured = capsys.readouterr()
+    assert "executor ID not found" in captured.err
+    assert captured.out == ""
 
 
 def test_route_executor_cli_fails_closed_when_quality_floor_rejects_cheap_models(

@@ -177,6 +177,16 @@ platform's `reusable-plan.yml` (`anthropics/claude-code-action`), so the generat
 generated `.github/ISSUE_TEMPLATE/agent-work-request.md`: `## Summary`, `## Acceptance
 Criteria`, `## Required Tests`, `## Non-Goals`, `## Dependencies`, the last two as lists.
 
+### Claude Max helper workers
+
+For Codex-led implementation with Claude providing independent reviews, test
+development, and research, use `sdlcctl claude-cloud-dispatch`. It submits a
+specific commit-scoped task to a subscription-backed Claude routine and records
+the returned session with durable duplicate suppression. Preview is the default;
+the adapter has no paid API-key fallback. See [setup, commands, and saved routine
+prompts](docs/claude-cloud-workers.md). This is an operator-driven helper lane,
+separate from the scheduled cloud implementer above.
+
 ### Issue leases: one agent per ticket
 
 Actions jobs, cloud routines and interactive Claude Code sessions all coordinate through a

@@ -26,6 +26,7 @@ from .capacity_metrics import (
     build_capacity_report,
     load_capacity_inputs,
 )
+from .claude_cloud import add_commands as add_claude_cloud_commands
 from .context_builder import (
     DEFAULT_PACKET_BYTES,
     ContextBuilderError,
@@ -2135,8 +2136,39 @@ def _route_executor(args: argparse.Namespace) -> int:
         budget_usd=args.budget_usd,
     )
     decision = route_executor(request, executors, policy)
+    if not args.codex_subscription_client and any(
+        executor.executor_id == decision.selected_executor_id and executor.is_codex_subscription
+        for executor in executors
+    ):
+        raise ExecutorError(
+            "Codex subscription routing requires a supported authenticated Codex client; "
+            "pass --codex-subscription-client only when that client will execute the route. "
+            "The legacy Actions Codex step uses API authentication."
+        )
     _write(decision.as_dict(), args.output)
     return 0 if decision.selected_executor_id else 2
+
+
+def _codex_subscription_run(args: argparse.Namespace) -> int:
+    from .codex_subscription import describe_run, run_subscription
+
+    executors = load_executors(json.loads(Path(args.executors).read_text(encoding="utf-8")))
+    executor = next((item for item in executors if item.executor_id == args.executor_id), None)
+    if executor is None:
+        raise ExecutorError("executor ID not found in the supplied registry")
+    prompt = Path(args.prompt_file).read_text(encoding="utf-8")
+    parameters = {
+        "worktree": Path(args.worktree),
+        "run_dir": Path(args.run_dir),
+        "timeout_seconds": args.timeout_seconds,
+        "sandbox": args.sandbox,
+    }
+    if args.execute:
+        result = run_subscription(executor, prompt=prompt, **parameters)
+    else:
+        result = describe_run(executor, **parameters)
+    _write(result, args.output)
+    return 0 if not args.execute or result.get("status") == "completed" else 2
 
 
 #: The run kinds each packet role's dispatches may seed: builders produce,
@@ -3633,6 +3665,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="print the installed version and the commit it was installed from",
     )
     commands = parser.add_subparsers(dest="command", required=True)
+    add_claude_cloud_commands(commands)
 
     validate = commands.add_parser("validate-task")
     validate.add_argument("--config", required=True)
@@ -3930,8 +3963,30 @@ def build_parser() -> argparse.ArgumentParser:
     route.add_argument("--required-tool-capability", action="append", default=[])
     route.add_argument("--min-context-window", type=int, default=0)
     route.add_argument("--budget-usd", type=_budget_usd, required=True)
+    route.add_argument(
+        "--codex-subscription-client",
+        action="store_true",
+        help="allow a Codex subscription route for a supported authenticated client, "
+        "rather than the legacy API-authenticated Actions step",
+    )
     route.add_argument("--output")
     route.set_defaults(handler=_route_executor)
+
+    subscription_run = commands.add_parser("codex-subscription-run")
+    subscription_run.add_argument("--executors", required=True)
+    subscription_run.add_argument("--executor-id", required=True)
+    subscription_run.add_argument("--worktree", required=True)
+    subscription_run.add_argument("--prompt-file", required=True)
+    subscription_run.add_argument("--run-dir", required=True)
+    subscription_run.add_argument("--timeout-seconds", type=int, default=900)
+    subscription_run.add_argument(
+        "--sandbox", choices=("read-only", "workspace-write"), default="read-only"
+    )
+    subscription_run.add_argument(
+        "--execute", action="store_true", help="run Codex; otherwise describe the run only"
+    )
+    subscription_run.add_argument("--output")
+    subscription_run.set_defaults(handler=_codex_subscription_run)
 
     orchestrate = commands.add_parser("orchestrate")
     orchestrate.add_argument(

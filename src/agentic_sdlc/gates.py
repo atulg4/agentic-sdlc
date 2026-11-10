@@ -79,6 +79,9 @@ _FORBIDDEN_ENVIRONMENT = {
     # authorization, state, completion and outcome artifact could be forged.
     "AGENTIC_SDLC_ATTESTATION_KEY_FILE",
     "ANTHROPIC_API_KEY",
+    "FORGE_CLAUDE_REVIEW_ROUTINE_TOKEN",
+    "FORGE_CLAUDE_TESTS_ROUTINE_TOKEN",
+    "FORGE_CLAUDE_RESEARCH_ROUTINE_TOKEN",
     "GH_TOKEN",
     "GITHUB_ENV",
     "GITHUB_OUTPUT",
