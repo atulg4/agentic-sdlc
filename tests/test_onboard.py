@@ -11177,13 +11177,32 @@ def test_lease_commands_exit_2_when_gh_stalls(monkeypatch):
 
 
 def test_every_subprocess_run_is_bounded():
-    """No subprocess call in the package (hook templates included) may wait forever."""
+    """Require timeout-bound run(), except the tested streaming Codex supervisor."""
     import ast
 
     root = Path(__file__).resolve().parents[1] / "src" / "agentic_sdlc"
     unbounded: list[str] = []
+    streaming_spawns = 0
     for path in sorted(root.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        streaming_spawn = None
+        if path.relative_to(root) == Path("codex_subscription.py"):
+            # This one launcher must stream progress while enforcing a monotonic
+            # deadline and output ceiling. subprocess.run cannot expose live
+            # heartbeats. test_codex_subscription exercises timeout termination,
+            # output limits and child cleanup after the launcher itself exits.
+            supervisor = next(
+                node
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef) and node.name == "run_subscription"
+            )
+            spawn = next(
+                node
+                for node in supervisor.body
+                if isinstance(node, ast.FunctionDef) and node.name == "spawn"
+            )
+            assert len(spawn.body) == 1 and isinstance(spawn.body[0], ast.Return)
+            streaming_spawn = spawn.body[0].value
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
                 continue
@@ -11191,10 +11210,21 @@ def test_every_subprocess_run_is_bounded():
             if not (isinstance(owner, ast.Name) and owner.id == "subprocess"):
                 continue
             where = f"{path.relative_to(root)}:{node.lineno}"
+            if node is streaming_spawn:
+                assert node.func.attr == "Popen", where
+                keywords = {keyword.arg: keyword.value for keyword in node.keywords}
+                assert ast.literal_eval(keywords["start_new_session"]) is True, where
+                for pipe in ("stdout", "stderr"):
+                    assert ast.dump(keywords[pipe]) == ast.dump(
+                        ast.parse("subprocess.PIPE", mode="eval").body
+                    ), where
+                streaming_spawns += 1
+                continue
             if node.func.attr != "run":
                 unbounded.append(f"{where}: subprocess.{node.func.attr} (use subprocess.run)")
             elif not any(k.arg == "timeout" for k in node.keywords):
                 unbounded.append(f"{where}: subprocess.run without timeout=")
+    assert streaming_spawns == 1
     assert not unbounded, unbounded
 
 
