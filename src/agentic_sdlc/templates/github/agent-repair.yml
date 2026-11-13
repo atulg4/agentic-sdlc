@@ -27,7 +27,7 @@ concurrency:
 
 jobs:
   auth_preflight:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.FORGE_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 5
     permissions: {}
     steps:
@@ -51,6 +51,7 @@ jobs:
       pull-requests: read
     uses: PLATFORM_REPOSITORY/.github/workflows/reusable-repair.yml@PLATFORM_COMMIT_SHA
     with:
+      runs_on: ${{ toJSON(vars.FORGE_RUNNER || 'ubuntu-latest') }}
       pull_request_number: ${{ inputs.pull_request_number }}
       base_sha: ${{ inputs.base_sha }}
       head_sha: ${{ inputs.head_sha }}

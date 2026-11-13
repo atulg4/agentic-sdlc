@@ -16,7 +16,7 @@ jobs:
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.FORGE_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 5
     permissions:
       pull-requests: read
@@ -55,6 +55,7 @@ jobs:
       contents: read
     uses: PLATFORM_REPOSITORY/.github/workflows/reusable-pre-review.yml@PLATFORM_COMMIT_SHA
     with:
+      runs_on: ${{ toJSON(vars.FORGE_RUNNER || 'ubuntu-latest') }}
       pull_request_number: ${{ needs.review_eligibility.outputs.pull_request_number }}
       base_sha: ${{ needs.review_eligibility.outputs.base_sha }}
       head_sha: ${{ needs.review_eligibility.outputs.head_sha }}
@@ -72,6 +73,7 @@ jobs:
       id-token: write
     uses: PLATFORM_REPOSITORY/.github/workflows/reusable-review.yml@PLATFORM_COMMIT_SHA
     with:
+      runs_on: ${{ toJSON(vars.FORGE_RUNNER || 'ubuntu-latest') }}
       pull_request_number: ${{ needs.review_eligibility.outputs.pull_request_number }}
       base_sha: ${{ needs.review_eligibility.outputs.base_sha }}
       head_sha: ${{ needs.review_eligibility.outputs.head_sha }}
