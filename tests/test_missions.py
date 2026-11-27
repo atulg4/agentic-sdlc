@@ -336,6 +336,29 @@ def test_identical_inputs_produce_reproducible_dispatch_envelope(
     )
     assert changed["envelopeSha256"] != first["envelopeSha256"]
 
+    # The dispatch nonce is digested INSIDE the body: each nonce yields its
+    # own envelope digest, so one digest identifies exactly one dispatch and
+    # a retry of unchanged content never collides with the recorded run.
+    nonced = create_dispatch_envelope(
+        mission,
+        agent,
+        work_ref="example/project#42",
+        prompt="Implement the approved plan.",
+        input_refs=("task-spec", "plan-comment"),
+        dispatch_nonce="a" * 32,
+    )
+    assert nonced["dispatchNonce"] == "a" * 32
+    assert nonced["envelopeSha256"] != first["envelopeSha256"]
+    renonced = create_dispatch_envelope(
+        mission,
+        agent,
+        work_ref="example/project#42",
+        prompt="Implement the approved plan.",
+        input_refs=("task-spec", "plan-comment"),
+        dispatch_nonce="b" * 32,
+    )
+    assert renonced["envelopeSha256"] != nonced["envelopeSha256"]
+
 
 def test_concurrency_limit_is_enforced(policy_file: Path) -> None:
     registry = load_registry(None, load_policy(policy_file))

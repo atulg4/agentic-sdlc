@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=84.0.0"]
+requires = ["setuptools>=84.2.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentic-sdlc"
-version = "0.1.0"
+version = "0.3.0"
 description = "Provider-neutral policy and orchestration primitives for agent-driven SDLC workflows"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -16,8 +16,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-  "pytest>=9.1.1,<10",
-  "ruff>=0.16.10,<1",
+  "pytest>=9.2.0,<10",
+  "ruff>=0.17.1,<1",
 ]
 
 [project.scripts]
@@ -27,7 +27,7 @@ sdlcctl = "agentic_sdlc.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-agentic_sdlc = ["templates/*.md", "templates/github/*.yml", "templates/gitlab/*.yml", "schemas/*.json"]
+agentic_sdlc = ["templates/*.md", "templates/github/*.yml", "templates/github/forge/*.yml", "templates/gitlab/*.yml", "templates/hooks/*.py", "schemas/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

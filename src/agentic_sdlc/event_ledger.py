@@ -26,6 +26,7 @@ transition history is byte-identical to the orchestrator's own
 from __future__ import annotations
 
 import re
+import urllib.parse
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from enum import StrEnum
@@ -362,6 +363,26 @@ class LifecycleEvent:
     depends_on: tuple[str, ...] = ()
     schema_version: int = EVENT_SCHEMA_VERSION
 
+    def __post_init__(self) -> None:
+        # Accepting a valid STRING is not enough: StrEnum equality lets it
+        # validate here while serialization (`self.stage.value`) and the
+        # projection's identity checks still expect enum members, so both
+        # fields are coerced to their members before anything else reads
+        # them. FactoryState/LifecycleStage raise for unknown values.
+        object.__setattr__(self, "stage", LifecycleStage(self.stage))
+        object.__setattr__(self, "state", FactoryState(self.state))
+        # Stage and state travel together on EVERY construction path, direct
+        # appends included: the document loader's check alone would let an
+        # in-process event project a contradictory pair the console rejects.
+        if (
+            self.stage is not STAGE_FOR_STATE[self.state]
+            and self.stage is not LifecycleStage.DEPENDENCY_WAIT
+        ):
+            raise LedgerError(
+                f"event {self.event_id}: stage {self.stage.value} "
+                f"disagrees with state {self.state.value}"
+            )
+
     @property
     def project_id(self) -> str:
         return self.work_unit.project_id
@@ -557,6 +578,12 @@ def load_lifecycle_event(document: Any) -> LifecycleEvent:
         state = FactoryState(state_value)
     except ValueError as error:
         raise LedgerError(f"{label}: unknown state: {state_value}") from error
+    # Stage and state travel together: every state has one canonical stage,
+    # and dependency-wait is the one declared exception (a stage, not a
+    # state, carried while the unit holds its current state). Any other pair
+    # would tell an operator work is in a phase its state contradicts.
+    if stage is not STAGE_FOR_STATE[state] and stage is not LifecycleStage.DEPENDENCY_WAIT:
+        raise LedgerError(f"{label}: stage {stage.value} disagrees with state {state_value}")
     occurred_at = _timestamp(
         _text(entry, "occurredAt", label, required=True), f"{label}: occurredAt"
     )
@@ -617,6 +644,7 @@ class WorkUnitProjection:
     stage: LifecycleStage
     references: WorkUnitRef
     transitions: tuple[ProjectionTransition, ...] = ()
+    merged_change_request_refs: tuple[str, ...] = ()
     repair_cycles: int = 0
     blocked_reason: str = ""
     depends_on: tuple[str, ...] = ()
@@ -649,6 +677,7 @@ class WorkUnitProjection:
                 "dependsOn": list(self.depends_on),
                 "references": self.references.as_dict(),
                 "transitions": [item.as_dict() for item in self.transitions],
+                "mergedChangeRequestRefs": list(self.merged_change_request_refs),
                 "eventCount": self.event_count,
                 "lastEventId": self.last_event_id,
                 "lastEventAt": self.last_event_at,
@@ -664,6 +693,31 @@ class WorkUnitProjection:
         }
 
 
+#: Post-merge states: entering one proves the unit's change request merged.
+#: The reference in effect at that moment is recorded, so merge proof binds
+#: to the change request it actually covered.
+#: Any URL userinfo (user:password@ or token@): the same rule the Control
+#: Center applies to current references before rendering them.
+_CREDENTIAL_REFERENCE = re.compile(r"://[^/?#\s]*@")
+#: Real provider token SHAPES; the canonical scan the Control Center reuses.
+_TOKEN_SHAPED = re.compile(r"gh[pousr]_|github_pat_|glpat-", re.IGNORECASE)
+
+
+def carries_credential_token(value: str) -> bool:
+    """A token-shaped credential anywhere in the value, percent-encoding
+    peeled first: ``?x=ghp%5FSECRET`` and ``?x=%67hp_SECRET`` decode to the
+    shapes a raw scan would miss. Bounded, with the final layer scanned."""
+    decoded = value
+    for _ in range(3):
+        if _TOKEN_SHAPED.search(decoded):
+            return True
+        peeled = urllib.parse.unquote(decoded)
+        if peeled == decoded:
+            break
+        decoded = peeled
+    return _TOKEN_SHAPED.search(decoded) is not None
+
+
 @dataclass
 class _Fold:
     """Mutable accumulator used while folding one work unit's events."""
@@ -674,6 +728,7 @@ class _Fold:
     stage: LifecycleStage = LifecycleStage.INTAKE
     references: WorkUnitRef = field(init=False)
     transitions: list[ProjectionTransition] = field(default_factory=list)
+    merged_change_request_refs: set[str] = field(default_factory=set)
     repair_cycles: int = 0
     blocked_reason: str = ""
     depends_on: tuple[str, ...] = ()
@@ -752,6 +807,25 @@ def _fold(events: Sequence[LifecycleEvent]) -> WorkUnitProjection:
                 accumulator.repair_cycles += 1
             accumulator.blocked_reason = event.reason if event.state is FactoryState.BLOCKED else ""
             accumulator.state = event.state
+            # Captured ONLY at the transition into merged: every post-merge
+            # state is reachable through merged alone (chains open at
+            # intake), so a same-state re-point of the current reference
+            # followed by a deploying transition must not mint fresh merge
+            # proof for a change request that never merged.
+            if event.state is FactoryState.MERGED and accumulator.references.change_request_ref:
+                reference = accumulator.references.change_request_ref
+                # A credential-bearing reference is never RETAINED: the
+                # historical set outlives the current reference's replacement
+                # and is serialized by project-state, which would bypass the
+                # Control Center's redaction of current references — and
+                # proof bound to a malformed reference proves nothing an
+                # incident may legitimately cite. Token SHAPES in a query
+                # string or fragment (percent-encoded or not) are credentials
+                # with no userinfo to catch, so they are screened too.
+                if not _CREDENTIAL_REFERENCE.search(reference) and not carries_credential_token(
+                    reference
+                ):
+                    accumulator.merged_change_request_refs.add(reference)
             # A durable state change retires the previous ephemeral activity.
             accumulator.activity = ""
             accumulator.activity_at = ""
@@ -775,6 +849,7 @@ def _fold(events: Sequence[LifecycleEvent]) -> WorkUnitProjection:
         stage=accumulator.stage,
         references=accumulator.references,
         transitions=tuple(accumulator.transitions),
+        merged_change_request_refs=tuple(sorted(accumulator.merged_change_request_refs)),
         repair_cycles=accumulator.repair_cycles,
         blocked_reason=accumulator.blocked_reason,
         depends_on=accumulator.depends_on,

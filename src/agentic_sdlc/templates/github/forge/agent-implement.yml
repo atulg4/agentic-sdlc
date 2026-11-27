@@ -1,0 +1,14 @@
+name: Agent implementation
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Approved GitHub issue number
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+IMPLEMENT_JOBS

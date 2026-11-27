@@ -6,6 +6,9 @@ import importlib.resources
 import re
 from pathlib import Path
 
+from .leases import publisher_bot_login_problem
+from .policy import branch_name_problem
+
 
 class ScaffoldError(ValueError):
     """Raised when a consumer repository cannot be scaffolded safely."""
@@ -20,7 +23,10 @@ def _resource(relative: str) -> str:
     return root.joinpath("templates", *relative.split("/")).read_text(encoding="utf-8")
 
 
-def _policy(project_id: str, provider: str, default_branch: str) -> str:
+def _policy(
+    project_id: str, provider: str, default_branch: str, publisher_bot_login: str = ""
+) -> str:
+    bot_line = f'publisher_bot_login = "{publisher_bot_login}"\n' if publisher_bot_login else ""
     return f'''\
 version = 1
 
@@ -39,7 +45,7 @@ default_mode = "plan"
 ready_label = "agent-ready"
 human_review_label = "human-review-required"
 implementation_label = "implementation-approved"
-
+{bot_line}
 [policy]
 human_merge_required = true
 max_changed_files = 20
@@ -122,7 +128,12 @@ def scaffold_project(
     platform_ref: str,
     default_branch: str = "main",
     automation_level: int = 1,
+    publisher_bot_login: str = "",
 ) -> tuple[Path, ...]:
+    """Write the profile into `destination`. On GitHub, levels 2 and 3 install the reusable
+    implementation workflow, whose `claim` posts its lease marker as the Publisher App's bot and
+    counts only a bot the policy names (Codex 4243386512): `publisher_bot_login`
+    (`<app-slug>[bot]`) is then required and written to `[automation] publisher_bot_login`."""
     root = Path(destination).resolve()
     if not root.is_dir() or not (root / ".git").exists():
         raise ScaffoldError("destination must be an existing Git repository")
@@ -132,13 +143,30 @@ def scaffold_project(
         raise ScaffoldError("project identifiers must use namespace/name format")
     if not _SHA.fullmatch(platform_ref):
         raise ScaffoldError("platform ref must be an immutable 40-character commit SHA")
-    if not re.fullmatch(r"[A-Za-z0-9._/-]+", default_branch):
-        raise ScaffoldError("default branch contains unsupported characters")
+    # The same rule the policy loader applies (Codex 4243550478): a name the old character-class
+    # check let through (`a..b`, `.topic`, `foo.lock`) scaffolded a policy every later load
+    # rejected, and names the loader accepts (`release+next`) were refused here.
+    problem = branch_name_problem(default_branch)
+    if problem:
+        raise ScaffoldError(f"default branch {problem}")
     if automation_level not in {1, 2, 3}:
         raise ScaffoldError("automation level must be 1, 2, or 3")
+    if publisher_bot_login:
+        problem = publisher_bot_login_problem(publisher_bot_login)
+        if problem:
+            raise ScaffoldError(f"publisher bot login {problem}")
+    elif provider == "github" and automation_level >= 2:
+        raise ScaffoldError(
+            f"automation level {automation_level} installs the implementation workflow, whose "
+            "issue lease is posted by the Publisher App's bot and counts only the bot the "
+            "policy names: pass --publisher-bot-login <app-slug>[bot] (the slug of the GitHub "
+            "App whose PUBLISHER_APP_CLIENT_ID / PUBLISHER_APP_PRIVATE_KEY the workflow uses)"
+        )
 
     files: dict[Path, str] = {
-        root / "agentic-sdlc.toml": _policy(project_id, provider, default_branch),
+        root / "agentic-sdlc.toml": _policy(
+            project_id, provider, default_branch, publisher_bot_login
+        ),
         root / "AGENTS.md": _agents(project_id),
     }
     if provider == "github":

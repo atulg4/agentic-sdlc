@@ -1,0 +1,146 @@
+name: Automatic planning
+
+on:
+  issues:
+    types: [labeled, unlabeled, edited, closed]
+
+permissions: {}
+
+# Codex 4240628982: authorization is read when the run starts, so REMOVING an approval label must
+# stop a run that is already queued or running: otherwise a Triage user could remove a label and
+# re-apply it while a writer-authorized run waits for a runner, and that run would proceed. Every
+# `labeled` event of a triggering label and every `unlabeled` event of a required label share one
+# group per issue; an `unlabeled` run cancels what is in it (and itself starts nothing: its label
+# is gone, so the label condition is false), while `labeled` runs queue as before. Any later run
+# re-authorizes from the label history. Other label events (the lease's `in-progress` label among
+# them) get a group of their own, so they never cancel the work. Codex 4241196649: an approval
+# covers the title and body it saw, so an `edited` event joins the group and cancels too (and
+# starts nothing itself); a later run is authorized only once the labels are re-applied after
+# the edit. Codex 4242925431: closing the issue withdraws the request, so a `closed` event joins
+# the group and cancels too (a closed issue's labels stay on it, but `preflight` runs only on
+# `labeled`, so the `closed` run itself starts nothing).
+concurrency:
+  group: AUTO_CONCURRENCY_GROUP
+  cancel-in-progress: >-
+    ${{ github.event.action == 'unlabeled' || github.event.action == 'edited' ||
+    github.event.action == 'closed' }}
+
+jobs:
+  # Anyone may open the work-request issue template, which applies the planning labels itself.
+  # The labeler's write authority is therefore checked HERE, on a GitHub-hosted runner, before
+  # any job is scheduled on RUNS_ON: an outsider's issue must not occupy a self-hosted runner
+  # (the reusable workflow checks again; this check only keeps unauthorized runs off it).
+  # Not tunable: doctor requires this job, its runner and the `plan` gate exactly as generated.
+  preflight:
+    # Either planning label triggers (Codex 4241196642: re-adding a removed label must restart
+    # the planning its removal cancelled); both must be on the issue. An issue opened with both
+    # labels fires one `labeled` run per label: the shared concurrency group runs them one after
+    # the other, and `dedupe` skips the later one once a plan covers the approval.
+    if: AUTO_PLAN_IF
+LABELER_AUTHORIZATION
+
+  # Duplicate suppression: no new plan when the platform's plan comment (posted by
+  # github-actions[bot], starting "## Agentic SDLC plan") is newer than the latest application of
+  # EVERY planning label (the newest of them, `approved_latest_at`) -- a plan already covers this
+  # approval. Re-applying a label (after a
+  # cancellation, an edit or a failure) makes the approval newer than any plan, so it plans
+  # again. Comments that cannot be read FAIL the job (reported by notify_failure), never plan
+  # twice in silence. Not tunable: GitHub-hosted, read-only.
+  dedupe:
+    needs: preflight
+    if: needs.preflight.outputs.authorized == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: read
+    outputs:
+      fresh: ${{ steps.dedupe.outputs.fresh }}
+    steps:
+      - name: Skip planning when a plan already covers the current approval
+        id: dedupe
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          # The NEWEST latest application of the planning labels (Codex 4241327876): re-applying
+          # just one label must outdate an earlier plan.
+          APPROVED_AT: ${{ needs.preflight.outputs.approved_latest_at }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$APPROVED_AT" =~ ^[0-9]+$ ]]; then
+            printf '::error::The approval time of issue #%s is unknown; not planning.\n' "$ISSUE_NUMBER"
+            exit 1
+          fi
+          errors="$(mktemp)"
+          planned=""
+          for attempt in 1 2 3; do
+            if planned="$(gh api --method GET --paginate \
+              "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments?per_page=100" \
+              --jq '.[] | select(.user.login == "github-actions[bot]"
+                and ((.body // "") | startswith("## Agentic SDLC plan")))
+                | .created_at | fromdateiso8601' 2>"$errors")"; then
+              break
+            fi
+            planned="unreadable"
+            printf '::warning::attempt %s: could not read the comments of issue #%s: %s\n' \
+              "$attempt" "$ISSUE_NUMBER" "$(head -c 300 "$errors" | tr '\n' ' ')"
+            if [ "$attempt" -lt 3 ]; then
+              sleep "$((attempt * 10))"
+            fi
+          done
+          if [ "$planned" = unreadable ]; then
+            printf '::error::Could not read the comments of issue #%s; not planning.\n' "$ISSUE_NUMBER"
+            exit 1
+          fi
+          fresh=true
+          while IFS= read -r at; do
+            if [ -n "$at" ] && [ "$at" -gt "$APPROVED_AT" ]; then
+              fresh=false
+            fi
+          done <<<"$planned"
+          printf 'fresh=%s\n' "$fresh" >> "$GITHUB_OUTPUT"
+          if [ "$fresh" != true ]; then
+            printf '::notice::A plan was already posted for the current approval of issue #%s; not planning again.\n' "$ISSUE_NUMBER"
+          fi
+
+  plan:
+    needs: [preflight, dedupe]
+    if: needs.preflight.outputs.authorized == 'true' && needs.dedupe.outputs.fresh == 'true'
+    permissions:
+      contents: read
+      issues: write
+      id-token: write
+    uses: REUSABLE_PLAN_USES
+    with:
+      runs_on: RUNS_ON_JSON
+      issue_number: ${{ format('{0}', github.event.issue.number) }}
+      trigger_actor: ${{ needs.preflight.outputs.approver }}
+      config_path: agentic-sdlc.toml
+      platform_ref: PLATFORM_COMMIT_SHA
+      platform_repository: PLATFORM_REPOSITORY
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      PLATFORM_READ_TOKEN: ${{ secrets.PLATFORM_READ_TOKEN }}
+
+  notify_failure:
+    needs: [dedupe, plan]
+    if: >-
+      ${{ always() &&
+      (needs.dedupe.result == 'failure' || needs.dedupe.result == 'cancelled' ||
+      needs.plan.result == 'failure' || needs.plan.result == 'cancelled') }}
+    runs-on: RUNS_ON_YAML
+    permissions:
+      issues: write
+    steps:
+      - name: Report planning failure
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number(process.env.ISSUE_NUMBER),
+              body: `Agent planning did not complete. Inspect the bounded run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });

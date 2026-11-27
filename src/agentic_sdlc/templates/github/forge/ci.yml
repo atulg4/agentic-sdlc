@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [DEFAULT_BRANCH]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# `bash --noprofile --norc -eo pipefail {0}`: without `shell: bash` GitHub runs `bash -e {0}`, where
+# `pytest | tee out` passes when pytest fails. Same semantics as `sdlcctl run-gates` (#153).
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    runs-on: CI_RUNS_ON_YAML
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: PYTHON_VERSION
+      - name: Setup
+        run: SETUP_COMMAND
+      - name: Quality
+        run: QUALITY_COMMAND
+      - name: Test
+        run: TEST_COMMAND

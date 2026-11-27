@@ -48,10 +48,11 @@ A routing policy must declare only known top-level keys: `policyVersion`,
 security field such as `deniedProvider` or `requireNoTrainingStore` can never be
 silently ignored.
 
-`allowedProviders` distinguishes a missing value from an explicitly empty one.
-Omitting the key allows every known provider. Setting `allowedProviders: []` is
-a deny-all decision for incident response or maintenance: no executor is
-eligible and the route fails closed instead of falling back to every provider.
+`allowedProviders` and `allowedDataResidency` each distinguish a missing value
+from an explicitly empty one. Omitting the key allows every known value. Setting
+either to `[]` is a deny-all decision for incident response or maintenance: no
+executor is eligible on that axis and the route fails closed instead of falling
+back to allowing everything.
 
 Budgets must be finite. A `--budget-usd` value of `nan` or `inf` is rejected by
 both the CLI and the router rather than silently disabling the maximum-spend
@@ -99,6 +100,16 @@ Secrets remain outside routing files. Adapter jobs should read credentials from
 environment variables populated by the CI secret store, for example
 `DEEPSEEK_API_KEY`, `ZAI_API_KEY`, `KIMI_API_KEY`,
 `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY`.
+
+Codex subscription profiles use saved ChatGPT authentication on a trusted
+client. See [Codex subscription workers](codex-subscription.md) for the
+operator-run adapter and execution-surface contract. `allowApiBillingFallback`
+is a boolean routing-policy field, defaulting to false. When a Codex subscription
+is registered for the repository and task class, direct-API OpenAI/Codex
+candidates require that explicit opt-in. API-only registries retain their
+existing behavior. The `route-executor` CLI additionally refuses selected Codex
+subscriptions unless the caller opts into `--codex-subscription-client`, keeping
+the existing API-authenticated Actions step from consuming that route.
 
 Every route decision records the selected provider, configured model ID,
 stable alias, policy version, candidate rejection reasons, and recoverable

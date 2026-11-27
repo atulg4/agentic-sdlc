@@ -1,0 +1,39 @@
+name: Automatic approved implementation
+
+on:
+  issues:
+    types: [labeled, unlabeled, edited, closed]
+
+permissions: {}
+
+# Codex 4240628982: authorization is read when the run starts, so REMOVING an approval label must
+# stop a run that is already queued or running: otherwise a Triage user could remove a label and
+# re-apply it while a writer-authorized run waits for a runner, and that run would proceed. Every
+# `labeled` event of a triggering label and every `unlabeled` event of a required label share one
+# group per issue; an `unlabeled` run cancels what is in it (and itself starts nothing: its label
+# is gone, so the label condition is false), while `labeled` runs queue as before. Any later run
+# re-authorizes from the label history. Other label events (the lease's `in-progress` label among
+# them) get a group of their own, so they never cancel the work. Codex 4241196649: an approval
+# covers the title and body it saw, so an `edited` event joins the group and cancels too (and
+# starts nothing itself); a later run is authorized only once the labels are re-applied after
+# the edit. Codex 4242753923: closing the issue withdraws the work, so a `closed` event joins the
+# group and cancels too (a closed issue's labels stay on it, but `authorize` runs only on
+# `labeled`, so the `closed` run itself starts nothing).
+concurrency:
+  group: AUTO_CONCURRENCY_GROUP
+  cancel-in-progress: >-
+    ${{ github.event.action == 'unlabeled' || github.event.action == 'edited' ||
+    github.event.action == 'closed' }}
+
+jobs:
+  # A Triage user can apply the approval labels without write access, so the labeler's write
+  # authority is checked HERE, on a GitHub-hosted runner, before any job is scheduled on RUNS_ON:
+  # toggling a label must not occupy a self-hosted runner (the reusable workflow checks again;
+  # this check only keeps unauthorized runs off it). Not tunable: doctor requires this job, its
+  # runner and every job's `authorize` gate exactly as generated.
+  authorize:
+    # Any approval label triggers; every one of them must be on the issue.
+    if: AUTO_IMPLEMENT_IF
+LABELER_AUTHORIZATION
+
+IMPLEMENT_JOBS

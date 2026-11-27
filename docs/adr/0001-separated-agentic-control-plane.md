@@ -37,7 +37,10 @@ Separate each authority into a fresh job:
 5. Reconstruct and attest the original patch in a clean job that executes no
    consumer code.
 6. Push only the attested branch using the native GitHub token.
-7. Open a draft pull request using a current-repository GitHub App token.
+7. Open a pull request using a current-repository GitHub App token, as a draft
+   by default. A consumer whose independent review gates on `draft == false`
+   sets `open_as_draft: false`, because nothing downstream promotes a draft and
+   the review would otherwise never run.
 8. Run normal CI and an independent Codex review.
 9. Require the owner to merge through protected-branch rules.
 
