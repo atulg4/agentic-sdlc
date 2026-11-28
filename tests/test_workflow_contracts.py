@@ -593,3 +593,21 @@ def test_verify_reads_the_ci_python_version_exactly(tmp_path) -> None:
             check=False,
         )
         assert (done.returncode, done.stdout.strip()) == (code, out), policy
+
+
+def test_release_workflow_writes_only_tags_and_releases_from_main() -> None:
+    document = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
+    release = _job(document, "release")
+
+    # Only main's pushes and a manual run release; nothing a pull request controls.
+    assert "pull_request" not in document
+    assert "branches: [main]" in document
+    assert document.index("permissions:\n  contents: read") < document.index("\njobs:")
+    assert "contents: write" in release
+    assert "persist-credentials: false" in release
+    assert "git merge-base --is-ancestor HEAD origin/main" in release
+    # Values reach the shell through env, never by interpolation into `run`.
+    for line in release.splitlines():
+        if "${{" in line:
+            assert line.lstrip().startswith(("ref:", "GH_TOKEN:", "TAG:", "MANUAL:")), line
+    assert "API_KEY" not in document

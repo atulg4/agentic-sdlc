@@ -101,7 +101,7 @@ def _gate_command_findings(config_path: str | Path) -> list[PreReviewFinding]:
                 )
             )
         # Shell syntax (`&&`, `cd`, `VAR=x cmd`) is no finding (Codex 4243193109): `run-gates`
-        # runs each gate as one `bash -e -o pipefail -c` line (ci.yml's shell, plus pipefail).
+        # runs each gate as one `bash -e -o pipefail -c` line, as ci.yml's `shell: bash` does.
     return findings
 
 
