@@ -1218,6 +1218,12 @@ class LearningLedger:
                 record.supersedes in self._by_id,
                 f"learning {record.learning_id} supersedes unknown learning {record.supersedes}",
             )
+            predecessor = self._by_id[record.supersedes]
+            _require(
+                predecessor.scope_project_id == record.scope_project_id,
+                f"learning {record.learning_id} cannot supersede learning "
+                f"{record.supersedes} from a different project",
+            )
         existing = self._by_id.get(record.learning_id)
         if existing is not None:
             _require(
@@ -1391,11 +1397,13 @@ class _ValueInputs:
     infrastructure_usd: float | None
     window_seconds: float | None
     record_count: int
+    unobserved_work_units: int
     missing: Mapping[str, int]
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "usageRecords": self.record_count,
+            "unobservedWorkUnits": self.unobserved_work_units,
             "agentSeconds": self.agent_seconds,
             "agentHours": (
                 None
@@ -1411,7 +1419,14 @@ class _ValueInputs:
         }
 
 
-def _value_inputs(records: Sequence[UsageRecord], window: ObservationWindow | None) -> _ValueInputs:
+def _value_inputs(
+    records: Sequence[UsageRecord],
+    window: ObservationWindow | None,
+    outcomes: Sequence[OutcomeRecord] = (),
+) -> _ValueInputs:
+    expected_work_units = {(record.project_id, record.work_unit_id) for record in outcomes}
+    observed_work_units = {(record.project_id, record.work_unit_id) for record in records}
+    unobserved_work_units = len(expected_work_units - observed_work_units)
     totals = {
         "agentSeconds": 0.0,
         "tokens": 0.0,
@@ -1461,7 +1476,7 @@ def _value_inputs(records: Sequence[UsageRecord], window: ObservationWindow | No
 
     def known(name: str) -> float | None:
         """A total only counts when the whole sample observed it."""
-        if not records or missing[name]:
+        if not records or missing[name] or unobserved_work_units:
             return None
         return round(totals[name], 6)
 
@@ -1475,6 +1490,7 @@ def _value_inputs(records: Sequence[UsageRecord], window: ObservationWindow | No
         infrastructure_usd=known("infrastructureUsd"),
         window_seconds=window.seconds if window is not None else None,
         record_count=len(records),
+        unobserved_work_units=unobserved_work_units,
         missing=dict(missing),
     )
 
@@ -1542,8 +1558,8 @@ def _value_report(
             agent_hours,
             "outcomes/agent-hour",
             missing_reason=(
-                "no usage record in the sample observed a runtime, or some did not; a "
-                "partial sum would overstate value"
+                "no usage record in the sample observed a runtime, some did not, or an "
+                "outcome work unit has no usage record; a partial sum would overstate value"
             ),
         ),
         "perMillionTokens": _per(
@@ -1552,8 +1568,8 @@ def _value_report(
             millions,
             "outcomes/1M tokens",
             missing_reason=(
-                "not every usage record in the sample observed a complete token count; a "
-                "partial sum would overstate value"
+                "not every usage record in the sample observed a complete token count, or an "
+                "outcome work unit has no usage record; a partial sum would overstate value"
             ),
         ),
         "perPaygDollar": _per(
@@ -1562,8 +1578,8 @@ def _value_report(
             inputs.payg_usd,
             "outcomes/USD billed",
             missing_reason=(
-                "not every usage record in the sample carried pay-as-you-go pricing; a "
-                "partial sum would overstate value"
+                "not every usage record in the sample carried pay-as-you-go pricing, or an "
+                "outcome work unit has no usage record; a partial sum would overstate value"
             ),
         ),
         "perSubscriptionEquivalentDollar": _per(
@@ -1573,7 +1589,8 @@ def _value_report(
             "outcomes/USD subscription-equivalent",
             missing_reason=(
                 "not every usage record in the sample carried a subscription reference "
-                "rate; a partial sum would overstate value"
+                "rate, or an outcome work unit has no usage record; a partial sum would "
+                "overstate value"
             ),
             status_label="subscription",
         ),
@@ -1583,8 +1600,8 @@ def _value_report(
             infrastructure,
             "outcomes/USD infrastructure",
             missing_reason=(
-                "not every usage record in the sample observed an infrastructure cost; a "
-                "partial sum would overstate value"
+                "not every usage record in the sample observed an infrastructure cost, or an "
+                "outcome work unit has no usage record; a partial sum would overstate value"
             ),
         ),
         "perWallClockDay": _per(
@@ -1796,7 +1813,7 @@ def build_effectiveness_report(
         by_result[record.result.value] += 1
         by_deployment[record.deployment_status.value] += 1
     accepted = sum(1 for record in scoped if record.accepted)
-    inputs = _value_inputs(scoped_usage, window)
+    inputs = _value_inputs(scoped_usage, window, scoped)
 
     by_project: dict[str, Any] = {}
     for project_id in sorted({record.project_id for record in scoped}):
@@ -1807,7 +1824,11 @@ def build_effectiveness_report(
             "outcomes": len(project_outcomes),
             "accepted": project_accepted,
             "quality": _quality_report(project_outcomes),
-            "value": _value_report(project_accepted, _value_inputs(project_usage, window), window),
+            "value": _value_report(
+                project_accepted,
+                _value_inputs(project_usage, window, project_outcomes),
+                window,
+            ),
             "learnings": sum(1 for item in scoped_learnings if item.scope_project_id == project_id),
         }
 

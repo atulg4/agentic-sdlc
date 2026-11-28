@@ -190,6 +190,7 @@ from .usage_ledger import (
     UsageLedger,
     load_pricing_document,
     load_usage_record,
+    parse_timestamp,
 )
 
 
@@ -3166,9 +3167,30 @@ def _effectiveness_report(args: argparse.Namespace) -> int:
         raise EffectivenessError("--window-start and --window-end are required together")
     if args.window_start:
         window = ObservationWindow(args.window_start, args.window_end)
+    outcome_records = outcomes.records
+    if window is not None:
+        def in_window(timestamp: str, label: str) -> bool:
+            instant = parse_timestamp(timestamp, label)
+            return window.started_at <= instant < window.ended_at
+
+        outcome_records = tuple(
+            record
+            for record in outcome_records
+            if in_window(record.recorded_at, "outcome recordedAt")
+        )
+        usage = tuple(
+            record
+            for record in usage
+            if in_window(record.occurred_at, "usage occurredAt")
+        )
+        learnings = tuple(
+            record
+            for record in learnings
+            if in_window(record.recorded_at, "learning recordedAt")
+        )
     _write(
         build_effectiveness_report(
-            outcomes.records,
+            outcome_records,
             usage_records=usage,
             window=window,
             learnings=learnings,

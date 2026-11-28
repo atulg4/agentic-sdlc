@@ -565,6 +565,26 @@ def test_value_metrics_report_unknown_rather_than_fabricating() -> None:
     assert value["inputs"]["tokens"] is None
 
 
+def test_value_metrics_refuse_partial_work_unit_coverage() -> None:
+    missing_unit = "github:example/alpha:issue:2"
+    report = build_effectiveness_report(
+        (
+            _outcome(),
+            _outcome(unit=missing_unit, release_ref="v2"),
+        ),
+        usage_records=(_usage("run-1"),),
+        window=WINDOW,
+    )
+    value = report["value"]
+
+    assert value["inputs"]["usageRecords"] == 1
+    assert value["inputs"]["unobservedWorkUnits"] == 1
+    assert value["inputs"]["agentSeconds"] is None
+    assert value["inputs"]["tokens"] is None
+    assert value["perAgentHour"]["status"] == "unknown"
+    assert "outcome work unit has no usage record" in value["perAgentHour"]["reason"]
+
+
 def test_value_metrics_never_divide_by_zero() -> None:
     zero_effort = build_effectiveness_report(
         (_outcome(),),
@@ -699,6 +719,21 @@ def test_learning_ledger_is_append_only_and_versioned() -> None:
     assert ledger.get(first.learning_id) == first
     assert [item.learning_id for item in ledger.current()] == [revision.learning_id]
     assert ledger.superseded_ids() == frozenset({first.learning_id})
+
+
+def test_learning_cannot_supersede_a_record_from_another_project() -> None:
+    ledger = LearningLedger()
+    first = _learning()
+    ledger.append(first)
+    foreign = _learning(
+        statement="a beta-project observation must not rewrite alpha history",
+        recorded_at="2026-10-05T10:00:00Z",
+        work_unit=_work_unit("beta", "github:example/beta:issue:9"),
+        supersedes=first.learning_id,
+    )
+
+    with pytest.raises(EffectivenessError, match="from a different project"):
+        ledger.append(foreign)
 
 
 def test_learning_records_retain_provenance_through_the_ledger_document() -> None:

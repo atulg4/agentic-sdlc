@@ -2728,11 +2728,28 @@ def test_effectiveness_report_cli_scores_outcomes_against_usage(tmp_path: Path) 
         "runtimeSeconds": 1800,
     }
     for run_id, project_id in (("run-1", "alpha"), ("run-2", "beta")):
-        record.write_text(
-            json.dumps(_usage_document(run_id, project_id=project_id, actual=actual)),
-            encoding="utf-8",
-        )
+        current_usage = _usage_document(run_id, project_id=project_id, actual=actual)
+        current_usage["recordedAt"] = "2026-10-02T08:00:00Z"
+        record.write_text(json.dumps(current_usage), encoding="utf-8")
         assert main(["record-usage", "--ledger", str(usage), "--record", str(record)]) == 0
+
+    # Historical outcome and usage must not leak into the requested report window.
+    outcome.write_text(
+        json.dumps(
+            _outcome_document(
+                "v0",
+                project_id="gamma",
+                recordedAt="2026-09-20T09:00:00Z",
+            )
+        ),
+        encoding="utf-8",
+    )
+    assert main(["record-outcome", "--outcomes", str(outcomes), "--outcome", str(outcome)]) == 0
+    record.write_text(
+        json.dumps(_usage_document("run-old", project_id="gamma", actual=actual)),
+        encoding="utf-8",
+    )
+    assert main(["record-usage", "--ledger", str(usage), "--record", str(record)]) == 0
 
     learning.write_text(
         json.dumps(_learning_document("waiting on a dependency dominated the delay")),
@@ -2765,6 +2782,8 @@ def test_effectiveness_report_cli_scores_outcomes_against_usage(tmp_path: Path) 
     report = json.loads(output.read_text(encoding="utf-8"))
 
     assert report["sampleCount"] == 3
+    assert report["value"]["inputs"]["usageRecords"] == 2
+    assert report["value"]["inputs"]["unobservedWorkUnits"] == 0
     assert report["outcomes"]["accepted"] == 2
     assert report["outcomes"]["byResult"]["reverted"] == 1
     # Two accepted outcomes over one agent-hour of observed runtime.
