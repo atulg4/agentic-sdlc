@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -360,6 +362,219 @@ def test_route_executor_cli_selects_lowest_ecps_eligible_model(
     decision = json.loads(output.read_text(encoding="utf-8"))
     assert decision["selectedExecutorId"] == "deepseek-1"
     assert decision["policyVersion"] == "1.0.0"
+
+
+@pytest.mark.parametrize("execution_type", ["subscription-cloud", "subscription-runner"])
+@pytest.mark.parametrize("client_opt_in", [False, True])
+def test_codex_subscription_route_requires_explicit_client(
+    tmp_path: Path, policy_file: Path, capsys, execution_type, client_opt_in
+) -> None:
+    executors = tmp_path / "executors.json"
+    output = tmp_path / "route.json"
+    executors.write_text(
+        json.dumps(
+            [
+                {
+                    "executorId": "codex-account",
+                    "provider": "codex",
+                    "adapter": "codex-cli",
+                    "adapterVersion": "1.0.0",
+                    "executionType": execution_type,
+                    "authMode": "oauth",
+                    "model": "account-supported-model",
+                    "modelAlias": "codex",
+                    "taskClasses": ["implementation"],
+                    "capabilities": ["edit-code", "author-tests", "run-commands"],
+                    "maxRisk": "medium",
+                    "qualityLowerBound": 0.8,
+                    "shadowCostUsd": 1,
+                    "subscriptionMonthlyUsd": 200,
+                    "subscriptionCapacityRemaining": 10,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    arguments = [
+        "route-executor",
+        "--config",
+        str(policy_file),
+        "--mission-id",
+        "implementation-worker",
+        "--executors",
+        str(executors),
+        "--repository",
+        "example/project",
+        "--task-class",
+        "implementation",
+        "--budget-usd",
+        "5",
+        "--output",
+        str(output),
+    ]
+    if client_opt_in:
+        arguments.append("--codex-subscription-client")
+
+    result = main(arguments)
+
+    if client_opt_in:
+        assert result == 0
+        assert json.loads(output.read_text())["selectedExecutorId"] == "codex-account"
+    else:
+        assert result == 2
+        assert not output.exists()
+        captured = capsys.readouterr()
+        assert "supported authenticated Codex client" in captured.err
+        assert "--codex-subscription-client" in captured.err
+        assert captured.out == ""
+
+
+@pytest.mark.parametrize(
+    ("provider", "model", "execution_type", "auth_mode"),
+    [
+        ("codex", "gpt-5", "direct-api", "api-key"),
+        ("anthropic", "claude-opus-5", "subscription-runner", "oauth"),
+    ],
+)
+def test_other_executor_routes_do_not_require_codex_client_opt_in(
+    tmp_path: Path, policy_file: Path, provider, model, execution_type, auth_mode
+) -> None:
+    executors = tmp_path / "executors.json"
+    output = tmp_path / "route.json"
+    executors.write_text(
+        json.dumps(
+            [
+                {
+                    "executorId": "existing-executor",
+                    "provider": provider,
+                    "adapter": "existing-adapter",
+                    "adapterVersion": "1.0.0",
+                    "executionType": execution_type,
+                    "authMode": auth_mode,
+                    "model": model,
+                    "taskClasses": ["implementation"],
+                    "capabilities": ["edit-code", "author-tests", "run-commands"],
+                    "maxRisk": "medium",
+                    "qualityLowerBound": 0.8,
+                    "shadowCostUsd": 1,
+                    "subscriptionMonthlyUsd": 200,
+                    "subscriptionCapacityRemaining": 10,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    result = main(
+        [
+            "route-executor",
+            "--config",
+            str(policy_file),
+            "--mission-id",
+            "implementation-worker",
+            "--executors",
+            str(executors),
+            "--repository",
+            "example/project",
+            "--task-class",
+            "implementation",
+            "--budget-usd",
+            "5",
+            "--output",
+            str(output),
+        ]
+    )
+    assert result == 0
+    assert json.loads(output.read_text())["selectedExecutorId"] == "existing-executor"
+
+
+@pytest.mark.parametrize(
+    ("execute", "status", "expected_code"),
+    [(False, "dry-run", 0), (True, "completed", 0), (True, "failed", 2)],
+)
+def test_codex_subscription_run_cli_requires_execute_and_passes_bounded_inputs(
+    tmp_path: Path, monkeypatch, capsys, execute, status, expected_code
+) -> None:
+    calls = []
+
+    def describe_run(executor, **kwargs):
+        calls.append(("describe", executor.executor_id, kwargs))
+        return {"status": status}
+
+    def run_subscription(executor, **kwargs):
+        calls.append(("execute", executor.executor_id, kwargs))
+        return {"status": status}
+
+    monkeypatch.setitem(
+        sys.modules,
+        "agentic_sdlc.codex_subscription",
+        SimpleNamespace(describe_run=describe_run, run_subscription=run_subscription),
+    )
+    registry = tmp_path / "executors.json"
+    registry.write_text(
+        json.dumps(
+            [
+                {
+                    "executorId": "account-worker",
+                    "provider": "codex",
+                    "adapter": "codex-cli",
+                    "adapterVersion": "1.0.0",
+                    "executionType": "subscription-runner",
+                    "authMode": "oauth",
+                    "model": "account-model",
+                    "modelAlias": "codex",
+                    "taskClasses": ["implementation"],
+                    "capabilities": ["edit-code"],
+                    "shadowCostUsd": 1,
+                    "subscriptionMonthlyUsd": 200,
+                    "subscriptionCapacityRemaining": 1,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("Fix the café label", encoding="utf-8")
+    arguments = [
+        "codex-subscription-run",
+        "--executors",
+        str(registry),
+        "--executor-id",
+        "account-worker",
+        "--worktree",
+        str(tmp_path / "checkout"),
+        "--prompt-file",
+        str(prompt),
+        "--run-dir",
+        str(tmp_path / "run"),
+        "--timeout-seconds",
+        "45",
+        "--sandbox",
+        "workspace-write",
+    ]
+    if execute:
+        arguments.append("--execute")
+
+    assert main(arguments) == expected_code
+    method, executor_id, parameters = calls[0]
+    assert len(calls) == 1
+    assert method == ("execute" if execute else "describe")
+    assert executor_id == "account-worker"
+    assert parameters == {
+        "worktree": tmp_path / "checkout",
+        "run_dir": tmp_path / "run",
+        "timeout_seconds": 45,
+        "sandbox": "workspace-write",
+        **({"prompt": "Fix the café label"} if execute else {}),
+    }
+    assert json.loads(capsys.readouterr().out) == {"status": status}
+
+    calls.clear()
+    arguments[arguments.index("--executor-id") + 1] = "unknown-worker"
+    assert main(arguments) == 2
+    assert calls == []
+    captured = capsys.readouterr()
+    assert "executor ID not found" in captured.err
+    assert captured.out == ""
 
 
 def test_route_executor_cli_fails_closed_when_quality_floor_rejects_cheap_models(
@@ -2419,6 +2634,101 @@ def test_github_backlog_withholds_credentialed_urls_from_errors(tmp_path, capsys
     err = capsys.readouterr().err
     assert "ghp_0123456789" not in err
     assert "withheld" in err
+
+
+def _dispatcher_checkpoints(path: Path) -> None:
+    from agentic_sdlc.checkpoints import SQLiteCheckpointStore
+    from agentic_sdlc.dispatcher import AutonomousIntakeDispatcher
+    from agentic_sdlc.models import WorkEvent, WorkKind
+    from agentic_sdlc.orchestration import Orchestrator
+
+    dispatcher = AutonomousIntakeDispatcher(Orchestrator(), checkpoints=SQLiteCheckpointStore(path))
+    for number, labels, timestamp in (
+        (1, ("forge-managed",), "2026-10-29T09:00:00Z"),
+        (2, ("forge-managed", "forge-paused"), "2026-10-29T09:10:00Z"),
+    ):
+        dispatcher.dispatch(
+            WorkEvent(
+                provider="github",
+                kind=WorkKind.ISSUE,
+                action="opened",
+                repository="example/alpha",
+                number=number,
+                title=f"Item {number}",
+                body="",
+                labels=labels,
+                actor="someone",
+                raw={},
+            ),
+            timestamp=timestamp,
+        )
+
+
+def test_dispatcher_status_cli_joins_heartbeat_with_lifecycle_buckets(tmp_path: Path) -> None:
+    checkpoints = tmp_path / "checkpoints.sqlite3"
+    ledger = tmp_path / "ledger.json"
+    event = tmp_path / "event.json"
+    output = tmp_path / "status.json"
+    _dispatcher_checkpoints(checkpoints)
+    plan = (
+        ("alpha", "github:example/alpha:issue:1", "intake", "intake"),
+        ("alpha", "github:example/alpha:issue:1", "triaged", "intake"),
+        ("beta", "github:example/beta:issue:9", "intake", "intake"),
+    )
+    for sequence, (project_id, unit, state, stage) in enumerate(plan):
+        event.write_text(
+            json.dumps(_event_document(sequence, state, stage, project_id=project_id, unit=unit)),
+            encoding="utf-8",
+        )
+        assert main(["record-event", "--ledger", str(ledger), "--event", str(event)]) == 0
+
+    argv = [
+        "dispatcher-status",
+        "--checkpoints",
+        str(checkpoints),
+        "--now",
+        "2026-10-29T09:40:00Z",
+        "--stale-after-seconds",
+        "3600",
+        "--ledger",
+        str(ledger),
+        "--project-id",
+        "alpha",
+        "--output",
+        str(output),
+    ]
+    assert main(argv) == 0
+
+    document = json.loads(output.read_text(encoding="utf-8"))
+    assert document["heartbeat"]["condition"] == "fresh"
+    assert document["heartbeat"]["ageSeconds"] == 1800
+    assert document["dispatcher"]["units"] == {"total": 1, "byState": {"triaged": 1}}
+    assert document["dispatcher"]["rejectedEvents"]["byState"] == {"blocked": 1}
+    assert document["lifecycle"]["workUnits"] == 1
+    assert document["lifecycle"]["queued"] == 1
+    assert document["lifecycle"]["unknownStates"] == []
+
+    assert main(argv) == 0
+    assert json.loads(output.read_text(encoding="utf-8")) == document
+
+
+def test_dispatcher_status_cli_fails_closed(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    missing = tmp_path / "missing.sqlite3"
+    assert (
+        main(["dispatcher-status", "--checkpoints", str(missing), "--now", "2026-10-29T09:00:00Z"])
+        == 2
+    )
+    assert "not found" in capsys.readouterr().err
+    assert not missing.exists()
+
+    checkpoints = tmp_path / "checkpoints.sqlite3"
+    _dispatcher_checkpoints(checkpoints)
+    base = ["dispatcher-status", "--checkpoints", str(checkpoints)]
+    assert main([*base, "--now", "2026-10-29T09:00:00"]) == 2
+    assert "UTC offset" in capsys.readouterr().err
+    assert main([*base, "--now", "2026-10-29T09:00:00Z", "--stale-after-seconds", "0"]) == 2
+    assert main([*base, "--now", "2026-10-29T09:00:00Z", "--project-id", "alpha"]) == 2
+    assert "only with --ledger" in capsys.readouterr().err
 
 
 def _forecast_usage_ledger(tmp_path: Path) -> Path:

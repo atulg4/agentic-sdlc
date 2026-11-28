@@ -198,3 +198,13 @@ bundled viewer would refuse the otherwise valid snapshot. A remediation descript
 step and names who may take it; taking it stays with that authority. Mutating
 the control plane is a separately reviewed change, not a side effect of
 rendering a page.
+
+## Live delivery and telemetry
+
+The snapshot answers *what is true now*. Two layers sit on top of it:
+`control_center_stream.py` carries ordered, resumable frames so a console can
+update without re-rendering and a reconnecting browser is never silently
+fast-forwarded past changes it missed, and `control_center_telemetry.py` joins
+cost, capacity, parallelism and outcome effectiveness onto the same snapshot.
+Both are contracts rather than servers, and neither holds a credential. See
+[docs/control-center-live.md](control-center-live.md).
