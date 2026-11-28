@@ -39,3 +39,14 @@ def test_plan_and_review_prompts_do_not_carry_implementation_guidance(
 
 def test_prompt_without_policy_is_unchanged(valid_body: str) -> None:
     assert "Repository policy" not in render_prompt(_task(valid_body), "implement")
+
+
+def test_builder_prompts_carry_no_reviewer_checklist_or_verdict_schema(
+    policy_file: Path, valid_body: str
+) -> None:
+    # Issue #119 role separation: builders never see the reviewer checklist
+    # or the review verdict schema.
+    policy = load_policy(policy_file)
+    prompt = render_prompt(_task(valid_body), "implement", policy=policy)
+    assert "Checklist for" not in prompt
+    assert "acceptanceCriteriaVerdict" not in prompt

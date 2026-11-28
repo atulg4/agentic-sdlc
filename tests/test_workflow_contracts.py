@@ -202,7 +202,7 @@ def test_reusable_identifiers_are_allowlisted_before_api_use() -> None:
     review = (WORKFLOWS / "reusable-review.yml").read_text(encoding="utf-8")
     pr_allowlist = '[[ "$PR_NUMBER" =~ ^[1-9][0-9]{0,9}$ ]]'
     assert pr_allowlist in review
-    assert review.index(pr_allowlist) < review.index("Validate and publish review")
+    assert review.index(pr_allowlist) < review.index("Publish review verdicts")
 
 
 def test_legacy_and_example_workflows_match_identifier_contracts() -> None:

@@ -706,6 +706,31 @@ def test_doctor_local_only_catches_label_mismatch_and_unpinned_platform(tmp_path
     assert "workflow label conditions match the policy labels" in names
 
 
+def test_doctor_requires_committed_knowledge_where_the_review_workflow_runs(tmp_path):
+    # Codex 4433905463: the independent review workflow builds #118 context
+    # packets from committed knowledge.toml, so a repo provisioned before
+    # the review gate existed fails every packet build until one lands.
+    repo = _repo(tmp_path)
+    write_onboarding(repo, spec())
+    (repo / ".github/workflows/agent-review.yml").write_text(
+        "name: Independent agent review\n", encoding="utf-8"
+    )
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    failed = {c.name: c for c in report.checks if not c.ok}
+    name = "knowledge.toml declares the review packet's sources"
+    assert name in failed
+    assert "[[source]]" in failed[name].detail
+    (repo / "knowledge.toml").write_text(
+        'version = 1\n\n[[source]]\nid = "repo-main"\ntype = "git-repository"\n'
+        'provider = "github"\nlocator = "https://github.com/owner/comic"\n'
+        'scope = "owner/comic"\n',
+        encoding="utf-8",
+    )
+    report = doctor(repo, "owner/comic", "owner/agentic-sdlc", FakeGh(), remote=False)
+    passed = {c.name for c in report.checks if c.ok}
+    assert name in passed
+
+
 def test_cloud_routine_mode_skips_actions_implementer_and_documents_the_routine(tmp_path):
     files = render_onboarding(spec(implementer="cloud-routine", runs_on=("ubuntu-latest",)))
     assert ".github/workflows/agent-implement.yml" not in files

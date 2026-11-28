@@ -85,6 +85,29 @@ gates = []
 '''
 
 
+def _knowledge(provider: str, project_id: str) -> str:
+    """A minimal committed knowledge configuration: the project itself.
+
+    The review and repair workflows build #118 context packets from the
+    committed ``knowledge.toml`` (the loader requires at least one
+    ``[[source]]``), so provisioning must install one or every packet build
+    in a scaffolded project fails closed. The repository source is internal
+    and unrestricted: an empty ``permitted_missions`` admits every mission.
+    """
+    host = "github.com" if provider == "github" else "gitlab.com"
+    locator = project_id if "." in project_id.split("/", 1)[0] else f"{host}/{project_id}"
+    return f'''\
+version = 1
+
+[[source]]
+id = "repo-main"
+type = "git-repository"
+provider = "{provider}"
+locator = "https://{locator}"
+scope = "{project_id}"
+'''
+
+
 def _agents(project_id: str) -> str:
     return f"""# {project_id} Agent Guide
 
@@ -167,6 +190,7 @@ def scaffold_project(
         root / "agentic-sdlc.toml": _policy(
             project_id, provider, default_branch, publisher_bot_login
         ),
+        root / "knowledge.toml": _knowledge(provider, project_id),
         root / "AGENTS.md": _agents(project_id),
     }
     if provider == "github":

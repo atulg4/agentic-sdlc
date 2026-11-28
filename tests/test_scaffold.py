@@ -265,3 +265,46 @@ def test_scaffold_accepts_every_branch_the_policy_loader_accepts(
     )
     policy = load_policy(repository / "agentic-sdlc.toml")
     assert policy.default_branch == branch
+
+
+def test_scaffold_installs_a_loadable_knowledge_configuration(tmp_path: Path) -> None:
+    # The review and repair workflows build #118 context packets from the
+    # committed knowledge.toml; a scaffolded project without one would fail
+    # every packet build closed (Codex 4433905463).
+    from agentic_sdlc.knowledge import load_sources
+
+    repository = _repository(tmp_path)
+    created = scaffold_project(
+        repository,
+        provider="github",
+        project_id="owner/consumer",
+        platform_repository="owner/agentic-sdlc",
+        platform_ref="c" * 40,
+        automation_level=2,
+        publisher_bot_login="consumer-publisher[bot]",
+    )
+    knowledge = repository / "knowledge.toml"
+    assert knowledge in created
+    sources = load_sources(knowledge)
+    assert [source.source_id for source in sources] == ["repo-main"]
+    assert sources[0].source_type == "git-repository"
+    assert sources[0].provider == "github"
+    assert sources[0].locator == "https://github.com/owner/consumer"
+    assert sources[0].scope == "owner/consumer"
+    # Empty permitted_missions admits every mission, reviewer and repair
+    # alike.
+    assert sources[0].permitted_missions == ()
+
+    gitlab = tmp_path / "gitlab-consumer"
+    gitlab.mkdir()
+    (gitlab / ".git").mkdir()
+    scaffold_project(
+        gitlab,
+        provider="gitlab",
+        project_id="gitlab.example.com/group/consumer",
+        platform_repository="group/agentic-sdlc",
+        platform_ref="d" * 40,
+    )
+    hosted = load_sources(gitlab / "knowledge.toml")[0]
+    assert hosted.provider == "gitlab"
+    assert hosted.locator == "https://gitlab.example.com/group/consumer"

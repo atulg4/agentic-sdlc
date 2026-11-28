@@ -40,6 +40,22 @@ def test_continuation_is_exact_head_fail_closed_and_idempotent() -> None:
     assert "core.setOutput('action', 'block')" in text
 
 
+def test_continuation_consumes_the_aggregate_role_aware_gate() -> None:
+    # Issue #119 (Codex 4433905456): the review artifact holds one
+    # review-<role>.json per role plus the engine-recorded aggregate
+    # gate.json — a single review.json no longer exists, and one role's
+    # verdict is not the decision: a passing code review with a blocked
+    # security review must repair.
+    text = CONTINUATION.read_text(encoding="utf-8")
+    assert "independent-review/review.json" not in text
+    assert "review.verdict" not in text
+    assert "independent-review/gate.json" in text
+    assert "typeof gate.allowed !== 'boolean'" in text
+    # The decision binds the exact head it was computed for.
+    assert "gate.headSha !== process.env.HEAD_SHA" in text
+    assert "if (!gate.allowed) {" in text
+
+
 def test_changes_requested_dispatches_accepted_bounded_repair_contract() -> None:
     document = _yaml(CONTINUATION)
     repair = document["jobs"]["repair"]

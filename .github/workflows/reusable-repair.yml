@@ -31,6 +31,10 @@ on:
         required: false
         default: agentic-sdlc.toml
         type: string
+      knowledge_path:
+        required: false
+        default: knowledge.toml
+        type: string
       platform_ref:
         required: true
         type: string
@@ -61,6 +65,7 @@ jobs:
     permissions:
       actions: read
       contents: read
+      issues: read
       pull-requests: read
     outputs:
       head_ref: ${{ steps.pr.outputs.head_ref }}
@@ -104,6 +109,17 @@ jobs:
           head_ref="$(jq -r '.head.ref' <<< "$pr")"
           [[ "$head_ref" =~ ^[A-Za-z0-9._/-]+$ ]]
           printf 'head_ref=%s\n' "$head_ref" >> "$GITHUB_OUTPUT"
+          # Forge-created pull requests carry exactly one `Closes #N` marker
+          # line naming the approved work item; its task feeds the #118
+          # builder context packet the repair agent receives. The body is
+          # data: the marker is matched as a whole line, never evaluated.
+          issue="$(jq -r '(.body // "") | split("\n") | map(select(test("^Closes #[1-9][0-9]{0,9}\\r?$"))) | if length == 1 then .[0] else "" end' <<< "$pr")"
+          issue="${issue//[!0-9]/}"
+          if [ -z "$issue" ]; then
+            echo "the pull request does not carry exactly one 'Closes #N' work-item marker" >&2
+            exit 1
+          fi
+          printf 'issue_number=%s\n' "$issue" >> "$GITHUB_OUTPUT"
       - name: Check out exact PR head without credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -118,50 +134,6 @@ jobs:
           set -euo pipefail
           mkdir -p .agentic-repair
           git show "${BASE_SHA}:${CONFIG_PATH}" > .agentic-repair/trusted-policy.toml
-      - name: Restore exact independent-review artifact
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: independent-review-${{ inputs.review_run_id }}
-          path: .agentic-repair/review
-          run-id: ${{ inputs.review_run_id }}
-          github-token: ${{ github.token }}
-      - name: Validate changes-requested review and build fixed repair prompt
-        env:
-          PR_NUMBER: ${{ inputs.pull_request_number }}
-          HEAD_SHA: ${{ inputs.head_sha }}
-          REPAIR_CYCLE: ${{ inputs.repair_cycle }}
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          path = Path('.agentic-repair/review/review.json')
-          review = json.loads(path.read_text(encoding='utf-8'))
-          if review.get('verdict') != 'changes_requested':
-              raise SystemExit('repair requires an exact changes_requested review')
-          findings = review.get('findings')
-          if not isinstance(findings, list) or not findings:
-              raise SystemExit('changes_requested review must contain findings')
-          lines = [
-              f"Repair pull request #{os.environ['PR_NUMBER']} at exact head {os.environ['HEAD_SHA']}.",
-              f"This is bounded repair cycle {os.environ['REPAIR_CYCLE']}.",
-              "Address only the independent-review findings below.",
-              "Do not push, merge, deploy, access credentials, or broaden scope.",
-              "Preserve existing behavior unless a finding requires a correction.",
-              "",
-          ]
-          for finding in findings[:50]:
-              severity = str(finding.get('severity', 'unknown'))
-              title = str(finding.get('title', ''))[:300]
-              body = str(finding.get('body', ''))[:4000]
-              file = str(finding.get('file', ''))[:1000]
-              line = finding.get('line')
-              location = f"{file}:{line}" if file and line else file
-              lines.extend([f"[{severity}] {title} ({location})", body, ""])
-          Path('.agentic-repair/prompt.md').write_text('\n'.join(lines), encoding='utf-8')
-          PY
       - name: Check out pinned policy engine
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -170,12 +142,82 @@ jobs:
           path: .agentic-platform
           persist-credentials: false
           token: ${{ secrets.PLATFORM_READ_TOKEN || github.token }}
+      - name: Install pinned policy engine
+        run: |
+          set -euo pipefail
+          printf '/.agentic-platform/\n' >> .git/info/exclude
+          python3 -P -m pip install --disable-pip-version-check -q ./.agentic-platform
+      - name: Restore exact independent-review artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: independent-review-${{ inputs.review_run_id }}
+          path: .agentic-repair/review
+          run-id: ${{ inputs.review_run_id }}
+          github-token: ${{ github.token }}
+      - name: Build fixed repair prompt from the packet and blocking findings
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pull_request_number }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          REPAIR_CYCLE: ${{ inputs.repair_cycle }}
+          ISSUE_NUMBER: ${{ steps.pr.outputs.issue_number }}
+          KNOWLEDGE_PATH: ${{ inputs.knowledge_path }}
+          CONFIG_PATH: ${{ inputs.config_path }}
+        run: |
+          set -euo pipefail
+          printf '/.agentic-repair/\n' >> .git/info/exclude
+          # Only the BLOCKING findings reach the write-capable repair run:
+          # low-severity and advisory findings never spend the bounded repair
+          # budget. The filter is the pinned engine's, never inline parsing.
+          review_args=()
+          for review in .agentic-repair/review/review-*.json; do
+            review_args+=(--review "$review")
+          done
+          sdlcctl repair-findings \
+            "${review_args[@]}" \
+            --output .agentic-repair/blocking.json \
+            --prompt-output .agentic-repair/findings.md
+          # The repair agent receives the #118 BUILDER context packet for the
+          # approved work item, pinned at the trusted base so the candidate's
+          # own head cannot shape the policy or knowledge it reads. A builder
+          # pin must be the candidate repository's CURRENT checkout, so the
+          # packet derives from a disposable worktree checked out at the
+          # exact base — never from this job's PR-head checkout.
+          gh api --method GET "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}" > .agentic-repair/issue.json
+          jq -e '.pull_request | not' .agentic-repair/issue.json > /dev/null
+          jq --arg repo "$GITHUB_REPOSITORY" --arg issue "$ISSUE_NUMBER" --arg base "$BASE_SHA" \
+            '{missionId: "repair-agent", workRef: ($repo + "#" + $issue), task: {title: (.title // ""), body: (.body // ""), labels: [.labels[].name]}, records: [], repositoryRevision: $base}' \
+            .agentic-repair/issue.json > .agentic-repair/request.json
+          base_tree="${RUNNER_TEMP}/agentic-repair-base"
+          rm -rf "$base_tree"
+          git worktree add --detach "$base_tree" "$BASE_SHA"
+          sdlcctl context-packet \
+            --config "$CONFIG_PATH" \
+            --knowledge "$KNOWLEDGE_PATH" \
+            --request .agentic-repair/request.json \
+            --candidate-repository "$base_tree" \
+            --output .agentic-repair/packet.json \
+            --prompt-output .agentic-repair/packet-prompt.md
+          git worktree remove --force "$base_tree"
+          {
+            printf 'Repair pull request #%s at exact head %s.\n' "$PR_NUMBER" "$HEAD_SHA"
+            printf 'This is bounded repair cycle %s.\n' "$REPAIR_CYCLE"
+            printf 'Address only the blocking independent-review findings below.\n'
+            printf 'Do not push, merge, deploy, access credentials, or broaden scope.\n'
+            printf 'Preserve existing behavior unless a finding requires a correction.\n\n'
+            cat .agentic-repair/packet-prompt.md
+            printf '\n\n'
+            cat .agentic-repair/findings.md
+            printf '\n'
+          } > .agentic-repair/prompt.md
       - name: Store trusted repair inputs
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: repair-input-${{ github.run_id }}
           path: |
             .agentic-repair/prompt.md
+            .agentic-repair/blocking.json
             .agentic-repair/trusted-policy.toml
           if-no-files-found: error
           include-hidden-files: true
@@ -276,7 +318,7 @@ jobs:
         run: |
           set -euo pipefail
           export PYTHONPATH="${GITHUB_WORKSPACE}/.agentic-platform/src"
-          python3 -m agentic_sdlc inspect-diff \
+          python3 -P -m agentic_sdlc inspect-diff \
             --config .agentic-repair/trusted-policy.toml \
             --repository . \
             --base "$HEAD_SHA" \
@@ -284,7 +326,7 @@ jobs:
             --paths-output .agentic-output/paths.txt \
             --decision-output .agentic-output/decision.json
           test -s .agentic-output/change.patch
-          python3 -m agentic_sdlc create-manifest \
+          python3 -P -m agentic_sdlc create-manifest \
             --patch .agentic-output/change.patch \
             --base-sha "$HEAD_SHA" \
             --repository "$GITHUB_REPOSITORY" \
@@ -334,7 +376,7 @@ jobs:
         run: |
           set -euo pipefail
           export PYTHONPATH="${GITHUB_WORKSPACE}/.agentic-platform/src"
-          python3 -m agentic_sdlc verify-artifact \
+          python3 -P -m agentic_sdlc verify-artifact \
             --patch "${RUNNER_TEMP}/repair-patch/change.patch" \
             --manifest "${RUNNER_TEMP}/repair-patch/manifest.json" \
             --base-sha "$HEAD_SHA" \
@@ -350,14 +392,14 @@ jobs:
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/verified-repair"
           export PYTHONPATH="${GITHUB_WORKSPACE}/.agentic-platform/src"
-          python3 -m agentic_sdlc inspect-diff \
+          python3 -P -m agentic_sdlc inspect-diff \
             --config .agentic-repair/trusted-policy.toml \
             --repository . \
             --base "$HEAD_SHA" \
             --patch-output "${RUNNER_TEMP}/verified-repair/change.patch" \
             --paths-output "${RUNNER_TEMP}/verified-repair/paths.txt" \
             --decision-output "${RUNNER_TEMP}/verified-repair/decision.json"
-          python3 -m agentic_sdlc create-manifest \
+          python3 -P -m agentic_sdlc create-manifest \
             --patch "${RUNNER_TEMP}/verified-repair/change.patch" \
             --base-sha "$HEAD_SHA" \
             --repository "$GITHUB_REPOSITORY" \
@@ -374,7 +416,7 @@ jobs:
         run: |
           set -euo pipefail
           PYTHONPATH="${GITHUB_WORKSPACE}/.agentic-platform/src" \
-            python3 -m agentic_sdlc run-gates \
+            python3 -P -m agentic_sdlc run-gates \
               --config .agentic-repair/trusted-policy.toml \
               --repository . \
               --output "${RUNNER_TEMP}/verified-repair/gates.json"

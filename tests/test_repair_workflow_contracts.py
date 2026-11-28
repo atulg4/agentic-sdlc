@@ -16,10 +16,50 @@ def _yaml(path: Path) -> dict:
 def test_repair_is_exact_head_bounded_and_uses_review_artifact() -> None:
     text = REUSABLE.read_text(encoding="utf-8")
     assert "independent-review-${{ inputs.review_run_id }}" in text
-    assert "repair requires an exact changes_requested review" in text
     assert 'test "$(jq -r \'.head.sha\' <<< "$pr")" = "$HEAD_SHA"' in text
     assert 'test "$REPAIR_CYCLE" -le "$MAX_REPAIR_CYCLES"' in text
     assert 'git push origin "HEAD:refs/heads/${HEAD_REF}"' in text
+
+
+def test_repair_receives_only_blocking_findings_plus_the_builder_packet() -> None:
+    # Issue #119: the repair prompt is the #118 builder context packet plus
+    # ONLY the blocking findings — filtered by the pinned engine, never by
+    # inline workflow parsing — and the packet pins policy and knowledge at
+    # the trusted base, not the candidate head.
+    text = REUSABLE.read_text(encoding="utf-8")
+    assert "sdlcctl repair-findings" in text
+    assert "--prompt-output .agentic-repair/findings.md" in text
+    assert "sdlcctl context-packet" in text
+    assert "--prompt-output .agentic-repair/packet-prompt.md" in text
+    assert "repositoryRevision: $base" in text
+    # A builder pin must be the candidate repository's CURRENT checkout, so
+    # the packet derives from a disposable worktree at the exact base — the
+    # PR-head checkout would make the engine reject the historical pin
+    # (Codex 4433905458).
+    assert 'git worktree add --detach "$base_tree" "$BASE_SHA"' in text
+    assert '--candidate-repository "$base_tree"' in text
+    assert "--candidate-repository . \\" not in text
+    assert "cat .agentic-repair/packet-prompt.md" in text
+    assert "cat .agentic-repair/findings.md" in text
+    # The work item comes from the PR's single Closes marker, matched as a
+    # whole line of data.
+    assert "Closes #[1-9][0-9]{0,9}" in text
+    # The engine is installed from the pinned platform ref before any of it
+    # runs.
+    assert text.index("Install pinned policy engine") < text.index("sdlcctl repair-findings")
+
+
+def test_trusted_python_in_repair_cannot_import_candidate_code() -> None:
+    # Every python3 here runs from the PR-head checkout, where stdin/-m
+    # execution would put the candidate tree first on sys.path: a committed
+    # root-level agentic_sdlc/ or pip/ package would shadow the pinned
+    # engine the verification steps run (Codex 4434015133). -P keeps the
+    # checkout off the import path; PYTHONPATH (the restored engine) stays.
+    text = REUSABLE.read_text(encoding="utf-8")
+    assert "python3 -m pip" not in text
+    assert "python3 -m agentic_sdlc" not in text
+    assert "python3 -P -m pip install" in text
+    assert text.count("python3 -P -m agentic_sdlc") == 6
 
 
 def test_ai_repair_job_has_no_repository_write_or_publisher_secret() -> None:

@@ -82,7 +82,7 @@ jobs:
           PR_NUMBER: ${{ steps.bind.outputs.number }}
           HEAD_SHA: ${{ steps.bind.outputs.head_sha }}
           STALE: ${{ steps.bind.outputs.stale }}
-          REVIEW_PATH: ${{ runner.temp }}/independent-review/review.json
+          GATE_PATH: ${{ runner.temp }}/independent-review/gate.json
           MAX_REPAIR_CYCLES: ${{ vars.FORGE_MAX_REPAIR_CYCLES || '2' }}
         with:
           github-token: ${{ github.token }}
@@ -98,9 +98,13 @@ jobs:
               core.setFailed('FORGE_MAX_REPAIR_CYCLES must be an integer from 1 to 20');
               return;
             }
-            const review = JSON.parse(fs.readFileSync(process.env.REVIEW_PATH, 'utf8'));
-            if (!['approve', 'changes_requested'].includes(review.verdict)) {
-              core.setFailed('independent review artifact has a non-terminal verdict');
+            // The continuation consumes the AGGREGATE role-aware gate the
+            // pinned engine recorded — never one role's verdict: a passing
+            // code review with a blocked security review must repair, and a
+            // decision for any other head is not a decision at all.
+            const gate = JSON.parse(fs.readFileSync(process.env.GATE_PATH, 'utf8'));
+            if (typeof gate.allowed !== 'boolean' || gate.headSha !== process.env.HEAD_SHA) {
+              core.setFailed('independent review artifact carries no same-head gate decision');
               return;
             }
             const comments = await github.paginate(github.rest.issues.listComments, {
@@ -126,7 +130,7 @@ jobs:
               .filter(Boolean)
               .map(match => Number(match[1]));
             const previous = allRepairMarkers.length ? Math.max(...allRepairMarkers) : 0;
-            if (review.verdict === 'changes_requested') {
+            if (!gate.allowed) {
               if (previous >= max) {
                 core.setOutput('action', 'block');
                 core.setOutput('repair_cycle', String(previous));
