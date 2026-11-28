@@ -1037,9 +1037,7 @@ def test_drilldown_orders_equivalent_offsets_by_the_underlying_instant() -> None
     earlier = _record(
         "earlier", started_at="2026-10-29T08:30:00+02:00", finished_at="2026-10-29T09:00:00+02:00"
     )
-    later = _record(
-        "later", started_at="2026-10-29T08:00:00Z", finished_at="2026-10-29T08:30:00Z"
-    )
+    later = _record("later", started_at="2026-10-29T08:00:00Z", finished_at="2026-10-29T08:30:00Z")
     result = build_telemetry_overlay(_snapshot(), usage_records=(later, earlier), registry=REGISTRY)
     runs = result["workUnits"]["forge/wu-1"]["runs"]
     assert [run["runId"] for run in runs] == ["earlier", "later"]
