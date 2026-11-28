@@ -1716,10 +1716,16 @@
     recovering = true;
     degrade(reason);
     try {
+      // The generation is claimed BEFORE the read, for the same reason the
+      // subscription drain claims it on receipt: a read is served with the
+      // document as it stood when it was issued, so claiming afterwards would
+      // make this older document outrank a delivery or manual load that
+      // adopted while the read was in flight, and the stale view would win.
+      const delivery = ++snapshotAdoptions;
       const snap = await state.db.doc("snapshots/current").get();
+      if (delivery !== snapshotAdoptions) return false;
       const body = snap?.data?.() || null;
       if (!body?.document) return false;
-      const delivery = ++snapshotAdoptions;
       const problem = validateSnapshot(body.document) || await digestMismatch(body.document);
       if (delivery !== snapshotAdoptions) return false;
       if (problem) { degrade("Recovery snapshot was refused: " + problem); return false; }
@@ -2008,7 +2014,7 @@
          "byDay":      <sdlcctl usage-report --group-by day>,
          "byWorkUnit": <sdlcctl usage-report --group-by project --group-by workUnit>,
          "capacity":   <sdlcctl capacity-report ...>,
-         "effectiveness": <sdlcctl effectiveness-report ...> }
+         "effectiveness": <pending: ships with Forge #106> }
 
      Every key is optional, and a view with no document behind it reads
      "unavailable" naming the command that produces it. Each sub-document is
@@ -2148,7 +2154,7 @@
     byDay: "paste a telemetry bundle whose byDay section is `sdlcctl usage-report --group-by day`.",
     byWorkUnit: "paste a telemetry bundle whose byWorkUnit section is `sdlcctl usage-report --group-by project --group-by workUnit`.",
     capacity: "paste a telemetry bundle whose capacity section is `sdlcctl capacity-report --usage … --window-start … --window-end …`.",
-    effectiveness: "paste a telemetry bundle whose effectiveness section is `sdlcctl effectiveness-report …`; outcomes are recorded separately and this console never infers delivery from the fact that runs happened.",
+    effectiveness: "its producer is not built yet: `sdlcctl effectiveness-report` arrives with the outcome-effectiveness layer (Forge #106). Outcomes are recorded separately and this console never infers delivery from the fact that runs happened, so this view stays unavailable until that report exists.",
   };
 
   /* ================= phone destinations =================
@@ -2160,7 +2166,14 @@
     patch(bar, DESTINATIONS.map(([id, label, glyph]) => tag(el("button", {
       class: "dest", type: "button",
       "aria-current": state.dest === id ? "page" : null,
-      on: { click: () => { state.dest = id; render(); window.scrollTo({ top: 0 }); } },
+      on: { click: () => {
+        state.dest = id;
+        // The sheet is drawn OVER the destinations, so leaving it open would
+        // highlight a destination the viewer cannot see.
+        state.sheet = "";
+        render();
+        window.scrollTo({ top: 0 });
+      } },
     },
       el("span", { class: "glyph", "aria-hidden": "true", text: glyph }),
       el("span", { class: "label", text: label }),
@@ -2252,10 +2265,17 @@
   }
 
   function portfolioByStage() {
+    // Summed from each project's own census, exactly as the project rail reads
+    // it. Rebuilding it from the active, attention and waiting lists drops
+    // every unit in none of them -- a merged or live one above all -- so the
+    // portfolio rail would contradict the project rails it sits above, and a
+    // portfolio of nothing but live work would report no stages at all.
     const counts = {};
-    for (const { unit } of allUnits()) {
-      if (!unit.stage) continue;
-      counts[unit.stage] = (counts[unit.stage] || 0) + 1;
+    for (const project of projects()) {
+      for (const [stage, count] of Object.entries(project.counts?.byStage || {})) {
+        if (!Number.isFinite(count)) continue;
+        counts[stage] = (counts[stage] || 0) + count;
+      }
     }
     return counts;
   }
@@ -2442,10 +2462,19 @@
     if (!report) {
       return el("div", { class: "chart-unknown", text: "unavailable — " + MISSING.byWorkUnit });
     }
+    if (!(report.groupBy || []).includes("projectId")) {
+      // Work-unit ids are reused across projects, so a report grouped by
+      // workUnit alone cannot say whose usage a bucket describes. Showing it
+      // under the selected project would attribute another project's cost to
+      // this one.
+      return el("div", { class: "chart-unknown", text: "unavailable \u2014 this usage report is "
+        + "grouped by work unit alone, so its buckets carry no project. Work-unit ids repeat "
+        + "across projects, so it cannot be attributed to one. Regroup it with "
+        + "`--group-by project --group-by workUnit`." });
+    }
     const match = (report.buckets || []).find((bucket) => {
       const key = bucket.key || {};
-      return key.workUnitId === unit.workUnitId
-        && (key.projectId === undefined || key.projectId === project.projectId);
+      return key.workUnitId === unit.workUnitId && key.projectId === project.projectId;
     });
     if (!match) {
       return el("div", { class: "chart-unknown", text: "unavailable — the telemetry bundle records no usage for this work unit." });
@@ -2612,7 +2641,11 @@
     const values = rows.map(read);
     const known = values.filter((entry) => entry.known).map((entry) => entry.value);
     if (!known.length) return chartUnknown(title, "no day in the usage report observed this figure.");
-    const max = Math.max(...known, 1);
+    // The scale is clamped so a chart of sub-unit values still has a height;
+    // the caption must report the OBSERVED peak, or a day of 0.957 reads as a
+    // peak of 1 and a day of zero as a peak of one.
+    const observed = Math.max(...known);
+    const max = Math.max(observed, 1);
     const step = rows.length > 1 ? 100 / (rows.length - 1) : 0;
     const summary = title + ": " + rows.map((row, index) =>
       row.label + " " + values[index].text).join(", ");
@@ -2660,7 +2693,7 @@
         el("span", { class: "key" }, el("span", { text: "? unobserved" })),
       ),
       el("p", { class: "tiny muted", style: "margin:8px 0 0", text: rows.length + " day(s), "
-        + gaps + " with no observation. Peak " + max + ". Every calendar day in the range has "
+        + gaps + " with no observation. Peak " + observed + ". Every calendar day in the range has "
         + "a place on the axis, and a gap is never bridged: an unmeasured day is not a zero one." }),
     );
   }
@@ -3857,7 +3890,7 @@
       : null;
     return el("div", { class: "card" },
       el("h3", { text: "Cost, capacity and effectiveness (optional)" }),
-      el("p", { class: "small", text: "The Cost, Agents and Effectiveness views render documents the Forge CLI emits. Paste them together as one bundle; every section is optional and an absent one reads unavailable rather than zero." }),
+      el("p", { class: "small", text: "The Cost and Agents views render documents the Forge CLI emits today. Paste them together as one bundle; every section is optional and an absent one reads unavailable rather than zero. The effectiveness section has no producer yet — it ships with the outcome-effectiveness layer (Forge #106) — so the Effectiveness views stay unavailable until then." }),
       el("pre", { class: "cmd", text: TELEMETRY_RECIPE }),
       el("div", { class: "row", style: "margin-top:8px" }, copyButton(TELEMETRY_RECIPE, "Copy the commands")),
       el("label", { class: "field" }, el("span", { text: "Telemetry bundle JSON" }), area),
@@ -3891,14 +3924,15 @@
     "sdlcctl capacity-report --usage usage.json \\",
     "  --window-start 2026-10-29T00:00:00Z \\",
     "  --window-end   2026-10-30T00:00:00Z                       > capacity.json",
-    "# Effectiveness is optional and comes from its own producer.",
-    "sdlcctl effectiveness-report --outcomes outcomes.json       > effectiveness.json",
+    "# The effectiveness section is OPTIONAL and its producer is not built yet:",
+    "# `sdlcctl effectiveness-report` arrives with the outcome-effectiveness",
+    "# layer (Forge #106). Until then omit the section and the Effectiveness",
+    "# views read unavailable, which is the honest answer.",
     "",
     "jq -n --slurpfile m by-model.json --slurpfile d by-day.json \\",
     "      --slurpfile w by-work-unit.json --slurpfile c capacity.json \\",
-    "      --slurpfile e effectiveness.json \\",
     "  '{schemaVersion:1, byModel:$m[0], byDay:$d[0], byWorkUnit:$w[0],",
-    "    capacity:$c[0], effectiveness:$e[0]}' > telemetry.json",
+    "    capacity:$c[0]}' > telemetry.json",
   ].join("\n");
 
   const SNAPSHOT_RECIPE = [

@@ -55,6 +55,14 @@
       }
     },
     set(path, body) { docs.set(path, body); },
+    //: Reads of a gated path block until the test releases them.
+    gates: new Map(),
+    gate(path) {
+      let release;
+      const promise = new Promise((resolve) => { release = resolve; });
+      window.__store.gates.set(path, { promise, release });
+      return () => release();
+    },
     // Deliver a bounded collection window, the way the console's note and
     // draft subscriptions receive one. Each entry is { id, data } so an
     // adopter can tell a scoped document from a legacy one.
@@ -78,7 +86,22 @@
         if (docs.has(path)) { try { next(snap(path)); } catch { /* ignored */ } }
         return () => {};
       },
-      get: async () => { calls.get += 1; return snap(path); },
+      get: async () => {
+        calls.get += 1;
+        // A read is served with the document as it stood when the read was
+        // ISSUED, which is what a real store does and what makes the race
+        // observable: a write that lands while the read is in flight does not
+        // retroactively change its result. A test can hold the read open to
+        // interleave a newer adoption with it.
+        const served = docs.get(path);
+        const gate = window.__store.gates.get(path);
+        if (gate) {
+          await gate.promise;
+          window.__store.gates.delete(path);
+          return { get exists() { return served !== undefined; }, data: () => served || null };
+        }
+        return snap(path);
+      },
       set: async (body) => { window.__store.deliver(path, body); },
     }),
   };

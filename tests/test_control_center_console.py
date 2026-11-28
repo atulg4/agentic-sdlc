@@ -426,6 +426,99 @@ def test_active_and_held_units_are_both_present_in_the_fixture() -> None:
     assert held >= 1, "nothing is held, so an over-count could not be detected"
 
 
+# --- second review round (reviewed at 20673c0) ------------------------------
+
+
+def test_the_recovery_read_claims_its_generation_before_it_awaits(html: str) -> None:
+    """The same ordering rule as the subscription drain, on the recovery path.
+
+    A read is served with the document as it stood when it was issued, so
+    claiming the generation afterwards would let this older document outrank a
+    delivery or manual load that adopted while the read was in flight.
+    """
+    recovery = html.split("async function recoverSnapshot(reason)")[1].split(
+        "function watchFeed()"
+    )[0]
+    claim = recovery.index("++snapshotAdoptions")
+    read = recovery.index('await state.db.doc("snapshots/current").get()')
+    assert claim < read, "the recovery read claims its generation after awaiting the read"
+    # Re-checked after the read AND after the digest verification.
+    assert recovery.count("if (delivery !== snapshotAdoptions) return false;") == 2
+
+
+def test_the_portfolio_rail_sums_the_snapshots_own_census(html: str) -> None:
+    # Rebuilding it from the active, attention and waiting lists drops every
+    # unit in none of them — a merged or live one above all — so the portfolio
+    # rail would contradict the project rails it sits above.
+    rail = html.split("function portfolioByStage()")[1].split("\n  }")[0]
+    assert "project.counts?.byStage" in rail
+    assert "allUnits()" not in rail
+    assert "contradict the project rails" in html
+
+
+def test_selecting_a_destination_closes_the_open_sheet(html: str) -> None:
+    # The sheet draws over the destinations, so leaving it open would highlight
+    # a destination the viewer cannot see.
+    nav = html.split("function renderBottomNav()")[1].split("function liveFeed()")[0]
+    assert 'state.sheet = "";' in nav
+
+
+def test_an_unscoped_work_unit_report_is_refused(html: str) -> None:
+    # Work-unit ids repeat across projects, so a report grouped by work unit
+    # alone cannot say whose usage a bucket describes.
+    assert 'if (!(report.groupBy || []).includes("projectId"))' in html
+    assert "grouped by work unit alone" in html
+    assert "--group-by project --group-by workUnit`." in html
+    # The project must now MATCH, not merely not-disagree.
+    assert "key.projectId === undefined" not in html
+    assert "key.workUnitId === unit.workUnitId && key.projectId === project.projectId" in html
+
+
+def test_the_trend_reports_the_observed_peak_not_the_scale_floor(html: str) -> None:
+    # The scale is clamped so a chart of sub-unit values still has a height;
+    # the caption must report what was observed.
+    assert "const observed = Math.max(...known);" in html
+    assert "const max = Math.max(observed, 1);" in html
+    assert 'Peak " + observed + "' in html
+    assert 'Peak " + max + "' not in html
+
+
+def test_the_recipe_names_no_command_the_cli_does_not_have() -> None:
+    """The telemetry recipe is instructions an operator runs verbatim.
+
+    It presented `sdlcctl effectiveness-report` as an existing CLI output while
+    that command ships with the outcome-effectiveness layer, so the recipe
+    could not be followed. Every command it names must exist here.
+    """
+    import re
+    import subprocess
+
+    html = CONSOLE.read_text(encoding="utf-8")
+    recipe = html.split("const TELEMETRY_RECIPE = [")[1].split('].join("\\n");')[0]
+    # Only the lines an operator actually runs. A comment may name the pending
+    # producer in order to say it is pending, which is the point.
+    runnable = "\n".join(line for line in recipe.splitlines() if not re.match(r'\s*"#', line))
+    named = set(re.findall(r"sdlcctl ([a-z][a-z-]+)", runnable))
+    assert named, "the recipe names no commands"
+    listed = subprocess.run(  # noqa: S603 - fixed argv, repository-local module
+        ["python3", "-m", "agentic_sdlc.cli", "--help"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={"PYTHONPATH": "src", "PATH": os.environ.get("PATH", "")},
+    ).stdout
+    missing = sorted(name for name in named if name not in listed)
+    assert not missing, (
+        "the recipe names commands this CLI does not have: "
+        + ", ".join(missing)
+        + " — an operator cannot follow it"
+    )
+    # The pending producer is named as pending, not as something to run.
+    assert "its producer is not built yet" in html
+    assert "producer is not built yet" in recipe or "not built yet" in recipe
+
+
 # --- the browser suite ------------------------------------------------------
 
 

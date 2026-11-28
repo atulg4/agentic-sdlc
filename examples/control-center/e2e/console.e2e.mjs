@@ -866,6 +866,158 @@ test("a queued delivery cannot overtake a newer adoption", async (browser) => {
   } finally { await context.close(); }
 });
 
+/* ================= second review round (reviewed at 20673c0) ================= */
+
+test("a recovery read cannot overwrite an adoption that landed while it ran", async (browser) => {
+  const { context, page } = await openConsole(browser);
+  try {
+    const result = await page.evaluate(async (document_) => {
+      // Hold the recovery read open, let a newer delivery adopt while it is in
+      // flight, then release it. The older document must not come back.
+      const release = window.__store.gate("snapshots/current");
+      const older = await window.__reseal(structuredClone(document_));
+      window.__store.set("snapshots/current", {
+        document: older, loadedAt: "2026-10-29T09:00:00Z", loadedBy: "older",
+      });
+      window.__store.fail("snapshots/current", { message: "listener terminated" });
+      await new Promise((resolve_) => setTimeout(resolve_, 60));
+
+      const newer = structuredClone(document_);
+      const project = newer.projects.find((entry) => (entry.active || []).length);
+      project.active[0].activity = "newer adoption";
+      window.__store.deliver("snapshots/current", {
+        document: await window.__reseal(newer), loadedAt: "2026-10-29T09:05:00Z", loadedBy: "newer",
+      });
+      for (let tick = 0; tick < 60; tick += 1) {
+        if (document.querySelector("#view").innerText.includes("newer adoption")) break;
+        await new Promise((resolve_) => setTimeout(resolve_, 10));
+      }
+      const adopted = document.querySelector("#view").innerText.includes("newer adoption");
+      release();
+      for (let tick = 0; tick < 80; tick += 1) {
+        await new Promise((resolve_) => setTimeout(resolve_, 10));
+      }
+      return { adopted, stillNewer: document.querySelector("#view").innerText.includes("newer adoption") };
+    }, SNAPSHOT);
+    assert(result.adopted, "the newer delivery never reached the view, so the case proves nothing");
+    assert(result.stillNewer,
+      "the in-flight recovery read overwrote the newer adoption with an older document");
+  } finally { await context.close(); }
+});
+
+test("the portfolio rail counts every unit the snapshot's own census holds", async (browser) => {
+  const { context, page } = await openConsole(browser);
+  try {
+    const rail = await page.evaluate(() => {
+      const census = {};
+      for (const project of window.__forgeConsole.snapshotProjects) {
+        for (const [stage, count] of Object.entries(project.counts?.byStage || {})) {
+          census[stage] = (census[stage] || 0) + count;
+        }
+      }
+      const label = [...document.querySelectorAll('#view svg[role="img"]')]
+        .map((node) => node.getAttribute("aria-label"))
+        .find((text) => /lifecycle rail, all projects/i.test(text)) || "";
+      return { census, label };
+    });
+    // A terminal unit is in counts.byStage but in none of the active,
+    // attention or waiting lists, so a census rebuilt from those lists drops
+    // it and the portfolio rail disagrees with the project rails.
+    assert(Object.keys(rail.census).length > 0, "the fixture carries no stage census");
+    // Off-rail stages (blocked, failed, cancelled, superseded, rollback) are
+    // deliberately not drawn on the forward rail; every ON-rail stage in the
+    // census must be.
+    const offRail = new Set(["blocked", "failed", "cancelled", "superseded", "rollback"]);
+    for (const [stage, count] of Object.entries(rail.census)) {
+      if (offRail.has(stage)) continue;
+      assert(rail.label.includes(count + " unit" + (count === 1 ? "" : "s") + " in " + stage)
+        || rail.label.includes(count + " in " + stage),
+        `the portfolio rail omits ${count} unit(s) in ${stage}: ${rail.label}`);
+    }
+    assert(/\blive\b/.test(rail.label),
+      `the fixture's live units are missing from the portfolio rail: ${rail.label}`);
+  } finally { await context.close(); }
+});
+
+test("a phone destination closes whatever sheet was open", async (browser) => {
+  const { context, page } = await openConsole(browser);
+  try {
+    await page.locator('#view button:text-matches("add project", "i")').first().click();
+    await page.waitForTimeout(80);
+    assert((await page.locator("#view").innerText()).includes("Add a project"),
+      "the sheet did not open, so the case proves nothing");
+    await page.locator("#bottom-nav .dest").nth(2).click();
+    await page.waitForTimeout(80);
+    const after = await page.evaluate(() => ({
+      dest: window.__forgeConsole.dest,
+      marked: [...document.querySelectorAll('#bottom-nav .dest[aria-current="page"]')]
+        .map((node) => node.textContent.trim()),
+      text: document.querySelector("#view").innerText,
+    }));
+    assertEqual(after.dest, "agents", "the destination was not selected");
+    assert(!after.text.includes("Add a project"),
+      "the sheet is still showing while a destination is highlighted");
+    assert(/active agents/i.test(after.text),
+      `the highlighted destination did not render: ${JSON.stringify(after.text.slice(0, 120))}`);
+  } finally { await context.close(); }
+});
+
+test("an unscoped work-unit report is not attributed to the selected project", async (browser) => {
+  const { context, page } = await openConsole(browser);
+  try {
+    // The fixture reuses work-unit ids across projects, so a report grouped by
+    // workUnit alone carries no project attribution and must not be shown
+    // under a project it may not describe.
+    const unscoped = structuredClone(TELEMETRY);
+    unscoped.byWorkUnit.groupBy = ["workUnitId"];
+    unscoped.byWorkUnit.buckets = unscoped.byWorkUnit.buckets.map((bucket) => {
+      const copy = structuredClone(bucket);
+      copy.key = { workUnitId: bucket.key.workUnitId };
+      return copy;
+    });
+    const problem = await page.evaluate(
+      (bundle) => window.__forgeConsole.loadTelemetry(bundle), unscoped);
+    if (problem) {
+      assert(/project/i.test(problem),
+        `the unscoped report was refused for the wrong reason: ${problem}`);
+      return;
+    }
+    await page.locator("#bottom-nav .dest").nth(1).click();
+    await page.waitForTimeout(60);
+    await page.locator("#view .ucard-btn").first().click();
+    await page.waitForTimeout(80);
+    const detail = await page.locator("#view .detail").first().innerText();
+    assert(/unavailable/i.test(detail.split("Tokens and cost")[1] || ""),
+      "an unscoped work-unit report was attributed to this project: "
+      + JSON.stringify((detail.split("Tokens and cost")[1] || "").slice(0, 200)));
+  } finally { await context.close(); }
+});
+
+test("the trend caption reports the observed peak, not the chart's scale floor", async (browser) => {
+  const { context, page } = await openConsole(browser);
+  try {
+    const problem = await page.evaluate(
+      (bundle) => window.__forgeConsole.loadTelemetry(bundle), TELEMETRY);
+    assertEqual(problem, "", "the fixture bundle was refused");
+    await page.locator("#bottom-nav .dest").nth(3).click();
+    await page.waitForTimeout(80);
+    const observed = Math.max(...TELEMETRY.byDay.buckets
+      .map((bucket) => bucket.actual.paygEquivalentUsd.value)
+      .filter((value) => value !== null && value !== undefined));
+    assert(observed < 1, "the fixture's daily peak is no longer below 1, so the case proves nothing");
+    const caption = await page.evaluate(() => {
+      const card = [...document.querySelectorAll("#view .card")]
+        .find((node) => /pay-as-you-go equivalent per day/i.test(node.innerText));
+      return card?.innerText || "";
+    });
+    // Not [0-9.]+ — that swallows the sentence's full stop and parses as NaN.
+    const peak = /Peak ([0-9]+(?:\.[0-9]+)?)/.exec(caption);
+    assert(peak !== null, `no peak in the caption: ${JSON.stringify(caption)}`);
+    assertEqual(Number(peak[1]), observed,
+      `the caption reports the scale floor rather than the observed peak (${caption})`);
+  } finally { await context.close(); }
+});
+
 /* ---------- runner ---------- */
 const browser = await chromium.launch({ args: ["--no-sandbox"] });
 let failed = 0;

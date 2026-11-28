@@ -195,7 +195,9 @@ Agents, Cost, Effectiveness — and every touch target is at least 44×44 CSS px
 The views that are not destinations (Blockers, Add project, Snapshot) open as
 an overlay, reached from buttons on the Projects destination: their desktop
 tabs are hidden at this width, so without those the console would lose project
-registration and the whole blocker remediation workflow on a phone. The
+registration and the whole blocker remediation workflow on a phone. Selecting
+a destination closes whatever sheet is open, since the sheet draws over the
+destinations and would otherwise leave one highlighted but unreachable. The
 desktop tab bar keeps every view it had, plus **All units** for the dense
 table.
 
@@ -209,7 +211,10 @@ fraction. Every missing value reads `unknown`; none reads `0`.
 
 Tapping a card opens a drill-down: the lifecycle timeline, time in the current
 state, worker and model, token and cost estimate versus actual, dependencies,
-and artifacts.
+and artifacts. The estimate-versus-actual table needs a usage report grouped by
+**project and work unit**: work-unit ids repeat across projects, so a report
+grouped by work unit alone cannot say whose usage a bucket describes and is
+refused rather than attributed to whichever project is on screen.
 
 The timeline marks **only the current stage**. A stage earlier on the rail is
 labelled as exactly that, never as *passed*: the forward path has legal
@@ -230,16 +235,29 @@ colour or position alone.
 
 | View | Chart | Source |
 |---|---|---|
-| Projects, Backlog | lifecycle rail / funnel | the snapshot's stage census |
+| Projects, Backlog | lifecycle rail / funnel | each project's own `counts.byStage`, summed |
 | Agents | active agents by model, by worker | the snapshot's **active** collection |
 | Agents | held work by why it is held, repair loops | the snapshot's work units |
 | Agents | queue and parallelism, model usage | `sdlcctl capacity-report` |
 | Cost | tokens and pay-as-you-go equivalent by model | `sdlcctl usage-report --group-by model` |
 | Cost | daily cost and runtime trend | `sdlcctl usage-report --group-by day` |
-| Effectiveness | outcome quality, accepted outcomes | `sdlcctl effectiveness-report` |
+| Effectiveness | outcome quality, accepted outcomes | an effectiveness report — **producer pending** |
+
+The portfolio rail sums each project's own census rather than rebuilding one
+from the active, attention and waiting lists: a unit in none of those lists —
+a merged or live one above all — would be dropped, so the portfolio rail would
+contradict the project rails it sits above, and a portfolio of nothing but
+live work would report no stages at all.
+
+The effectiveness views have **no producer yet**: `sdlcctl
+effectiveness-report` ships with the outcome-effectiveness layer (Forge #106).
+Until then the bundle omits that section and those views read `unavailable`,
+which is the honest answer. The recipe in the console names only commands the
+CLI has today, and a test enforces that by running `--help` and comparing.
 
 A chart whose source document was not loaded reads **unavailable** and names
-the command that produces it. A figure the producer reported as unobserved
+the command that produces it, or says the producer is pending where one does
+not exist yet. A figure the producer reported as unobserved
 (`value: null`) stays `unknown` everywhere it is written — the bar, the visible
 label and the accessible summary — and is left out of the chart's scale, so an
 unmeasured cost is never announced as zero dollars.
@@ -249,6 +267,10 @@ unmeasured cost is never announced as zero dollars.
 unit still names the model and worker that last touched it, and counting those
 would report execution that is not happening; held work gets its own chart
 instead, grouped by why it is held.
+
+The trend's caption reports the **observed** peak. Its scale is clamped so a
+chart of sub-unit values still has a height, and reusing that clamp in the
+caption would report a peak of 1 for a day that cost 0.957.
 
 A daily trend never bridges a day nobody observed. The usage report emits a
 bucket only for a day that carried records, so a quiet day is *absent* rather
@@ -298,7 +320,10 @@ the `snapshotSha256` digest.
 Each delivery claims its adoption generation **when it arrives**, not when the
 drain reaches it. Stamping it at processing time would make a document that had
 been waiting *newer* than a manual load that adopted while it waited, and the
-older document would win.
+older document would win. The recovery read claims its generation before it
+issues the read, for the same reason: a read is served with the document as it
+stood when it was issued, so a claim made afterwards would let that older
+document outrank whatever adopted while the read was in flight.
 
 A view's signature covers everything it renders, including the contents of the
 store-backed note and draft collections. A note reworded or a draft replaced
