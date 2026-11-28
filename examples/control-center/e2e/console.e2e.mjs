@@ -1,7 +1,7 @@
 /* Browser tests for the mobile-first Control Center console.
  *
  * Run directly:  node examples/control-center/e2e/console.e2e.mjs
- * Or through pytest, which skips when Playwright or its browser is absent:
+ * Or through pytest with Forge's development dependencies:
  *   python -m pytest tests/test_control_center_console.py
  *
  * Offline by construction: the page is a single file loaded over file://, the
@@ -17,7 +17,9 @@ import { dirname, resolve } from "node:path";
 // Resolved through CommonJS: ESM import ignores NODE_PATH, and Playwright is
 // commonly installed outside the repository (a toolchain directory, a global
 // prefix) rather than as a dependency of this stdlib-only project.
-const { chromium } = createRequire(import.meta.url)("playwright");
+// Pytest passes the pinned Python wheel's bundled Node driver as an absolute path.
+// Running this file directly uses the usual npm installation.
+const { chromium } = createRequire(import.meta.url)(process.argv[2] || "playwright");
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, "..");
@@ -1259,7 +1261,9 @@ for (const [name, width, height] of PHONES) {
 }
 
 /* ---------- runner ---------- */
-const browser = await chromium.launch({ args: ["--no-sandbox"] });
+const channel = process.env.GITHUB_ACTIONS === "true" ? "chrome" : undefined;
+const browser = await chromium.launch({ channel, args: ["--no-sandbox"] });
+console.log("Chromium " + browser.version());
 let failed = 0;
 try {
   for (const [name, fn] of cases) {

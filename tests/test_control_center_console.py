@@ -4,13 +4,11 @@ Two layers:
 
 * **Structural** tests read ``examples/control-center/control-center.html``
   and pin the contracts the console's producers and its browser tests both
-  depend on. They run everywhere, including CI, which has no browser.
+  depend on. They run independently of browser availability.
 * The **browser** suite is a Playwright harness
-  (``examples/control-center/e2e/console.e2e.mjs``) driving bundled Chromium
-  against the example fixtures. It is skipped when Node or Playwright is
-  absent rather than failing: this project is stdlib-only Python and its CI
-  image carries no browser, so a browser test cannot be a required check.
-  Run it directly with ``node examples/control-center/e2e/console.e2e.mjs``.
+  (``examples/control-center/e2e/console.e2e.mjs``) driving Chromium against
+  the example fixtures. The hosted CI runner supplies Chrome and requires this
+  suite to pass. A local checkout without browser tooling may skip the suite.
 """
 
 from __future__ import annotations
@@ -20,6 +18,7 @@ import os
 import re
 import shutil
 import subprocess
+from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
 
 import pytest
@@ -532,27 +531,13 @@ def test_the_recipe_names_no_command_the_cli_does_not_have() -> None:
 # --- the browser suite ------------------------------------------------------
 
 
-def _node_with_playwright() -> str | None:
-    node = shutil.which("node")
-    if node is None:
-        return None
-    probe = subprocess.run(  # noqa: S603 - a fixed probe, no user input
-        [node, "-e", "require.resolve('playwright')"],
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    return node if probe.returncode == 0 else None
-
-
 def test_extra_grouping_really_does_collapse_a_days_buckets() -> None:
     """The premise the console's grouping guard rests on, from the producer.
 
     The guard refuses a ``byDay`` report grouped by more than the day. This
     pins *why*: the producer legitimately emits several buckets for one
     calendar day, each holding only part of that day, so a reader that
-    indexes by day keeps whichever happens to come last. It runs in CI, where
-    the browser suite cannot.
+    indexes by day keeps whichever happens to come last.
     """
     from agentic_sdlc.usage_ledger import UsageLedger
     from tests.test_usage_ledger import _actual, _estimate, _record
@@ -597,33 +582,38 @@ def test_extra_grouping_really_does_collapse_a_days_buckets() -> None:
     assert sum(parts) == day_only["buckets"][0]["actual"]["runtimeSeconds"]["value"]
 
 
-@pytest.mark.skipif(
-    os.environ.get("FORGE_SKIP_BROWSER_TESTS") == "1",
-    reason="browser tests disabled by FORGE_SKIP_BROWSER_TESTS",
-)
-def test_the_console_passes_its_browser_suite() -> None:
-    """Drive the real console in Chromium: layout, navigation, live updates.
-
-    Skipped rather than failed where Node or Playwright is absent. The suite
-    needs a browser, this project ships no JavaScript dependency, and a check
-    that cannot run in CI must not be able to report green by accident - so
-    the skip reason names exactly what is missing.
-    """
-    node = _node_with_playwright()
+def test_the_console_passes_its_browser_suite(capsys: pytest.CaptureFixture[str]) -> None:
+    """Drive the mobile and desktop console with the same JavaScript suite developers run."""
+    hosted_ci = os.environ.get("GITHUB_ACTIONS") == "true"
+    if not hosted_ci and os.environ.get("FORGE_SKIP_BROWSER_TESTS") == "1":
+        pytest.skip("browser tests disabled by FORGE_SKIP_BROWSER_TESTS")
+    node = shutil.which("node")
     if node is None:
-        pytest.skip(
-            "node with the playwright package is required; run "
-            "`node examples/control-center/e2e/console.e2e.mjs` where it is installed"
-        )
-    completed = subprocess.run(  # noqa: S603 - fixed argv, repository-local script
-        [node, str(E2E)],
+        if hosted_ci:
+            pytest.fail("Node is required for Control Center browser validation")
+        pytest.skip("Node is unavailable")
+    command = [node, str(E2E)]
+    try:
+        driver = distribution("playwright").locate_file("playwright/driver/package")
+    except PackageNotFoundError:
+        pass  # The standalone suite can also use the npm playwright package.
+    else:
+        command.append(str(driver))
+    completed = subprocess.run(  # noqa: S603 - fixed suite and installed Playwright
+        command,
         cwd=ROOT,
         capture_output=True,
         text=True,
         timeout=900,
     )
     output = completed.stdout + completed.stderr
-    if "Executable doesn't exist" in output or "browserType.launch" in output:
-        pytest.skip("playwright is installed but its Chromium build is not: " + output[-400:])
+    if not hosted_ci and (
+        "Executable doesn't exist" in output or "Cannot find module 'playwright'" in output
+    ):
+        pytest.skip("local Playwright browser tooling is unavailable")
     assert completed.returncode == 0, output
-    assert re.search(r"\n\d+ passed, 0 failed", output), output
+    version = re.search(r"^Chromium ([\d.]+)$", output, re.MULTILINE)
+    summary = re.search(r"^([1-9]\d* passed, 0 failed)$", output, re.MULTILINE)
+    assert version and summary, output
+    with capsys.disabled():
+        print(f"\nControl Center browser suite: Chromium {version[1]}, {summary[1]}")

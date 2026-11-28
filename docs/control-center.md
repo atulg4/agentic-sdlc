@@ -395,7 +395,7 @@ something did.
 
 ### Testing the console
 
-`examples/control-center/e2e/console.e2e.mjs` drives the real page in bundled
+`examples/control-center/e2e/console.e2e.mjs` drives the real page in headless
 Chromium against the fixtures in `examples/control-center/`, through a fake
 store injected before the console's own module runs. It covers the phone
 viewports (360×780, 390×844, 412×915), the five destinations, touch-target
@@ -407,9 +407,13 @@ budgets, and the dense desktop view.
 node examples/control-center/e2e/console.e2e.mjs
 ```
 
-`tests/test_control_center_console.py` runs it, and **skips** when Node or
-Playwright is absent: this project ships no JavaScript dependency and its CI
-image carries no browser, so a browser check cannot be a required one. The
+Platform CI installs the pinned Playwright development dependency and runs the
+suite through pytest with the runner's Chrome stable channel. The job fails
+if Chrome cannot launch or any browser assertion fails. Its test log records
+the browser version and case count. Locally, install the development extra
+and run `python -m playwright install chromium` before pytest, or run the
+Node command above with an npm Playwright installation. Local tests skip the
+browser suite when Node, Playwright, or the Chromium build is missing. The
 same file also pins the console's structural contracts — the rail matching the
 producer's own lifecycle stages, the budgets matching this document, the
 credential rules — and those run everywhere.
