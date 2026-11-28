@@ -31,6 +31,7 @@ transport built on it stays a read-only view by construction.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -412,16 +413,18 @@ def render_sse_frame(frame: StreamFrame, *, snapshot_sha256: str = "") -> str:
     field and split one frame into two.
 
     ``snapshot_sha256`` is the digest the client has reconciled against: the
-    one a snapshot frame published, carried forward. A frame's own payload
-    only holds a digest when it *is* a snapshot, so without this every
-    heartbeat and change after one would publish a sequence-only id, the
-    browser would echo that back, and ``build_reconnect_response`` would have
-    nothing to detect a snapshot mismatch with -- silently losing the recovery
-    check on the very path the docs tell transports to rely on.
+    previous digest for a heartbeat. On a digest-aware stream each content
+    change must publish its resulting digest. Advancing the sequence with a
+    digest describing the old content makes a correct client appear stale.
     """
     data = json.dumps(frame.as_dict(), sort_keys=True, separators=(",", ":"))
     _require("\n" not in data and "\r" not in data, "a rendered frame must not contain a newline")
-    carried = str(frame.payload.get("snapshotSha256", "") or "") or str(snapshot_sha256 or "")
+    published = str(frame.payload.get("snapshotSha256", "") or "")
+    _require(
+        frame.kind is not FrameKind.CHANGE or published or not snapshot_sha256,
+        "a change on a digest-aware SSE stream must name the resulting snapshot in snapshotSha256",
+    )
+    carried = published or str(snapshot_sha256 or "")
     # Validated before it reaches the id line, whichever door it came in by:
     # a frame's own payload or the keyword a transport carries it forward with.
     # StreamCursor checks it too, but the message should name where it came
@@ -471,6 +474,10 @@ class StreamLog:
         self._retain = retain
         self._frames: list[StreamFrame] = []
         self._event_ids: dict[str, StreamFrame] = {}
+        # Evicted payloads are not retained. Their opaque identity digests
+        # keep a producer retry from acquiring a new sequence after eviction.
+        # None means a legacy checkpoint lacks that history and is read-only.
+        self._retired_ids: set[str] | None = set()
         self._assigned = 0
         self._dropped = 0
 
@@ -560,12 +567,23 @@ class StreamLog:
             f"frame {frame.event_id} has sequence {frame.sequence}, but the log's "
             f"next sequence is {self.next_sequence}; a stream must stay contiguous",
         )
+        _require(
+            self._retired_ids is not None,
+            "this legacy stream checkpoint lacks replay history for evicted frames; "
+            "restore from the original event stream before appending",
+        )
+        assert self._retired_ids is not None
+        _require(
+            hashlib.sha256(frame.event_id.encode("utf-8")).hexdigest() not in self._retired_ids,
+            "an event whose frame has retired cannot be assigned a new sequence",
+        )
         self._frames.append(frame)
         self._event_ids[frame.event_id] = frame
         self._assigned = frame.sequence
         while len(self._frames) > self._retain:
             retired = self._frames.pop(0)
             self._event_ids.pop(retired.event_id, None)
+            self._retired_ids.add(hashlib.sha256(retired.event_id.encode("utf-8")).hexdigest())
             self._dropped += 1
         return frame
 
@@ -630,6 +648,8 @@ class StreamLog:
         }
         if scope is not None:
             document["scopedTo"] = sorted(scope)
+        elif self._retired_ids:
+            document["retiredEventDigests"] = sorted(self._retired_ids)
         return document
 
     @classmethod
@@ -651,6 +671,7 @@ class StreamLog:
                     "assigned",
                     "dropped",
                     "earliestResumable",
+                    "retiredEventDigests",
                     "cursor",
                     "frames",
                     "scopedTo",
@@ -659,7 +680,7 @@ class StreamLog:
             "stream log",
         )
         _require(
-            not entry.get("scopedTo"),
+            "scopedTo" not in entry,
             "a project-scoped stream document is a view for analysis, not a log: "
             "its frames are filtered, so it cannot be rehydrated",
         )
@@ -673,6 +694,7 @@ class StreamLog:
         raw_frames = entry.get("frames", [])
         _require(isinstance(raw_frames, list), "stream log frames must be an array")
         assert isinstance(raw_frames, list)
+        _require(len(raw_frames) <= retain, "stream log exceeds its retained frame limit")
         frames = [load_stream_frame(item) for item in raw_frames]
         if frames:
             # A slid window starts above 1: seed the counter so the first
@@ -708,6 +730,24 @@ class StreamLog:
             isinstance(dropped, int) and not isinstance(dropped, bool) and dropped >= 0,
             "stream log dropped must be a non-negative integer",
         )
+        missing = assigned - len(log)
+        retired = entry.get("retiredEventDigests")
+        if retired is None and missing:
+            log._retired_ids = None
+        elif retired is not None:
+            _require(
+                isinstance(retired, list)
+                and len(retired) == missing == dropped
+                and all(isinstance(item, str) and _is_digest(item) for item in retired),
+                "retired event digests must contain one sha256 digest per dropped frame",
+            )
+            retired_ids = {digest.lower() for digest in retired}
+            active_ids = {hashlib.sha256(key.encode("utf-8")).hexdigest() for key in log._event_ids}
+            _require(
+                len(retired_ids) == dropped and retired_ids.isdisjoint(active_ids),
+                "retired event digests must be unique and distinct from retained events",
+            )
+            log._retired_ids = retired_ids
         log._dropped = dropped
         return log
 
@@ -834,15 +874,33 @@ def build_reconnect_response(
     if reason is None:
         assert cursor is not None
         frames = log.since(cursor, project_ids=project_ids)
-        return {
-            "schemaVersion": STREAM_SCHEMA_VERSION,
-            "mode": "resumed",
-            "resumedFrom": cursor.as_dict(),
-            "cursor": StreamCursor(sequence=log.cursor.sequence, snapshot_sha256=digest).as_dict(),
-            "freshness": freshness,
-            "frames": [frame.as_dict() for frame in frames],
-            "snapshot": None,
-        }
+        changes = [i for i, frame in enumerate(frames) if frame.kind in _CONTENT_FRAMES]
+        # Only the last content frame is known to produce the current
+        # snapshot. Never label an intermediate change with that digest.
+        unverifiable = cursor.snapshot_sha256 and any(
+            project_ids is not None or not frames[i].payload.get("snapshotSha256")
+            for i in changes[:-1]
+        )
+        last_payload = frames[changes[-1]].payload if changes else {}
+        if unverifiable or (
+            "snapshotSha256" not in last_payload and len(last_payload) >= MAX_PAYLOAD_KEYS
+        ):
+            reason = ResetReason.SNAPSHOT_MISMATCH
+        else:
+            documents = [frame.as_dict() for frame in frames]
+            if changes:
+                documents[changes[-1]]["payload"]["snapshotSha256"] = digest
+            return {
+                "schemaVersion": STREAM_SCHEMA_VERSION,
+                "mode": "resumed",
+                "resumedFrom": cursor.as_dict(),
+                "cursor": StreamCursor(
+                    sequence=log.cursor.sequence, snapshot_sha256=digest
+                ).as_dict(),
+                "freshness": freshness,
+                "frames": documents,
+                "snapshot": None,
+            }
 
     snapshot_frame = StreamFrame(
         sequence=log.cursor.sequence,

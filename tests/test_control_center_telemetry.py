@@ -6,7 +6,12 @@ import json
 
 import pytest
 
-from agentic_sdlc.capacity_metrics import CapacityInputs, ObservationWindow, RunnerPool
+from agentic_sdlc.capacity_metrics import (
+    CapacityInputs,
+    ObservationWindow,
+    PlanCapacityObservation,
+    RunnerPool,
+)
 from agentic_sdlc.control_center import ControlCenterError, build_control_center_snapshot
 from agentic_sdlc.control_center_stream import StreamLog
 from agentic_sdlc.control_center_telemetry import (
@@ -1004,3 +1009,37 @@ def test_a_consumed_document_key_is_bounded() -> None:
 
     with pytest.raises(ControlCenterError, match="key longer than"):
         load_effectiveness_document(document)
+
+
+def test_project_scopes_withhold_unattributable_capacity_declarations() -> None:
+    inputs = CapacityInputs(
+        pools=(RunnerPool(pool_id="atlas-only", slots=3, workers=("atlas-runner",)),),
+        provider_limits={"atlas-only-provider": 3},
+        plan_capacity=(
+            PlanCapacityObservation("atlas-only-provider", "atlas-plan", "credits", NOW, 8, 1),
+        ),
+    )
+    result = build_telemetry_overlay(
+        _snapshot(),
+        usage_records=(_record(),),
+        window=WINDOW,
+        capacity_inputs=inputs,
+        registry=REGISTRY,
+        project_ids=("forge",),
+    )
+    assert "atlas-only" not in json.dumps(result)
+    assert "atlas-runner" not in json.dumps(result)
+    assert "atlas-plan" not in json.dumps(result)
+    assert result["parallelism"]["concurrency"]["peak"] == 1
+
+
+def test_drilldown_orders_equivalent_offsets_by_the_underlying_instant() -> None:
+    earlier = _record(
+        "earlier", started_at="2026-10-29T08:30:00+02:00", finished_at="2026-10-29T09:00:00+02:00"
+    )
+    later = _record(
+        "later", started_at="2026-10-29T08:00:00Z", finished_at="2026-10-29T08:30:00Z"
+    )
+    result = build_telemetry_overlay(_snapshot(), usage_records=(later, earlier), registry=REGISTRY)
+    runs = result["workUnits"]["forge/wu-1"]["runs"]
+    assert [run["runId"] for run in runs] == ["earlier", "later"]

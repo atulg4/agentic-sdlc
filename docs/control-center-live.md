@@ -102,15 +102,9 @@ difference; otherwise it resets.
 
 The encoded cursor is published as `lastEventId` — what SSE calls it, and what
 the browser echoes back in `Last-Event-ID`, so reconnect needs no client-side
-bookkeeping. Only a snapshot frame carries a digest in its payload, so
-`render_sse_frame` takes the digest the client has reconciled against and
-`render_sse_stream` carries it forward across the frames that follow.
-Without that, every heartbeat and change after a snapshot published a
-sequence-only id, the browser echoed that back, and the mismatch check above
-had nothing to work with — losing snapshot recovery on precisely the path this
-section tells transports to rely on. It is deliberately *not* called `token`: it is not a credential,
-and a field by that name would trip every secret scanner, including this
-module's own.
+bookkeeping. A snapshot publishes its digest, a heartbeat preserves it, and
+a content change publishes the digest of its resulting snapshot. The SSE
+renderers refuse to pair a change with a previously reconciled digest.
 
 ### The wire form
 
@@ -285,3 +279,22 @@ It opens no socket, holds no credential, and mutates nothing. There is no
 merge, deploy, broker or model authority anywhere in it, and no path from a
 frame or an overlay back into the factory: a transport built on it stays a
 read-only view by construction.
+
+## Checkpoint and scope compatibility
+
+Unscoped checkpoints include a SHA-256 identity digest for each evicted event.
+Only the retained window stores event payloads. A retry within the window
+compares content, and an evicted ID is rejected without assigning another
+sequence. The identity index grows by one digest per eviction. Scoped exports
+omit it. A legacy checkpoint missing identities for discarded sequences can
+still serve readers. Restore its original event history before appending.
+
+A digest-aware transport carries the previous digest across heartbeats.
+Each change must publish the hash of the snapshot after applying that change.
+The reconnect builder supplies the current digest for the last visible change.
+It sends a snapshot if a batch lacks evidence for an intermediate digest.
+
+Project-scoped telemetry derives observations from the selected usage records.
+Runner-pool declarations, account plan balances, provider limits and dependency
+classifications carry no project ownership, so only the portfolio view consumes
+those declarations.

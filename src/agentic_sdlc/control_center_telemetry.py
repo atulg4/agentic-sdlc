@@ -320,7 +320,9 @@ def _work_unit_section(ledger: UsageLedger, records: Sequence[UsageRecord]) -> d
     for entry in units.values():
         runs = entry["runs"]
         assert isinstance(runs, list)
-        runs.sort(key=lambda item: (str(item["occurredAt"]), str(item["usageId"])))
+        runs.sort(
+            key=lambda item: (parse_timestamp(item["occurredAt"], "occurredAt"), item["usageId"])
+        )
         stages = entry["stages"]
         assert isinstance(stages, list)
         stages.sort()
@@ -444,7 +446,10 @@ def build_telemetry_overlay(
         report = build_capacity_report(
             records,
             window=window,
-            inputs=capacity_inputs,
+            # Capacity declarations identify account-wide plans, limits, pools
+            # and dependencies. None carries a project scope. The scoped
+            # records still give us the project's observed timing and usage.
+            inputs=capacity_inputs if project_ids is None else None,
             project_ids=project_ids,
         )
         # Utilization is measured from run timing, so a run with no observed
@@ -516,6 +521,7 @@ def build_telemetry_overlay(
             "subscription usage is a labeled pay-as-you-go equivalent and is never "
             "presented as billed dollars",
             "remaining plan capacity appears only where a provider reported it",
+            "capacity declarations are portfolio-wide and are withheld from project-scoped views",
             "utilization requires an explicit observation window, so a quiet period "
             "stays in the denominator",
             "the overlay is a read-only view: it holds no credential and executes nothing",

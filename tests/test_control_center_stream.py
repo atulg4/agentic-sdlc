@@ -22,6 +22,7 @@ from agentic_sdlc.control_center_stream import (
     StreamFrame,
     StreamLog,
     build_reconnect_response,
+    load_stream_frame,
     render_sse_frame,
     render_sse_stream,
 )
@@ -861,3 +862,64 @@ def test_a_payload_key_is_bounded_like_a_payload_value() -> None:
         change=ChangeKind.WORK_UNIT,
         payload={"k" * MAX_TEXT_LENGTH: "v"},
     ).payload
+
+
+def test_evicted_event_never_receives_a_new_sequence_after_restart() -> None:
+    log = _log(retain=1, frames=2)
+    for candidate in (log, StreamLog.from_dict(log.as_dict())):
+        with pytest.raises(ControlCenterError, match="retired"):
+            candidate.record(
+                FrameKind.CHANGE,
+                event_id="f-1",
+                project_id="forge",
+                change=ChangeKind.WORK_UNIT,
+                occurred_at=NOW,
+                work_unit_id="wu-1",
+                payload={"state": "implementing"},
+            )
+        assert candidate.next_sequence == 3
+        assert candidate.since(StreamCursor(2)) == ()
+
+
+def test_legacy_slid_log_can_resume_but_cannot_resequence_unknown_ids() -> None:
+    document = _log(retain=1, frames=2).as_dict()
+    document.pop("retiredEventDigests", None)
+    legacy = StreamLog.from_dict(document)
+    assert [frame.event_id for frame in legacy.since(StreamCursor(1))] == ["f-2"]
+    with pytest.raises(ControlCenterError, match="replay history"):
+        legacy.record(FrameKind.HEARTBEAT, event_id="f-1")
+
+
+def test_change_on_digest_aware_transport_never_acknowledges_an_old_snapshot() -> None:
+    before, after = _snapshot(), _snapshot(with_unit=False)
+    log = _log(frames=1)
+    initial = StreamCursor(sequence=0, snapshot_sha256=before.snapshot_sha256)
+    change = log.frames[0]
+    with pytest.raises(ControlCenterError, match="resulting snapshot"):
+        render_sse_frame(change, snapshot_sha256=before.snapshot_sha256)
+    delivery = build_reconnect_response(log, after, cursor=initial)
+    assert delivery["mode"] == "resumed"
+    wire = render_sse_stream(
+        [load_stream_frame(frame) for frame in delivery["frames"]],
+        snapshot_sha256=initial.snapshot_sha256,
+    )
+    cursor = StreamCursor.decode(wire.splitlines()[0].removeprefix("id: "))
+    assert cursor.snapshot_sha256 == after.snapshot_sha256
+    assert build_reconnect_response(log, after, cursor=cursor)["mode"] == "resumed"
+
+
+def test_intermediate_change_without_scoped_digest_recovers_from_snapshot() -> None:
+    before, after = _snapshot(), _snapshot(with_unit=False)
+    log = _log(frames=2)
+    response = build_reconnect_response(log, after, cursor=StreamCursor(0, before.snapshot_sha256))
+    assert response["mode"] == "snapshot"
+    assert response["snapshot"]["snapshotSha256"] == after.snapshot_sha256
+
+
+def test_retired_identity_metadata_is_checked_and_excluded_from_scoped_exports() -> None:
+    log = _log(retain=1, frames=2)
+    assert "retiredEventDigests" not in log.as_dict(project_ids=("forge",))
+    doc = log.as_dict()
+    doc["retiredEventDigests"] = []
+    with pytest.raises(ControlCenterError, match="one sha256 digest per dropped frame"):
+        StreamLog.from_dict(doc)
