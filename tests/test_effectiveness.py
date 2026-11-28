@@ -1365,7 +1365,6 @@ def test_query_time_bounds_compare_instants_not_strings() -> None:
         ledger.query(since="yesterday")
 
 
-
 def test_completion_timestamp_and_usage_only_project_coverage_regressions() -> None:
     ledger = EffectivenessLedger()
     intake = _outcome(
