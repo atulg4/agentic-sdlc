@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   review_eligibility:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.FORGE_RUNNER || 'ubuntu-latest' }}
     permissions: {}
     steps:
       - name: Require same-repository non-draft pull request
@@ -26,7 +26,7 @@ jobs:
 
   review_auth_preflight:
     needs: review_eligibility
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.FORGE_RUNNER || 'ubuntu-latest' }}
     permissions: {}
     steps:
       - name: Require Claude Max OAuth
@@ -42,6 +42,7 @@ jobs:
       id-token: write
     uses: atulg4/agentic-sdlc/.github/workflows/reusable-review.yml@PLATFORM_COMMIT_SHA
     with:
+      runs_on: ${{ toJSON(vars.FORGE_RUNNER || 'ubuntu-latest') }}
       pull_request_number: ${{ format('{0}', github.event.pull_request.number) }}
       base_sha: ${{ github.event.pull_request.base.sha }}
       head_sha: ${{ github.event.pull_request.head.sha }}

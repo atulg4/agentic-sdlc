@@ -1,0 +1,8 @@
+githubConfigUrl: https://github.com/atulg4/MusicMaestro
+githubConfigSecret: github-pat
+runnerScaleSetName: musicmaestro-runners
+minRunners: 0
+maxRunners: 2
+controllerServiceAccount:
+  namespace: arc-systems
+  name: arc-gha-rs-controller

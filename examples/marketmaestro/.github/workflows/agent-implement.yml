@@ -12,7 +12,7 @@ permissions: {}
 
 jobs:
   preflight:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.FORGE_RUNNER || 'ubuntu-latest' }}
     permissions: {}
     steps:
       - name: Require Claude Max OAuth and publisher configuration
@@ -35,6 +35,7 @@ jobs:
       id-token: write
     uses: atulg4/agentic-sdlc/.github/workflows/reusable-implement.yml@PLATFORM_COMMIT_SHA
     with:
+      runs_on: ${{ toJSON(vars.FORGE_RUNNER || 'ubuntu-latest') }}
       issue_number: ${{ inputs.issue_number }}
       trigger_actor: ${{ github.actor }}
       config_path: agentic-sdlc.toml

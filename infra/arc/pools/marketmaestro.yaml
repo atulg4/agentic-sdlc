@@ -1,0 +1,8 @@
+githubConfigUrl: https://github.com/atulg4/marketmaestro
+githubConfigSecret: github-pat
+runnerScaleSetName: marketmaestro-runners
+minRunners: 0
+maxRunners: 4
+controllerServiceAccount:
+  namespace: arc-systems
+  name: arc-gha-rs-controller
