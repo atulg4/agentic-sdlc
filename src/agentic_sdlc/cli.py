@@ -3178,15 +3178,16 @@ def _effectiveness_report(args: argparse.Namespace) -> int:
             for record in outcome_records
             if in_window(record.recorded_at, "outcome recordedAt")
         )
+        outcome_work_units = {
+            (record.project_id, record.work_unit_id) for record in outcome_records
+        }
         usage = tuple(
             record
             for record in usage
-            if in_window(record.occurred_at, "usage occurredAt")
+            if (record.project_id, record.work_unit_id) in outcome_work_units
         )
         learnings = tuple(
-            record
-            for record in learnings
-            if in_window(record.recorded_at, "learning recordedAt")
+            record for record in learnings if in_window(record.recorded_at, "learning recordedAt")
         )
     _write(
         build_effectiveness_report(

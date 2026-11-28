@@ -2751,6 +2751,14 @@ def test_effectiveness_report_cli_scores_outcomes_against_usage(tmp_path: Path) 
     )
     assert main(["record-usage", "--ledger", str(usage), "--record", str(record)]) == 0
 
+    # Effort for a selected outcome remains part of its denominator even when
+    # the run happened before the delivery window.
+    record.write_text(
+        json.dumps(_usage_document("run-before-window", project_id="alpha", actual=actual)),
+        encoding="utf-8",
+    )
+    assert main(["record-usage", "--ledger", str(usage), "--record", str(record)]) == 0
+
     learning.write_text(
         json.dumps(_learning_document("waiting on a dependency dominated the delay")),
         encoding="utf-8",
@@ -2782,13 +2790,14 @@ def test_effectiveness_report_cli_scores_outcomes_against_usage(tmp_path: Path) 
     report = json.loads(output.read_text(encoding="utf-8"))
 
     assert report["sampleCount"] == 3
-    assert report["value"]["inputs"]["usageRecords"] == 2
+    assert report["value"]["inputs"]["usageRecords"] == 3
     assert report["value"]["inputs"]["unobservedWorkUnits"] == 0
     assert report["outcomes"]["accepted"] == 2
     assert report["outcomes"]["byResult"]["reverted"] == 1
-    # Two accepted outcomes over one agent-hour of observed runtime.
-    assert report["value"]["inputs"]["agentHours"] == 1.0
-    assert report["value"]["perAgentHour"]["value"] == 2.0
+    # Two accepted outcomes over 1.5 agent-hours, including alpha's
+    # pre-window run; filtering that run would overstate this ratio.
+    assert report["value"]["inputs"]["agentHours"] == 1.5
+    assert report["value"]["perAgentHour"]["value"] == 1.333333
     assert report["value"]["perWallClockDay"]["value"] == 1.0
     assert report["learnings"]["count"] == 1
     assert report["learnings"]["advisory"] is True
