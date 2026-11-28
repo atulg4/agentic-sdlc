@@ -129,6 +129,15 @@ def _scan(value: Any, label: str, depth: int = 0) -> Any:
                 key.lower() not in _SECRET_KEYS,
                 f"{label} must not carry a credential field: {key}",
             )
+            # The same omission the stream scanner had: a key is serialized to
+            # the browser exactly like a value, so matching it only against
+            # known field names let a credential through whenever it was the
+            # key rather than the value.
+            _require(
+                not carries_credential_token(key),
+                f"{label} has a credential-shaped key (withheld); the overlay "
+                "is serialized to a browser and must never carry one",
+            )
             _scan(item, f"{label}.{key}", depth + 1)
         return value
     if isinstance(value, (list, tuple)):
@@ -410,6 +419,14 @@ def build_telemetry_overlay(
     )
     ledger = UsageLedger(registry=registry)
     ledger.extend(scoped_records)
+    # Every section reads the ledger's CANONICAL records from here on, not the
+    # raw inputs. `extend` is idempotent on a replayed usage id and merges a
+    # staged estimate with the actual that lands later, so reading the inputs
+    # downstream counted the same run twice: cost (which aggregates through the
+    # ledger) said one run while billing mix, the drill-down and peak
+    # concurrency said two. A view that disagrees with itself is worse than one
+    # that is merely wrong.
+    records = ledger.records
 
     if window is None:
         capacity: dict[str, Any] = _unknown(
@@ -419,20 +436,41 @@ def build_telemetry_overlay(
         parallelism: dict[str, Any] = dict(capacity)
     else:
         report = build_capacity_report(
-            scoped_records,
+            records,
             window=window,
             inputs=capacity_inputs,
             project_ids=project_ids,
         )
+        # Utilization is measured from run timing, so a run with no observed
+        # start and finish is not idle capacity -- it is capacity nobody
+        # measured. The capacity report counts those in `coverage`; dropping it
+        # and labelling the section "observed" turned missing instrumentation
+        # into spare capacity, which is the one direction an honest metric must
+        # never fail in.
+        coverage = dict(report["coverage"])
+        timed = int(coverage.get("runsTimed", 0) or 0)
+        untimed = int(coverage.get("runsUntimed", 0) or 0)
+        timing_status = "observed" if untimed == 0 else "unavailable" if timed == 0 else "partial"
+        timing = {
+            "status": timing_status,
+            "coverage": coverage,
+        }
+        if timing_status != "observed":
+            timing["reason"] = (
+                f"{untimed} of {timed + untimed} run(s) recorded no start and finish, so "
+                "their time is not in these figures; an unmeasured run is not an idle one"
+            )
         capacity = {
-            "status": "observed",
+            "status": timing_status,
+            "timing": timing,
             "window": report["window"],
             "models": report["models"],
             "planCapacity": report["planCapacity"],
             "limitations": report["limitations"],
         }
         parallelism = {
-            "status": "observed",
+            "status": timing_status,
+            "timing": timing,
             "window": report["window"],
             "concurrency": report["concurrency"],
             "queue": report["queue"],
@@ -455,14 +493,14 @@ def build_telemetry_overlay(
             stale_after_seconds=stale_after_seconds,
         ),
         "cost": _cost_section(ledger, project_ids),
-        "billingMix": _billing_mix(scoped_records),
+        "billingMix": _billing_mix(records),
         "capacity": capacity,
         "parallelism": parallelism,
         "effectiveness": _effectiveness_section(
             load_effectiveness_document(effectiveness) if effectiveness is not None else None,
             project_ids,
         ),
-        "workUnits": _work_unit_section(ledger, scoped_records),
+        "workUnits": _work_unit_section(ledger, records),
         "limitations": [
             "every figure is composed from the usage, capacity and effectiveness "
             "layers; this overlay adds no arithmetic of its own",

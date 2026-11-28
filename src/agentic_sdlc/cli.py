@@ -14,7 +14,7 @@ import re
 import secrets
 import shlex
 import sys
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -2814,14 +2814,16 @@ def _control_center(args: argparse.Namespace) -> int:
         *args.backlog,
         *args.incidents,
     ]
-    for flag, destination in (
+    destinations = (
         ("--output", args.output),
         ("--telemetry-output", args.telemetry_output),
         ("--stream-output", args.stream_output),
         ("--export-output", args.export_output),
-    ):
+    )
+    for flag, destination in destinations:
         if destination:
             _require_not_an_input(destination, declared_inputs, flag)
+    _require_distinct_destinations(destinations)
     if args.resume_from and not args.stream_output:
         raise ControlCenterError(
             "--resume-from needs --stream-output: the reconnect response is the "
@@ -2870,6 +2872,34 @@ def _control_center(args: argparse.Namespace) -> int:
     # link arrangement) is replaced by a fresh inode, never truncated.
     _write_group(outputs)
     return 0
+
+
+def _require_distinct_destinations(destinations: Sequence[tuple[str, str | None]]) -> None:
+    """Reject two output flags that name the same file.
+
+    Each output flag owns one document, so two naming one file is a request
+    that cannot be honoured: the grouped writer would replace the file once per
+    document and exit successfully with only the last one in it, silently
+    discarding the rest. Aliases count -- a resolved path or a shared inode is
+    the same file whatever it is spelled as.
+    """
+
+    seen: list[tuple[str, str, Path]] = []
+    for flag, destination in destinations:
+        if not destination:
+            continue
+        resolved = Path(destination).resolve()
+        for other_flag, other, other_resolved in seen:
+            same = other_resolved == resolved
+            if not same and Path(other).exists() and Path(destination).exists():
+                same = os.path.samefile(other, destination)
+            if same:
+                raise ControlCenterError(
+                    f"{flag} and {other_flag} name the same file: {destination}. "
+                    "Each output flag owns one document, so one of them would be "
+                    "overwritten by the other"
+                )
+        seen.append((flag, destination, resolved))
 
 
 def _require_not_an_input(output: str, inputs: list[str | None], flag: str) -> None:

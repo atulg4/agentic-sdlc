@@ -357,9 +357,14 @@ def test_frames_are_scoped_per_project() -> None:
 
     assert [frame.event_id for frame in scoped] == ["f-forge", "beat"]
     assert "f-atlas" not in {frame.event_id for frame in scoped}
+    # A scoped reconnect takes a snapshot built with the same scope: frames and
+    # snapshot are scoped together, so isolation cannot depend on whether the
+    # cursor happens to be resumable.
     response = build_reconnect_response(
         log,
-        _snapshot(),
+        build_control_center_snapshot(
+            generated_at=NOW, registry=REGISTRY, projections=(), project_ids=("atlas",)
+        ),
         cursor=StreamCursor(sequence=0),
         observed_at=NOW,
         age_seconds=1,
@@ -624,3 +629,133 @@ def test_a_scoped_log_document_cannot_be_rehydrated() -> None:
         StreamLog.from_dict(log.as_dict(project_ids=("forge",)))
 
     assert StreamLog.from_dict(log.as_dict()).frames == log.frames
+
+
+# --- second review round (reviewed at 5e2d955) ------------------------------
+
+
+def test_a_scoped_reconnect_refuses_an_unscoped_snapshot() -> None:
+    """Isolation must not depend on whether the cursor happens to resume.
+
+    Frames are filtered by scope, but a first connection and a reset both ship
+    the whole snapshot document, so a portfolio snapshot handed to a scoped
+    reconnect leaked every other project.
+    """
+    log = _log(frames=1)
+    snapshot = _snapshot()  # carries both forge and atlas
+
+    with pytest.raises(ControlCenterError, match="also carries atlas"):
+        build_reconnect_response(
+            log, snapshot, cursor=None, observed_at=NOW, age_seconds=5, project_ids=("forge",)
+        )
+    # Refused rather than filtered: the digest covers the snapshot's own
+    # content, so filtering here would make it wrong, and recomputing one
+    # would hand the client a document no producer published.
+    scoped = build_control_center_snapshot(
+        generated_at=NOW, registry=REGISTRY, projections=(), project_ids=("forge",)
+    )
+    response = build_reconnect_response(
+        log, scoped, cursor=None, observed_at=NOW, age_seconds=5, project_ids=("forge",)
+    )
+    assert [project["projectId"] for project in response["snapshot"]["projects"]] == ["forge"]
+    assert response["snapshot"]["snapshotSha256"] == scoped.snapshot_sha256
+
+
+def test_an_unscoped_reconnect_still_ships_the_whole_portfolio() -> None:
+    response = build_reconnect_response(
+        _log(frames=1), _snapshot(), cursor=None, observed_at=NOW, age_seconds=5
+    )
+    assert sorted(p["projectId"] for p in response["snapshot"]["projects"]) == ["atlas", "forge"]
+
+
+def test_a_high_water_mark_above_the_last_retained_frame_fails_closed() -> None:
+    """Sequences between the last frame and the mark can never be served.
+
+    A client resuming from inside the window would be told it was up to date,
+    its cursor would jump to the mark, and the next append would leave a gap
+    the log's own contiguity rule rejects -- so the log could not be reloaded
+    from the document it had just written.
+    """
+    document = _log(frames=1).as_dict()
+    document["assigned"] = 4
+
+    with pytest.raises(ControlCenterError, match="can never be served"):
+        StreamLog.from_dict(document)
+
+    # A log that really has slid its window still rehydrates: the mark is the
+    # last retained frame, not the count of frames.
+    slid = _log(retain=2, frames=5)
+    assert [frame.sequence for frame in slid.frames] == [4, 5]
+    assert StreamLog.from_dict(slid.as_dict()).as_dict() == slid.as_dict()
+    # An empty log may declare a mark above zero: every frame was dropped.
+    empty = {**document, "frames": [], "assigned": 4, "earliestResumable": 4}
+    assert StreamLog.from_dict(empty).next_sequence == 5
+
+
+def test_the_resume_id_carries_the_snapshot_digest_forward() -> None:
+    """Only a snapshot frame holds a digest, and reconnect needs it.
+
+    Without carrying it, every heartbeat and change after a snapshot published
+    a sequence-only id, the browser echoed that back, and the mismatch check
+    had nothing to work with -- losing snapshot recovery on exactly the
+    Last-Event-ID path the docs tell transports to rely on.
+    """
+    first = _snapshot()
+    changed = _snapshot(with_unit=False)
+    assert first.snapshot_sha256 != changed.snapshot_sha256
+
+    log = StreamLog()
+    log.record(
+        FrameKind.SNAPSHOT,
+        event_id="s-1",
+        occurred_at=NOW,
+        payload={"snapshotSha256": first.snapshot_sha256},
+    )
+    log.record(FrameKind.HEARTBEAT, event_id="hb-1", occurred_at=NOW)
+
+    ids = [block.splitlines()[0] for block in render_sse_stream(log.frames).strip().split("\n\n")]
+    published = StreamCursor(sequence=1, snapshot_sha256=first.snapshot_sha256).encode()
+    assert ids[0] == "id: " + published
+    assert ids[1].endswith(first.snapshot_sha256), f"the heartbeat dropped the digest: {ids[1]}"
+
+    echoed = StreamCursor.decode(ids[1].removeprefix("id: "))
+    recovered = build_reconnect_response(
+        log, changed, cursor=echoed, observed_at=NOW, age_seconds=5
+    )
+    assert recovered["mode"] == "snapshot"
+    assert recovered["resetReason"] == ResetReason.SNAPSHOT_MISMATCH.value
+
+    # The same frame rendered without the carried digest is what used to be
+    # published, and it cannot detect the mismatch at all.
+    rendered = render_sse_frame(log.frames[-1]).splitlines()[0].removeprefix("id: ")
+    bare = StreamCursor.decode(rendered)
+    assert bare.snapshot_sha256 == ""
+    assert (
+        build_reconnect_response(log, changed, cursor=bare, observed_at=NOW, age_seconds=5)["mode"]
+        == "resumed"
+    )
+
+
+def test_a_credential_shaped_key_is_refused_like_a_credential_value() -> None:
+    """A key is serialized to the browser exactly like a value."""
+    with pytest.raises(ControlCenterError, match="credential-shaped key"):
+        StreamFrame(
+            sequence=1,
+            event_id="f-1",
+            kind=FrameKind.CHANGE,
+            occurred_at=NOW,
+            project_id="forge",
+            change=ChangeKind.WORK_UNIT,
+            payload={"ghp_0123456789abcdefghij": "metadata"},
+        )
+    # Percent-encoding is peeled for keys too, as it already was for values.
+    with pytest.raises(ControlCenterError, match="credential-shaped key"):
+        StreamFrame(
+            sequence=1,
+            event_id="f-1",
+            kind=FrameKind.CHANGE,
+            occurred_at=NOW,
+            project_id="forge",
+            change=ChangeKind.WORK_UNIT,
+            payload={"%67hp_0123456789abcdefghij": "metadata"},
+        )

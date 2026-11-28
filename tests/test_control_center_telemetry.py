@@ -843,3 +843,155 @@ def test_control_center_cli_refuses_to_overwrite_the_frame_log_it_reads(tmp_path
 
     # The log is still the log, not a reconnect response written over it.
     assert StreamLog.from_dict(json.loads(frames.read_text(encoding="utf-8"))).frames == log.frames
+
+
+# --- second review round (reviewed at 5e2d955) ------------------------------
+
+
+def test_untimed_runs_are_not_reported_as_observed_idle_capacity() -> None:
+    """Utilization is measured from run timing, so an unmeasured run is not idle.
+
+    The capacity report counts runs with no observed start and finish in its
+    coverage; dropping that and labelling the section "observed" turned missing
+    instrumentation into spare capacity.
+    """
+    untimed = _record("untimed", started_at="", finished_at="")
+    overlay = build_telemetry_overlay(
+        _snapshot(),
+        usage_records=(untimed,),
+        window=WINDOW,
+        registry=REGISTRY,
+        observed_at=NOW,
+        age_seconds=5,
+    )
+
+    for section in ("capacity", "parallelism"):
+        entry = overlay[section]
+        assert entry["status"] == "unavailable", section
+        timing = entry["timing"]
+        assert timing["status"] == "unavailable"
+        assert timing["coverage"]["runsUntimed"] == 1
+        assert timing["coverage"]["runsTimed"] == 0
+        assert "an unmeasured run is not an idle one" in timing["reason"]
+    # The figures themselves are still carried, but nothing now reads a fully
+    # idle window as observed capacity.
+    assert overlay["parallelism"]["concurrency"]["runs"] == 0
+
+
+def test_partial_timing_coverage_is_neither_observed_nor_unavailable() -> None:
+    overlay = build_telemetry_overlay(
+        _snapshot(),
+        usage_records=(_record("timed"), _record("untimed", started_at="", finished_at="")),
+        window=WINDOW,
+        registry=REGISTRY,
+        observed_at=NOW,
+        age_seconds=5,
+    )
+    timing = overlay["parallelism"]["timing"]
+    assert overlay["parallelism"]["status"] == "partial"
+    assert timing["status"] == "partial"
+    assert timing["coverage"]["runsTimed"] == 1
+    assert timing["coverage"]["runsUntimed"] == 1
+    assert "1 of 2 run(s)" in timing["reason"]
+
+
+def test_fully_timed_records_still_read_observed() -> None:
+    overlay = build_telemetry_overlay(
+        _snapshot(),
+        usage_records=(_record("run-1"), _record("run-2")),
+        window=WINDOW,
+        registry=REGISTRY,
+        observed_at=NOW,
+        age_seconds=5,
+    )
+    assert overlay["parallelism"]["status"] == "observed"
+    assert overlay["capacity"]["status"] == "observed"
+    assert overlay["parallelism"]["timing"]["status"] == "observed"
+    assert "reason" not in overlay["parallelism"]["timing"]
+
+
+def test_a_replayed_record_cannot_inflate_any_section() -> None:
+    """Every section reads the ledger's canonical records.
+
+    ``extend`` is idempotent on a replayed usage id, so cost aggregated one
+    run while billing mix, the drill-down and peak concurrency -- all reading
+    the raw inputs -- counted two. A view that disagrees with itself is worse
+    than one that is merely wrong.
+    """
+    once = build_telemetry_overlay(
+        _snapshot(),
+        usage_records=(_record("run-1"),),
+        window=WINDOW,
+        registry=REGISTRY,
+        observed_at=NOW,
+        age_seconds=5,
+    )
+    twice = build_telemetry_overlay(
+        _snapshot(),
+        usage_records=(_record("run-1"), _record("run-1")),
+        window=WINDOW,
+        registry=REGISTRY,
+        observed_at=NOW,
+        age_seconds=5,
+    )
+
+    assert twice["cost"] == once["cost"]
+    assert twice["billingMix"] == once["billingMix"]
+    assert twice["workUnits"] == once["workUnits"]
+    assert twice["parallelism"]["concurrency"] == once["parallelism"]["concurrency"]
+    # And the figures are the single-run ones, not doubled.
+    assert twice["billingMix"]["payg"] == 1
+    assert next(iter(twice["workUnits"].values()))["runCount"] == 1
+    assert twice["parallelism"]["concurrency"]["peak"] == 1
+
+
+def test_two_output_flags_naming_one_file_fail_closed(tmp_path) -> None:
+    """Each output flag owns one document, so two naming one file cannot be honoured.
+
+    The grouped writer replaced the file once per document and exited
+    successfully with only the last one in it.
+    """
+    from agentic_sdlc.cli import main
+
+    registry = _write(tmp_path / "registry.json", REGISTRY.as_dict())
+    shared = tmp_path / "both.json"
+    base = ["control-center", "--registry", registry, "--generated-at", NOW]
+
+    assert main([*base, "--output", str(shared), "--telemetry-output", str(shared)]) == 2
+    assert not shared.exists(), "a refused invocation still wrote a file"
+    # An alias of the same file counts: a resolved path or a shared inode is
+    # the same file whatever it is spelled as.
+    assert (
+        main(
+            [
+                *base,
+                "--output",
+                str(shared),
+                "--export-output",
+                str(tmp_path / "." / "both.json"),
+            ]
+        )
+        == 2
+    )
+    # Distinct destinations still each get their own document.
+    snapshot_out = tmp_path / "snapshot.json"
+    telemetry_out = tmp_path / "telemetry.json"
+    assert (
+        main([*base, "--output", str(snapshot_out), "--telemetry-output", str(telemetry_out)]) == 0
+    )
+    assert "snapshotSha256" in json.loads(snapshot_out.read_text(encoding="utf-8"))
+    assert "billingMix" in json.loads(telemetry_out.read_text(encoding="utf-8"))
+
+
+def test_a_credential_shaped_key_is_refused_in_a_consumed_document() -> None:
+    """The same omission the stream scanner had, on the overlay's own path."""
+    document = _effectiveness_document()
+    document["quality"] = {"ghp_0123456789abcdefghij": {"value": 0.5}}
+
+    with pytest.raises(ControlCenterError, match="credential-shaped key"):
+        load_effectiveness_document(document)
+
+    # And in an export, which is the other document that reaches a browser.
+    snapshot = _snapshot()
+    with pytest.raises(ControlCenterError, match="credential-shaped key"):
+        export_control_center(snapshot, stream={"%67hp_0123456789abcdefghij": "leaked"})

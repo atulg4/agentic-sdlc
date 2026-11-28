@@ -58,6 +58,21 @@ it concerns, and a bounded payload.
 - **Staleness is labeled.** Every reconnect response carries the freshness of
   the data behind it and the instant it was last good, so a console shows
   "as of 09:12" instead of implying live truth.
+- **Scope covers the snapshot, not just the frames.** A scoped reconnect is
+  given a snapshot built with the same scope, and one carrying another project
+  fails closed. A first connection and a reset both ship the whole snapshot
+  document, so filtering only the frames would make isolation depend on
+  whether the cursor happened to be resumable. It is refused rather than
+  filtered here because the digest covers the snapshot's own content:
+  filtering would make that digest wrong, and recomputing one would hand the
+  client a document no producer ever published and that cannot be checked
+  against the console it came from.
+- **A retained log ends at its high-water mark.** A declared `assigned` above
+  the last retained frame claims sequences the log cannot serve: a client
+  resuming from inside the window would be told it was up to date, its cursor
+  would jump to the mark, and the next append would leave a gap the contiguity
+  rule rejects — so the log could not be reloaded from the document it had
+  just written. That fails closed on load.
 
 ### Resume
 
@@ -87,7 +102,13 @@ difference; otherwise it resets.
 
 The encoded cursor is published as `lastEventId` — what SSE calls it, and what
 the browser echoes back in `Last-Event-ID`, so reconnect needs no client-side
-bookkeeping. It is deliberately *not* called `token`: it is not a credential,
+bookkeeping. Only a snapshot frame carries a digest in its payload, so
+`render_sse_frame` takes the digest the client has reconciled against and
+`render_sse_stream` carries it forward across the frames that follow.
+Without that, every heartbeat and change after a snapshot published a
+sequence-only id, the browser echoed that back, and the mismatch check above
+had nothing to work with — losing snapshot recovery on precisely the path this
+section tells transports to rely on. It is deliberately *not* called `token`: it is not a credential,
 and a field by that name would trip every secret scanner, including this
 module's own.
 
@@ -117,6 +138,7 @@ honesty rules of the layers below cannot be broken here:
 | `billingMix` | usage records | Keeps subscription separable from billed |
 | `capacity` | `capacity_metrics` | Model usage and plan capacity |
 | `parallelism` | `capacity_metrics` | Concurrency, queue, runners, bottlenecks |
+| `timing` | `capacity_metrics` coverage | Whether run timing was observed at all |
 | `effectiveness` | an effectiveness **report document** | First-pass rates, time-to-live, value per unit of effort |
 | `workUnits` | usage records | Per-unit drill-down: every run, with estimate versus actual |
 
@@ -150,12 +172,25 @@ A section with no data behind it reports `status: "unknown"` with the reason:
   denominator
 - no effectiveness report → `effectiveness` is unknown, and the console never
   infers delivery from the fact that runs happened
+- runs with no observed start and finish → `capacity` and `parallelism` read
+  `unavailable` (or `partial` where some runs were timed), carrying the
+  capacity report's own coverage counters and the count of runs that were not
+  timed. Utilization is measured from run timing, so an unmeasured run is not
+  an idle one, and labelling it observed would turn missing instrumentation
+  into spare capacity — the one direction an honest metric must never fail in
 
 ### Drill-down agrees with the rollup
 
 Each work unit's `cost` is taken from the usage ledger's own aggregation rather
 than re-summed, so the drill-down and the cost view cannot disagree. A test
 asserts they match.
+
+Every section reads the ledger's **canonical** records, not the records handed
+in. `UsageLedger.extend` is idempotent on a replayed usage id and merges a
+staged estimate with the actual that lands later, so reading the inputs
+downstream counted the same run twice: cost reported one run while the billing
+mix, the drill-down and peak concurrency reported two. A view that disagrees
+with itself is worse than one that is merely wrong.
 
 ## Historical ranges and export
 
@@ -178,8 +213,11 @@ in the sequence it was never going to have.
 ## No credentials, ever
 
 The overlay and every frame are serialized to a browser, so both are scanned
-for credential-shaped values (percent-encoding peeled first, via the ledger's
-own `carries_credential_token`) and secret-shaped keys. Frame payloads are
+for credential-shaped values **and credential-shaped keys** (percent-encoding
+peeled first, via the ledger's own `carries_credential_token`), as well as
+secret-shaped field names. A key reaches the browser exactly like a value, so
+checking keys only against known field names let a credential through whenever
+it was used as the key rather than the value. Frame payloads are
 additionally bounded in text length, key count and nesting depth, so the
 transport cannot be used to ship bulk content or a prompt.
 
@@ -215,7 +253,10 @@ rather than standing in an empty log, because "nothing happened since your
 cursor" and "the frames could not be consulted" are different answers. It is
 also an input, so it cannot double as an output destination.
 
-Each output flag owns one document. The snapshot still defaults to stdout when
+Each output flag owns one document, and two flags naming the same file fail
+closed — aliases included, by resolved path or shared inode. The grouped
+writer would otherwise replace the file once per document and exit
+successfully with only the last one in it. The snapshot still defaults to stdout when
 no other output is requested, so a caller who wants only the reconnect
 response is not forced to name a snapshot path — mixing stdout with files
 cannot be written atomically, and the grouped writer refuses it.

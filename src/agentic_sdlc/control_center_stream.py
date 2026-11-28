@@ -176,6 +176,15 @@ def _scan_payload(value: Any, label: str, depth: int = 0) -> Any:
                 key.lower() not in _SECRET_KEYS,
                 f"{label} must not carry a credential field: {key}",
             )
+            # A key is serialized to the browser exactly like a value, so the
+            # content check belongs on both. Matching the key only against
+            # known field names let a credential through whenever it was used
+            # as the key rather than the value.
+            _require(
+                not carries_credential_token(key),
+                f"{label} has a credential-shaped key (withheld); a frame "
+                "reaches a browser and must never carry one",
+            )
             scanned[key] = _scan_payload(item, f"{label}.{key}", depth + 1)
         return scanned
     if isinstance(value, (list, tuple)):
@@ -359,25 +368,44 @@ class StreamFrame:
         }
 
 
-def render_sse_frame(frame: StreamFrame) -> str:
+def render_sse_frame(frame: StreamFrame, *, snapshot_sha256: str = "") -> str:
     """One frame as a server-sent-events block.
 
     The ``id`` line is the resume token the browser echoes back as
     ``Last-Event-ID``, so reconnect needs no client-side bookkeeping. Data is
     emitted as a single line of JSON because a raw newline would terminate the
     field and split one frame into two.
+
+    ``snapshot_sha256`` is the digest the client has reconciled against: the
+    one a snapshot frame published, carried forward. A frame's own payload
+    only holds a digest when it *is* a snapshot, so without this every
+    heartbeat and change after one would publish a sequence-only id, the
+    browser would echo that back, and ``build_reconnect_response`` would have
+    nothing to detect a snapshot mismatch with -- silently losing the recovery
+    check on the very path the docs tell transports to rely on.
     """
     data = json.dumps(frame.as_dict(), sort_keys=True, separators=(",", ":"))
     _require("\n" not in data and "\r" not in data, "a rendered frame must not contain a newline")
-    token = StreamCursor(
-        sequence=frame.sequence,
-        snapshot_sha256=str(frame.payload.get("snapshotSha256", "") or ""),
-    ).encode()
+    carried = str(frame.payload.get("snapshotSha256", "") or "") or str(snapshot_sha256 or "")
+    token = StreamCursor(sequence=frame.sequence, snapshot_sha256=carried).encode()
     return f"id: {token}\nevent: {frame.kind.value}\ndata: {data}\n\n"
 
 
-def render_sse_stream(frames: Iterable[StreamFrame]) -> str:
-    return "".join(render_sse_frame(frame) for frame in frames)
+def render_sse_stream(frames: Iterable[StreamFrame], *, snapshot_sha256: str = "") -> str:
+    """Render frames in order, carrying each snapshot's digest forward.
+
+    A transport writing frames one at a time keeps the digest itself and
+    passes it to ``render_sse_frame``; rendering a run of them here does that
+    bookkeeping, so the ids a client echoes back stay reconcilable.
+    """
+    carried = str(snapshot_sha256 or "")
+    blocks = []
+    for frame in frames:
+        published = str(frame.payload.get("snapshotSha256", "") or "")
+        if published:
+            carried = published
+        blocks.append(render_sse_frame(frame, snapshot_sha256=carried))
+    return "".join(blocks)
 
 
 class StreamLog:
@@ -609,11 +637,27 @@ class StreamLog:
         log.extend(frames)
         assigned = entry.get("assigned", log._assigned)
         _require(
-            isinstance(assigned, int)
-            and not isinstance(assigned, bool)
-            and assigned >= log._assigned,
-            "stream log assigned must be an integer at or above its last frame",
+            isinstance(assigned, int) and not isinstance(assigned, bool),
+            "stream log assigned must be an integer",
         )
+        assert isinstance(assigned, int)
+        if frames:
+            # A retained log ends AT its high-water mark. A mark above the last
+            # frame claims sequences the log cannot serve: a client resuming
+            # from inside the window would be told it is up to date, its cursor
+            # would jump to the mark, and the next append would leave a gap the
+            # log's own contiguity rule rejects -- so it could not even be
+            # reloaded from the document it just wrote.
+            _require(
+                assigned == frames[-1].sequence,
+                f"stream log declares assigned {assigned} but its last retained frame is "
+                f"{frames[-1].sequence}; the sequences between them can never be served",
+            )
+        else:
+            _require(
+                assigned >= log._assigned,
+                "stream log assigned must be an integer at or above its last frame",
+            )
         log._assigned = assigned
         dropped = entry.get("dropped", 0)
         _require(
@@ -694,6 +738,33 @@ def build_reconnect_response(
     """
     snapshot_document = snapshot.as_document()
     digest = str(snapshot_document.get("snapshotSha256", ""))
+    if project_ids is not None:
+        # Frames are filtered by scope, so the snapshot must already be: a
+        # first connection and a reset both ship the whole document, and
+        # isolation that depends on whether a cursor happens to be resumable
+        # is no isolation at all.
+        #
+        # It is refused rather than filtered here, because the snapshot's
+        # digest covers its own content: filtering it would make the digest
+        # wrong, and recomputing one would hand the client a document that no
+        # producer ever published and that cannot be checked against the
+        # console it came from. The caller scopes the snapshot at the point it
+        # is built, which is where the digest is computed too.
+        scope = frozenset(project_ids)
+        outside = sorted(
+            str(project.get("projectId", ""))
+            for project in snapshot_document.get("projects", [])
+            if str(project.get("projectId", "")) not in scope
+        )
+        _require(
+            not outside,
+            "a reconnect scoped to "
+            + ", ".join(sorted(scope))
+            + " was given a snapshot that also carries "
+            + ", ".join(outside)
+            + "; build the snapshot with the same project scope, so its digest "
+            "covers what the client is actually sent",
+        )
     freshness = _freshness(
         observed_at=observed_at or snapshot.generated_at,
         age_seconds=age_seconds,
