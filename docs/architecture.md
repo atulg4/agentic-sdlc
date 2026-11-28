@@ -65,6 +65,9 @@ The Python package owns behavior that must be identical on GitHub and GitLab:
 - the read-only Control Center snapshot that joins the registry, the
   lifecycle ledger, each project's epic tree and its open blockers, with a
   declared remediation per blocker kind (`docs/control-center.md`);
+- the Control Center's live delivery contract and telemetry overlay: ordered
+  resumable frames with a snapshot fallback, and cost, capacity, parallelism
+  and effectiveness joined onto one snapshot (`docs/control-center-live.md`);
 - machine-readable decisions and audit output.
 
 ### Provider adapters
