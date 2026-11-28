@@ -336,12 +336,15 @@ the generated templates". Each gate command must be a single line (join several 
 must not contain `${{` (GitHub would evaluate it before the shell runs the command); `onboard`
 refuses such a command and `doctor` fails a policy holding one, rather than normalizing it into
 something that runs differently. The Actions implement and repair paths verify a patch with
-`sdlcctl run-gates`, which runs each gate the way ci.yml's default `run:` shell does -- one
+`sdlcctl run-gates`, which runs each gate the way ci.yml's `run:` shell does -- one
 `bash -e -o pipefail -c '<command>'` (`sh -e -c` without bash) from the repository root -- so
 `cd sub && make test`, `VAR=x pytest` and `a && b` mean the same there as in CI (Codex
 4243193109); only its environment differs (an allowlist, never the runner's credentials or
-control files), and pipefail makes it stricter than ci.yml's plain `bash -e` in one case: a
-piped gate (`pytest | tee out`) fails when any part of the pipe fails (Codex 4246344191).
+control files). The generated ci.yml sets `defaults.run.shell: bash` (#153): with no `shell:`
+GitHub runs plain `bash -e {0}`, where a piped gate (`pytest | tee out`) passes when pytest
+fails. `doctor` counts a command before a pipe as enforced only under that explicit `bash` or
+after the script's own `set -o pipefail`, so a ci.yml from before #153 reads as template drift
+until `sdlcctl onboard --force` regenerates it.
 
 ### What `doctor` verifies exactly
 
