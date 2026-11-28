@@ -221,7 +221,7 @@ def test_trusted_python_steps_use_a_protected_isolated_interpreter() -> None:
     assert "python3 - <<'PY'" not in document
     assert "python3 -m pip" not in document
     assert "python3 -P" not in document
-    assert document.count('"$TRUSTED_PYTHON" -I - <<\'PY\'') == 7
+    assert document.count("\"$TRUSTED_PYTHON\" -I - <<'PY'") == 7
     assert document.count('"$TRUSTED_PYTHON" -I -c') == 2
 
 
