@@ -995,3 +995,12 @@ def test_a_credential_shaped_key_is_refused_in_a_consumed_document() -> None:
     snapshot = _snapshot()
     with pytest.raises(ControlCenterError, match="credential-shaped key"):
         export_control_center(snapshot, stream={"%67hp_0123456789abcdefghij": "leaked"})
+
+
+def test_a_consumed_document_key_is_bounded() -> None:
+    """The stream scanner's key bound, applied on the overlay's path too."""
+    document = _effectiveness_document()
+    document["quality"] = {"k" * 4097: {"value": 0.5}}
+
+    with pytest.raises(ControlCenterError, match="key longer than"):
+        load_effectiveness_document(document)

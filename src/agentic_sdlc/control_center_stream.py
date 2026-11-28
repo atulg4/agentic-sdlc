@@ -172,6 +172,15 @@ def _scan_payload(value: Any, label: str, depth: int = 0) -> Any:
         for key, item in value.items():
             _require(isinstance(key, str), f"{label} keys must be strings")
             assert isinstance(key, str)
+            # Bounded like a value. A key is text a frame carries, retains and
+            # renders, so leaving it unbounded let a single-entry payload ship
+            # a megabyte -- the exact bulk content these bounds exist to keep
+            # off the transport.
+            _require(
+                len(key) <= MAX_TEXT_LENGTH,
+                f"{label} has a key longer than {MAX_TEXT_LENGTH} characters; a frame "
+                "carries bounded references, not bulk content",
+            )
             _require(
                 key.lower() not in _SECRET_KEYS,
                 f"{label} must not carry a credential field: {key}",
@@ -258,6 +267,18 @@ def load_stream_frame(document: Any) -> StreamFrame:
     )
 
 
+def _is_digest(value: str) -> bool:
+    """Whether a value really is a sha256 digest.
+
+    Length alone is not enough. The digest is interpolated into the SSE ``id``
+    line without escaping, so a 64-character value carrying a newline could
+    append fields of its own -- ``event:`` and ``data:`` lines the producer
+    never wrote -- corrupting the event boundary and the resume id the browser
+    sends back. Hex-only is the honest check, and it is what a digest is.
+    """
+    return len(value) == 64 and all(character in "0123456789abcdefABCDEF" for character in value)
+
+
 @dataclass(frozen=True)
 class StreamCursor:
     """Where a client has read to, and what it reconciled against.
@@ -273,8 +294,8 @@ class StreamCursor:
     def __post_init__(self) -> None:
         _sequence(self.sequence, "cursor sequence")
         _require(
-            not self.snapshot_sha256 or len(self.snapshot_sha256) == 64,
-            "cursor snapshotSha256 must be a sha256 digest",
+            not self.snapshot_sha256 or _is_digest(self.snapshot_sha256),
+            "cursor snapshotSha256 must be a sha256 digest: 64 hexadecimal characters",
         )
 
     def encode(self) -> str:
@@ -364,8 +385,22 @@ class StreamFrame:
             "workUnitId": self.work_unit_id,
             "resetReason": self.reset_reason.value if self.reset_reason else "",
             "occurredAt": self.occurred_at,
-            "payload": dict(self.payload),
+            # Deep-copied: a shallow dict() shared every nested mapping with
+            # the frame the log retains, so a consumer editing a reconnect or
+            # export document could rewrite validated history -- adding a
+            # credential-shaped key that then rendered without ever passing
+            # the scanner.
+            "payload": _detach(self.payload),
         }
+
+
+def _detach(value: Any) -> Any:
+    """A copy that shares no mapping or sequence with its original."""
+    if isinstance(value, Mapping):
+        return {key: _detach(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_detach(item) for item in value]
+    return value
 
 
 def render_sse_frame(frame: StreamFrame, *, snapshot_sha256: str = "") -> str:
@@ -387,6 +422,15 @@ def render_sse_frame(frame: StreamFrame, *, snapshot_sha256: str = "") -> str:
     data = json.dumps(frame.as_dict(), sort_keys=True, separators=(",", ":"))
     _require("\n" not in data and "\r" not in data, "a rendered frame must not contain a newline")
     carried = str(frame.payload.get("snapshotSha256", "") or "") or str(snapshot_sha256 or "")
+    # Validated before it reaches the id line, whichever door it came in by:
+    # a frame's own payload or the keyword a transport carries it forward with.
+    # StreamCursor checks it too, but the message should name where it came
+    # from rather than talk about a cursor the caller never built.
+    _require(
+        not carried or _is_digest(carried),
+        "a frame's snapshotSha256 must be a sha256 digest (64 hexadecimal "
+        "characters) before it is written to an SSE id line",
+    )
     token = StreamCursor(sequence=frame.sequence, snapshot_sha256=carried).encode()
     return f"id: {token}\nevent: {frame.kind.value}\ndata: {data}\n\n"
 

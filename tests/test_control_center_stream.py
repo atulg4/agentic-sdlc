@@ -759,3 +759,105 @@ def test_a_credential_shaped_key_is_refused_like_a_credential_value() -> None:
             change=ChangeKind.WORK_UNIT,
             payload={"%67hp_0123456789abcdefghij": "metadata"},
         )
+
+
+# --- verification round (reviewed at d1829ce) -------------------------------
+
+
+def test_a_digest_that_is_not_hexadecimal_never_reaches_an_sse_id() -> None:
+    """The id line is interpolated unescaped, so length alone is no check.
+
+    A 64-character value carrying newlines appended ``event:`` and ``data:``
+    lines the producer never wrote, corrupting the event boundary and the
+    resume id the browser echoes back.
+    """
+    injection = "a" * 20 + "\nevent: spoofed\ndata: {}\n" + "x" * 19
+    assert len(injection) == 64
+
+    # Through a snapshot frame's own published digest...
+    frame = StreamFrame(
+        sequence=1,
+        event_id="s-1",
+        kind=FrameKind.SNAPSHOT,
+        occurred_at=NOW,
+        payload={"snapshotSha256": injection},
+    )
+    with pytest.raises(ControlCenterError, match="64 hexadecimal"):
+        render_sse_frame(frame)
+    # ...and through the keyword a transport carries the digest forward with.
+    heartbeat = StreamFrame(sequence=2, event_id="hb-1", kind=FrameKind.HEARTBEAT, occurred_at=NOW)
+    with pytest.raises(ControlCenterError, match="64 hexadecimal"):
+        render_sse_frame(heartbeat, snapshot_sha256=injection)
+    # A cursor refuses it too, so a resume token cannot smuggle one in.
+    with pytest.raises(ControlCenterError, match="64 hexadecimal"):
+        StreamCursor(sequence=1, snapshot_sha256=injection)
+
+    # A real digest still renders exactly one event line.
+    rendered = render_sse_frame(heartbeat, snapshot_sha256="0" * 63 + "f")
+    assert rendered.count("event:") == 1
+    assert rendered.count("\nid:") + rendered.startswith("id:") == 1
+
+
+def test_a_serialized_frame_cannot_rewrite_the_retained_one() -> None:
+    """``as_dict`` shared every nested mapping with the frame the log keeps.
+
+    A consumer editing a reconnect or export document could rewrite validated
+    history -- adding a credential-shaped key that then rendered without ever
+    passing the scanner.
+    """
+    log = StreamLog()
+    log.record(
+        FrameKind.CHANGE,
+        event_id="f-1",
+        project_id="forge",
+        change=ChangeKind.WORK_UNIT,
+        occurred_at=NOW,
+        payload={"nested": {"state": "implementing"}, "list": [{"deep": "value"}]},
+    )
+    document = log.frames[0].as_dict()
+    document["payload"]["nested"]["ghp_0123456789abcdefghij"] = "leaked"
+    document["payload"]["list"][0]["deep"] = "rewritten"
+
+    retained = log.frames[0].payload
+    assert "ghp_0123456789abcdefghij" not in str(retained)
+    assert retained["list"][0]["deep"] == "value"
+    assert "ghp_0123456789abcdefghij" not in render_sse_frame(log.frames[0])
+    # Two documents from the same frame do not share structure either.
+    first, second = log.frames[0].as_dict(), log.frames[0].as_dict()
+    first["payload"]["nested"]["state"] = "done"
+    assert second["payload"]["nested"]["state"] == "implementing"
+
+
+def test_a_payload_key_is_bounded_like_a_payload_value() -> None:
+    """A key is text the frame carries, retains and renders."""
+    with pytest.raises(ControlCenterError, match="key longer than"):
+        StreamFrame(
+            sequence=1,
+            event_id="f-1",
+            kind=FrameKind.CHANGE,
+            occurred_at=NOW,
+            project_id="forge",
+            change=ChangeKind.WORK_UNIT,
+            payload={"k" * (MAX_TEXT_LENGTH + 1): "v"},
+        )
+    # At every depth, not just the top level.
+    with pytest.raises(ControlCenterError, match="key longer than"):
+        StreamFrame(
+            sequence=1,
+            event_id="f-1",
+            kind=FrameKind.CHANGE,
+            occurred_at=NOW,
+            project_id="forge",
+            change=ChangeKind.WORK_UNIT,
+            payload={"nested": {"k" * (MAX_TEXT_LENGTH + 1): "v"}},
+        )
+    # A key at the bound is fine.
+    assert StreamFrame(
+        sequence=1,
+        event_id="f-1",
+        kind=FrameKind.CHANGE,
+        occurred_at=NOW,
+        project_id="forge",
+        change=ChangeKind.WORK_UNIT,
+        payload={"k" * MAX_TEXT_LENGTH: "v"},
+    ).payload

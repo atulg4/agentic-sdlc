@@ -219,7 +219,25 @@ secret-shaped field names. A key reaches the browser exactly like a value, so
 checking keys only against known field names let a credential through whenever
 it was used as the key rather than the value. Frame payloads are
 additionally bounded in text length, key count and nesting depth, so the
-transport cannot be used to ship bulk content or a prompt.
+transport cannot be used to ship bulk content or a prompt. A key is bounded
+in length for the same reason its value is: an unbounded key let a
+single-entry object carry the bulk content the bound exists to refuse.
+
+A frame's serialized form is also detached from the frame the log retains, so
+a consumer that edits a reconnect or export document cannot rewrite validated
+history -- or add a credential-shaped key to a payload that has already passed
+the scanner.
+
+## A resume id is a digest or nothing
+
+The SSE `id:` line carries `<sequence>-<snapshotSha256>`, and a browser echoes
+it back as `lastEventId`. The line is text, so a value that merely *looks* the
+right length is not enough: a 64-character string containing newlines would
+append `event:` and `data:` lines the producer never wrote, splitting one frame
+into several and corrupting both the event boundary and the resume token. Every
+`snapshotSha256` -- in a cursor, in a frame's payload, or carried forward by
+the transport -- must be 64 hexadecimal characters before it reaches an id
+line, and is refused otherwise.
 
 ## CLI
 

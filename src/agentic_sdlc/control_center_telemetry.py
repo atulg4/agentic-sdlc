@@ -129,14 +129,20 @@ def _scan(value: Any, label: str, depth: int = 0) -> Any:
                 key.lower() not in _SECRET_KEYS,
                 f"{label} must not carry a credential field: {key}",
             )
-            # The same omission the stream scanner had: a key is serialized to
-            # the browser exactly like a value, so matching it only against
-            # known field names let a credential through whenever it was the
-            # key rather than the value.
+            # The same omissions the stream scanner had: a key is serialized
+            # to the browser exactly like a value, so both the credential
+            # check and the length bound belong on keys too. Matching a key
+            # only against known field names let a credential through whenever
+            # it was the key rather than the value, and leaving keys unbounded
+            # let a one-entry object carry bulk text.
             _require(
                 not carries_credential_token(key),
                 f"{label} has a credential-shaped key (withheld); the overlay "
                 "is serialized to a browser and must never carry one",
+            )
+            _require(
+                len(key) <= 4096,
+                f"{label} has a key longer than 4096 characters",
             )
             _scan(item, f"{label}.{key}", depth + 1)
         return value
