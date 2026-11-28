@@ -3169,6 +3169,7 @@ def _effectiveness_report(args: argparse.Namespace) -> int:
         window = ObservationWindow(args.window_start, args.window_end)
     outcome_records = outcomes.records
     if window is not None:
+
         def in_window(timestamp: str, label: str) -> bool:
             instant = parse_timestamp(timestamp, label)
             return window.started_at <= instant < window.ended_at
