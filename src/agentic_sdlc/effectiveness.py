@@ -1052,6 +1052,11 @@ class EffectivenessLedger:
                 f"outcome {existing.outcome_id}: result is already recorded as "
                 f"{existing.result.value} and cannot be rewritten to {incoming.result.value}",
             )
+            if existing.result is OutcomeResult.UNKNOWN:
+                # The first conclusive result is the delivery observation used by
+                # windowed throughput reports. Preserve intakeAt separately, but do
+                # not attribute a later delivery to the intake record's timestamp.
+                updates["recorded_at"] = incoming.recorded_at
             updates["result"] = incoming.result
         if (
             incoming.deployment_status is not DeploymentStatus.UNKNOWN
@@ -1816,7 +1821,12 @@ def build_effectiveness_report(
     inputs = _value_inputs(scoped_usage, window, scoped)
 
     by_project: dict[str, Any] = {}
-    for project_id in sorted({record.project_id for record in scoped}):
+    covered_projects = (
+        {record.project_id for record in scoped}
+        | {record.project_id for record in scoped_usage}
+        | {record.scope_project_id for record in scoped_learnings}
+    )
+    for project_id in sorted(covered_projects):
         project_outcomes = [record for record in scoped if record.project_id == project_id]
         project_usage = [record for record in scoped_usage if record.project_id == project_id]
         project_accepted = sum(1 for record in project_outcomes if record.accepted)
