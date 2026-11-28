@@ -15,6 +15,7 @@ jobs:
     permissions:
       contents: read
       issues: write
+      id-token: write
     uses: PLATFORM_REPOSITORY/.github/workflows/reusable-plan.yml@PLATFORM_COMMIT_SHA
     with:
       issue_number: ${{ inputs.issue_number }}

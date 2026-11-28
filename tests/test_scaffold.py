@@ -75,6 +75,15 @@ def test_level_three_adds_label_driven_automation(tmp_path: Path) -> None:
     assert "github.event.label.name == 'agent-ready'" in auto_plan.read_text(encoding="utf-8")
     assert "implementation-approved" in auto_implement.read_text(encoding="utf-8")
 
+    # Both entry points call the same OAuth planner. Its generate job needs OIDC,
+    # while the separate publish job is the only job that writes to issues.
+    for caller in (repository / ".github/workflows/agent-plan.yml", auto_plan):
+        plan = caller.read_text(encoding="utf-8")
+        assert "permissions: {}" in plan
+        assert "      id-token: write\n" in plan
+        assert "CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}" in plan
+        assert "API_KEY" not in plan
+
 
 def test_scaffold_refuses_to_overwrite_existing_policy(tmp_path: Path) -> None:
     repository = _repository(tmp_path)

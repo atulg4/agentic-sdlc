@@ -27,6 +27,12 @@ PROJECT = "owner/repo"
 PAGE = 30
 
 
+@pytest.fixture(autouse=True)
+def _isolate_fake_project_policy(tmp_path, monkeypatch):
+    """Fake-project tests must not discover the real repository policy."""
+    monkeypatch.chdir(tmp_path)
+
+
 def _comment_row(cid, body, created_at, login="atulg4", kind="User", association="OWNER"):
     return {
         "id": cid,
@@ -578,9 +584,12 @@ def test_claim_refuses_closed_issues_and_pull_requests_without_writing():
     assert gh.issues[7]["comments"] == [] and gh.issues[8]["comments"] == []
 
 
-def test_cli_renew_and_release_honor_output(tmp_path, monkeypatch):
+@pytest.mark.parametrize("local_policy", [False, True])
+def test_cli_renew_and_release_honor_output(tmp_path, monkeypatch, local_policy):
     from agentic_sdlc import cli
 
+    if local_policy:
+        (tmp_path / "agentic-sdlc.toml").write_text(_POLICY)
     wall = datetime.now(UTC)  # the CLI runs on the wall clock, and renew refuses expired leases
     mine = format_claim_marker(Lease(7, "me", "s1", "b", wall + timedelta(hours=1)))
     gh = FakeGh().issue(7, labels=[IN_PROGRESS_LABEL])
