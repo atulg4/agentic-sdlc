@@ -107,6 +107,34 @@ def test_token_backpressure_skips_large_unit_and_starts_smaller_ready_work(polic
     ]
 
 
+def test_running_token_reservations_allow_smaller_work_and_refill_on_completion(policy) -> None:
+    graph = validate_graph(
+        (
+            _unit("alpha", max_tokens=80),
+            _unit("beta", max_tokens=60),
+            _unit("gamma", max_tokens=20),
+        ),
+        policy,
+    )
+    executor = GraphExecutor(graph, base_sha=BASE, max_parallel=3, total_token_budget=100)
+    decisions = fill_safe_slots(executor, now=1, agent_for=lambda unit_id: f"worker-{unit_id}")
+
+    assert [(item.unit_id, item.status) for item in decisions] == [
+        ("alpha", "started"),
+        ("beta", "waiting"),
+        ("gamma", "started"),
+    ]
+    executor.complete(
+        "alpha",
+        artifact_digest="sha256:" + "a" * 64,
+        verification_passed=True,
+        tokens_used=20,
+        now=2,
+    )
+    decisions = fill_safe_slots(executor, now=3, agent_for=lambda unit_id: f"worker-{unit_id}")
+    assert [(item.unit_id, item.status) for item in decisions] == [("beta", "started")]
+
+
 def test_missing_agent_identity_fails_closed(policy) -> None:
     graph = validate_graph((_unit("alpha"),), policy)
     executor = GraphExecutor(graph, base_sha=BASE)

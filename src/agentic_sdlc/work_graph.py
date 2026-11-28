@@ -358,10 +358,11 @@ class GraphExecutor:
             active = sum(1 for other in running if self.graph.get(other).provider == spec.provider)
             if limit is not None and active >= limit:
                 raise WorkGraphError(f"provider {spec.provider} concurrency limit {limit} reached")
-        if self._tokens_spent + spec.max_tokens > self.total_token_budget:
+        reserved = sum(self.graph.get(other).max_tokens for other in running)
+        if self._tokens_spent + reserved + spec.max_tokens > self.total_token_budget:
             raise WorkGraphError(
                 f"starting {unit_id} would exceed the total token budget "
-                f"({self._tokens_spent} spent, {spec.max_tokens} requested, "
+                f"({self._tokens_spent} spent, {reserved} reserved, {spec.max_tokens} requested, "
                 f"{self.total_token_budget} allowed)"
             )
         for resource in (*spec.owned_paths, *spec.shared_resources):
