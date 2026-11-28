@@ -202,17 +202,27 @@ def test_gate_sandbox_persists_setup_installs_across_gate_invocations() -> None:
     assert "--setenv HOME /tmp" not in review
 
 
-def test_trusted_python_steps_cannot_import_candidate_code() -> None:
+def test_trusted_python_steps_use_a_protected_isolated_interpreter() -> None:
     document = WORKFLOW.read_text(encoding="utf-8")
-    # Trusted snippets execute from the PR-head checkout, where stdin and -m
-    # execution would otherwise put the candidate tree first on sys.path: a
-    # committed root-level agentic_sdlc/ (or pip/) package would shadow the
-    # pinned engine (Codex 4434015133). -P (safe path) keeps the checkout
-    # off the import path while the user-site engine install stays visible.
+    review = _review_job()
+    # Trusted snippets execute from the PR-head checkout after a reviewer has
+    # held a Write tool. A candidate package must not shadow the pinned engine,
+    # and a reviewer-written usercustomize.py must not execute before the seal
+    # or enforcement checks (Codex 4434015133 and 4725701273).
+    assert "TRUSTED_VENV: ${{ runner.temp }}/forge-review-python-" in review
+    assert "TRUSTED_PYTHON: ${{ runner.temp }}/forge-review-python-" in review
+    assert 'PYTHONNOUSERSITE: "1"' in review
+    assert 'sudo "$host_python" -I -m venv "$TRUSTED_VENV"' in review
+    assert 'sudo "$TRUSTED_PYTHON" -I -m pip install' in review
+    assert 'sudo chown -R root:root "$TRUSTED_VENV"' in review
+    assert 'sudo chmod -R go-w "$TRUSTED_VENV"' in review
+    assert 'test ! -w "$TRUSTED_VENV"' in review
+    assert 'echo "$TRUSTED_VENV/bin" >> "$GITHUB_PATH"' in review
     assert "python3 - <<'PY'" not in document
     assert "python3 -m pip" not in document
-    assert document.count("python3 -P - <<'PY'") == 7
-    assert "python3 -P -m pip install" in document
+    assert "python3 -P" not in document
+    assert document.count('"$TRUSTED_PYTHON" -I - <<\'PY\'') == 7
+    assert document.count('"$TRUSTED_PYTHON" -I -c') == 2
 
 
 def test_trusted_inputs_are_sealed_before_review_and_verified_after() -> None:

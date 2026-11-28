@@ -54,6 +54,10 @@ jobs:
   review:
     runs-on: ${{ fromJSON(inputs.runs_on) }}
     timeout-minutes: 60
+    env:
+      TRUSTED_VENV: ${{ runner.temp }}/forge-review-python-${{ github.run_id }}-${{ github.run_attempt }}
+      TRUSTED_PYTHON: ${{ runner.temp }}/forge-review-python-${{ github.run_id }}-${{ github.run_attempt }}/bin/python
+      PYTHONNOUSERSITE: "1"
     permissions:
       contents: read
       issues: read
@@ -116,11 +120,21 @@ jobs:
           path: .agentic-platform
           persist-credentials: false
           token: ${{ secrets.PLATFORM_READ_TOKEN || github.token }}
-      - name: Install pinned platform engine
+      - name: Install pinned platform engine in protected interpreter
         run: |
           set -euo pipefail
           printf '/.agentic-platform/\n' >> .git/info/exclude
-          python3 -P -m pip install --disable-pip-version-check -q ./.agentic-platform
+          # A reviewer has a Write tool. Keep both the interpreter startup
+          # path and the installed engine outside every runner-writable Python
+          # site so usercustomize/sitecustomize cannot run before seal checks.
+          host_python="$(command -v python3)"
+          test ! -e "$TRUSTED_VENV"
+          sudo "$host_python" -I -m venv "$TRUSTED_VENV"
+          sudo "$TRUSTED_PYTHON" -I -m pip install --disable-pip-version-check -q ./.agentic-platform
+          sudo chown -R root:root "$TRUSTED_VENV"
+          sudo chmod -R go-w "$TRUSTED_VENV"
+          test ! -w "$TRUSTED_VENV"
+          echo "$TRUSTED_VENV/bin" >> "$GITHUB_PATH"
       - name: Check out trusted review target at the authenticated base branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -140,7 +154,7 @@ jobs:
           # inline alphabet would refuse supported names like release+next
           # or feature@two and fail every review for such a project, while
           # the contract still refuses shell-dangerous characters.
-          DEFAULT_BRANCH="$default_branch" python3 -P - <<'PY'
+          DEFAULT_BRANCH="$default_branch" "$TRUSTED_PYTHON" -I - <<'PY'
           import os
 
           from agentic_sdlc.policy import branch_name_problem
@@ -289,7 +303,7 @@ jobs:
           # select the security reviewer, and an endpoint-only `git diff`
           # listing omits it. Written NUL-delimited, so a non-ASCII
           # protected path stays literal instead of C-quoted.
-          python3 -P - <<'PY'
+          "$TRUSTED_PYTHON" -I - <<'PY'
           import json
           from pathlib import Path
 
@@ -311,7 +325,7 @@ jobs:
             --changed-paths-file0 .agentic-review/changed-paths.txt \
             --config .agentic-review/trusted-policy.toml \
             --output .agentic-review/roles.json
-          python3 -P - <<'PY'
+          "$TRUSTED_PYTHON" -I - <<'PY'
           import json
           from pathlib import Path
 
@@ -332,7 +346,7 @@ jobs:
           # The schema the reviewer is held to IS the versioned platform
           # schema: materialized from the pinned engine, so the workflow can
           # never drift from what enforce-review validates.
-          python3 -P - <<'PY'
+          "$TRUSTED_PYTHON" -I - <<'PY'
           import json
           from pathlib import Path
 
@@ -367,7 +381,7 @@ jobs:
           # before any control file or engine import is trusted again. Only
           # the review-<role>.json verdicts are legitimately written during
           # review.
-          engine_dir=$(python3 -P -c 'import importlib.util; print(importlib.util.find_spec("agentic_sdlc").submodule_search_locations[0])')
+          engine_dir=$("$TRUSTED_PYTHON" -I -c 'import importlib.util; print(importlib.util.find_spec("agentic_sdlc").submodule_search_locations[0])')
           digest=$(
             {
               find .agentic-review -type f ! -name 'review-*.json' -print0
@@ -443,7 +457,7 @@ jobs:
           # reviewers ran, and the code verdict still matches the digest
           # recorded before the security reviewer ran: one compromised
           # reviewer must never supply both approvals.
-          engine_dir=$(python3 -P -c 'import importlib.util; print(importlib.util.find_spec("agentic_sdlc").submodule_search_locations[0])')
+          engine_dir=$("$TRUSTED_PYTHON" -I -c 'import importlib.util; print(importlib.util.find_spec("agentic_sdlc").submodule_search_locations[0])')
           digest=$(
             {
               find .agentic-review -type f ! -name 'review-*.json' -print0
@@ -477,7 +491,7 @@ jobs:
 
           unexpected=$(git ls-files --others --exclude-standard | grep -v '^\.agentic-review/' | grep -v '^\.agentic-platform/' || true)
           test -z "$unexpected"
-          python3 -P - <<'PY'
+          "$TRUSTED_PYTHON" -I - <<'PY'
           import json
           from pathlib import Path
 
@@ -502,7 +516,7 @@ jobs:
           HEAD_SHA: ${{ inputs.head_sha }}
         run: |
           set -euo pipefail
-          python3 -P - <<'PY'
+          "$TRUSTED_PYTHON" -I - <<'PY'
           import json
           import os
           from pathlib import Path
@@ -531,7 +545,7 @@ jobs:
           # RECORDED for the publisher job: the publisher must stay
           # checkout-free, and the comment must publish even when the gate
           # blocks, so the verdict travels as data.
-          python3 -P - <<'PY'
+          "$TRUSTED_PYTHON" -I - <<'PY'
           import json
           import os
           from pathlib import Path
