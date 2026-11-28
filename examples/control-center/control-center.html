@@ -1715,13 +1715,14 @@
     if (recovering || !state.db) return false;
     recovering = true;
     degrade(reason);
+    // The generation is claimed BEFORE the read, for the same reason the
+    // subscription drain claims it on receipt: a read is served with the
+    // document as it stood when it was issued, so claiming afterwards would
+    // make this older document outrank a delivery or manual load that
+    // adopted while the read was in flight, and the stale view would win.
+    // It is claimed outside the try so the FAILURE path can check it too.
+    const delivery = ++snapshotAdoptions;
     try {
-      // The generation is claimed BEFORE the read, for the same reason the
-      // subscription drain claims it on receipt: a read is served with the
-      // document as it stood when it was issued, so claiming afterwards would
-      // make this older document outrank a delivery or manual load that
-      // adopted while the read was in flight, and the stale view would win.
-      const delivery = ++snapshotAdoptions;
       const snap = await state.db.doc("snapshots/current").get();
       if (delivery !== snapshotAdoptions) return false;
       const body = snap?.data?.() || null;
@@ -1734,6 +1735,12 @@
       render();
       return true;
     } catch (error) {
+      // The same generation check every success path makes. A superseded read
+      // has nothing to say about the current view, and that is as true of its
+      // failure as of its result: a newer delivery may already have verified,
+      // adopted and healed the feed this read was issued to repair, and
+      // re-degrading it would report a healthy view as stale.
+      if (delivery !== snapshotAdoptions) return false;
       degrade("Snapshot recovery failed (" + describe(error) + "). Showing the last-good view.");
       return false;
     } finally {
@@ -2123,6 +2130,35 @@
     return { known: true, value: Number(value), text: String(value), note: Number(entry.unknownRecords) ? entry.unknownRecords + " record(s) unobserved" : "" };
   }
 
+  /* The grouping a view's reader depends on.
+   *
+   * A usage report declares its own `groupBy`, and a report grouped by MORE
+   * dimensions than a reader expects holds SEVERAL buckets for each key that
+   * reader indexes or searches by - so one of them silently stands in for all
+   * of them. `--group-by day --group-by model` gives two buckets for one
+   * calendar day, and a trend built by day then shows the last model's cost
+   * and runtime as the day's own.
+   *
+   * Checking the declared grouping is both cheaper and more honest than
+   * combining the buckets here. Combining would mean adding figures whose
+   * known/unknown record counts differ, which is this page's one forbidden
+   * move: a day with one observed and one unobserved bucket has no total
+   * anybody measured, and printing their sum would present a partial figure
+   * as a whole one. The producer can group by day; the console should ask it
+   * to rather than guess.
+   */
+  function wrongGrouping(report, expected, recipe) {
+    const declared = Array.isArray(report?.groupBy) ? report.groupBy : [];
+    const sorted = (list) => [...list].sort().join(",");
+    if (declared.length === expected.length && sorted(declared) === sorted(expected)) return "";
+    const want = expected.join(" + ");
+    return "this usage report is grouped by " + (declared.join(" + ") || "nothing")
+      + ", but this view reads one bucket per " + want + ". Extra grouping puts several "
+      + "buckets under the same " + want + ", so one would silently stand in for all of "
+      + "them, and their figures cannot be added without inventing a total nobody "
+      + "measured. Regroup it with `" + recipe + "`.";
+  }
+
   function bucketLabel(bucket, dimension) {
     const key = bucket.key || {};
     return String(key[dimension] ?? Object.values(key)[0] ?? "unattributed") || "unattributed";
@@ -2472,6 +2508,15 @@
         + "across projects, so it cannot be attributed to one. Regroup it with "
         + "`--group-by project --group-by workUnit`." });
     }
+    const unitGrouping = wrongGrouping(report, ["projectId", "workUnitId"],
+      "sdlcctl usage-report --group-by project --group-by workUnit");
+    if (unitGrouping) {
+      // The same defect as the daily trend, one function over: `find` below
+      // takes the FIRST bucket matching this project and work unit, so a
+      // report additionally grouped by day or run would present one day's
+      // usage as the unit's whole estimate-versus-actual.
+      return el("div", { class: "chart-unknown", text: "unavailable \u2014 " + unitGrouping });
+    }
     const match = (report.buckets || []).find((bucket) => {
       const key = bucket.key || {};
       return key.workUnitId === unit.workUnitId && key.projectId === project.projectId;
@@ -2567,7 +2612,10 @@
   function phoneCost() {
     const nodes = [freshnessCard()];
     const byModel = state.telemetry?.byModel;
+    const modelGrouping = byModel
+      && wrongGrouping(byModel, ["model"], "sdlcctl usage-report --group-by model");
     if (!byModel) nodes.push(chartUnknown("Cost by model", MISSING.byModel));
+    else if (modelGrouping) nodes.push(chartUnknown("Cost by model", modelGrouping));
     else {
       nodes.push(barChart("Tokens by model", usageRows(byModel, "model",
         (bucket) => figure(bucket.actual?.totalTokens)), { note: "Actual total tokens per model, from the usage ledger's own rollup." }));
@@ -2594,6 +2642,8 @@
   const MAX_TREND_DAYS = 400;
 
   function dailyRows(byDay) {
+    const grouping = wrongGrouping(byDay, ["day"], "sdlcctl usage-report --group-by day");
+    if (grouping) return grouping;
     const unknown = { known: false, value: null, text: "unknown" };
     const observed = new Map();
     for (const bucket of byDay.buckets || []) {

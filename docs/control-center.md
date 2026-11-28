@@ -295,7 +295,25 @@ bundle:
   "effectiveness": "<sdlcctl effectiveness-report ...>" }
 ```
 
-Every section is optional. The bundle is validated fail-closed on the way in —
+Every section is optional, and **each section's grouping is part of the
+recipe, not a suggestion.** A usage report declares its own `groupBy`, and a
+report grouped by more dimensions than a view reads holds several buckets for
+each key that view indexes or searches by — so one of them silently stands in
+for all of them. `--group-by day --group-by model` gives two buckets for one
+calendar day, and the daily trend would draw the last model's cost and runtime
+as the whole day's. The console checks the declared grouping and says what the
+report is actually grouped by, which view reads it, and how to regroup it.
+
+Combining those buckets instead would be the dishonest repair: their
+known-record and unknown-record counts differ, so a day with one observed and
+one unobserved bucket has no total anyone measured, and printing their sum
+would present a partial figure as a whole one. The producer can group by day;
+the console asks it to rather than guess. The same check covers the per-model
+charts (one bucket per model) and the work-unit drill-down, which searches for
+the first bucket matching a project and work unit and would otherwise show one
+day as the unit's entire estimate-versus-actual.
+
+The bundle is also validated fail-closed on the way in —
 an unsupported version, an unknown section, an over-budget collection, a
 credential-shaped value or a secret-shaped key is refused rather than rendered
 — and it is never written to the shared store: it is a per-viewer analysis
@@ -324,6 +342,13 @@ older document would win. The recovery read claims its generation before it
 issues the read, for the same reason: a read is served with the document as it
 stood when it was issued, so a claim made afterwards would let that older
 document outrank whatever adopted while the read was in flight.
+
+That generation check governs the recovery read's **failure** as much as its
+result. A read that has been superseded has nothing to say about the current
+view: a newer delivery may already have verified, adopted and healed the feed
+the read was issued to repair, and letting the obsolete rejection through
+would report a healthy view as degraded until the next delivery happened to
+arrive. A read that is still current and fails is reported as before.
 
 A view's signature covers everything it renders, including the contents of the
 store-backed note and draft collections. A note reworded or a draft replaced

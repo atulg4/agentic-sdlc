@@ -1018,6 +1018,166 @@ test("the trend caption reports the observed peak, not the chart's scale floor",
   } finally { await context.close(); }
 });
 
+
+/* ---------- verification round (reviewed at 2209610) ---------- */
+
+/* Split one day bucket into two carrying an extra dimension, exactly as
+ * `aggregate(group_by=("day", "model"))` emits it. Verified against the real
+ * producer: two same-day runs of 100s and 200s give two buckets, and the
+ * console rendered 200 as the day's runtime while the day-only report for the
+ * same records reports 300.
+ */
+/* A newer live delivery of the same portfolio, resealed so it verifies. */
+async function deliverFresh(page, snapshot, by) {
+  await page.evaluate(async ([document_, loadedBy]) => {
+    const fresh = JSON.parse(JSON.stringify(document_));
+    fresh.generatedAt = new Date().toISOString();
+    window.__store.deliver("snapshots/current", {
+      document: await window.__reseal(fresh),
+      loadedAt: new Date().toISOString(),
+      loadedBy,
+    });
+  }, [snapshot, by]);
+}
+
+function regroupByDayAnd(bundle, dimension, value) {
+  const report = structuredClone(bundle.byDay);
+  report.groupBy = [...report.groupBy, dimension];
+  report.buckets = report.buckets.flatMap((bucket) => {
+    const halves = [value, value + "-other"].map((entry) => {
+      const half = structuredClone(bucket);
+      half.key = { ...half.key, [dimension]: entry };
+      return half;
+    });
+    return halves;
+  });
+  return { ...structuredClone(bundle), byDay: report };
+}
+
+test("a daily trend refuses a report grouped by more than the day", async (browser) => {
+  const { context, page, problems } = await openConsole(browser);
+  try {
+    const regrouped = regroupByDayAnd(TELEMETRY, "model", "claude-opus-5");
+    // Two buckets now share every calendar day, and each carries the whole
+    // day's figures - so whichever one won would be presented as the day's.
+    const days = regrouped.byDay.buckets.map((bucket) => bucket.key.day);
+    assert(days.length === new Set(days).size * 2, "the fixture was not actually split per day");
+
+    const problem = await page.evaluate(
+      (bundle) => window.__forgeConsole.loadTelemetry(bundle), regrouped);
+    assertEqual(problem, "", "the bundle itself is well-formed and must still load");
+    await page.locator("#bottom-nav .dest").nth(3).click();
+    await page.waitForTimeout(80);
+
+    const view = await page.locator("#view").innerText();
+    assert(/grouped by day \+ model/.test(view),
+      "the trend did not say what the report is actually grouped by");
+    assert(/--group-by day/.test(view), "the refusal does not name the regrouping recipe");
+    const drawn = await page.evaluate(() => [...document.querySelectorAll("svg[aria-label]")]
+      .map((node) => node.getAttribute("aria-label"))
+      .filter((label) => /per day/.test(label)));
+    assertEqual(drawn.length, 0, "a trend was drawn from buckets that cannot be read by day");
+
+    // The control: the real day-only report still draws its trend.
+    const restored = await page.evaluate(
+      (bundle) => window.__forgeConsole.loadTelemetry(bundle), TELEMETRY);
+    assertEqual(restored, "", "the day-only fixture was refused");
+    await page.waitForTimeout(80);
+    const good = await page.evaluate(() => [...document.querySelectorAll("svg[aria-label]")]
+      .map((node) => node.getAttribute("aria-label"))
+      .filter((label) => /Runtime per day/.test(label)));
+    assertEqual(good.length, 1, "the day-only report no longer draws a runtime trend");
+    assertEqual(problems.length, 0, "console errors: " + problems.join(" | "));
+  } finally {
+    await context.close();
+  }
+});
+
+test("the model and work-unit views refuse extra grouping too", async (browser) => {
+  const { context, page } = await openConsole(browser);
+  try {
+    // byModel: one bar per model, so a model+day report would repeat labels
+    // and attribute one day's tokens to the model as a whole.
+    const byModel = structuredClone(TELEMETRY);
+    byModel.byModel.groupBy = ["model", "day"];
+    assertEqual(await page.evaluate((bundle) => window.__forgeConsole.loadTelemetry(bundle), byModel),
+      "", "the bundle is well-formed and must load");
+    await page.locator("#bottom-nav .dest").nth(3).click();
+    await page.waitForTimeout(80);
+    const cost = await page.locator("#view").innerText();
+    assert(/grouped by model \+ day/.test(cost), "the cost view accepted model + day grouping");
+    assert(!/Tokens by model/.test(cost), "a per-model chart was drawn from model + day buckets");
+
+    // byWorkUnit: the drill-down takes the FIRST matching bucket, so a report
+    // additionally grouped by day would show one day as the unit's total.
+    const byUnit = structuredClone(TELEMETRY);
+    byUnit.byWorkUnit.groupBy = ["projectId", "workUnitId", "day"];
+    assertEqual(await page.evaluate((bundle) => window.__forgeConsole.loadTelemetry(bundle), byUnit),
+      "", "the bundle is well-formed and must load");
+    await page.locator("#bottom-nav .dest").nth(1).click();
+    await page.waitForTimeout(60);
+    await page.locator("#view .ucard-btn").first().click();
+    await page.waitForTimeout(80);
+    const detail = await page.locator("#view").innerText();
+    assert(/grouped by projectId \+ workUnitId \+ day/.test(detail),
+      "the drill-down accepted a report grouped by more than project + work unit");
+  } finally {
+    await context.close();
+  }
+});
+
+test("a superseded recovery read cannot re-degrade a healed view", async (browser) => {
+  const { context, page } = await openConsole(browser);
+  try {
+    assertEqual(await page.evaluate(() => window.__forgeConsole.degraded), "",
+      "the seeded console did not start healthy");
+
+    // Hold the recovery read open and arrange for it to fail.
+    await page.evaluate(() => {
+      window.__release = window.__store.gate("snapshots/current", { reject: true });
+    });
+    await page.evaluate(() => window.__store.fail("snapshots/current", new Error("dropped")));
+    await page.waitForTimeout(80);
+    assert(await page.evaluate(() => window.__forgeConsole.degraded),
+      "a terminated subscription did not degrade the view");
+
+    // A newer delivery verifies and adopts while that read is still in
+    // flight, which heals the feed.
+    await deliverFresh(page, SNAPSHOT, "newer delivery");
+    await page.waitForTimeout(150);
+    assertEqual(await page.evaluate(() => window.__forgeConsole.degraded), "",
+      "a verified newer delivery did not heal the feed");
+
+    // Only now does the superseded read reject. It has nothing to say.
+    await page.evaluate(() => window.__release());
+    await page.waitForTimeout(150);
+    assertEqual(await page.evaluate(() => window.__forgeConsole.degraded), "",
+      "an obsolete read's rejection re-degraded a view a newer delivery had healed");
+  } finally {
+    await context.close();
+  }
+});
+
+test("a recovery read that fails with nothing newer still degrades", async (browser) => {
+  // The control for the test above: the generation check must not swallow the
+  // failure it exists to report.
+  const { context, page } = await openConsole(browser);
+  try {
+    await page.evaluate(() => {
+      window.__release = window.__store.gate("snapshots/current", { reject: true });
+    });
+    await page.evaluate(() => window.__store.fail("snapshots/current", new Error("dropped")));
+    await page.waitForTimeout(80);
+    await page.evaluate(() => window.__release());
+    await page.waitForTimeout(150);
+    const degraded = await page.evaluate(() => window.__forgeConsole.degraded);
+    assert(/recovery failed/i.test(degraded),
+      "a current read's failure was not reported: " + JSON.stringify(degraded));
+  } finally {
+    await context.close();
+  }
+});
+
 /* ---------- runner ---------- */
 const browser = await chromium.launch({ args: ["--no-sandbox"] });
 let failed = 0;

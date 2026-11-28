@@ -57,10 +57,10 @@
     set(path, body) { docs.set(path, body); },
     //: Reads of a gated path block until the test releases them.
     gates: new Map(),
-    gate(path) {
+    gate(path, { reject = false } = {}) {
       let release;
       const promise = new Promise((resolve) => { release = resolve; });
-      window.__store.gates.set(path, { promise, release });
+      window.__store.gates.set(path, { promise, release, reject });
       return () => release();
     },
     // Deliver a bounded collection window, the way the console's note and
@@ -98,6 +98,11 @@
         if (gate) {
           await gate.promise;
           window.__store.gates.delete(path);
+          // A held read can be released as a FAILURE as well as a success: a
+          // store read rejects on a dropped connection or a permission
+          // change, and a rejection that arrives after a newer document has
+          // already been adopted is its own race.
+          if (gate.reject) throw new Error("read failed");
           return { get exists() { return served !== undefined; }, data: () => served || null };
         }
         return snap(path);

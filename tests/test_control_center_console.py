@@ -442,8 +442,18 @@ def test_the_recovery_read_claims_its_generation_before_it_awaits(html: str) -> 
     claim = recovery.index("++snapshotAdoptions")
     read = recovery.index('await state.db.doc("snapshots/current").get()')
     assert claim < read, "the recovery read claims its generation after awaiting the read"
-    # Re-checked after the read AND after the digest verification.
-    assert recovery.count("if (delivery !== snapshotAdoptions) return false;") == 2
+    # The claim is also outside the `try`, so the FAILURE path can see it: a
+    # superseded read that rejects must not re-degrade a view a newer delivery
+    # has already healed.
+    assert claim < recovery.index("try {"), "the generation is claimed inside the try"
+    # Re-checked after the read, after the digest verification, and on the
+    # rejection path. Three, not two: the catch block reported a stale failure
+    # against the current view until it made the same check.
+    assert recovery.count("if (delivery !== snapshotAdoptions) return false;") == 3
+    catch = recovery.index("} catch (error) {")
+    assert recovery.index(
+        "if (delivery !== snapshotAdoptions) return false;", catch
+    ) < recovery.index("degrade(", catch), "the failure path degrades before checking"
 
 
 def test_the_portfolio_rail_sums_the_snapshots_own_census(html: str) -> None:
@@ -533,6 +543,58 @@ def _node_with_playwright() -> str | None:
         timeout=60,
     )
     return node if probe.returncode == 0 else None
+
+
+def test_extra_grouping_really_does_collapse_a_days_buckets() -> None:
+    """The premise the console's grouping guard rests on, from the producer.
+
+    The guard refuses a ``byDay`` report grouped by more than the day. This
+    pins *why*: the producer legitimately emits several buckets for one
+    calendar day, each holding only part of that day, so a reader that
+    indexes by day keeps whichever happens to come last. It runs in CI, where
+    the browser suite cannot.
+    """
+    from agentic_sdlc.usage_ledger import UsageLedger
+    from tests.test_usage_ledger import _actual, _estimate, _record
+
+    ledger = UsageLedger()
+    ledger.append(
+        _record(
+            "run-a",
+            model="claude-opus-5",
+            recorded_at="2026-09-21T10:00:00Z",
+            estimate=_estimate(),
+            actual=_actual(runtime=100),
+        )
+    )
+    ledger.append(
+        _record(
+            "run-b",
+            model="gpt-5",
+            recorded_at="2026-09-21T18:00:00Z",
+            estimate=_estimate(),
+            actual=_actual(runtime=200),
+        )
+    )
+
+    day_only = ledger.aggregate(group_by=("day",))
+    day_model = ledger.aggregate(group_by=("day", "model"))
+
+    assert day_only["groupBy"] == ["day"]
+    assert day_model["groupBy"] == ["day", "model"]
+
+    # One bucket for the day, holding the whole day.
+    assert len(day_only["buckets"]) == 1
+    assert day_only["buckets"][0]["actual"]["runtimeSeconds"]["value"] == 300
+
+    # Two buckets for the SAME day, each holding part of it. Keeping either
+    # one as the day's observation reports 100 or 200 seconds for a day that
+    # ran 300 - which is what the console did before it checked the grouping.
+    days = [bucket["key"]["day"] for bucket in day_model["buckets"]]
+    assert days == ["2026-09-21", "2026-09-21"]
+    parts = [bucket["actual"]["runtimeSeconds"]["value"] for bucket in day_model["buckets"]]
+    assert sorted(parts) == [100, 200]
+    assert sum(parts) == day_only["buckets"][0]["actual"]["runtimeSeconds"]["value"]
 
 
 @pytest.mark.skipif(
