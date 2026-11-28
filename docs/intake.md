@@ -168,3 +168,49 @@ open issue is opened, edited or labelled and does not already carry
 Label and body writes made with the workflow token do not start new
 workflow runs. Once merged, the body passes `spec-check`, so the stage does
 not loop.
+
+## Dispatcher status
+
+`sdlcctl dispatcher-status` shows whether the intake dispatcher is alive and
+what it has decided. It reads the dispatcher's checkpoint journal and,
+optionally, the lifecycle event ledger. It writes nothing.
+
+```text
+sdlcctl dispatcher-status --checkpoints forge-checkpoints.sqlite3 \
+  --now 2026-10-29T09:40:00Z [--stale-after-seconds 3600] [--blocked-limit 20] \
+  [--ledger ledger.json [--registry projects.json] [--project-id alpha]] [--output status.json]
+```
+
+- **Heartbeat.** The dispatcher touches its heartbeat on every event it sees,
+  so the heartbeat dates the last event rather than proving a running
+  process. `condition` is `fresh`, `stale` (older than
+  `--stale-after-seconds`), `missing` (never written), `unreadable` or
+  `future` (a timestamp ahead of `--now`, meaning a skewed clock). Every
+  condition except `fresh` sets `stale: true`. `--now` is an input, so the
+  same journal and `--now` always give the same output.
+- **Units.** `dispatcher.units` counts each accepted work unit once, by its
+  latest checkpoint. Duplicate and replayed events do not inflate it.
+- **Rejected events.** The dispatcher records `ignored` and `blocked`
+  decisions before it derives a unit id, so these are counted per event in
+  `dispatcher.rejectedEvents`, not per unit. `dispatcher.blockedEvents` lists
+  the most recent blocked events with their recorded reason, latest first, up
+  to `--blocked-limit`; `blockedEventsTruncated` says when more exist. A
+  reason carrying a credential-shaped token is redacted.
+- **Lifecycle buckets.** With `--ledger`, `lifecycle` folds the ledger's
+  per-state totals into buckets. Buckets use states, not stages, because the
+  merge and rollback stages each mix waiting or running work with finished
+  work.
+
+| Bucket | States |
+|---|---|
+| `queued` | intake, triaged, specified, planned, approved, dispatched |
+| `running` | implementing, verifying, reviewing, repair-needed, repairing, re-reviewing, deploying, deployment-verifying, rolling-back |
+| `awaitingHuman` | approval-pending, ready-for-human-merge |
+| `blocked` | blocked |
+| `finished` | merged, live, rolled-back, failed, cancelled, superseded |
+| `unknown` | any state not listed above, named in `unknownStates`; never counted as queued or running |
+
+The command fails closed (exit code 2) on a missing checkpoint database
+(without creating one), on a file that is not a dispatcher journal, on a
+`--now` without a UTC offset, and on `--project-id` or `--registry` without
+`--ledger`.

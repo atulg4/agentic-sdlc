@@ -26,6 +26,7 @@ from .capacity_metrics import (
     build_capacity_report,
     load_capacity_inputs,
 )
+from .checkpoints import CheckpointError, read_checkpoint_snapshot
 from .claude_cloud import add_commands as add_claude_cloud_commands
 from .context_builder import (
     DEFAULT_PACKET_BYTES,
@@ -57,6 +58,17 @@ from .control_center_telemetry import (
     load_effectiveness_document,
 )
 from .dashboard_efficiency import build_infrastructure_blocker_panel
+from .dispatcher_status import build_dispatcher_status
+from .effectiveness import (
+    COMPARABLE_METRICS,
+    EffectivenessError,
+    EffectivenessLedger,
+    LearningLedger,
+    build_effectiveness_report,
+    compare_projects,
+    load_learning_record,
+    load_outcome_record,
+)
 from .event_ledger import EventLedger, LedgerError, LifecycleStage, load_lifecycle_event
 from .events import EventError, normalize_event
 from .executors import (
@@ -192,6 +204,7 @@ from .usage_ledger import (
     UsageLedger,
     load_pricing_document,
     load_usage_record,
+    parse_timestamp,
 )
 
 
@@ -3242,6 +3255,30 @@ def _estimate_usage(args: argparse.Namespace) -> int:
     return 0
 
 
+def _dispatcher_status(args: argparse.Namespace) -> int:
+    snapshot = read_checkpoint_snapshot(args.checkpoints)
+    aggregate = None
+    if args.ledger:
+        registry = read_optional_project_registry(args.registry)
+        ledger = EventLedger.from_dict(
+            json.loads(Path(args.ledger).read_text(encoding="utf-8")), registry=registry
+        )
+        aggregate = ledger.aggregate(project_ids=tuple(args.project_id) or None)
+    elif args.project_id or args.registry:
+        raise ValueError("--project-id and --registry apply only with --ledger")
+    _write(
+        build_dispatcher_status(
+            snapshot,
+            now=args.now,
+            stale_after_seconds=args.stale_after_seconds,
+            blocked_event_limit=args.blocked_limit,
+            ledger_aggregate=aggregate,
+        ),
+        args.output,
+    )
+    return 0
+
+
 def _schedule_forecast(args: argparse.Namespace) -> int:
     registry = read_optional_project_registry(args.registry)
     projects = load_forecast_document(json.loads(Path(args.graph).read_text(encoding="utf-8")))
@@ -3274,6 +3311,115 @@ def _capacity_report(args: argparse.Namespace) -> int:
             ledger.records,
             window=ObservationWindow(args.window_start, args.window_end),
             inputs=inputs,
+            project_ids=tuple(args.project_id) or None,
+        ),
+        args.output,
+    )
+    return 0
+
+
+def _read_outcome_ledger(
+    path: str, registry_path: str | None, *, create: bool
+) -> EffectivenessLedger:
+    registry = read_optional_project_registry(registry_path)
+    ledger_path = Path(path)
+    if ledger_path.is_file():
+        return EffectivenessLedger.from_dict(
+            json.loads(ledger_path.read_text(encoding="utf-8")), registry=registry
+        )
+    if not create:
+        raise EffectivenessError(f"outcome ledger not found: {path}")
+    return EffectivenessLedger(registry=registry)
+
+
+def _read_learning_ledger(
+    path: str | None, registry_path: str | None, *, create: bool
+) -> LearningLedger:
+    registry = read_optional_project_registry(registry_path)
+    if path and Path(path).is_file():
+        return LearningLedger.from_dict(
+            json.loads(Path(path).read_text(encoding="utf-8")), registry=registry
+        )
+    if path and not create:
+        raise EffectivenessError(f"learning ledger not found: {path}")
+    return LearningLedger(registry=registry)
+
+
+def _record_outcome(args: argparse.Namespace) -> int:
+    ledger = _read_outcome_ledger(args.outcomes, args.registry, create=True)
+    document = json.loads(Path(args.outcome).read_text(encoding="utf-8"))
+    record = ledger.append(load_outcome_record(document))
+    _write(ledger.as_dict(), args.outcomes)
+    if args.output:
+        _write(record.as_dict(), args.output)
+    return 0
+
+
+def _record_learning(args: argparse.Namespace) -> int:
+    ledger = _read_learning_ledger(args.learnings, args.registry, create=True)
+    document = json.loads(Path(args.learning).read_text(encoding="utf-8"))
+    record = ledger.append(load_learning_record(document))
+    _write(ledger.as_dict(), args.learnings)
+    if args.output:
+        _write(record.as_dict(), args.output)
+    return 0
+
+
+def _effectiveness_report(args: argparse.Namespace) -> int:
+    outcomes = _read_outcome_ledger(args.outcomes, args.registry, create=False)
+    usage = ()
+    if args.usage:
+        usage = _read_usage_ledger(args.usage, args.registry, create=False).records
+    learnings: tuple[Any, ...] = ()
+    if args.learnings:
+        learnings = _read_learning_ledger(args.learnings, args.registry, create=False).records
+    window = None
+    if bool(args.window_start) != bool(args.window_end):
+        raise EffectivenessError("--window-start and --window-end are required together")
+    if args.window_start:
+        window = ObservationWindow(args.window_start, args.window_end)
+    outcome_records = outcomes.records
+    if window is not None:
+
+        def in_window(timestamp: str, label: str) -> bool:
+            instant = parse_timestamp(timestamp, label)
+            return window.started_at <= instant < window.ended_at
+
+        outcome_records = tuple(
+            record
+            for record in outcome_records
+            if in_window(record.recorded_at, "outcome recordedAt")
+        )
+        outcome_work_units = {
+            (record.project_id, record.work_unit_id) for record in outcome_records
+        }
+        usage = tuple(
+            record
+            for record in usage
+            if (record.project_id, record.work_unit_id) in outcome_work_units
+        )
+        learnings = tuple(
+            record for record in learnings if in_window(record.recorded_at, "learning recordedAt")
+        )
+    _write(
+        build_effectiveness_report(
+            outcome_records,
+            usage_records=usage,
+            window=window,
+            learnings=learnings,
+            project_ids=tuple(args.project_id) or None,
+        ),
+        args.output,
+    )
+    return 0
+
+
+def _compare_projects(args: argparse.Namespace) -> int:
+    ledger = _read_outcome_ledger(args.outcomes, args.registry, create=False)
+    _write(
+        compare_projects(
+            ledger.records,
+            metric=args.metric,
             project_ids=tuple(args.project_id) or None,
         ),
         args.output,
@@ -4339,6 +4485,17 @@ def build_parser() -> argparse.ArgumentParser:
     estimate_usage.add_argument("--output")
     estimate_usage.set_defaults(handler=_estimate_usage)
 
+    dispatcher_status = commands.add_parser("dispatcher-status")
+    dispatcher_status.add_argument("--checkpoints", required=True)
+    dispatcher_status.add_argument("--now", required=True)
+    dispatcher_status.add_argument("--stale-after-seconds", type=int, default=3600)
+    dispatcher_status.add_argument("--blocked-limit", type=int, default=20)
+    dispatcher_status.add_argument("--ledger")
+    dispatcher_status.add_argument("--registry")
+    dispatcher_status.add_argument("--project-id", action="append", default=[])
+    dispatcher_status.add_argument("--output")
+    dispatcher_status.set_defaults(handler=_dispatcher_status)
+
     schedule_forecast = commands.add_parser("schedule-forecast")
     schedule_forecast.add_argument("--graph", required=True)
     schedule_forecast.add_argument("--usage", required=True)
@@ -4359,6 +4516,41 @@ def build_parser() -> argparse.ArgumentParser:
     capacity.add_argument("--project-id", action="append", default=[])
     capacity.add_argument("--output")
     capacity.set_defaults(handler=_capacity_report)
+
+    record_outcome = commands.add_parser("record-outcome")
+    record_outcome.add_argument("--outcomes", required=True)
+    record_outcome.add_argument("--outcome", required=True)
+    record_outcome.add_argument("--registry")
+    record_outcome.add_argument("--output")
+    record_outcome.set_defaults(handler=_record_outcome)
+
+    record_learning = commands.add_parser("record-learning")
+    record_learning.add_argument("--learnings", required=True)
+    record_learning.add_argument("--learning", required=True)
+    record_learning.add_argument("--registry")
+    record_learning.add_argument("--output")
+    record_learning.set_defaults(handler=_record_learning)
+
+    effectiveness = commands.add_parser("effectiveness-report")
+    effectiveness.add_argument("--outcomes", required=True)
+    effectiveness.add_argument("--usage")
+    effectiveness.add_argument("--learnings")
+    effectiveness.add_argument("--registry")
+    effectiveness.add_argument("--window-start")
+    effectiveness.add_argument("--window-end")
+    effectiveness.add_argument("--project-id", action="append", default=[])
+    effectiveness.add_argument("--output")
+    effectiveness.set_defaults(handler=_effectiveness_report)
+
+    compare = commands.add_parser("compare-projects")
+    compare.add_argument("--outcomes", required=True)
+    compare.add_argument("--registry")
+    compare.add_argument(
+        "--metric", choices=tuple(sorted(COMPARABLE_METRICS)), default="acceptedOutcomeRate"
+    )
+    compare.add_argument("--project-id", action="append", default=[])
+    compare.add_argument("--output")
+    compare.set_defaults(handler=_compare_projects)
 
     knowledge = commands.add_parser("validate-knowledge")
     knowledge.add_argument("--knowledge", required=True)
@@ -4687,8 +4879,10 @@ def main(argv: list[str] | None = None) -> int:
         TaskSpecError,
         ArtifactError,
         CapacityError,
+        CheckpointError,
         ContextBuilderError,
         ControlCenterError,
+        EffectivenessError,
         EventError,
         ExecutorError,
         GateError,
