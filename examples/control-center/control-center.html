@@ -276,6 +276,8 @@
   /* ---------- charts ---------- */
   .chart { margin: 4px 0 0; }
   .chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .bar-row { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); gap: 8px; align-items: center; min-height: 26px; }
+  .bar-label { font-size: 12px; color: var(--ink-2); overflow-wrap: anywhere; }
   .seg { cursor: default; }
   .seg:focus { outline: none; }
   .seg-label { font-size: 11px; fill: var(--ink-2); }
@@ -355,7 +357,7 @@
     // feed is labelled with.
     layout: "phone", dest: "projects", detail: null, sheet: "", shown: 0,
     telemetry: null, telemetryAt: "",
-    lastGoodAt: "", degraded: "", feedSeenAt: 0,
+    lastGoodAt: "", degraded: "", feedSeenAt: 0, recoveryReadAt: 0,
     // Listener failures per collection: a later snapshot adoption clears
     // state.error, but a dead notes or drafts feed stays dead until reload,
     // so its banner must survive adoption.
@@ -895,6 +897,7 @@
     }
     document_.totals = totals;
     state.snapshot = document_;
+    state.lastGoodAt = document_.generatedAt || "";
     backfillNotes(document_);
     state.snapshotMeta = { loadedAt: loadedAt || "", loadedBy: loadedBy || "" };
     state.error = "";
@@ -1698,7 +1701,7 @@
 
   function markFeedAlive() {
     state.feedSeenAt = Date.now();
-    if (state.snapshot) state.lastGoodAt = state.snapshot.generatedAt || state.lastGoodAt;
+    state.feedErrors.delete("snapshot");
     if (state.degraded) { state.degraded = ""; render(); }
   }
 
@@ -1714,6 +1717,7 @@
     // on screen until the replacement verifies.
     if (recovering || !state.db) return false;
     recovering = true;
+    state.recoveryReadAt = Date.now();
     degrade(reason);
     // The generation is claimed BEFORE the read, for the same reason the
     // subscription drain claims it on receipt: a read is served with the
@@ -1731,7 +1735,8 @@
       if (delivery !== snapshotAdoptions) return false;
       if (problem) { degrade("Recovery snapshot was refused: " + problem); return false; }
       adoptSnapshot(body.document, body.loadedAt, body.loadedBy);
-      markFeedAlive();
+      // A verified read refreshes the snapshot. Subscription health changes on delivery.
+      state.degraded = "Snapshot refreshed. Waiting for a live subscription update.";
       render();
       return true;
     } catch (error) {
@@ -1806,8 +1811,8 @@
 
   function watchFeed() {
     setInterval(() => {
-      if (!state.db || !state.feedSeenAt) return;
-      if (Date.now() - state.feedSeenAt < FEED_STALL_MS) return;
+      const lastContact = Math.max(state.feedSeenAt, state.recoveryReadAt);
+      if (!state.db || !lastContact || Date.now() - lastContact < FEED_STALL_MS) return;
       recoverSnapshot("Live updates went quiet; reloading a full snapshot.");
     }, 15_000);
   }
@@ -1909,46 +1914,32 @@
         || "no entry in this view observed the figure it would be ranked by.");
     }
     const max = Math.max(...known.map((row) => row.value), 1);
-    const rowHeight = 26;
-    const height = rows.length * rowHeight;
-    const labelWidth = 34;
     const reading = (row) => (row.value === null || row.value === undefined
-      ? "unknown" : String(row.value));
+      ? "unknown" : row.reading || String(row.value));
     const summary = title + ": " + rows.map((row) => row.label + " " + reading(row)).join(", ");
-    const svg = svgEl("svg", {
-      viewBox: "0 0 100 " + height, preserveAspectRatio: "none",
-      role: "img", "aria-label": summary, focusable: "false",
-      style: "height:" + height + "px",
-    });
+    const chart = el("div", { class: "chart bar-chart", role: "img", "aria-label": summary });
     rows.forEach((row, index) => {
       const unknown = row.value === null || row.value === undefined;
-      const width = unknown ? 0 : Math.max(row.value > 0 ? 1 : 0, (row.value / max) * (100 - labelWidth));
-      const y = index * rowHeight;
+      const width = unknown ? 0 : Math.max(row.value > 0 ? 1 : 0, row.value / max * 100);
       const group = svgEl("g", {});
       group.append(svgEl("rect", {
-        x: 0, y: y + 6, width: 100 - labelWidth, height: 12, rx: 3,
-        fill: "var(--mute-bg)",
-        // A hatched track, so an unknown row is not read as a zero-length bar.
+        x: 0, y: 2, width: 100, height: 12, rx: 3, fill: "var(--mute-bg)",
         "stroke-dasharray": unknown ? "2 2" : null,
-        stroke: unknown ? "var(--ink-3)" : null,
-        "stroke-width": unknown ? "0.4" : null,
+        stroke: unknown ? "var(--ink-3)" : null, "stroke-width": unknown ? "0.4" : null,
       }));
       if (width > 0) {
         group.append(svgEl("rect", {
-          x: 0, y: y + 6, width, height: 12, rx: 3,
-          fill: row.colour || SERIES[index % SERIES.length],
+          x: 0, y: 2, width, height: 12, rx: 3, fill: row.colour || SERIES[index % SERIES.length],
         }));
       }
-      group.append(svgEl("text", {
-        x: 100 - labelWidth + 2, y: y + 15, class: "seg-label",
-        "font-size": "9", text: row.label + " · " + reading(row),
-      }));
-      svg.append(describable(group, row.label + ": " + reading(row)
-        + (row.note ? " (" + row.note + ")" : "")));
+      const bar = svgEl("svg", { viewBox: "0 0 100 16", preserveAspectRatio: "none", style: "height:16px" });
+      bar.append(describable(group, row.label + ": " + reading(row) + (row.note ? " (" + row.note + ")" : "")));
+      chart.append(el("div", { class: "bar-row" }, bar,
+        el("span", { class: "bar-label", text: row.label + " · " + reading(row) })));
     });
     return el("div", { class: "card" },
       el("h3", { text: title }),
-      el("div", { class: "chart" }, svg),
+      chart,
       rows.length > known.length
         ? el("p", { class: "tiny muted", style: "margin:8px 0 0",
             text: (rows.length - known.length) + " of " + rows.length
@@ -2127,7 +2118,13 @@
       const missing = Number(entry.unknownRecords) || 0;
       return { known: false, value: null, text: "unknown", note: missing ? missing + " record(s) did not observe it" : "" };
     }
-    return { known: true, value: Number(value), text: String(value), note: Number(entry.unknownRecords) ? entry.unknownRecords + " record(s) unobserved" : "" };
+    const { knownRecords, unknownRecords } = entry;
+    const partial = Number.isInteger(unknownRecords) && unknownRecords > 0;
+    return {
+      known: true, value: Number(value), knownRecords, unknownRecords,
+      text: String(value) + (partial ? " (partial)" : ""),
+      note: partial ? unknownRecords + " record(s) unobserved" : "",
+    };
   }
 
   /* The grouping a view's reader depends on.
@@ -2175,6 +2172,7 @@
         // "claude-opus-5 · 0" in the chart's own label and announce a figure
         // nobody measured as zero dollars.
         value: amount.known ? amount.value : null,
+        reading: amount.text,
         note: amount.known ? amount.note : amount.note || "not observed",
       });
     }
@@ -2535,7 +2533,9 @@
         el("thead", null, el("tr", null,
           el("th", { text: "figure" }), el("th", { text: "estimate" }), el("th", { text: "actual" }), el("th", { text: "delta" }))),
         el("tbody", null, pairs.map(([label, estimate, actual]) => {
-          const both = estimate.known && actual.known;
+          const both = Number.isSafeInteger(match.records) && match.records > 0
+            && [estimate, actual].every((amount) => amount.known && amount.unknownRecords === 0
+              && amount.knownRecords === match.records);
           return el("tr", null,
             el("td", { text: label }),
             el("td", { text: estimate.text }),
@@ -3306,7 +3306,11 @@
     // "resolved" note, whatever the timestamps say: export times are not
     // occurrence times, so no clock comparison decides this.
     const contradicted = note?.status === "resolved";
-    const card = el("div", { class: "inc " + (incident.severity || "advisory") },
+    const card = el("div", {
+      class: "inc " + (incident.severity || "advisory"),
+      // The phone sheet retains sections by markup. Include the identity used by its actions.
+      "data-note-target": JSON.stringify([incident.projectId, incident.sourceProvider || "", incident.incidentId]),
+    },
       el("div", { class: "row" },
         chip(txt(incident.severity), SEVERITY[incident.severity] || "line"),
         chip(txt(project.displayName, project.projectId), "line"),

@@ -208,7 +208,7 @@ test("charts are accessible images with keyboard-reachable tooltips", async (bro
     await page.locator("#bottom-nav .dest").nth(2).click();
     await page.waitForTimeout(60);
     const charts = await page.evaluate(() =>
-      [...document.querySelectorAll('#view svg[role="img"]')].map((node) => node.getAttribute("aria-label")));
+      [...document.querySelectorAll('#view svg[role="img"], #view .bar-chart[role="img"]')].map((node) => node.getAttribute("aria-label")));
     assert(charts.length > 0, "the Agents destination drew no chart");
     for (const label of charts) {
       assert(label && label.length > 8, `a chart has no usable aria-label: ${JSON.stringify(label)}`);
@@ -408,6 +408,12 @@ test("a stopped feed keeps the last-good view and reloads a full snapshot", asyn
     assert(after.text.includes("last good") || after.text.includes("Showing the last"),
       "the degraded view is not labelled as last-good");
     assert(after.lastGoodAt.length > 0, "no last-good instant was recorded");
+    assert(after.degraded, "a recovery read incorrectly restored the live status");
+    assertEqual(await page.locator("#view .chip.ok").filter({ hasText: /^live$/ }).count(), 0, "a terminated listener is labelled live");
+    await deliverFresh(page, SNAPSHOT, "subscription resumed");
+    await page.waitForFunction(() => window.__forgeConsole.degraded === "");
+    assertEqual(await page.getByText("Live snapshot updates stopped", { exact: false }).count(), 0,
+      "a verified subscription delivery retained a stopped-feed warning");
   } finally { await context.close(); }
 });
 
@@ -680,7 +686,7 @@ test("active-agent charts count only units the producer calls active", async (br
         totals.active += (project.active || []).length;
         totals.held += (project.attention || []).length + (project.waiting || []).length;
       }
-      const label = [...document.querySelectorAll('#view svg[role="img"]')]
+      const label = [...document.querySelectorAll('#view svg[role="img"], #view .bar-chart[role="img"]')]
         .map((node) => node.getAttribute("aria-label"))
         .find((text) => /active agents by model/i.test(text)) || "";
       const charted = [...label.matchAll(/ (\d+)(?:,|$)/g)].reduce(
@@ -741,7 +747,7 @@ test("a daily trend breaks across a calendar day nobody observed", async (browse
     await page.locator("#bottom-nav .dest").nth(3).click();
     await page.waitForTimeout(80);
     const trend = await page.evaluate(() => {
-      const label = [...document.querySelectorAll('#view svg[role="img"]')]
+      const label = [...document.querySelectorAll('#view svg[role="img"], #view .bar-chart[role="img"]')]
         .map((node) => node.getAttribute("aria-label"))
         .find((text) => /per day/i.test(text)) || "";
       const summary = [...document.querySelectorAll("#view .card")]
@@ -772,11 +778,11 @@ test("an unobserved cost is never charted or announced as zero", async (browser)
     const chart = await page.evaluate((name) => {
       const card = [...document.querySelectorAll("#view .card")]
         .find((node) => /pay-as-you-go equivalent by model/i.test(node.innerText));
-      const svg = card?.querySelector('svg[role="img"]');
+      const chart = card?.querySelector('.bar-chart[role="img"]');
       const row = [...(card?.querySelectorAll("svg .seg") || [])]
         .map((node) => node.getAttribute("aria-label"))
         .find((text) => text && text.startsWith(name));
-      return { label: svg?.getAttribute("aria-label") || "", text: card?.innerText || "", row };
+      return { label: chart?.getAttribute("aria-label") || "", text: card?.innerText || "", row };
     }, model);
     assert(!new RegExp(model + " 0(?!\\\\d)").test(chart.label),
       `the accessible summary announces an unobserved cost as zero: ${chart.label}`);
@@ -915,7 +921,7 @@ test("the portfolio rail counts every unit the snapshot's own census holds", asy
           census[stage] = (census[stage] || 0) + count;
         }
       }
-      const label = [...document.querySelectorAll('#view svg[role="img"]')]
+      const label = [...document.querySelectorAll('#view svg[role="img"], #view .bar-chart[role="img"]')]
         .map((node) => node.getAttribute("aria-label"))
         .find((text) => /lifecycle rail, all projects/i.test(text)) || "";
       return { census, label };
@@ -1177,6 +1183,80 @@ test("a recovery read that fails with nothing newer still degrades", async (brow
     await context.close();
   }
 });
+
+
+test("partial work-unit measurements retain coverage and suppress the delta", async (browser) => {
+  const { context, page } = await openConsole(browser);
+  try {
+    const bundle = structuredClone(TELEMETRY);
+    const bucket = bundle.byWorkUnit.buckets.find((item) =>
+      item.key.projectId === SNAPSHOT.projects[0].projectId && item.key.workUnitId === SNAPSHOT.projects[0].active[0].workUnitId);
+    bucket.records = 2;
+    bucket.estimated.runtimeSeconds = { value: 200, knownRecords: 2, unknownRecords: 0 };
+    bucket.actual.runtimeSeconds = { value: 100, knownRecords: 1, unknownRecords: 1 };
+    assertEqual(await page.evaluate((data) => window.__forgeConsole.loadTelemetry(data), bundle), "", "bundle load");
+    await page.locator("#bottom-nav .dest").nth(1).tap();
+    await page.locator(".ucard-btn").filter({ has: page.getByText(bucket.key.workUnitId, { exact: true }) }).tap();
+    const row = page.locator(".detail tr").filter({ has: page.getByText("runtime seconds", { exact: true }) });
+    const cells = await row.locator("td").allTextContents();
+    assertEqual(cells.join("|"), "runtime seconds|200|100 (partial)|unknown", "partial coverage");
+
+    bucket.actual.runtimeSeconds = { value: 100, knownRecords: 2, unknownRecords: 0 };
+    assertEqual(await page.evaluate((data) => window.__forgeConsole.loadTelemetry(data), bundle), "", "complete bundle");
+    assertEqual(await row.locator("td").last().textContent(), "-100", "complete coverage delta");
+  } finally { await context.close(); }
+});
+
+test("recording on the phone blocker sheet uses the replacement incident identity", async (browser) => {
+  const { context, page } = await openConsole(browser);
+  try {
+    const snapshot = structuredClone(SNAPSHOT);
+    const incident = snapshot.projects[0].incidents[0];
+    // Remove evidence links so changing the provider cannot change any visible markup.
+    incident.evidenceRef = "";
+    incident.backlogItemId = "";
+    incident.detail = "Identically worded incident";
+    await deliverFresh(page, snapshot, "first incident");
+    await page.getByRole("button", { name: /^Blockers/ }).tap();
+    const card = page.locator("#view .inc").filter({ has: page.getByText(incident.detail, { exact: true }) });
+    await card.waitFor();
+    incident.incidentId += "-replacement";
+    incident.sourceProvider = "gitlab";
+    await deliverFresh(page, snapshot, "replacement incident");
+    await page.waitForFunction((id) => window.__forgeConsole.snapshotProjects[0].incidents[0].incidentId === id,
+      incident.incidentId);
+    const text = "Recorded on the replacement incident";
+    await card.getByRole("textbox").fill(text);
+    await card.getByRole("button", { name: "Record", exact: true }).tap();
+    await card.getByText(text, { exact: true }).waitFor({ timeout: 5000 });
+  } finally { await context.close(); }
+});
+
+for (const [name, width, height] of PHONES) {
+  test(`full model and worker labels fit the chart on ${name}`, async (browser) => {
+    const { context, page } = await openConsole(browser, { width, height });
+    try {
+      await page.locator("#bottom-nav .dest").nth(2).tap();
+      const cards = page.locator("#view .card").filter({ has: page.getByRole("heading", { name: /^Active agents by (model|worker)$/ }) });
+      assertEqual(await cards.count(), 2, "model and worker charts");
+      for (const card of await cards.all()) {
+        const labels = card.locator(".bar-label");
+        assert(await labels.count() > 0, "missing chart labels");
+        for (const label of await labels.all()) {
+          const visible = await label.evaluate((element) => {
+            const bounds = element.closest(".card").getBoundingClientRect();
+            const range = document.createRange();
+            range.selectNodeContents(element);
+            const rects = Array.from(range.getClientRects());
+            return /.+ · \d+/.test(element.textContent) && rects.length > 0 && rects.every((r) =>
+              r.left >= bounds.left && r.right <= bounds.right && r.top >= bounds.top && r.bottom <= bounds.bottom);
+          });
+          assert(visible, "a complete label/value pair is not visible inside its card");
+        }
+      }
+    } finally { await context.close(); }
+  });
+}
 
 /* ---------- runner ---------- */
 const browser = await chromium.launch({ args: ["--no-sandbox"] });
