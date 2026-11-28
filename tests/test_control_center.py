@@ -5378,7 +5378,9 @@ def test_the_console_binds_incidents_and_enforces_full_membership():
     assert 'Live " + collection + " updates stopped' in html
     assert "function feedStopped(collection, error)" in html
     assert "feedErrors: new Map()" in html
-    assert "for (const message of state.feedErrors.values())" in html
+    # Each banner is keyed by its collection now that the view is patched
+    # rather than rebuilt, so the entries are iterated, not just the messages.
+    assert "for (const [collection, message] of state.feedErrors)" in html
     # Both timestamp clamps are bounded — notes AND project drafts: an absurd
     # stored timestamp cannot overflow the Date range and break every save.
     assert html.count("parsed <= ceiling") == 2
@@ -5488,7 +5490,10 @@ def test_the_console_validates_backlog_provenance_and_scoped_liveness():
     # escapes are peeled INDIVIDUALLY: decodeURIComponent throws on one
     # malformed escape (%ZZ%67hp_...) and would stop the scan before the
     # valid escape beside it decoded.
-    assert "const tokenShaped = (raw) =>" in html
+    # Hoisted to module scope so the snapshot and telemetry validators share
+    # exactly one implementation; the snapshot validator binds the old name.
+    assert "function credentialShaped(raw) {" in html
+    assert "const tokenShaped = credentialShaped;" in html
     assert "try { peeled = decodeURIComponent(decoded); } catch" not in html
     assert "const peel = (text) => text.replace(/%([0-9a-fA-F]{2})/g," in html
     assert html.count("|| tokenShaped(value)") >= 4

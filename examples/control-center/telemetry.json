@@ -1,0 +1,3054 @@
+{
+ "schemaVersion": 1,
+ "generatedAt": "2026-10-29T09:00:00Z",
+ "byModel": {
+  "schemaVersion": 1,
+  "groupBy": [
+   "model"
+  ],
+  "buckets": [
+   {
+    "key": {
+     "model": "claude-opus-5"
+    },
+    "records": 9,
+    "runs": 9,
+    "retryAttempts": 0,
+    "byResult": {
+     "completed": 9
+    },
+    "estimated": {
+     "tokens": {
+      "input": {
+       "value": 99000,
+       "knownRecords": 9,
+       "unknownRecords": 0
+      },
+      "output": {
+       "value": 27000,
+       "knownRecords": 9,
+       "unknownRecords": 0
+      },
+      "cacheRead": {
+       "value": null,
+       "knownRecords": 0,
+       "unknownRecords": 9
+      },
+      "cacheWrite": {
+       "value": null,
+       "knownRecords": 0,
+       "unknownRecords": 9
+      }
+     },
+     "totalTokens": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 9
+     },
+     "runtimeSeconds": {
+      "value": 16200,
+      "knownRecords": 9,
+      "unknownRecords": 0
+     },
+     "paygEquivalentUsd": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 9
+     },
+     "planCapacityUnits": {}
+    },
+    "actual": {
+     "tokens": {
+      "input": {
+       "value": 132500,
+       "knownRecords": 9,
+       "unknownRecords": 0
+      },
+      "output": {
+       "value": 35100,
+       "knownRecords": 9,
+       "unknownRecords": 0
+      },
+      "cacheRead": {
+       "value": 36000,
+       "knownRecords": 9,
+       "unknownRecords": 0
+      },
+      "cacheWrite": {
+       "value": 10800,
+       "knownRecords": 9,
+       "unknownRecords": 0
+      }
+     },
+     "totalTokens": {
+      "value": 214400,
+      "knownRecords": 9,
+      "unknownRecords": 0
+     },
+     "runtimeSeconds": {
+      "value": 21600,
+      "knownRecords": 9,
+      "unknownRecords": 0
+     },
+     "waitSeconds": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 9
+     },
+     "runtimeSecondsByResult": {
+      "completed": {
+       "value": 21600,
+       "knownRecords": 9,
+       "unknownRecords": 0
+      }
+     },
+     "paygEquivalentUsd": {
+      "value": 0.9753,
+      "knownRecords": 9,
+      "unknownRecords": 0
+     },
+     "billedUsd": {
+      "value": 0.9753,
+      "knownRecords": 9,
+      "unknownRecords": 0
+     },
+     "planCapacityUnits": {},
+     "monetaryStatus": {
+      "payg": 9
+     }
+    },
+    "estimateError": {
+     "meanAbsolutePercentage": {
+      "input": {
+       "value": 33.8389,
+       "samples": 9
+      },
+      "output": {
+       "value": 29.9967,
+       "samples": 9
+      },
+      "runtimeSeconds": {
+       "value": 33.33,
+       "samples": 9
+      }
+     }
+    },
+    "infrastructure": {
+     "costUsd": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 9
+     },
+     "runnerSeconds": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 9
+     },
+     "ciMinutes": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 9
+     }
+    }
+   },
+   {
+    "key": {
+     "model": "gpt-5-codex"
+    },
+    "records": 9,
+    "runs": 9,
+    "retryAttempts": 0,
+    "byResult": {
+     "completed": 9
+    },
+    "estimated": {
+     "tokens": {
+      "input": {
+       "value": 99000,
+       "knownRecords": 9,
+       "unknownRecords": 0
+      },
+      "output": {
+       "value": 27000,
+       "knownRecords": 9,
+       "unknownRecords": 0
+      },
+      "cacheRead": {
+       "value": null,
+       "knownRecords": 0,
+       "unknownRecords": 9
+      },
+      "cacheWrite": {
+       "value": null,
+       "knownRecords": 0,
+       "unknownRecords": 9
+      }
+     },
+     "totalTokens": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 9
+     },
+     "runtimeSeconds": {
+      "value": 16200,
+      "knownRecords": 9,
+      "unknownRecords": 0
+     },
+     "paygEquivalentUsd": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 9
+     },
+     "planCapacityUnits": {}
+    },
+    "actual": {
+     "tokens": {
+      "input": {
+       "value": 132500,
+       "knownRecords": 9,
+       "unknownRecords": 0
+      },
+      "output": {
+       "value": 35100,
+       "knownRecords": 9,
+       "unknownRecords": 0
+      },
+      "cacheRead": {
+       "value": 36000,
+       "knownRecords": 9,
+       "unknownRecords": 0
+      },
+      "cacheWrite": {
+       "value": 10800,
+       "knownRecords": 9,
+       "unknownRecords": 0
+      }
+     },
+     "totalTokens": {
+      "value": 214400,
+      "knownRecords": 9,
+      "unknownRecords": 0
+     },
+     "runtimeSeconds": {
+      "value": 21600,
+      "knownRecords": 9,
+      "unknownRecords": 0
+     },
+     "waitSeconds": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 9
+     },
+     "runtimeSecondsByResult": {
+      "completed": {
+       "value": 21600,
+       "knownRecords": 9,
+       "unknownRecords": 0
+      }
+     },
+     "paygEquivalentUsd": {
+      "value": 0.9753,
+      "knownRecords": 9,
+      "unknownRecords": 0
+     },
+     "billedUsd": {
+      "value": 0.9753,
+      "knownRecords": 9,
+      "unknownRecords": 0
+     },
+     "planCapacityUnits": {},
+     "monetaryStatus": {
+      "payg": 9
+     }
+    },
+    "estimateError": {
+     "meanAbsolutePercentage": {
+      "input": {
+       "value": 33.8389,
+       "samples": 9
+      },
+      "output": {
+       "value": 29.9967,
+       "samples": 9
+      },
+      "runtimeSeconds": {
+       "value": 33.33,
+       "samples": 9
+      }
+     }
+    },
+    "infrastructure": {
+     "costUsd": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 9
+     },
+     "runnerSeconds": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 9
+     },
+     "ciMinutes": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 9
+     }
+    }
+   }
+  ],
+  "totals": {
+   "key": {},
+   "records": 18,
+   "runs": 18,
+   "retryAttempts": 0,
+   "byResult": {
+    "completed": 18
+   },
+   "estimated": {
+    "tokens": {
+     "input": {
+      "value": 198000,
+      "knownRecords": 18,
+      "unknownRecords": 0
+     },
+     "output": {
+      "value": 54000,
+      "knownRecords": 18,
+      "unknownRecords": 0
+     },
+     "cacheRead": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 18
+     },
+     "cacheWrite": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 18
+     }
+    },
+    "totalTokens": {
+     "value": null,
+     "knownRecords": 0,
+     "unknownRecords": 18
+    },
+    "runtimeSeconds": {
+     "value": 32400,
+     "knownRecords": 18,
+     "unknownRecords": 0
+    },
+    "paygEquivalentUsd": {
+     "value": null,
+     "knownRecords": 0,
+     "unknownRecords": 18
+    },
+    "planCapacityUnits": {}
+   },
+   "actual": {
+    "tokens": {
+     "input": {
+      "value": 265000,
+      "knownRecords": 18,
+      "unknownRecords": 0
+     },
+     "output": {
+      "value": 70200,
+      "knownRecords": 18,
+      "unknownRecords": 0
+     },
+     "cacheRead": {
+      "value": 72000,
+      "knownRecords": 18,
+      "unknownRecords": 0
+     },
+     "cacheWrite": {
+      "value": 21600,
+      "knownRecords": 18,
+      "unknownRecords": 0
+     }
+    },
+    "totalTokens": {
+     "value": 428800,
+     "knownRecords": 18,
+     "unknownRecords": 0
+    },
+    "runtimeSeconds": {
+     "value": 43200,
+     "knownRecords": 18,
+     "unknownRecords": 0
+    },
+    "waitSeconds": {
+     "value": null,
+     "knownRecords": 0,
+     "unknownRecords": 18
+    },
+    "runtimeSecondsByResult": {
+     "completed": {
+      "value": 43200,
+      "knownRecords": 18,
+      "unknownRecords": 0
+     }
+    },
+    "paygEquivalentUsd": {
+     "value": 1.9506,
+     "knownRecords": 18,
+     "unknownRecords": 0
+    },
+    "billedUsd": {
+     "value": 1.9506,
+     "knownRecords": 18,
+     "unknownRecords": 0
+    },
+    "planCapacityUnits": {},
+    "monetaryStatus": {
+     "payg": 18
+    }
+   },
+   "estimateError": {
+    "meanAbsolutePercentage": {
+     "input": {
+      "value": 33.8389,
+      "samples": 18
+     },
+     "output": {
+      "value": 29.9967,
+      "samples": 18
+     },
+     "runtimeSeconds": {
+      "value": 33.33,
+      "samples": 18
+     }
+    }
+   },
+   "infrastructure": {
+    "costUsd": {
+     "value": null,
+     "knownRecords": 0,
+     "unknownRecords": 18
+    },
+    "runnerSeconds": {
+     "value": null,
+     "knownRecords": 0,
+     "unknownRecords": 18
+    },
+    "ciMinutes": {
+     "value": null,
+     "knownRecords": 0,
+     "unknownRecords": 18
+    }
+   }
+  },
+  "limitations": [
+   "sums cover known values only; unknownRecords counts what was not observable",
+   "billedUsd is set only for pay-as-you-go pricing; subscription usage is never presented as billed",
+   "paygEquivalentUsd for subscription usage is a reference figure at the snapshot's reference rates",
+   "infrastructure cost is reported separately from AI cost equivalent and is never combined into one total"
+  ]
+ },
+ "byDay": {
+  "schemaVersion": 1,
+  "groupBy": [
+   "day"
+  ],
+  "buckets": [
+   {
+    "key": {
+     "day": "2026-10-26"
+    },
+    "records": 10,
+    "runs": 10,
+    "retryAttempts": 0,
+    "byResult": {
+     "completed": 10
+    },
+    "estimated": {
+     "tokens": {
+      "input": {
+       "value": 110000,
+       "knownRecords": 10,
+       "unknownRecords": 0
+      },
+      "output": {
+       "value": 30000,
+       "knownRecords": 10,
+       "unknownRecords": 0
+      },
+      "cacheRead": {
+       "value": null,
+       "knownRecords": 0,
+       "unknownRecords": 10
+      },
+      "cacheWrite": {
+       "value": null,
+       "knownRecords": 0,
+       "unknownRecords": 10
+      }
+     },
+     "totalTokens": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 10
+     },
+     "runtimeSeconds": {
+      "value": 18000,
+      "knownRecords": 10,
+      "unknownRecords": 0
+     },
+     "paygEquivalentUsd": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 10
+     },
+     "planCapacityUnits": {}
+    },
+    "actual": {
+     "tokens": {
+      "input": {
+       "value": 130000,
+       "knownRecords": 10,
+       "unknownRecords": 0
+      },
+      "output": {
+       "value": 34000,
+       "knownRecords": 10,
+       "unknownRecords": 0
+      },
+      "cacheRead": {
+       "value": 40000,
+       "knownRecords": 10,
+       "unknownRecords": 0
+      },
+      "cacheWrite": {
+       "value": 12000,
+       "knownRecords": 10,
+       "unknownRecords": 0
+      }
+     },
+     "totalTokens": {
+      "value": 216000,
+      "knownRecords": 10,
+      "unknownRecords": 0
+     },
+     "runtimeSeconds": {
+      "value": 24000,
+      "knownRecords": 10,
+      "unknownRecords": 0
+     },
+     "waitSeconds": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 10
+     },
+     "runtimeSecondsByResult": {
+      "completed": {
+       "value": 24000,
+       "knownRecords": 10,
+       "unknownRecords": 0
+      }
+     },
+     "paygEquivalentUsd": {
+      "value": 0.957,
+      "knownRecords": 10,
+      "unknownRecords": 0
+     },
+     "billedUsd": {
+      "value": 0.957,
+      "knownRecords": 10,
+      "unknownRecords": 0
+     },
+     "planCapacityUnits": {},
+     "monetaryStatus": {
+      "payg": 10
+     }
+    },
+    "estimateError": {
+     "meanAbsolutePercentage": {
+      "input": {
+       "value": 18.182,
+       "samples": 10
+      },
+      "output": {
+       "value": 13.33,
+       "samples": 10
+      },
+      "runtimeSeconds": {
+       "value": 33.33,
+       "samples": 10
+      }
+     }
+    },
+    "infrastructure": {
+     "costUsd": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 10
+     },
+     "runnerSeconds": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 10
+     },
+     "ciMinutes": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 10
+     }
+    }
+   },
+   {
+    "key": {
+     "day": "2026-10-27"
+    },
+    "records": 6,
+    "runs": 6,
+    "retryAttempts": 0,
+    "byResult": {
+     "completed": 6
+    },
+    "estimated": {
+     "tokens": {
+      "input": {
+       "value": 66000,
+       "knownRecords": 6,
+       "unknownRecords": 0
+      },
+      "output": {
+       "value": 18000,
+       "knownRecords": 6,
+       "unknownRecords": 0
+      },
+      "cacheRead": {
+       "value": null,
+       "knownRecords": 0,
+       "unknownRecords": 6
+      },
+      "cacheWrite": {
+       "value": null,
+       "knownRecords": 0,
+       "unknownRecords": 6
+      }
+     },
+     "totalTokens": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 6
+     },
+     "runtimeSeconds": {
+      "value": 10800,
+      "knownRecords": 6,
+      "unknownRecords": 0
+     },
+     "paygEquivalentUsd": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 6
+     },
+     "planCapacityUnits": {}
+    },
+    "actual": {
+     "tokens": {
+      "input": {
+       "value": 97000,
+       "knownRecords": 6,
+       "unknownRecords": 0
+      },
+      "output": {
+       "value": 25800,
+       "knownRecords": 6,
+       "unknownRecords": 0
+      },
+      "cacheRead": {
+       "value": 24000,
+       "knownRecords": 6,
+       "unknownRecords": 0
+      },
+      "cacheWrite": {
+       "value": 7200,
+       "knownRecords": 6,
+       "unknownRecords": 0
+      }
+     },
+     "totalTokens": {
+      "value": 154000,
+      "knownRecords": 6,
+      "unknownRecords": 0
+     },
+     "runtimeSeconds": {
+      "value": 14400,
+      "knownRecords": 6,
+      "unknownRecords": 0
+     },
+     "waitSeconds": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 6
+     },
+     "runtimeSecondsByResult": {
+      "completed": {
+       "value": 14400,
+       "knownRecords": 6,
+       "unknownRecords": 0
+      }
+     },
+     "paygEquivalentUsd": {
+      "value": 0.7122,
+      "knownRecords": 6,
+      "unknownRecords": 0
+     },
+     "billedUsd": {
+      "value": 0.7122,
+      "knownRecords": 6,
+      "unknownRecords": 0
+     },
+     "planCapacityUnits": {},
+     "monetaryStatus": {
+      "payg": 6
+     }
+    },
+    "estimateError": {
+     "meanAbsolutePercentage": {
+      "input": {
+       "value": 46.97,
+       "samples": 6
+      },
+      "output": {
+       "value": 43.33,
+       "samples": 6
+      },
+      "runtimeSeconds": {
+       "value": 33.33,
+       "samples": 6
+      }
+     }
+    },
+    "infrastructure": {
+     "costUsd": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 6
+     },
+     "runnerSeconds": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 6
+     },
+     "ciMinutes": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 6
+     }
+    }
+   },
+   {
+    "key": {
+     "day": "2026-10-28"
+    },
+    "records": 2,
+    "runs": 2,
+    "retryAttempts": 0,
+    "byResult": {
+     "completed": 2
+    },
+    "estimated": {
+     "tokens": {
+      "input": {
+       "value": 22000,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      },
+      "output": {
+       "value": 6000,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      },
+      "cacheRead": {
+       "value": null,
+       "knownRecords": 0,
+       "unknownRecords": 2
+      },
+      "cacheWrite": {
+       "value": null,
+       "knownRecords": 0,
+       "unknownRecords": 2
+      }
+     },
+     "totalTokens": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 2
+     },
+     "runtimeSeconds": {
+      "value": 3600,
+      "knownRecords": 2,
+      "unknownRecords": 0
+     },
+     "paygEquivalentUsd": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 2
+     },
+     "planCapacityUnits": {}
+    },
+    "actual": {
+     "tokens": {
+      "input": {
+       "value": 38000,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      },
+      "output": {
+       "value": 10400,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      },
+      "cacheRead": {
+       "value": 8000,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      },
+      "cacheWrite": {
+       "value": 2400,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      }
+     },
+     "totalTokens": {
+      "value": 58800,
+      "knownRecords": 2,
+      "unknownRecords": 0
+     },
+     "runtimeSeconds": {
+      "value": 4800,
+      "knownRecords": 2,
+      "unknownRecords": 0
+     },
+     "waitSeconds": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 2
+     },
+     "runtimeSecondsByResult": {
+      "completed": {
+       "value": 4800,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      }
+     },
+     "paygEquivalentUsd": {
+      "value": 0.2814,
+      "knownRecords": 2,
+      "unknownRecords": 0
+     },
+     "billedUsd": {
+      "value": 0.2814,
+      "knownRecords": 2,
+      "unknownRecords": 0
+     },
+     "planCapacityUnits": {},
+     "monetaryStatus": {
+      "payg": 2
+     }
+    },
+    "estimateError": {
+     "meanAbsolutePercentage": {
+      "input": {
+       "value": 72.73,
+       "samples": 2
+      },
+      "output": {
+       "value": 73.33,
+       "samples": 2
+      },
+      "runtimeSeconds": {
+       "value": 33.33,
+       "samples": 2
+      }
+     }
+    },
+    "infrastructure": {
+     "costUsd": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 2
+     },
+     "runnerSeconds": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 2
+     },
+     "ciMinutes": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 2
+     }
+    }
+   }
+  ],
+  "totals": {
+   "key": {},
+   "records": 18,
+   "runs": 18,
+   "retryAttempts": 0,
+   "byResult": {
+    "completed": 18
+   },
+   "estimated": {
+    "tokens": {
+     "input": {
+      "value": 198000,
+      "knownRecords": 18,
+      "unknownRecords": 0
+     },
+     "output": {
+      "value": 54000,
+      "knownRecords": 18,
+      "unknownRecords": 0
+     },
+     "cacheRead": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 18
+     },
+     "cacheWrite": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 18
+     }
+    },
+    "totalTokens": {
+     "value": null,
+     "knownRecords": 0,
+     "unknownRecords": 18
+    },
+    "runtimeSeconds": {
+     "value": 32400,
+     "knownRecords": 18,
+     "unknownRecords": 0
+    },
+    "paygEquivalentUsd": {
+     "value": null,
+     "knownRecords": 0,
+     "unknownRecords": 18
+    },
+    "planCapacityUnits": {}
+   },
+   "actual": {
+    "tokens": {
+     "input": {
+      "value": 265000,
+      "knownRecords": 18,
+      "unknownRecords": 0
+     },
+     "output": {
+      "value": 70200,
+      "knownRecords": 18,
+      "unknownRecords": 0
+     },
+     "cacheRead": {
+      "value": 72000,
+      "knownRecords": 18,
+      "unknownRecords": 0
+     },
+     "cacheWrite": {
+      "value": 21600,
+      "knownRecords": 18,
+      "unknownRecords": 0
+     }
+    },
+    "totalTokens": {
+     "value": 428800,
+     "knownRecords": 18,
+     "unknownRecords": 0
+    },
+    "runtimeSeconds": {
+     "value": 43200,
+     "knownRecords": 18,
+     "unknownRecords": 0
+    },
+    "waitSeconds": {
+     "value": null,
+     "knownRecords": 0,
+     "unknownRecords": 18
+    },
+    "runtimeSecondsByResult": {
+     "completed": {
+      "value": 43200,
+      "knownRecords": 18,
+      "unknownRecords": 0
+     }
+    },
+    "paygEquivalentUsd": {
+     "value": 1.9506,
+     "knownRecords": 18,
+     "unknownRecords": 0
+    },
+    "billedUsd": {
+     "value": 1.9506,
+     "knownRecords": 18,
+     "unknownRecords": 0
+    },
+    "planCapacityUnits": {},
+    "monetaryStatus": {
+     "payg": 18
+    }
+   },
+   "estimateError": {
+    "meanAbsolutePercentage": {
+     "input": {
+      "value": 33.8389,
+      "samples": 18
+     },
+     "output": {
+      "value": 29.9967,
+      "samples": 18
+     },
+     "runtimeSeconds": {
+      "value": 33.33,
+      "samples": 18
+     }
+    }
+   },
+   "infrastructure": {
+    "costUsd": {
+     "value": null,
+     "knownRecords": 0,
+     "unknownRecords": 18
+    },
+    "runnerSeconds": {
+     "value": null,
+     "knownRecords": 0,
+     "unknownRecords": 18
+    },
+    "ciMinutes": {
+     "value": null,
+     "knownRecords": 0,
+     "unknownRecords": 18
+    }
+   }
+  },
+  "limitations": [
+   "sums cover known values only; unknownRecords counts what was not observable",
+   "billedUsd is set only for pay-as-you-go pricing; subscription usage is never presented as billed",
+   "paygEquivalentUsd for subscription usage is a reference figure at the snapshot's reference rates",
+   "infrastructure cost is reported separately from AI cost equivalent and is never combined into one total"
+  ]
+ },
+ "byWorkUnit": {
+  "schemaVersion": 1,
+  "groupBy": [
+   "projectId",
+   "workUnitId"
+  ],
+  "buckets": [
+   {
+    "key": {
+     "projectId": "forge",
+     "workUnitId": "wu-101"
+    },
+    "records": 1,
+    "runs": 1,
+    "retryAttempts": 0,
+    "byResult": {
+     "completed": 1
+    },
+    "estimated": {
+     "tokens": {
+      "input": {
+       "value": 11000,
+       "knownRecords": 1,
+       "unknownRecords": 0
+      },
+      "output": {
+       "value": 3000,
+       "knownRecords": 1,
+       "unknownRecords": 0
+      },
+      "cacheRead": {
+       "value": null,
+       "knownRecords": 0,
+       "unknownRecords": 1
+      },
+      "cacheWrite": {
+       "value": null,
+       "knownRecords": 0,
+       "unknownRecords": 1
+      }
+     },
+     "totalTokens": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 1
+     },
+     "runtimeSeconds": {
+      "value": 1800,
+      "knownRecords": 1,
+      "unknownRecords": 0
+     },
+     "paygEquivalentUsd": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 1
+     },
+     "planCapacityUnits": {}
+    },
+    "actual": {
+     "tokens": {
+      "input": {
+       "value": 12000,
+       "knownRecords": 1,
+       "unknownRecords": 0
+      },
+      "output": {
+       "value": 3400,
+       "knownRecords": 1,
+       "unknownRecords": 0
+      },
+      "cacheRead": {
+       "value": 4000,
+       "knownRecords": 1,
+       "unknownRecords": 0
+      },
+      "cacheWrite": {
+       "value": 1200,
+       "knownRecords": 1,
+       "unknownRecords": 0
+      }
+     },
+     "totalTokens": {
+      "value": 20600,
+      "knownRecords": 1,
+      "unknownRecords": 0
+     },
+     "runtimeSeconds": {
+      "value": 2400,
+      "knownRecords": 1,
+      "unknownRecords": 0
+     },
+     "waitSeconds": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 1
+     },
+     "runtimeSecondsByResult": {
+      "completed": {
+       "value": 2400,
+       "knownRecords": 1,
+       "unknownRecords": 0
+      }
+     },
+     "paygEquivalentUsd": {
+      "value": 0.0927,
+      "knownRecords": 1,
+      "unknownRecords": 0
+     },
+     "billedUsd": {
+      "value": 0.0927,
+      "knownRecords": 1,
+      "unknownRecords": 0
+     },
+     "planCapacityUnits": {},
+     "monetaryStatus": {
+      "payg": 1
+     }
+    },
+    "estimateError": {
+     "meanAbsolutePercentage": {
+      "input": {
+       "value": 9.09,
+       "samples": 1
+      },
+      "output": {
+       "value": 13.33,
+       "samples": 1
+      },
+      "runtimeSeconds": {
+       "value": 33.33,
+       "samples": 1
+      }
+     }
+    },
+    "infrastructure": {
+     "costUsd": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 1
+     },
+     "runnerSeconds": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 1
+     },
+     "ciMinutes": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 1
+     }
+    }
+   },
+   {
+    "key": {
+     "projectId": "forge",
+     "workUnitId": "wu-102"
+    },
+    "records": 2,
+    "runs": 2,
+    "retryAttempts": 0,
+    "byResult": {
+     "completed": 2
+    },
+    "estimated": {
+     "tokens": {
+      "input": {
+       "value": 22000,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      },
+      "output": {
+       "value": 6000,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      },
+      "cacheRead": {
+       "value": null,
+       "knownRecords": 0,
+       "unknownRecords": 2
+      },
+      "cacheWrite": {
+       "value": null,
+       "knownRecords": 0,
+       "unknownRecords": 2
+      }
+     },
+     "totalTokens": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 2
+     },
+     "runtimeSeconds": {
+      "value": 3600,
+      "knownRecords": 2,
+      "unknownRecords": 0
+     },
+     "paygEquivalentUsd": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 2
+     },
+     "planCapacityUnits": {}
+    },
+    "actual": {
+     "tokens": {
+      "input": {
+       "value": 28000,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      },
+      "output": {
+       "value": 7700,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      },
+      "cacheRead": {
+       "value": 8000,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      },
+      "cacheWrite": {
+       "value": 2400,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      }
+     },
+     "totalTokens": {
+      "value": 46100,
+      "knownRecords": 2,
+      "unknownRecords": 0
+     },
+     "runtimeSeconds": {
+      "value": 4800,
+      "knownRecords": 2,
+      "unknownRecords": 0
+     },
+     "waitSeconds": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 2
+     },
+     "runtimeSecondsByResult": {
+      "completed": {
+       "value": 4800,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      }
+     },
+     "paygEquivalentUsd": {
+      "value": 0.2109,
+      "knownRecords": 2,
+      "unknownRecords": 0
+     },
+     "billedUsd": {
+      "value": 0.2109,
+      "knownRecords": 2,
+      "unknownRecords": 0
+     },
+     "planCapacityUnits": {},
+     "monetaryStatus": {
+      "payg": 2
+     }
+    },
+    "estimateError": {
+     "meanAbsolutePercentage": {
+      "input": {
+       "value": 27.275,
+       "samples": 2
+      },
+      "output": {
+       "value": 28.33,
+       "samples": 2
+      },
+      "runtimeSeconds": {
+       "value": 33.33,
+       "samples": 2
+      }
+     }
+    },
+    "infrastructure": {
+     "costUsd": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 2
+     },
+     "runnerSeconds": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 2
+     },
+     "ciMinutes": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 2
+     }
+    }
+   },
+   {
+    "key": {
+     "projectId": "forge",
+     "workUnitId": "wu-104"
+    },
+    "records": 1,
+    "runs": 1,
+    "retryAttempts": 0,
+    "byResult": {
+     "completed": 1
+    },
+    "estimated": {
+     "tokens": {
+      "input": {
+       "value": 11000,
+       "knownRecords": 1,
+       "unknownRecords": 0
+      },
+      "output": {
+       "value": 3000,
+       "knownRecords": 1,
+       "unknownRecords": 0
+      },
+      "cacheRead": {
+       "value": null,
+       "knownRecords": 0,
+       "unknownRecords": 1
+      },
+      "cacheWrite": {
+       "value": null,
+       "knownRecords": 0,
+       "unknownRecords": 1
+      }
+     },
+     "totalTokens": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 1
+     },
+     "runtimeSeconds": {
+      "value": 1800,
+      "knownRecords": 1,
+      "unknownRecords": 0
+     },
+     "paygEquivalentUsd": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 1
+     },
+     "planCapacityUnits": {}
+    },
+    "actual": {
+     "tokens": {
+      "input": {
+       "value": 13500,
+       "knownRecords": 1,
+       "unknownRecords": 0
+      },
+      "output": {
+       "value": 3400,
+       "knownRecords": 1,
+       "unknownRecords": 0
+      },
+      "cacheRead": {
+       "value": 4000,
+       "knownRecords": 1,
+       "unknownRecords": 0
+      },
+      "cacheWrite": {
+       "value": 1200,
+       "knownRecords": 1,
+       "unknownRecords": 0
+      }
+     },
+     "totalTokens": {
+      "value": 22100,
+      "knownRecords": 1,
+      "unknownRecords": 0
+     },
+     "runtimeSeconds": {
+      "value": 2400,
+      "knownRecords": 1,
+      "unknownRecords": 0
+     },
+     "waitSeconds": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 1
+     },
+     "runtimeSecondsByResult": {
+      "completed": {
+       "value": 2400,
+       "knownRecords": 1,
+       "unknownRecords": 0
+      }
+     },
+     "paygEquivalentUsd": {
+      "value": 0.0972,
+      "knownRecords": 1,
+      "unknownRecords": 0
+     },
+     "billedUsd": {
+      "value": 0.0972,
+      "knownRecords": 1,
+      "unknownRecords": 0
+     },
+     "planCapacityUnits": {},
+     "monetaryStatus": {
+      "payg": 1
+     }
+    },
+    "estimateError": {
+     "meanAbsolutePercentage": {
+      "input": {
+       "value": 22.73,
+       "samples": 1
+      },
+      "output": {
+       "value": 13.33,
+       "samples": 1
+      },
+      "runtimeSeconds": {
+       "value": 33.33,
+       "samples": 1
+      }
+     }
+    },
+    "infrastructure": {
+     "costUsd": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 1
+     },
+     "runnerSeconds": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 1
+     },
+     "ciMinutes": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 1
+     }
+    }
+   },
+   {
+    "key": {
+     "projectId": "forge",
+     "workUnitId": "wu-105"
+    },
+    "records": 2,
+    "runs": 2,
+    "retryAttempts": 0,
+    "byResult": {
+     "completed": 2
+    },
+    "estimated": {
+     "tokens": {
+      "input": {
+       "value": 22000,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      },
+      "output": {
+       "value": 6000,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      },
+      "cacheRead": {
+       "value": null,
+       "knownRecords": 0,
+       "unknownRecords": 2
+      },
+      "cacheWrite": {
+       "value": null,
+       "knownRecords": 0,
+       "unknownRecords": 2
+      }
+     },
+     "totalTokens": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 2
+     },
+     "runtimeSeconds": {
+      "value": 3600,
+      "knownRecords": 2,
+      "unknownRecords": 0
+     },
+     "paygEquivalentUsd": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 2
+     },
+     "planCapacityUnits": {}
+    },
+    "actual": {
+     "tokens": {
+      "input": {
+       "value": 31000,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      },
+      "output": {
+       "value": 7700,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      },
+      "cacheRead": {
+       "value": 8000,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      },
+      "cacheWrite": {
+       "value": 2400,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      }
+     },
+     "totalTokens": {
+      "value": 49100,
+      "knownRecords": 2,
+      "unknownRecords": 0
+     },
+     "runtimeSeconds": {
+      "value": 4800,
+      "knownRecords": 2,
+      "unknownRecords": 0
+     },
+     "waitSeconds": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 2
+     },
+     "runtimeSecondsByResult": {
+      "completed": {
+       "value": 4800,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      }
+     },
+     "paygEquivalentUsd": {
+      "value": 0.2199,
+      "knownRecords": 2,
+      "unknownRecords": 0
+     },
+     "billedUsd": {
+      "value": 0.2199,
+      "knownRecords": 2,
+      "unknownRecords": 0
+     },
+     "planCapacityUnits": {},
+     "monetaryStatus": {
+      "payg": 2
+     }
+    },
+    "estimateError": {
+     "meanAbsolutePercentage": {
+      "input": {
+       "value": 40.91,
+       "samples": 2
+      },
+      "output": {
+       "value": 28.33,
+       "samples": 2
+      },
+      "runtimeSeconds": {
+       "value": 33.33,
+       "samples": 2
+      }
+     }
+    },
+    "infrastructure": {
+     "costUsd": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 2
+     },
+     "runnerSeconds": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 2
+     },
+     "ciMinutes": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 2
+     }
+    }
+   },
+   {
+    "key": {
+     "projectId": "marketingmaestro",
+     "workUnitId": "wu-102"
+    },
+    "records": 2,
+    "runs": 2,
+    "retryAttempts": 0,
+    "byResult": {
+     "completed": 2
+    },
+    "estimated": {
+     "tokens": {
+      "input": {
+       "value": 22000,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      },
+      "output": {
+       "value": 6000,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      },
+      "cacheRead": {
+       "value": null,
+       "knownRecords": 0,
+       "unknownRecords": 2
+      },
+      "cacheWrite": {
+       "value": null,
+       "knownRecords": 0,
+       "unknownRecords": 2
+      }
+     },
+     "totalTokens": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 2
+     },
+     "runtimeSeconds": {
+      "value": 3600,
+      "knownRecords": 2,
+      "unknownRecords": 0
+     },
+     "paygEquivalentUsd": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 2
+     },
+     "planCapacityUnits": {}
+    },
+    "actual": {
+     "tokens": {
+      "input": {
+       "value": 28000,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      },
+      "output": {
+       "value": 7700,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      },
+      "cacheRead": {
+       "value": 8000,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      },
+      "cacheWrite": {
+       "value": 2400,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      }
+     },
+     "totalTokens": {
+      "value": 46100,
+      "knownRecords": 2,
+      "unknownRecords": 0
+     },
+     "runtimeSeconds": {
+      "value": 4800,
+      "knownRecords": 2,
+      "unknownRecords": 0
+     },
+     "waitSeconds": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 2
+     },
+     "runtimeSecondsByResult": {
+      "completed": {
+       "value": 4800,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      }
+     },
+     "paygEquivalentUsd": {
+      "value": 0.2109,
+      "knownRecords": 2,
+      "unknownRecords": 0
+     },
+     "billedUsd": {
+      "value": 0.2109,
+      "knownRecords": 2,
+      "unknownRecords": 0
+     },
+     "planCapacityUnits": {},
+     "monetaryStatus": {
+      "payg": 2
+     }
+    },
+    "estimateError": {
+     "meanAbsolutePercentage": {
+      "input": {
+       "value": 27.275,
+       "samples": 2
+      },
+      "output": {
+       "value": 28.33,
+       "samples": 2
+      },
+      "runtimeSeconds": {
+       "value": 33.33,
+       "samples": 2
+      }
+     }
+    },
+    "infrastructure": {
+     "costUsd": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 2
+     },
+     "runnerSeconds": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 2
+     },
+     "ciMinutes": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 2
+     }
+    }
+   },
+   {
+    "key": {
+     "projectId": "marketingmaestro",
+     "workUnitId": "wu-103"
+    },
+    "records": 3,
+    "runs": 3,
+    "retryAttempts": 0,
+    "byResult": {
+     "completed": 3
+    },
+    "estimated": {
+     "tokens": {
+      "input": {
+       "value": 33000,
+       "knownRecords": 3,
+       "unknownRecords": 0
+      },
+      "output": {
+       "value": 9000,
+       "knownRecords": 3,
+       "unknownRecords": 0
+      },
+      "cacheRead": {
+       "value": null,
+       "knownRecords": 0,
+       "unknownRecords": 3
+      },
+      "cacheWrite": {
+       "value": null,
+       "knownRecords": 0,
+       "unknownRecords": 3
+      }
+     },
+     "totalTokens": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 3
+     },
+     "runtimeSeconds": {
+      "value": 5400,
+      "knownRecords": 3,
+      "unknownRecords": 0
+     },
+     "paygEquivalentUsd": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 3
+     },
+     "planCapacityUnits": {}
+    },
+    "actual": {
+     "tokens": {
+      "input": {
+       "value": 48000,
+       "knownRecords": 3,
+       "unknownRecords": 0
+      },
+      "output": {
+       "value": 12900,
+       "knownRecords": 3,
+       "unknownRecords": 0
+      },
+      "cacheRead": {
+       "value": 12000,
+       "knownRecords": 3,
+       "unknownRecords": 0
+      },
+      "cacheWrite": {
+       "value": 3600,
+       "knownRecords": 3,
+       "unknownRecords": 0
+      }
+     },
+     "totalTokens": {
+      "value": 76500,
+      "knownRecords": 3,
+      "unknownRecords": 0
+     },
+     "runtimeSeconds": {
+      "value": 7200,
+      "knownRecords": 3,
+      "unknownRecords": 0
+     },
+     "waitSeconds": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 3
+     },
+     "runtimeSecondsByResult": {
+      "completed": {
+       "value": 7200,
+       "knownRecords": 3,
+       "unknownRecords": 0
+      }
+     },
+     "paygEquivalentUsd": {
+      "value": 0.3546,
+      "knownRecords": 3,
+      "unknownRecords": 0
+     },
+     "billedUsd": {
+      "value": 0.3546,
+      "knownRecords": 3,
+      "unknownRecords": 0
+     },
+     "planCapacityUnits": {},
+     "monetaryStatus": {
+      "payg": 3
+     }
+    },
+    "estimateError": {
+     "meanAbsolutePercentage": {
+      "input": {
+       "value": 45.4533,
+       "samples": 3
+      },
+      "output": {
+       "value": 43.33,
+       "samples": 3
+      },
+      "runtimeSeconds": {
+       "value": 33.33,
+       "samples": 3
+      }
+     }
+    },
+    "infrastructure": {
+     "costUsd": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 3
+     },
+     "runnerSeconds": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 3
+     },
+     "ciMinutes": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 3
+     }
+    }
+   },
+   {
+    "key": {
+     "projectId": "marketingmaestro",
+     "workUnitId": "wu-105"
+    },
+    "records": 2,
+    "runs": 2,
+    "retryAttempts": 0,
+    "byResult": {
+     "completed": 2
+    },
+    "estimated": {
+     "tokens": {
+      "input": {
+       "value": 22000,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      },
+      "output": {
+       "value": 6000,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      },
+      "cacheRead": {
+       "value": null,
+       "knownRecords": 0,
+       "unknownRecords": 2
+      },
+      "cacheWrite": {
+       "value": null,
+       "knownRecords": 0,
+       "unknownRecords": 2
+      }
+     },
+     "totalTokens": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 2
+     },
+     "runtimeSeconds": {
+      "value": 3600,
+      "knownRecords": 2,
+      "unknownRecords": 0
+     },
+     "paygEquivalentUsd": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 2
+     },
+     "planCapacityUnits": {}
+    },
+    "actual": {
+     "tokens": {
+      "input": {
+       "value": 31000,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      },
+      "output": {
+       "value": 7700,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      },
+      "cacheRead": {
+       "value": 8000,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      },
+      "cacheWrite": {
+       "value": 2400,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      }
+     },
+     "totalTokens": {
+      "value": 49100,
+      "knownRecords": 2,
+      "unknownRecords": 0
+     },
+     "runtimeSeconds": {
+      "value": 4800,
+      "knownRecords": 2,
+      "unknownRecords": 0
+     },
+     "waitSeconds": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 2
+     },
+     "runtimeSecondsByResult": {
+      "completed": {
+       "value": 4800,
+       "knownRecords": 2,
+       "unknownRecords": 0
+      }
+     },
+     "paygEquivalentUsd": {
+      "value": 0.2199,
+      "knownRecords": 2,
+      "unknownRecords": 0
+     },
+     "billedUsd": {
+      "value": 0.2199,
+      "knownRecords": 2,
+      "unknownRecords": 0
+     },
+     "planCapacityUnits": {},
+     "monetaryStatus": {
+      "payg": 2
+     }
+    },
+    "estimateError": {
+     "meanAbsolutePercentage": {
+      "input": {
+       "value": 40.91,
+       "samples": 2
+      },
+      "output": {
+       "value": 28.33,
+       "samples": 2
+      },
+      "runtimeSeconds": {
+       "value": 33.33,
+       "samples": 2
+      }
+     }
+    },
+    "infrastructure": {
+     "costUsd": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 2
+     },
+     "runnerSeconds": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 2
+     },
+     "ciMinutes": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 2
+     }
+    }
+   },
+   {
+    "key": {
+     "projectId": "marketmaestro",
+     "workUnitId": "wu-101"
+    },
+    "records": 1,
+    "runs": 1,
+    "retryAttempts": 0,
+    "byResult": {
+     "completed": 1
+    },
+    "estimated": {
+     "tokens": {
+      "input": {
+       "value": 11000,
+       "knownRecords": 1,
+       "unknownRecords": 0
+      },
+      "output": {
+       "value": 3000,
+       "knownRecords": 1,
+       "unknownRecords": 0
+      },
+      "cacheRead": {
+       "value": null,
+       "knownRecords": 0,
+       "unknownRecords": 1
+      },
+      "cacheWrite": {
+       "value": null,
+       "knownRecords": 0,
+       "unknownRecords": 1
+      }
+     },
+     "totalTokens": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 1
+     },
+     "runtimeSeconds": {
+      "value": 1800,
+      "knownRecords": 1,
+      "unknownRecords": 0
+     },
+     "paygEquivalentUsd": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 1
+     },
+     "planCapacityUnits": {}
+    },
+    "actual": {
+     "tokens": {
+      "input": {
+       "value": 12000,
+       "knownRecords": 1,
+       "unknownRecords": 0
+      },
+      "output": {
+       "value": 3400,
+       "knownRecords": 1,
+       "unknownRecords": 0
+      },
+      "cacheRead": {
+       "value": 4000,
+       "knownRecords": 1,
+       "unknownRecords": 0
+      },
+      "cacheWrite": {
+       "value": 1200,
+       "knownRecords": 1,
+       "unknownRecords": 0
+      }
+     },
+     "totalTokens": {
+      "value": 20600,
+      "knownRecords": 1,
+      "unknownRecords": 0
+     },
+     "runtimeSeconds": {
+      "value": 2400,
+      "knownRecords": 1,
+      "unknownRecords": 0
+     },
+     "waitSeconds": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 1
+     },
+     "runtimeSecondsByResult": {
+      "completed": {
+       "value": 2400,
+       "knownRecords": 1,
+       "unknownRecords": 0
+      }
+     },
+     "paygEquivalentUsd": {
+      "value": 0.0927,
+      "knownRecords": 1,
+      "unknownRecords": 0
+     },
+     "billedUsd": {
+      "value": 0.0927,
+      "knownRecords": 1,
+      "unknownRecords": 0
+     },
+     "planCapacityUnits": {},
+     "monetaryStatus": {
+      "payg": 1
+     }
+    },
+    "estimateError": {
+     "meanAbsolutePercentage": {
+      "input": {
+       "value": 9.09,
+       "samples": 1
+      },
+      "output": {
+       "value": 13.33,
+       "samples": 1
+      },
+      "runtimeSeconds": {
+       "value": 33.33,
+       "samples": 1
+      }
+     }
+    },
+    "infrastructure": {
+     "costUsd": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 1
+     },
+     "runnerSeconds": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 1
+     },
+     "ciMinutes": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 1
+     }
+    }
+   },
+   {
+    "key": {
+     "projectId": "marketmaestro",
+     "workUnitId": "wu-103"
+    },
+    "records": 3,
+    "runs": 3,
+    "retryAttempts": 0,
+    "byResult": {
+     "completed": 3
+    },
+    "estimated": {
+     "tokens": {
+      "input": {
+       "value": 33000,
+       "knownRecords": 3,
+       "unknownRecords": 0
+      },
+      "output": {
+       "value": 9000,
+       "knownRecords": 3,
+       "unknownRecords": 0
+      },
+      "cacheRead": {
+       "value": null,
+       "knownRecords": 0,
+       "unknownRecords": 3
+      },
+      "cacheWrite": {
+       "value": null,
+       "knownRecords": 0,
+       "unknownRecords": 3
+      }
+     },
+     "totalTokens": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 3
+     },
+     "runtimeSeconds": {
+      "value": 5400,
+      "knownRecords": 3,
+      "unknownRecords": 0
+     },
+     "paygEquivalentUsd": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 3
+     },
+     "planCapacityUnits": {}
+    },
+    "actual": {
+     "tokens": {
+      "input": {
+       "value": 48000,
+       "knownRecords": 3,
+       "unknownRecords": 0
+      },
+      "output": {
+       "value": 12900,
+       "knownRecords": 3,
+       "unknownRecords": 0
+      },
+      "cacheRead": {
+       "value": 12000,
+       "knownRecords": 3,
+       "unknownRecords": 0
+      },
+      "cacheWrite": {
+       "value": 3600,
+       "knownRecords": 3,
+       "unknownRecords": 0
+      }
+     },
+     "totalTokens": {
+      "value": 76500,
+      "knownRecords": 3,
+      "unknownRecords": 0
+     },
+     "runtimeSeconds": {
+      "value": 7200,
+      "knownRecords": 3,
+      "unknownRecords": 0
+     },
+     "waitSeconds": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 3
+     },
+     "runtimeSecondsByResult": {
+      "completed": {
+       "value": 7200,
+       "knownRecords": 3,
+       "unknownRecords": 0
+      }
+     },
+     "paygEquivalentUsd": {
+      "value": 0.3546,
+      "knownRecords": 3,
+      "unknownRecords": 0
+     },
+     "billedUsd": {
+      "value": 0.3546,
+      "knownRecords": 3,
+      "unknownRecords": 0
+     },
+     "planCapacityUnits": {},
+     "monetaryStatus": {
+      "payg": 3
+     }
+    },
+    "estimateError": {
+     "meanAbsolutePercentage": {
+      "input": {
+       "value": 45.4533,
+       "samples": 3
+      },
+      "output": {
+       "value": 43.33,
+       "samples": 3
+      },
+      "runtimeSeconds": {
+       "value": 33.33,
+       "samples": 3
+      }
+     }
+    },
+    "infrastructure": {
+     "costUsd": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 3
+     },
+     "runnerSeconds": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 3
+     },
+     "ciMinutes": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 3
+     }
+    }
+   },
+   {
+    "key": {
+     "projectId": "marketmaestro",
+     "workUnitId": "wu-104"
+    },
+    "records": 1,
+    "runs": 1,
+    "retryAttempts": 0,
+    "byResult": {
+     "completed": 1
+    },
+    "estimated": {
+     "tokens": {
+      "input": {
+       "value": 11000,
+       "knownRecords": 1,
+       "unknownRecords": 0
+      },
+      "output": {
+       "value": 3000,
+       "knownRecords": 1,
+       "unknownRecords": 0
+      },
+      "cacheRead": {
+       "value": null,
+       "knownRecords": 0,
+       "unknownRecords": 1
+      },
+      "cacheWrite": {
+       "value": null,
+       "knownRecords": 0,
+       "unknownRecords": 1
+      }
+     },
+     "totalTokens": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 1
+     },
+     "runtimeSeconds": {
+      "value": 1800,
+      "knownRecords": 1,
+      "unknownRecords": 0
+     },
+     "paygEquivalentUsd": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 1
+     },
+     "planCapacityUnits": {}
+    },
+    "actual": {
+     "tokens": {
+      "input": {
+       "value": 13500,
+       "knownRecords": 1,
+       "unknownRecords": 0
+      },
+      "output": {
+       "value": 3400,
+       "knownRecords": 1,
+       "unknownRecords": 0
+      },
+      "cacheRead": {
+       "value": 4000,
+       "knownRecords": 1,
+       "unknownRecords": 0
+      },
+      "cacheWrite": {
+       "value": 1200,
+       "knownRecords": 1,
+       "unknownRecords": 0
+      }
+     },
+     "totalTokens": {
+      "value": 22100,
+      "knownRecords": 1,
+      "unknownRecords": 0
+     },
+     "runtimeSeconds": {
+      "value": 2400,
+      "knownRecords": 1,
+      "unknownRecords": 0
+     },
+     "waitSeconds": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 1
+     },
+     "runtimeSecondsByResult": {
+      "completed": {
+       "value": 2400,
+       "knownRecords": 1,
+       "unknownRecords": 0
+      }
+     },
+     "paygEquivalentUsd": {
+      "value": 0.0972,
+      "knownRecords": 1,
+      "unknownRecords": 0
+     },
+     "billedUsd": {
+      "value": 0.0972,
+      "knownRecords": 1,
+      "unknownRecords": 0
+     },
+     "planCapacityUnits": {},
+     "monetaryStatus": {
+      "payg": 1
+     }
+    },
+    "estimateError": {
+     "meanAbsolutePercentage": {
+      "input": {
+       "value": 22.73,
+       "samples": 1
+      },
+      "output": {
+       "value": 13.33,
+       "samples": 1
+      },
+      "runtimeSeconds": {
+       "value": 33.33,
+       "samples": 1
+      }
+     }
+    },
+    "infrastructure": {
+     "costUsd": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 1
+     },
+     "runnerSeconds": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 1
+     },
+     "ciMinutes": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 1
+     }
+    }
+   }
+  ],
+  "totals": {
+   "key": {},
+   "records": 18,
+   "runs": 18,
+   "retryAttempts": 0,
+   "byResult": {
+    "completed": 18
+   },
+   "estimated": {
+    "tokens": {
+     "input": {
+      "value": 198000,
+      "knownRecords": 18,
+      "unknownRecords": 0
+     },
+     "output": {
+      "value": 54000,
+      "knownRecords": 18,
+      "unknownRecords": 0
+     },
+     "cacheRead": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 18
+     },
+     "cacheWrite": {
+      "value": null,
+      "knownRecords": 0,
+      "unknownRecords": 18
+     }
+    },
+    "totalTokens": {
+     "value": null,
+     "knownRecords": 0,
+     "unknownRecords": 18
+    },
+    "runtimeSeconds": {
+     "value": 32400,
+     "knownRecords": 18,
+     "unknownRecords": 0
+    },
+    "paygEquivalentUsd": {
+     "value": null,
+     "knownRecords": 0,
+     "unknownRecords": 18
+    },
+    "planCapacityUnits": {}
+   },
+   "actual": {
+    "tokens": {
+     "input": {
+      "value": 265000,
+      "knownRecords": 18,
+      "unknownRecords": 0
+     },
+     "output": {
+      "value": 70200,
+      "knownRecords": 18,
+      "unknownRecords": 0
+     },
+     "cacheRead": {
+      "value": 72000,
+      "knownRecords": 18,
+      "unknownRecords": 0
+     },
+     "cacheWrite": {
+      "value": 21600,
+      "knownRecords": 18,
+      "unknownRecords": 0
+     }
+    },
+    "totalTokens": {
+     "value": 428800,
+     "knownRecords": 18,
+     "unknownRecords": 0
+    },
+    "runtimeSeconds": {
+     "value": 43200,
+     "knownRecords": 18,
+     "unknownRecords": 0
+    },
+    "waitSeconds": {
+     "value": null,
+     "knownRecords": 0,
+     "unknownRecords": 18
+    },
+    "runtimeSecondsByResult": {
+     "completed": {
+      "value": 43200,
+      "knownRecords": 18,
+      "unknownRecords": 0
+     }
+    },
+    "paygEquivalentUsd": {
+     "value": 1.9506,
+     "knownRecords": 18,
+     "unknownRecords": 0
+    },
+    "billedUsd": {
+     "value": 1.9506,
+     "knownRecords": 18,
+     "unknownRecords": 0
+    },
+    "planCapacityUnits": {},
+    "monetaryStatus": {
+     "payg": 18
+    }
+   },
+   "estimateError": {
+    "meanAbsolutePercentage": {
+     "input": {
+      "value": 33.8389,
+      "samples": 18
+     },
+     "output": {
+      "value": 29.9967,
+      "samples": 18
+     },
+     "runtimeSeconds": {
+      "value": 33.33,
+      "samples": 18
+     }
+    }
+   },
+   "infrastructure": {
+    "costUsd": {
+     "value": null,
+     "knownRecords": 0,
+     "unknownRecords": 18
+    },
+    "runnerSeconds": {
+     "value": null,
+     "knownRecords": 0,
+     "unknownRecords": 18
+    },
+    "ciMinutes": {
+     "value": null,
+     "knownRecords": 0,
+     "unknownRecords": 18
+    }
+   }
+  },
+  "limitations": [
+   "sums cover known values only; unknownRecords counts what was not observable",
+   "billedUsd is set only for pay-as-you-go pricing; subscription usage is never presented as billed",
+   "paygEquivalentUsd for subscription usage is a reference figure at the snapshot's reference rates",
+   "infrastructure cost is reported separately from AI cost equivalent and is never combined into one total"
+  ]
+ },
+ "capacity": {
+  "schemaVersion": 1,
+  "window": {
+   "start": "2026-10-26T00:00:00Z",
+   "end": "2026-10-30T00:00:00Z",
+   "seconds": 345600
+  },
+  "coverage": {
+   "records": 18,
+   "runsClipped": 0,
+   "runsOutsideWindow": 0,
+   "runsTimed": 18,
+   "runsUntimed": 0,
+   "waitsOutsideWindow": 0,
+   "waitsTimed": 0,
+   "waitsUntimed": 18
+  },
+  "concurrency": {
+   "peak": 2,
+   "mean": 0.125,
+   "busySeconds": 43200,
+   "occupiedSeconds": 21600,
+   "idleSeconds": 324000,
+   "windowSeconds": 345600,
+   "runs": 18,
+   "segments": [
+    {
+     "from": "2026-10-26T08:00:00+00:00",
+     "to": "2026-10-26T08:40:00+00:00",
+     "active": 2,
+     "seconds": 2400
+    },
+    {
+     "from": "2026-10-26T09:00:00+00:00",
+     "to": "2026-10-26T09:40:00+00:00",
+     "active": 2,
+     "seconds": 2400
+    },
+    {
+     "from": "2026-10-26T10:00:00+00:00",
+     "to": "2026-10-26T10:40:00+00:00",
+     "active": 2,
+     "seconds": 2400
+    },
+    {
+     "from": "2026-10-26T11:00:00+00:00",
+     "to": "2026-10-26T11:40:00+00:00",
+     "active": 2,
+     "seconds": 2400
+    },
+    {
+     "from": "2026-10-26T12:00:00+00:00",
+     "to": "2026-10-26T12:40:00+00:00",
+     "active": 2,
+     "seconds": 2400
+    },
+    {
+     "from": "2026-10-27T09:00:00+00:00",
+     "to": "2026-10-27T09:40:00+00:00",
+     "active": 2,
+     "seconds": 2400
+    },
+    {
+     "from": "2026-10-27T10:00:00+00:00",
+     "to": "2026-10-27T10:40:00+00:00",
+     "active": 2,
+     "seconds": 2400
+    },
+    {
+     "from": "2026-10-27T12:00:00+00:00",
+     "to": "2026-10-27T12:40:00+00:00",
+     "active": 2,
+     "seconds": 2400
+    },
+    {
+     "from": "2026-10-28T10:00:00+00:00",
+     "to": "2026-10-28T10:40:00+00:00",
+     "active": 2,
+     "seconds": 2400
+    }
+   ]
+  },
+  "queue": {
+   "peak": 0,
+   "mean": 0.0,
+   "busySeconds": 0,
+   "occupiedSeconds": 0,
+   "idleSeconds": 345600,
+   "windowSeconds": 345600,
+   "runs": 0,
+   "segments": []
+  },
+  "wait": {
+   "totalSeconds": 0,
+   "waitsTimed": 0,
+   "waitsUntimed": 18,
+   "byCause": {
+    "dependency": {
+     "seconds": 0,
+     "waits": 0,
+     "blockers": {}
+    },
+    "resource": {
+     "seconds": 0,
+     "waits": 0,
+     "blockers": {}
+    },
+    "unclassified": {
+     "seconds": 0,
+     "waits": 0,
+     "blockers": {}
+    }
+   },
+   "byStageSeconds": {},
+   "handoff": {
+    "totalSeconds": 0,
+    "byWorkUnitSeconds": {}
+   }
+  },
+  "runners": {
+   "byWorker": {
+    "gha-runner-3": {
+     "peak": 1,
+     "mean": 0.0625,
+     "busySeconds": 21600,
+     "occupiedSeconds": 21600,
+     "idleSeconds": 324000,
+     "windowSeconds": 345600,
+     "runs": 9,
+     "utilization": null,
+     "pool": null,
+     "utilizationStatus": "unknown"
+    },
+    "gha-runner-7": {
+     "peak": 1,
+     "mean": 0.0625,
+     "busySeconds": 21600,
+     "occupiedSeconds": 21600,
+     "idleSeconds": 324000,
+     "windowSeconds": 345600,
+     "runs": 9,
+     "utilization": null,
+     "pool": null,
+     "utilizationStatus": "unknown"
+    }
+   },
+   "byPool": {},
+   "undeclaredWorkers": [
+    "gha-runner-3",
+    "gha-runner-7"
+   ],
+   "undeclaredWorkerUtilization": "unknown"
+  },
+  "models": {
+   "byModel": {
+    "claude-opus-5": {
+     "peak": 1,
+     "mean": 0.0625,
+     "busySeconds": 21600,
+     "occupiedSeconds": 21600,
+     "idleSeconds": 324000,
+     "windowSeconds": 345600,
+     "runs": 9,
+     "stageMix": {
+      "implementation": 9
+     }
+    },
+    "gpt-5-codex": {
+     "peak": 1,
+     "mean": 0.0625,
+     "busySeconds": 21600,
+     "occupiedSeconds": 21600,
+     "idleSeconds": 324000,
+     "windowSeconds": 345600,
+     "runs": 9,
+     "stageMix": {
+      "implementation": 9
+     }
+    }
+   },
+   "byProvider": {
+    "anthropic": {
+     "peak": 1,
+     "mean": 0.0625,
+     "busySeconds": 21600,
+     "occupiedSeconds": 21600,
+     "idleSeconds": 324000,
+     "windowSeconds": 345600,
+     "runs": 9,
+     "stageMix": {
+      "implementation": 9
+     }
+    },
+    "openai": {
+     "peak": 1,
+     "mean": 0.0625,
+     "busySeconds": 21600,
+     "occupiedSeconds": 21600,
+     "idleSeconds": 324000,
+     "windowSeconds": 345600,
+     "runs": 9,
+     "stageMix": {
+      "implementation": 9
+     }
+    }
+   }
+  },
+  "planCapacity": {
+   "anthropic": {
+    "provider": "anthropic",
+    "status": "unknown",
+    "reason": "no plan capacity observation was supplied for this provider",
+    "unitsTotal": null,
+    "unitsUsed": null,
+    "usedFraction": null,
+    "exhausted": null,
+    "usageProxies": {
+     "peakConcurrentRuns": 1,
+     "busySeconds": 21600,
+     "runs": 9,
+     "observedCapacityUnits": {},
+     "estimatedCapacityUnits": {},
+     "runsWithUnknownCapacityUnits": 0
+    }
+   },
+   "openai": {
+    "provider": "openai",
+    "status": "unknown",
+    "reason": "no plan capacity observation was supplied for this provider",
+    "unitsTotal": null,
+    "unitsUsed": null,
+    "usedFraction": null,
+    "exhausted": null,
+    "usageProxies": {
+     "peakConcurrentRuns": 1,
+     "busySeconds": 21600,
+     "runs": 9,
+     "observedCapacityUnits": {},
+     "estimatedCapacityUnits": {},
+     "runsWithUnknownCapacityUnits": 0
+    }
+   }
+  },
+  "usefulWork": {
+   "rawBusySeconds": 43200,
+   "usefulSeconds": 43200,
+   "reworkSeconds": 0,
+   "usefulWorkRatio": 1.0,
+   "formula": "busy seconds of runs that completed on their first attempt / all busy seconds; failed, cancelled, abandoned, inconclusive and retried runs stay in the denominator",
+   "numeratorSeconds": 43200,
+   "denominatorSeconds": 43200,
+   "byResult": {
+    "completed": {
+     "seconds": 43200,
+     "runs": 18
+    }
+   },
+   "firstAttempt": {
+    "seconds": 43200,
+    "runs": 18
+   },
+   "retries": {
+    "seconds": 0,
+    "runs": 0
+   }
+  },
+  "bottlenecks": [],
+  "recommendations": [],
+  "byProject": {
+   "forge": {
+    "concurrency": {
+     "peak": 1,
+     "mean": 0.0417,
+     "busySeconds": 14400,
+     "occupiedSeconds": 14400,
+     "idleSeconds": 331200,
+     "windowSeconds": 345600,
+     "runs": 6
+    },
+    "queue": {
+     "peak": 0,
+     "mean": 0.0,
+     "busySeconds": 0,
+     "occupiedSeconds": 0,
+     "idleSeconds": 345600,
+     "windowSeconds": 345600,
+     "runs": 0
+    },
+    "waitSeconds": 0,
+    "usefulWork": {
+     "rawBusySeconds": 14400,
+     "usefulSeconds": 14400,
+     "reworkSeconds": 0,
+     "usefulWorkRatio": 1.0,
+     "formula": "busy seconds of runs that completed on their first attempt / all busy seconds; failed, cancelled, abandoned, inconclusive and retried runs stay in the denominator",
+     "numeratorSeconds": 14400,
+     "denominatorSeconds": 14400,
+     "byResult": {
+      "completed": {
+       "seconds": 14400,
+       "runs": 6
+      }
+     },
+     "firstAttempt": {
+      "seconds": 14400,
+      "runs": 6
+     },
+     "retries": {
+      "seconds": 0,
+      "runs": 0
+     }
+    }
+   },
+   "marketingmaestro": {
+    "concurrency": {
+     "peak": 1,
+     "mean": 0.0486,
+     "busySeconds": 16800,
+     "occupiedSeconds": 16800,
+     "idleSeconds": 328800,
+     "windowSeconds": 345600,
+     "runs": 7
+    },
+    "queue": {
+     "peak": 0,
+     "mean": 0.0,
+     "busySeconds": 0,
+     "occupiedSeconds": 0,
+     "idleSeconds": 345600,
+     "windowSeconds": 345600,
+     "runs": 0
+    },
+    "waitSeconds": 0,
+    "usefulWork": {
+     "rawBusySeconds": 16800,
+     "usefulSeconds": 16800,
+     "reworkSeconds": 0,
+     "usefulWorkRatio": 1.0,
+     "formula": "busy seconds of runs that completed on their first attempt / all busy seconds; failed, cancelled, abandoned, inconclusive and retried runs stay in the denominator",
+     "numeratorSeconds": 16800,
+     "denominatorSeconds": 16800,
+     "byResult": {
+      "completed": {
+       "seconds": 16800,
+       "runs": 7
+      }
+     },
+     "firstAttempt": {
+      "seconds": 16800,
+      "runs": 7
+     },
+     "retries": {
+      "seconds": 0,
+      "runs": 0
+     }
+    }
+   },
+   "marketmaestro": {
+    "concurrency": {
+     "peak": 1,
+     "mean": 0.0347,
+     "busySeconds": 12000,
+     "occupiedSeconds": 12000,
+     "idleSeconds": 333600,
+     "windowSeconds": 345600,
+     "runs": 5
+    },
+    "queue": {
+     "peak": 0,
+     "mean": 0.0,
+     "busySeconds": 0,
+     "occupiedSeconds": 0,
+     "idleSeconds": 345600,
+     "windowSeconds": 345600,
+     "runs": 0
+    },
+    "waitSeconds": 0,
+    "usefulWork": {
+     "rawBusySeconds": 12000,
+     "usefulSeconds": 12000,
+     "reworkSeconds": 0,
+     "usefulWorkRatio": 1.0,
+     "formula": "busy seconds of runs that completed on their first attempt / all busy seconds; failed, cancelled, abandoned, inconclusive and retried runs stay in the denominator",
+     "numeratorSeconds": 12000,
+     "denominatorSeconds": 12000,
+     "byResult": {
+      "completed": {
+       "seconds": 12000,
+       "runs": 5
+      }
+     },
+     "firstAttempt": {
+      "seconds": 12000,
+      "runs": 5
+     },
+     "retries": {
+      "seconds": 0,
+      "runs": 0
+     }
+    }
+   }
+  },
+  "limitations": [
+   "the observation window is supplied by the caller, so idle capacity stays in every denominator",
+   "runs without a recorded start and finish are counted as unobserved, never assumed to have run",
+   "a utilization figure appears only where the capacity it divides by was declared; undeclared runners and unobserved plan capacity read as unknown",
+   "a wait is called resource-blocked only when the pool that ran it was saturated for most of the wait; anything else stays unclassified",
+   "useful work counts only runs that completed on their first attempt; retries and failures remain in the denominator",
+   "bottlenecks and recommendations are evidence with an explanation, and change no routing, concurrency or spending policy"
+  ]
+ }
+}

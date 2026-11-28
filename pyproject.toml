@@ -16,6 +16,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  "playwright==1.62.0",
   "pytest>=9.2.0,<10",
   "ruff>=0.17.5,<1",
 ]
