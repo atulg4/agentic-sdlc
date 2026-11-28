@@ -1363,3 +1363,43 @@ def test_query_time_bounds_compare_instants_not_strings() -> None:
     assert len(ledger.query(since="2026-10-01T09:00:00.500Z")) == 0
     with pytest.raises(EffectivenessError, match="query since"):
         ledger.query(since="yesterday")
+
+
+
+def test_completion_timestamp_and_usage_only_project_coverage_regressions() -> None:
+    ledger = EffectivenessLedger()
+    intake = _outcome(
+        result=OutcomeResult.UNKNOWN,
+        deployment_status=DeploymentStatus.UNKNOWN,
+        recorded_at=T0,
+    )
+    completed = _outcome(recorded_at=T2)
+
+    ledger.append(intake)
+    merged = ledger.append(completed)
+
+    assert merged.recorded_at == T2
+
+    beta_unit = "github:example/beta:issue:2"
+    gamma_unit = "github:example/gamma:issue:3"
+    report = build_effectiveness_report(
+        (completed,),
+        usage_records=(
+            _usage(
+                "run-beta",
+                project_id="beta",
+                unit=beta_unit,
+            ),
+        ),
+        learnings=(
+            _learning(
+                work_unit=_work_unit("gamma", gamma_unit),
+            ),
+        ),
+        window=WINDOW,
+    )
+
+    assert set(report["byProject"]) == {"alpha", "beta", "gamma"}
+    assert report["byProject"]["beta"]["outcomes"] == 0
+    assert report["byProject"]["gamma"]["outcomes"] == 0
+    assert report["byProject"]["gamma"]["learnings"] == 1
