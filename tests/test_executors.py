@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from agentic_sdlc.executors import (
+    AuthMode,
     ExecutorError,
     RouteRequest,
     RouteStatus,
+    RoutingPolicy,
     TaskClass,
     load_executors,
     load_routing_policy,
@@ -52,6 +56,215 @@ def _request(**overrides) -> RouteRequest:
     }
     values.update(overrides)
     return RouteRequest(**values)
+
+
+def _codex_subscription(**overrides):
+    values = {
+        "provider": "codex",
+        "adapter": "codex-cli",
+        "executionType": "subscription-runner",
+        "authMode": "oauth",
+        "model": "account-supported-model",
+        "modelAlias": "codex",
+        "directCostUsd": 0,
+        "shadowCostUsd": 1,
+        "subscriptionMonthlyUsd": 200,
+        "subscriptionCapacityRemaining": 10,
+    }
+    values.update(overrides)
+    return _executor("codex-subscription", **values)
+
+
+@pytest.mark.parametrize("execution_type", ["subscription-cloud", "subscription-runner"])
+def test_codex_subscription_requires_oauth(execution_type) -> None:
+    executor = load_executors([_codex_subscription(executionType=execution_type)])[0]
+    assert executor.auth_mode is AuthMode.OAUTH
+
+    with pytest.raises(ExecutorError, match="Codex subscription executors require oauth"):
+        load_executors([_codex_subscription(executionType=execution_type, authMode="api-key")])
+    with pytest.raises(ExecutorError, match="credentials or secrets"):
+        load_executors([_codex_subscription(credentialReference="OPENAI_API_KEY")])
+
+
+def test_directly_constructed_codex_subscription_cannot_route_with_api_auth() -> None:
+    executor = load_executors([_codex_subscription()])[0]
+    invalid = replace(executor, auth_mode=AuthMode.API_KEY)
+
+    with pytest.raises(ExecutorError, match="Codex subscription executors require oauth"):
+        route_executor(_request(), [invalid])
+
+
+@pytest.mark.parametrize(
+    ("execution_type", "auth_mode", "expected"),
+    [
+        ("subscription-cloud", "oauth", "provider-cloud"),
+        ("subscription-runner", "oauth", "authenticated-remote-client"),
+        ("direct-api", "api-key", "api"),
+        ("cloud-platform", "oidc", "api"),
+        ("self-hosted", "local-trusted-runner", "authenticated-remote-client"),
+    ],
+)
+def test_routes_report_the_derived_execution_surface(execution_type, auth_mode, expected) -> None:
+    executor = load_executors(
+        [_codex_subscription(executionType=execution_type, authMode=auth_mode)]
+    )[0]
+    decision = route_executor(_request(), [executor])
+
+    assert executor.execution_surface == expected
+    assert decision.as_dict()["executionSurface"] == expected
+    assert decision.as_dict()["candidates"][0]["executionSurface"] == expected
+
+
+@pytest.mark.parametrize("provider", ["openai", "codex"])
+@pytest.mark.parametrize("policy_document", [None, {}, {"allowApiBillingFallback": False}])
+def test_codex_subscription_does_not_silently_fall_back_to_api(provider, policy_document) -> None:
+    executors = load_executors(
+        [
+            _codex_subscription(runtimeStatus="quota-exhausted"),
+            _executor("paid-api", provider=provider, directCostUsd=0.01),
+        ]
+    )
+    decision = route_executor(_request(), executors, load_routing_policy(policy_document))
+
+    assert decision.status is RouteStatus.INSUFFICIENT_BUDGET_OR_ASSURANCE
+    assert decision.as_dict()["executionSurface"] is None
+    by_id = {item["executorId"]: item for item in decision.candidates}
+    assert by_id["codex-subscription"]["recoverable"] is True
+    assert "API billing fallback is disabled" in by_id["paid-api"]["rejectionReasons"]
+
+
+def test_explicit_api_fallback_still_enforces_quality_floor() -> None:
+    policy = load_routing_policy({"allowApiBillingFallback": True})
+    executors = load_executors(
+        [
+            _codex_subscription(runtimeStatus="quota-exhausted"),
+            _executor("paid-api", qualityLowerBound=0.6),
+        ]
+    )
+    assert policy.as_dict()["allowApiBillingFallback"] is True
+    assert route_executor(_request(), executors, policy).status is (
+        RouteStatus.INSUFFICIENT_BUDGET_OR_ASSURANCE
+    )
+
+    qualified = replace(executors[1], quality_lower_bound=0.9)
+    decision = route_executor(_request(), [executors[0], qualified], policy)
+    assert decision.selected_executor_id == "paid-api"
+    assert decision.as_dict()["executionSurface"] == "api"
+
+
+def test_exhausted_codex_subscription_can_fall_back_to_qualified_claude_subscription() -> None:
+    executors = load_executors(
+        [
+            _codex_subscription(runtimeStatus="quota-exhausted"),
+            _executor(
+                "claude-subscription",
+                provider="anthropic",
+                model="claude-opus-5",
+                executionType="subscription-runner",
+                authMode="oauth",
+                directCostUsd=0,
+                shadowCostUsd=1,
+                subscriptionMonthlyUsd=200,
+                subscriptionCapacityRemaining=10,
+            ),
+        ]
+    )
+    assert route_executor(_request(), executors).selected_executor_id == "claude-subscription"
+    unqualified = replace(executors[1], quality_lower_bound=0.6)
+    assert route_executor(_request(), [executors[0], unqualified]).status is (
+        RouteStatus.INSUFFICIENT_BUDGET_OR_ASSURANCE
+    )
+
+
+@pytest.mark.parametrize("value", [1, "true", None, []])
+def test_api_billing_fallback_flag_requires_a_boolean(value) -> None:
+    with pytest.raises(ExecutorError, match="allowApiBillingFallback must be a boolean"):
+        load_routing_policy({"allowApiBillingFallback": value})
+    with pytest.raises(ExecutorError, match="allowApiBillingFallback must be a boolean"):
+        route_executor(
+            _request(),
+            load_executors([_executor("paid-api")]),
+            RoutingPolicy(allow_api_billing_fallback=value),
+        )
+
+
+def test_subscription_route_serializes_only_approved_control_fields() -> None:
+    executor = load_executors([_codex_subscription()])[0]
+    route = route_executor(_request(), [executor]).as_dict()
+
+    assert set(executor.as_dict()) == {
+        "executorId",
+        "provider",
+        "adapter",
+        "adapterVersion",
+        "executionType",
+        "authMode",
+        "model",
+        "modelAlias",
+        "modelFamily",
+        "taskClasses",
+        "capabilities",
+        "toolCapabilities",
+        "contextWindow",
+        "supportsCloud",
+        "available",
+        "runtimeStatus",
+        "runtimeStatusReason",
+        "maxConcurrency",
+        "activeRuns",
+        "maxRisk",
+        "qualityLowerBound",
+        "directCostUsd",
+        "shadowCostUsd",
+        "subscriptionMonthlyUsd",
+        "subscriptionCapacityRemaining",
+        "averageLatencySeconds",
+        "recentFailureRate",
+        "dataResidency",
+        "storesTrainingData",
+        "permittedRepositories",
+    }
+    assert set(route) == {
+        "status",
+        "selectedExecutorId",
+        "executionSurface",
+        "policyVersion",
+        "requiredQualityFloor",
+        "budgetUsd",
+        "candidates",
+        "reason",
+    }
+    assert set(route["candidates"][0]) == {
+        "executorId",
+        "provider",
+        "model",
+        "modelAlias",
+        "executionType",
+        "executionSurface",
+        "authMode",
+        "qualityLowerBound",
+        "expectedMissionCostUsd",
+        "ecps",
+        "preferenceRank",
+        "recoverable",
+        "eligible",
+        "rejectionReasons",
+    }
+
+
+@pytest.mark.parametrize(
+    "subscription_overrides",
+    [None, {"permittedRepositories": ["another/repository"]}, {"taskClasses": ["review"]}],
+)
+def test_api_routing_without_a_matching_codex_subscription_is_preserved(
+    subscription_overrides,
+) -> None:
+    entries = [_executor("paid-api")]
+    if subscription_overrides is not None:
+        entries.append(_codex_subscription(**subscription_overrides))
+
+    decision = route_executor(_request(), load_executors(entries))
+    assert decision.selected_executor_id == "paid-api"
 
 
 def test_deepseek_can_be_selected_when_it_meets_quality_and_capability_floor() -> None:

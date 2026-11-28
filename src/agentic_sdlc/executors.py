@@ -188,6 +188,7 @@ ROUTING_POLICY_KEYS = frozenset(
         "preferredModelAliases",
         "requireNoTrainingStorage",
         "allowedDataResidency",
+        "allowApiBillingFallback",
     }
 )
 
@@ -228,6 +229,24 @@ class ExecutorProfile:
     @property
     def expected_mission_cost(self) -> float:
         return self.direct_cost_usd + self.shadow_cost_usd
+
+    @property
+    def execution_surface(self) -> str:
+        """Describe the execution boundary without adding credential metadata."""
+        return {
+            ExecutionType.SUBSCRIPTION_CLOUD: "provider-cloud",
+            ExecutionType.SUBSCRIPTION_RUNNER: "authenticated-remote-client",
+            ExecutionType.SELF_HOSTED: "authenticated-remote-client",
+            ExecutionType.DIRECT_API: "api",
+            ExecutionType.CLOUD_PLATFORM: "api",
+        }[self.execution_type]
+
+    @property
+    def is_codex_subscription(self) -> bool:
+        return self.provider == "codex" and self.execution_type in {
+            ExecutionType.SUBSCRIPTION_CLOUD,
+            ExecutionType.SUBSCRIPTION_RUNNER,
+        }
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -273,6 +292,7 @@ class RoutingPolicy:
     preferred_model_aliases: Mapping[str, tuple[str, ...]] | None = None
     require_no_training_storage: bool = False
     allowed_data_residency: tuple[str, ...] = tuple(sorted(DATA_RESIDENCY))
+    allow_api_billing_fallback: bool = False
 
     def floor_for(self, risk: RiskLevel) -> float:
         floors = self.quality_floors or {
@@ -303,6 +323,7 @@ class RoutingPolicy:
             },
             "requireNoTrainingStorage": self.require_no_training_storage,
             "allowedDataResidency": list(self.allowed_data_residency),
+            "allowApiBillingFallback": self.allow_api_billing_fallback,
         }
 
     def preference_for(self, task_class: TaskClass, risk: RiskLevel) -> tuple[str, ...]:
@@ -345,10 +366,22 @@ class RouteDecision:
     candidates: tuple[dict[str, Any], ...]
     reason: str
 
+    @property
+    def execution_surface(self) -> str | None:
+        return next(
+            (
+                candidate.get("executionSurface")
+                for candidate in self.candidates
+                if candidate["executorId"] == self.selected_executor_id
+            ),
+            None,
+        )
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "status": self.status.value,
             "selectedExecutorId": self.selected_executor_id,
+            "executionSurface": self.execution_surface,
             "policyVersion": self.policy_version,
             "requiredQualityFloor": self.required_quality_floor,
             "budgetUsd": self.budget_usd,
@@ -411,6 +444,11 @@ def _auth_mode(value: object) -> AuthMode:
         return AuthMode(str(value))
     except ValueError as error:
         raise ExecutorError("authMode is unknown") from error
+
+
+def _validate_subscription_auth(executor: ExecutorProfile) -> None:
+    if executor.is_codex_subscription and executor.auth_mode is not AuthMode.OAUTH:
+        raise ExecutorError("Codex subscription executors require oauth authentication")
 
 
 def _parse_executor(entry: object) -> ExecutorProfile:
@@ -538,7 +576,7 @@ def _parse_executor(entry: object) -> ExecutorProfile:
                 f"executor {executor_id}: subscription executors require positive shadowCostUsd"
             )
 
-    return ExecutorProfile(
+    executor = ExecutorProfile(
         executor_id=executor_id,
         provider=provider,
         adapter=adapter,
@@ -574,6 +612,8 @@ def _parse_executor(entry: object) -> ExecutorProfile:
             entry.get("permittedRepositories"), f"executor {executor_id}: permittedRepositories"
         ),
     )
+    _validate_subscription_auth(executor)
+    return executor
 
 
 def load_executors(document: object) -> tuple[ExecutorProfile, ...]:
@@ -645,6 +685,9 @@ def load_routing_policy(document: object | None) -> RoutingPolicy:
     require_no_training_storage = document.get("requireNoTrainingStorage", False)
     if not isinstance(require_no_training_storage, bool):
         raise ExecutorError("requireNoTrainingStorage must be a boolean")
+    allow_api_billing_fallback = document.get("allowApiBillingFallback", False)
+    if not isinstance(allow_api_billing_fallback, bool):
+        raise ExecutorError("allowApiBillingFallback must be a boolean")
     return RoutingPolicy(
         policy_version=version,
         quality_floors=quality_floors,
@@ -653,6 +696,7 @@ def load_routing_policy(document: object | None) -> RoutingPolicy:
         preferred_model_aliases=preferred_model_aliases or None,
         require_no_training_storage=require_no_training_storage,
         allowed_data_residency=allowed_data_residency,
+        allow_api_billing_fallback=allow_api_billing_fallback,
     )
 
 
@@ -715,6 +759,24 @@ def route_executor(
     policy: RoutingPolicy | None = None,
 ) -> RouteDecision:
     active_policy = policy or RoutingPolicy()
+    _require(
+        isinstance(active_policy.allow_api_billing_fallback, bool),
+        "allowApiBillingFallback must be a boolean",
+    )
+    for executor in executors:
+        _validate_subscription_auth(executor)
+    # Preserve API-only registries. A subscription registered for this work
+    # keeps its billing boundary even while exhausted, unavailable or busy.
+    subscription_scope = any(
+        executor.is_codex_subscription
+        and request.task_class in executor.task_classes
+        and (
+            not request.repository
+            or not executor.permitted_repositories
+            or request.repository in executor.permitted_repositories
+        )
+        for executor in executors
+    )
     floor = active_policy.floor_for(request.risk)
     required_capabilities = set(request.required_capabilities)
     unknown_caps = sorted(required_capabilities - KNOWN_CAPABILITIES)
@@ -736,6 +798,13 @@ def route_executor(
     eligible: list[tuple[int, float, str, ExecutorProfile]] = []
     for executor in executors:
         reasons: list[str] = []
+        if (
+            subscription_scope
+            and not active_policy.allow_api_billing_fallback
+            and executor.provider in {"codex", "openai"}
+            and executor.execution_type is ExecutionType.DIRECT_API
+        ):
+            reasons.append("API billing fallback is disabled")
         if not executor.available:
             reasons.append("unavailable")
         if executor.runtime_status is not RuntimeStatus.READY:
@@ -808,6 +877,7 @@ def route_executor(
                 "model": executor.model,
                 "modelAlias": executor.model_alias,
                 "executionType": executor.execution_type.value,
+                "executionSurface": executor.execution_surface,
                 "authMode": executor.auth_mode.value,
                 "qualityLowerBound": executor.quality_lower_bound,
                 "expectedMissionCostUsd": round(executor.expected_mission_cost, 6),
